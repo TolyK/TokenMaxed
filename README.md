@@ -65,12 +65,65 @@ changes and nothing new leaving the machine.
   built-in type stripping, which is enabled by default from 22.18 — no extra
   test runner). A `tsc` build emits plain JavaScript for publishing/consumption.
 
-## Quick start (development)
+## Getting started
+
+> **Note:** v0 is early. There is not yet an end-user CLI or Claude Code plugin
+> to install (those are on the [Roadmap](#roadmap)). Today you configure your
+> lanes and drive the routing brain (`@tokenmaxed/core`) programmatically. The
+> steps below show both.
+
+### 1. Install
 
 ```bash
 git clone https://github.com/TolyK/TokenMaxed.git
 cd TokenMaxed
 npm install
+npm run build    # compile @tokenmaxed/core so it can be imported by name
+```
+
+### 2. Configure your lanes
+
+A *lane* is a way to run a task — a subscription CLI, a local model, or (later)
+a metered API. Copy the example and edit it for your machine:
+
+```bash
+mkdir -p config
+cp config/lanes.example.yaml config/lanes.yaml
+```
+
+Each lane declares its `kind`, `model`, `trust` tier, `costBasis`, provenance,
+and optional per-category `capability` scores in `[0, 1]`. See
+[`config/lanes.example.yaml`](./config/lanes.example.yaml) for the full,
+commented schema. Only **trusted, non-API** lanes are selectable until the
+minimization/policy gate ships — that ordering is enforced in code.
+
+### 3. Route a task
+
+```ts
+import { routeDecide } from '@tokenmaxed/core';
+import { loadLaneConfig } from '@tokenmaxed/core/node'; // file I/O lives in the Node adapter
+
+// Load and validate your lanes (throws a clear error on a bad config).
+const registry = loadLaneConfig('config/lanes.yaml');
+
+// Decide which lane should handle a task of a given category.
+const decision = routeDecide(
+  { category: 'bugfix' },
+  { lanes: registry.candidateLanes('bugfix') },
+  {}, // policy — empty in v0
+);
+
+console.log(`${decision.laneId} — ${decision.reason}`);
+// codex-cli — Selected codex-cli (gpt-5.5) for bugfix: capability 0.92 at subscription cost.
+```
+
+`routeDecide` is pure and deterministic: the same inputs always pick the same
+lane, and `decision.scores` shows how every candidate ranked (useful for a
+future `why` command).
+
+### Development
+
+```bash
 npm test         # run the test suite (TypeScript, no build needed)
 npm run typecheck
 npm run build    # emit JavaScript to packages/*/dist
@@ -82,7 +135,7 @@ v0 is built locally first; a hosted dashboard is purely additive on top of the
 same content-free event log.
 
 - [x] **P1-S1** — Scaffold + pure `routeDecide`
-- [ ] **P1-S2** — Lane registry (`lanes.yaml`)
+- [x] **P1-S2** — Lane registry (`lanes.yaml`)
 - [ ] **P1-S3** — Pricing + canonical savings math
 - [ ] **P1-S4** — Append-only JSONL ledger + token stats
 - [ ] **P1-S5** — Token estimation + subscription-cap tracking

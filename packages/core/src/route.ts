@@ -62,7 +62,7 @@ function clamp01(n: number): number {
 }
 
 /** The lane's capability for a task category, defaulting when unspecified. */
-function capabilityFor(lane: Lane, category: Task['category']): number {
+export function capabilityFor(lane: Lane, category: Task['category']): number {
   const declared = lane.capability?.[category];
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }

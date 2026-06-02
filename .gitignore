@@ -9,6 +9,10 @@ dist/
 *.jsonl
 .tokenmaxed/
 
+# User's local lane config (only the .example is tracked)
+config/lanes.yaml
+config/policy.yaml
+
 # Logs
 *.log
 npm-debug.log*

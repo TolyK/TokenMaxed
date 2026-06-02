@@ -1,0 +1,59 @@
+# TokenMaxed lane registry (example).
+#
+# Copy this file to config/lanes.yaml and edit it for your machine.
+# Lane identity and trust live ONLY here. The hosted registry feed may later
+# overlay reference data (prices, capability scores) onto a lane, but it can
+# never create, enable, or re-trust one.
+#
+# Fields:
+#   id           unique local identifier for the lane
+#   kind         cli | api | local
+#   model        model id used for pricing / registry lookups
+#   trust        trusted | untrusted   (untrusted lanes get minimized payloads only)
+#   costBasis    subscription | metered | local
+#   provenance   vendor/org, e.g. anthropic, openai, meta
+#   jurisdiction legal jurisdiction of the provider, e.g. US, CN
+#   capability   optional per-category competence in [0, 1]; omit a category to
+#                use the default, or set it to 0 to opt the lane out entirely.
+
+lanes:
+  - id: claude-native
+    kind: cli
+    model: claude-opus-4-7
+    trust: trusted
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    capability:
+      feature: 0.95
+      refactor: 0.90
+      bugfix: 0.88
+      boilerplate: 0.90
+      explain: 0.90
+      codegen: 0.88
+      docs: 0.85
+
+  - id: codex-cli
+    kind: cli
+    model: gpt-5.5
+    trust: trusted
+    costBasis: subscription
+    provenance: openai
+    jurisdiction: US
+    capability:
+      bugfix: 0.92
+      codegen: 0.90
+      feature: 0.85
+      refactor: 0.82
+
+  - id: ollama-llama3
+    kind: local
+    model: llama3.1:8b
+    trust: trusted
+    costBasis: local
+    provenance: meta
+    jurisdiction: US
+    capability:
+      boilerplate: 0.70
+      docs: 0.60
+      explain: 0.60
