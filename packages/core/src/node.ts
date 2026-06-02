@@ -6,9 +6,10 @@
  * APIs never pull in `node:fs`.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,6 +18,7 @@ import { PriceError, validatePriceTable } from './price.ts';
 import type { PriceTable } from './price.ts';
 import { PolicyConfigError, parsePolicyConfig } from './policy.ts';
 import type { Policy } from './types.ts';
+import type { SecretScanner } from './minimize.ts';
 import { LedgerError, parseEvent, serializeEvent, validateEventInput } from './ledger.ts';
 import type { TaskEvent, TaskEventInput } from './ledger.ts';
 
@@ -73,6 +75,49 @@ export function loadPolicyConfig(path: string | URL): Policy {
     throw new PolicyConfigError(`Could not read policy config at "${filePath}": ${detail}`);
   }
   return parsePolicyConfig(text);
+}
+
+/**
+ * A {@link SecretScanner} backed by the local `gitleaks` binary (stdin/temp-file
+ * scan). **Required-if-present:** if gitleaks is not installed, the scanner
+ * reports `available: false`, which makes the minimizer block — we never send
+ * unscrubbed content to an untrusted lane.
+ *
+ * NOTE: the exact gitleaks CLI contract (flags / exit codes) is confirmed in the
+ * adapter spike; the fail-safe paths (missing binary, unexpected error ⇒ treat as
+ * unsafe) hold regardless.
+ */
+export function makeGitleaksScanner(): SecretScanner {
+  return async (texts) => {
+    let dir: string | undefined;
+    try {
+      dir = mkdtempSync(join(tmpdir(), 'tmx-scan-'));
+      // Each text in its own file so multi-line secrets don't span boundaries.
+      texts.forEach((t, i) => writeFileSync(join(dir as string, `p${i}.txt`), t, 'utf8'));
+      const res = spawnSync('gitleaks', ['detect', '--no-git', '--source', dir, '--redact'], {
+        encoding: 'utf8',
+      });
+      if (res.error) {
+        const code = (res.error as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return { available: false, hasSecret: false }; // not installed
+        return { available: true, hasSecret: true }; // unexpected error ⇒ fail safe (assume secret)
+      }
+      if (res.status === 0) return { available: true, hasSecret: false }; // no leaks
+      return { available: true, hasSecret: true }; // status 1 (leaks) or anything else ⇒ fail safe
+    } catch {
+      // Temp-file / environment failure (e.g. unwritable tmp, quota) ⇒ never escape;
+      // treat as unsafe so the minimizer blocks the untrusted send.
+      return { available: true, hasSecret: true };
+    } finally {
+      if (dir) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+    }
+  };
 }
 
 /** Default ledger location: `~/.tokenmaxed/ledger.jsonl`. */

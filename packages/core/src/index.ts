@@ -38,6 +38,15 @@ export type {
 } from './ledger.ts';
 export { evaluate, laneAllowedByVerdict, parsePolicyConfig, PolicyConfigError } from './policy.ts';
 export type { PolicyDecision } from './policy.ts';
+export { minimize, isMinimizedPayload, scrubText, LIMITS } from './minimize.ts';
+export type {
+  MinimizedAttachment,
+  MinimizedRequest,
+  MinimizedPayload,
+  MinimizeResult,
+  SecretScanner,
+  SecretScanResult,
+} from './minimize.ts';
 export {
   UsageError,
   estimateTokens,

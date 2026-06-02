@@ -175,7 +175,8 @@ same content-free event log.
 - [ ] Minimization + policy gate (before any untrusted/API lane)
   - [x] Trust model (`trust_mode`, roles, `execution_mode`, manager eligibility)
   - [x] Policy engine (ordered rules + deny-by-default; routing filters by verdict)
-  - [ ] Minimizer (typed `MinimizedPayload` boundary + secret scrub) + egress CI
+  - [x] Minimizer (branded `MinimizedPayload` boundary + scrub + gitleaks fail-safe)
+  - [ ] Untrusted execution boundary + egress-envelope CI
 
 ## Contributing
 
