@@ -51,6 +51,14 @@ export type { PolicyDecision } from './policy.ts';
 export { minimize, isMinimizedPayload, scrubText, LIMITS } from './minimize.ts';
 export { buildUntrustedRequestBody, isExecutorCertified } from './boundary.ts';
 export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody } from './boundary.ts';
+export { runTask } from './run.ts';
+export type {
+  RunRequest,
+  RunResult,
+  RunDeps,
+  TrustedExecResult,
+  UntrustedExecResultLite,
+} from './run.ts';
 export type {
   MinimizedAttachment,
   MinimizedRequest,
@@ -63,6 +71,7 @@ export {
   UsageError,
   estimateTokens,
   resolveUsage,
+  usageFromReported,
   capUsedFraction,
   capHeadroom,
   capLevel,

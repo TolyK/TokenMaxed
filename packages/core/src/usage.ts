@@ -96,6 +96,24 @@ export function resolveUsage(args: {
   };
 }
 
+/**
+ * Build usage from a possibly-partial reported record (missing side ⇒ 0, cache
+ * tokens folded into input), marked reported. Used to preserve whatever spend a
+ * lane reported even on a failed/partial attempt (so spend is never under-counted).
+ * Defensive: coerces to non-negative integers rather than throwing.
+ */
+export function usageFromReported(reported: RawUsage): ResolvedUsage {
+  const toInt = (n: number | undefined): number => {
+    const v = Math.floor(Number(n));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  };
+  const tokens_in =
+    toInt(reported.tokens_in) +
+    toInt(reported.cache_read_input_tokens) +
+    toInt(reported.cache_creation_input_tokens);
+  return { tokens_in, tokens_out: toInt(reported.tokens_out), tokens_estimated: false };
+}
+
 /** Fraction of the weekly cap consumed, in [0, ∞). 0 when there is no cap (cap <= 0). */
 export function capUsedFraction(consumedTokens: number, weeklyCap: number): number {
   if (weeklyCap <= 0) return 0;
