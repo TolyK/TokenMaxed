@@ -51,6 +51,8 @@ export type { PolicyDecision } from './policy.ts';
 export { minimize, isMinimizedPayload, scrubText, LIMITS } from './minimize.ts';
 export { buildUntrustedRequestBody, isExecutorCertified } from './boundary.ts';
 export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody } from './boundary.ts';
+export { review, ReviewError } from './review.ts';
+export type { ReviewRequest, ReviewResult, ReviewDeps, ManagerReviewOutput } from './review.ts';
 export { runTask } from './run.ts';
 export type {
   RunRequest,
