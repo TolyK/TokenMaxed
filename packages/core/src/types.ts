@@ -76,6 +76,17 @@ export interface Task {
   category: TaskCategory;
 }
 
+/**
+ * Token usage for a single executed task. Both counts are non-negative
+ * integers. Any provider cache-read/cache-write tokens are folded into
+ * `tokens_in` (P1-S5) and priced as ordinary input — never claimed as an
+ * off-provider cache discount.
+ */
+export interface Usage {
+  tokens_in: number;
+  tokens_out: number;
+}
+
 /** Inputs to a routing decision beyond the task itself. */
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
