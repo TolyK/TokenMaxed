@@ -1,0 +1,23 @@
+{
+  "name": "@tokenmaxed/core",
+  "version": "0.0.0",
+  "description": "Portable, host-agnostic routing brain for TokenMaxed. No I/O, no host code.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build"
+  }
+}
