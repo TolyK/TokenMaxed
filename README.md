@@ -121,6 +121,37 @@ console.log(`${decision.laneId} — ${decision.reason}`);
 lane, and `decision.scores` shows how every candidate ranked (useful for a
 future `why` command).
 
+### 4. See your savings and token usage (CLI)
+
+After `npm run build`, the `tokenmaxed` command reads your local, content-free
+ledger (`~/.tokenmaxed/ledger.jsonl` by default) and reports on it:
+
+```bash
+npx tokenmaxed savings            # estimated $ avoided + honest metered $ + token summary
+npx tokenmaxed tokens --by lane   # full per-lane token breakdown (--by model is the default)
+npx tokenmaxed savings --period 7d
+```
+
+```
+TokenMaxed — savings (all time)
+
+  Estimated $139.50 avoided vs the all-frontier baseline (100.0% of frontier cost)
+  Metered API — spent $0.00, avoided $139.50 (100.0%)
+
+  Lanes: claude-native ×1, codex-cli ×1, ollama-llama3 ×1
+  Sensitive sends blocked: 0
+
+  Tokens (usage, not $): 2,800,000 in / 1,300,000 out / 4,100,000 total
+    claude-opus-4-7  2,000,000 / 1,000,000 / 3,000,000  (73.2%)  reported
+    ...
+  → full breakdown: tokenmaxed tokens
+```
+
+The headline is always labeled *estimated vs the all-frontier baseline*, and the
+token block is explicitly a usage count (not dollars), with estimated figures
+marked. Until the Claude Code adapter lands to record tasks automatically, the
+ledger starts empty (the report says "No tasks recorded yet").
+
 ### Development
 
 ```bash
@@ -139,7 +170,7 @@ same content-free event log.
 - [x] **P1-S3** — Pricing + canonical savings math
 - [x] **P1-S4** — Append-only JSONL ledger + token stats
 - [x] **P1-S5** — Token estimation + subscription-cap tracking
-- [ ] **CLI** — `tokenmaxed savings` / `tokenmaxed tokens`
+- [x] **CLI** — `tokenmaxed savings` / `tokenmaxed tokens`
 - [ ] Claude Code plugin adapter (commands, hooks, trusted lanes)
 - [ ] Minimization + policy gate (before any untrusted/API lane)
 

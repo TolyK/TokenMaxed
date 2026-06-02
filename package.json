@@ -12,7 +12,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build -w @tokenmaxed/core && npm run build -w @tokenmaxed/cli",
     "test": "node --test \"packages/**/test/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json"
   },

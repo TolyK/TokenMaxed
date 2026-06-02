@@ -11,7 +11,12 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "types": ["node"]
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@tokenmaxed/core": ["packages/core/src/index.ts"],
+      "@tokenmaxed/core/node": ["packages/core/src/node.ts"]
+    }
   },
   "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts"]
 }

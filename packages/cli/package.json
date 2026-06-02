@@ -1,0 +1,20 @@
+{
+  "name": "@tokenmaxed/cli",
+  "version": "0.0.0",
+  "description": "TokenMaxed command-line interface: local savings and token reports.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "tokenmaxed": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/cli.js', 0o755)\"",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@tokenmaxed/core": "0.0.0"
+  }
+}
