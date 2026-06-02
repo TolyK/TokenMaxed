@@ -1,0 +1,23 @@
+{
+  "name": "tokenmaxed",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A Claude-Code-native router that sends each coding task to the cheapest capable, policy-allowed lane — local-first, content-free.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "node --test \"packages/**/test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

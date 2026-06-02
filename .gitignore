@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local runtime data (the ledger lives in the user's home dir, never in the repo)
+*.jsonl
+.tokenmaxed/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Env
+.env
+.env.*
+!.env.example
