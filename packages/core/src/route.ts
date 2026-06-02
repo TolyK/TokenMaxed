@@ -12,6 +12,7 @@
  * before scoring once untrusted lanes exist. The shape returned here is stable.
  */
 
+import { isExecutorCertified } from './boundary.ts';
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
 import { TRUSTED_PROVENANCES } from './types.ts';
 import type {
@@ -81,11 +82,10 @@ export function isSelectablePreGate(lane: Lane, gateReady = false): boolean {
   if (lane.trust_mode === 'blocked') return false; // never selectable, period
   // `monitored` is deferred (later phase) — no monitoring implementation yet.
   if (lane.trust_mode === 'monitored') return false;
-  // Untrusted `worker` lanes require BOTH the policy gate (minimization) AND
-  // per-executor egress certification — neither exists yet — so they are never
-  // admitted by this structural guard, regardless of `gateReady`. Their
-  // admission is added by the policy-engine + certification steps, layered on top.
-  if (lane.trust_mode === 'worker') return false;
+  // Untrusted `worker` lanes are admitted only when the gate is ready AND a
+  // core-owned, egress-CI-certified executor exists for the lane. The policy gate
+  // and the minimizer then apply on top (defense in depth) before anything sends.
+  if (lane.trust_mode === 'worker') return gateReady && isExecutorCertified(lane);
   // Full (trusted, user-approved) lanes: CLI/local always selectable; an API lane
   // only once the gate is ready (the blanket pre-gate "no API lane" guard relaxes).
   return gateReady || lane.kind !== 'api';

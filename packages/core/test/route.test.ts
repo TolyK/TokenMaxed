@@ -135,11 +135,14 @@ test('isSelectablePreGate admits only full, non-API lanes while the gate is not 
   assert.equal(isSelectablePreGate(claude), true);
   assert.equal(isSelectablePreGate(codex), true);
   assert.equal(isSelectablePreGate(ollama), true);
-  const worker: Lane = { ...ollama, id: 'w', trust_mode: 'worker' };
-  // Worker lanes are never admitted by this guard until the policy gate + egress
-  // certification exist — regardless of gateReady.
+  const worker: Lane = { ...ollama, id: 'w', trust_mode: 'worker' }; // ollama is kind 'local'
+  // A local worker has no certified executor ⇒ never admitted by this guard.
   assert.equal(isSelectablePreGate(worker), false);
   assert.equal(isSelectablePreGate(worker, true), false);
+  // An api worker has a certified executor ⇒ admitted once the gate is ready.
+  const apiWorker: Lane = { ...ollama, id: 'wa', kind: 'api', trust_mode: 'worker' };
+  assert.equal(isSelectablePreGate(apiWorker), false); // gate not ready
+  assert.equal(isSelectablePreGate(apiWorker, true), true); // gate ready + certified
   const blocked: Lane = { ...ollama, id: 'b', trust_mode: 'blocked' };
   assert.equal(isSelectablePreGate(blocked, true), false); // blocked never runs
   const monitored: Lane = { ...ollama, id: 'm', trust_mode: 'monitored' };
@@ -277,16 +280,29 @@ test('routeDecide sets the chosen lane policy verdict', () => {
   assert.equal(routeDecide({ category: 'feature' }, { lanes: [claude] }, noPolicy).policyVerdict, 'force-trusted');
 });
 
-test('layered safety: a worker stays excluded in C-2 even with gateReady + permissive policy', () => {
-  // Worker admission additionally requires egress certification (a later step),
-  // so isSelectablePreGate still excludes workers here — defense in depth on top
-  // of the policy verdict.
+test('worker (api) is selectable once gate ready + certified + policy allows; layered otherwise', () => {
   const worker: Lane = { ...ollama, id: 'w-api', kind: 'api', trust_mode: 'worker', capability: { docs: 0.99 } };
-  const d = routeDecide(
-    { category: 'docs' },
-    { lanes: [worker, claude], gateReady: true, policyContext: { repo_class: 'public', sensitivity: 'normal' } },
-    noPolicy,
+  // gate ready + certified executor + public/normal policy ⇒ worker admitted and wins on capability.
+  assert.equal(
+    routeDecide(
+      { category: 'docs' },
+      { lanes: [worker, claude], gateReady: true, policyContext: { repo_class: 'public', sensitivity: 'normal' } },
+      noPolicy,
+    ).laneId,
+    'w-api',
   );
-  assert.equal(d.laneId, 'claude-native');
-  assert.ok(!d.scores.some((s) => s.laneId === 'w-api'));
+  // Unknown context ⇒ policy force-trusted ⇒ worker dropped (defense in depth).
+  assert.equal(
+    routeDecide({ category: 'docs' }, { lanes: [worker, claude], gateReady: true }, noPolicy).laneId,
+    'claude-native',
+  );
+  // Gate not ready ⇒ worker excluded regardless of policy.
+  assert.equal(
+    routeDecide(
+      { category: 'docs' },
+      { lanes: [worker, claude], policyContext: { repo_class: 'public', sensitivity: 'normal' } },
+      noPolicy,
+    ).laneId,
+    'claude-native',
+  );
 });

@@ -18,7 +18,11 @@ import { PriceError, validatePriceTable } from './price.ts';
 import type { PriceTable } from './price.ts';
 import { PolicyConfigError, parsePolicyConfig } from './policy.ts';
 import type { Policy } from './types.ts';
+import { isMinimizedPayload } from './minimize.ts';
 import type { SecretScanner } from './minimize.ts';
+import { buildUntrustedRequestBody } from './boundary.ts';
+import type { SafeUntrustedEnvelope } from './boundary.ts';
+import type { RawUsage } from './usage.ts';
 import { LedgerError, parseEvent, serializeEvent, validateEventInput } from './ledger.ts';
 import type { TaskEvent, TaskEventInput } from './ledger.ts';
 
@@ -118,6 +122,83 @@ export function makeGitleaksScanner(): SecretScanner {
       }
     }
   };
+}
+
+/** A minimal fetch-like response (so the transport can be injected in tests). */
+interface FetchLikeResponse {
+  ok: boolean;
+  status: number;
+  json: () => Promise<unknown>;
+}
+type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<FetchLikeResponse>;
+
+/** Injectable dependencies for {@link executeUntrusted} (transport + auth resolver). */
+export interface UntrustedExecDeps {
+  fetchImpl?: FetchLike;
+  /** Resolve the opaque authHandle to a bearer token (e.g. from a keychain). */
+  resolveAuth?: (authHandle: string) => string;
+}
+
+/** Result of an untrusted execution. Errors are content-free (redacted) by design. */
+export interface UntrustedExecResult {
+  ok: boolean;
+  resultText?: string;
+  reported?: RawUsage;
+  error?: string;
+}
+
+function extractText(data: unknown): string {
+  const choices = (data as { choices?: { message?: { content?: unknown } }[] })?.choices;
+  const content = choices?.[0]?.message?.content;
+  return typeof content === 'string' ? content : '';
+}
+
+function extractUsage(data: unknown): RawUsage | undefined {
+  const u = (data as { usage?: Record<string, unknown> })?.usage;
+  if (!u) return undefined;
+  const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+  return { tokens_in: num(u.prompt_tokens), tokens_out: num(u.completion_tokens) };
+}
+
+/**
+ * Execute a task on an untrusted lane over HTTP. The ONLY untrusted-execution
+ * entry point; it accepts a {@link SafeUntrustedEnvelope} and additionally
+ * verifies at runtime that the payload is genuine (produced by `minimize`) — a
+ * spread/cloned object is refused, never sent. On any failure it returns a
+ * content-free error (never throws raw content).
+ */
+export async function executeUntrusted(
+  env: SafeUntrustedEnvelope,
+  deps: UntrustedExecDeps = {},
+): Promise<UntrustedExecResult> {
+  // Runtime boundary check — the real guarantee (the type brand is copyable).
+  if (!isMinimizedPayload(env.payload)) {
+    return { ok: false, error: 'refused: payload was not produced by minimize()' };
+  }
+  const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as FetchLike | undefined);
+  if (!doFetch) return { ok: false, error: 'no fetch implementation available' };
+
+  try {
+    // Auth resolution + body build are part of the egress path: any failure here
+    // (e.g. a missing/locked keychain entry) must also fail content-free.
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (env.lane.authHandle) {
+      // A non-empty authHandle means auth is required: fail closed (before sending)
+      // if it cannot be resolved to a token.
+      const token = deps.resolveAuth ? deps.resolveAuth(env.lane.authHandle) : '';
+      if (!token) return { ok: false, error: 'auth resolution failed for untrusted lane' };
+      headers.authorization = `Bearer ${token}`;
+    }
+    const body = JSON.stringify(buildUntrustedRequestBody(env));
+
+    const res = await doFetch(env.lane.endpoint, { method: 'POST', headers, body });
+    if (!res.ok) return { ok: false, error: `untrusted lane returned status ${res.status}` };
+    const data = await res.json();
+    return { ok: true, resultText: extractText(data), reported: extractUsage(data) };
+  } catch {
+    // Content-free: never surface payload/repo text (or a resolver's raw error).
+    return { ok: false, error: 'untrusted lane request failed' };
+  }
 }
 
 /** Default ledger location: `~/.tokenmaxed/ledger.jsonl`. */

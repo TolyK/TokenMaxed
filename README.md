@@ -176,7 +176,7 @@ same content-free event log.
   - [x] Trust model (`trust_mode`, roles, `execution_mode`, manager eligibility)
   - [x] Policy engine (ordered rules + deny-by-default; routing filters by verdict)
   - [x] Minimizer (branded `MinimizedPayload` boundary + scrub + gitleaks fail-safe)
-  - [ ] Untrusted execution boundary + egress-envelope CI
+  - [x] Untrusted execution boundary (`executeUntrusted`) + egress-envelope CI
 
 ## Contributing
 

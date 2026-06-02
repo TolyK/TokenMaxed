@@ -39,6 +39,8 @@ export type {
 export { evaluate, laneAllowedByVerdict, parsePolicyConfig, PolicyConfigError } from './policy.ts';
 export type { PolicyDecision } from './policy.ts';
 export { minimize, isMinimizedPayload, scrubText, LIMITS } from './minimize.ts';
+export { buildUntrustedRequestBody, isExecutorCertified } from './boundary.ts';
+export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody } from './boundary.ts';
 export type {
   MinimizedAttachment,
   MinimizedRequest,
