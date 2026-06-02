@@ -17,13 +17,8 @@
 
 import { aggregateSavings } from './price.ts';
 import type { CostPrimitives, SavingsSummary } from './price.ts';
-import { TASK_CATEGORIES } from './types.ts';
-import type { TaskCategory } from './types.ts';
-
-/** Outcome of the policy gate for a task. v0 only ever emits `allow`. */
-export type PolicyVerdict = 'allow' | 'block' | 'force-trusted';
-
-const VERDICTS: readonly PolicyVerdict[] = ['allow', 'block', 'force-trusted'];
+import { POLICY_VERDICTS, TASK_CATEGORIES } from './types.ts';
+import type { PolicyVerdict, TaskCategory } from './types.ts';
 
 /** What a caller provides for a completed task; the ledger assigns id/seq/ts. */
 export interface TaskEventInput {
@@ -155,7 +150,7 @@ export function validateEventInput(input: TaskEventInput): TaskEventInput {
     metered_spent,
     frontier_avoided: frontier_cost - actual_cost,
     metered_avoided: frontier_cost - metered_spent,
-    policy_verdict: requireEnum(input.policy_verdict, VERDICTS, 'event.policy_verdict'),
+    policy_verdict: requireEnum(input.policy_verdict, POLICY_VERDICTS, 'event.policy_verdict'),
   };
 }
 

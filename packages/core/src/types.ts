@@ -137,14 +137,63 @@ export interface RouteContext {
    * lanes are rejected regardless of config).
    */
   gateReady?: boolean;
+  /** Task-level context the policy gate evaluates against (defaults to unknown/sensitive). */
+  policyContext?: PolicyContext;
 }
 
 /**
- * Routing policy. In v0 this is intentionally empty (allow-all over trusted
- * lanes); the ordered minimization/policy rules arrive with the M3 gate
- * (P1-S9) before any untrusted/API lane exists.
+ * Verdict of the policy gate for a (task, lane) pair:
+ * - `allow`: the lane may handle this task.
+ * - `block`: the lane must not handle this task (excluded entirely).
+ * - `force-trusted`: only a `full`/trusted lane may handle this task (a non-`full`
+ *   lane receiving this verdict is excluded).
+ */
+export type PolicyVerdict = 'allow' | 'block' | 'force-trusted';
+
+/** All policy verdicts, canonical order. */
+export const POLICY_VERDICTS: readonly PolicyVerdict[] = ['allow', 'block', 'force-trusted'];
+
+/** Classification of the repository the task touches. `unknown` is treated as sensitive. */
+export type RepoClass = 'public' | 'private' | 'unknown';
+
+/** Sensitivity of the path/payload involved. `unknown` is treated as sensitive. */
+export type Sensitivity = 'normal' | 'sensitive' | 'unknown';
+
+/**
+ * Task-level context the policy gate evaluates against. Sourced from explicit
+ * adapter input or local config; any field omitted defaults to its `unknown`
+ * value and is treated as sensitive (deny-by-default).
+ */
+export interface PolicyContext {
+  repo_class?: RepoClass;
+  sensitivity?: Sensitivity;
+  /** A secret was detected in the candidate payload ⇒ trusted/local only. */
+  secretHit?: boolean;
+}
+
+/**
+ * An ordered policy rule. A condition that is omitted matches anything; a
+ * condition given as an array matches if the value is in the array. The first
+ * matching rule (in order) decides the verdict.
+ */
+export interface PolicyRule {
+  repo_class?: RepoClass | RepoClass[];
+  sensitivity?: Sensitivity | Sensitivity[];
+  trust_mode?: TrustMode | TrustMode[];
+  provenance?: string | string[];
+  jurisdiction?: string | string[];
+  category?: TaskCategory | TaskCategory[];
+  verdict: PolicyVerdict;
+  reason?: string;
+}
+
+/**
+ * Routing policy. Ordered `rules` are evaluated by the policy engine
+ * (`policy.ts`); when no rule matches, a deny-by-default baseline applies.
  */
 export interface Policy {
+  /** Ordered rules; first match wins. */
+  rules?: PolicyRule[];
   /** Lane ids that are administratively disabled and must never be selected. */
   disabledLaneIds?: string[];
 }
@@ -171,4 +220,6 @@ export interface RouteDecision {
   reason: string;
   /** Every candidate's score, sorted best-first (deterministic). */
   scores: LaneScore[];
+  /** The policy verdict for the chosen lane (`allow` or `force-trusted`). */
+  policyVerdict: PolicyVerdict;
 }

@@ -15,6 +15,8 @@ import { fileURLToPath } from 'node:url';
 import { LaneConfigError, LaneRegistry, parseLaneConfig } from './registry.ts';
 import { PriceError, validatePriceTable } from './price.ts';
 import type { PriceTable } from './price.ts';
+import { PolicyConfigError, parsePolicyConfig } from './policy.ts';
+import type { Policy } from './types.ts';
 import { LedgerError, parseEvent, serializeEvent, validateEventInput } from './ledger.ts';
 import type { TaskEvent, TaskEventInput } from './ledger.ts';
 
@@ -55,6 +57,22 @@ export function loadPriceTable(path: string | URL): PriceTable {
     throw new PriceError(`Could not parse price table at "${filePath}" as JSON: ${detail}`);
   }
   return validatePriceTable(parsed);
+}
+
+/**
+ * Read, parse, and validate policy configuration from a YAML file path or
+ * `file:` URL. Throws {@link PolicyConfigError} on a read or parse failure.
+ */
+export function loadPolicyConfig(path: string | URL): Policy {
+  const filePath = typeof path === 'string' ? path : fileURLToPath(path);
+  let text: string;
+  try {
+    text = readFileSync(filePath, 'utf8');
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PolicyConfigError(`Could not read policy config at "${filePath}": ${detail}`);
+  }
+  return parsePolicyConfig(text);
 }
 
 /** Default ledger location: `~/.tokenmaxed/ledger.jsonl`. */

@@ -12,12 +12,14 @@
  * before scoring once untrusted lanes exist. The shape returned here is stable.
  */
 
+import { evaluate, laneAllowedByVerdict } from './policy.ts';
 import { TRUSTED_PROVENANCES } from './types.ts';
 import type {
   ExecutionMode,
   Lane,
   LaneScore,
   Policy,
+  PolicyVerdict,
   RouteContext,
   RouteDecision,
   Task,
@@ -156,14 +158,24 @@ export function routeDecide(
   policy: Policy,
 ): RouteDecision {
   const disabled = new Set(policy.disabledLaneIds ?? []);
-  const candidates = ctx.lanes.filter(
-    (lane) => !disabled.has(lane.id) && isSelectablePreGate(lane, ctx.gateReady ?? false),
-  );
+  const policyContext = ctx.policyContext ?? {};
+  const gateReady = ctx.gateReady ?? false;
+
+  // Filter candidates by the structural pre-gate guard AND the policy verdict,
+  // before scoring. Remember each survivor's verdict for the decision.
+  const verdicts = new Map<string, PolicyVerdict>();
+  const candidates = ctx.lanes.filter((lane) => {
+    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady)) return false;
+    const { verdict } = evaluate(task, lane, policyContext, policy);
+    if (!laneAllowedByVerdict(lane, verdict)) return false;
+    verdicts.set(lane.id, verdict);
+    return true;
+  });
 
   if (candidates.length === 0) {
     throw new Error(
-      'routeDecide: no candidate lanes available (lanes empty, disabled by policy, ' +
-        'or excluded as untrusted/API before the minimization gate exists).',
+      'routeDecide: no candidate lanes available (lanes empty, disabled, excluded ' +
+        'before the gate, or blocked/forced-trusted away by policy).',
     );
   }
 
@@ -177,5 +189,6 @@ export function routeDecide(
     laneId: winner.laneId,
     reason: describe(winningLane, winner, task),
     scores,
+    policyVerdict: verdicts.get(winner.laneId)!,
   };
 }

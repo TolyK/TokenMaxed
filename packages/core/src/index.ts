@@ -29,7 +29,6 @@ export {
   tokenStats,
 } from './ledger.ts';
 export type {
-  PolicyVerdict,
   TaskEvent,
   TaskEventInput,
   LedgerSummary,
@@ -37,6 +36,8 @@ export type {
   TokenGroup,
   TokenStats,
 } from './ledger.ts';
+export { evaluate, laneAllowedByVerdict, parsePolicyConfig, PolicyConfigError } from './policy.ts';
+export type { PolicyDecision } from './policy.ts';
 export {
   UsageError,
   estimateTokens,

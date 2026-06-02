@@ -173,6 +173,9 @@ same content-free event log.
 - [x] **CLI** — `tokenmaxed savings` / `tokenmaxed tokens`
 - [ ] Claude Code plugin adapter (commands, hooks, trusted lanes)
 - [ ] Minimization + policy gate (before any untrusted/API lane)
+  - [x] Trust model (`trust_mode`, roles, `execution_mode`, manager eligibility)
+  - [x] Policy engine (ordered rules + deny-by-default; routing filters by verdict)
+  - [ ] Minimizer (typed `MinimizedPayload` boundary + secret scrub) + egress CI
 
 ## Contributing
 

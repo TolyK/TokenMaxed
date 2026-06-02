@@ -1,0 +1,34 @@
+# TokenMaxed policy (example).
+#
+# Copy to config/policy.yaml and edit. Rules are evaluated in order; the FIRST
+# matching rule decides the verdict. A condition you omit matches anything; a
+# condition given as a list matches if the value is in the list.
+#
+# Conditions: repo_class (public|private|unknown), sensitivity (normal|sensitive|unknown),
+#             trust_mode (full|worker|monitored|blocked), provenance, jurisdiction, category
+# Verdict:    allow | block | force-trusted
+#               allow         = lane may handle the task
+#               block         = lane excluded entirely
+#               force-trusted = only a full/trusted lane may handle it
+#
+# Deny-by-default: if NO rule matches, anything other than a clearly-safe context
+# (public repo + normal sensitivity, no secret detected) defaults to
+# force-trusted — an unknown/sensitive context never silently uses a worker lane.
+
+rules:
+  # Private or unknown repos never go to an untrusted worker lane.
+  - repo_class: [private, unknown]
+    trust_mode: [worker, monitored]
+    verdict: block
+    reason: "private/unknown repo: untrusted lanes blocked"
+
+  # Sensitive paths/payloads stay on trusted lanes only.
+  - sensitivity: [sensitive, unknown]
+    verdict: force-trusted
+    reason: "sensitive content: trusted/local lanes only"
+
+  # Public repos with normal sensitivity may use any (gated) lane.
+  - repo_class: public
+    sensitivity: normal
+    verdict: allow
+    reason: "public repo, normal sensitivity"

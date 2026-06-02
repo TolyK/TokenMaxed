@@ -259,3 +259,34 @@ test('executionModeOf defaults to answer-only', () => {
   assert.equal(executionModeOf(claude), 'answer-only');
   assert.equal(executionModeOf({ ...claude, execution_mode: 'agentic' }), 'agentic');
 });
+
+test('routeDecide excludes a lane blocked by a policy rule', () => {
+  // Block codex for bugfix; claude should win instead.
+  const policy: Policy = { rules: [{ provenance: 'openai', category: 'bugfix', verdict: 'block' }] };
+  const ctx2: RouteContext = { lanes: [claude, codex], policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+  const d = routeDecide({ category: 'bugfix' }, ctx2, policy);
+  assert.notEqual(d.laneId, 'codex-cli');
+  assert.ok(!d.scores.some((s) => s.laneId === 'codex-cli'));
+});
+
+test('routeDecide sets the chosen lane policy verdict', () => {
+  // public+normal ⇒ allow.
+  const allowCtx: RouteContext = { lanes: [claude], policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+  assert.equal(routeDecide({ category: 'feature' }, allowCtx, noPolicy).policyVerdict, 'allow');
+  // unknown context ⇒ deny-by-default force-trusted (full lane still allowed).
+  assert.equal(routeDecide({ category: 'feature' }, { lanes: [claude] }, noPolicy).policyVerdict, 'force-trusted');
+});
+
+test('layered safety: a worker stays excluded in C-2 even with gateReady + permissive policy', () => {
+  // Worker admission additionally requires egress certification (a later step),
+  // so isSelectablePreGate still excludes workers here — defense in depth on top
+  // of the policy verdict.
+  const worker: Lane = { ...ollama, id: 'w-api', kind: 'api', trust_mode: 'worker', capability: { docs: 0.99 } };
+  const d = routeDecide(
+    { category: 'docs' },
+    { lanes: [worker, claude], gateReady: true, policyContext: { repo_class: 'public', sensitivity: 'normal' } },
+    noPolicy,
+  );
+  assert.equal(d.laneId, 'claude-native');
+  assert.ok(!d.scores.some((s) => s.laneId === 'w-api'));
+});
