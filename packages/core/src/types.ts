@@ -91,6 +91,13 @@ export interface Usage {
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];
+  /**
+   * Optional remaining weekly-cap headroom per lane id, in [0, 1] (1 = full /
+   * no cap). Near-cap subscription lanes are deprioritized; a lane at/over its
+   * critical threshold becomes last-resort. A lane absent here is treated as
+   * having full headroom.
+   */
+  capHeadroom?: Record<string, number>;
 }
 
 /**
@@ -112,6 +119,8 @@ export interface LaneScore {
     capability: number;
     /** Cost-basis penalty (higher = more expensive marginal cost). */
     costPenalty: number;
+    /** Weekly-cap penalty (0 when healthy; larger as the lane nears/exceeds its cap). */
+    capPenalty: number;
   };
 }
 

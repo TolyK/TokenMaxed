@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { isSelectablePreGate, routeDecide } from '../src/route.ts';
+import { capHeadroom } from '../src/usage.ts';
 import type { Lane, Policy, RouteContext, Task } from '../src/types.ts';
 
 const claude: Lane = {
@@ -148,6 +149,53 @@ test('throws when only untrusted/API lanes are available (none selectable pre-ga
     () => routeDecide({ category: 'feature' }, { lanes: [onlyUntrusted] }, noPolicy),
     /no candidate lanes/,
   );
+});
+
+test('deprioritizes a near-cap (warn) lane in favor of an equally-capable healthy one', () => {
+  // Two lanes equally capable at docs; the one near its weekly cap loses.
+  const a: Lane = { ...codex, id: 'a-warn', capability: { docs: 0.9 } };
+  const b: Lane = { ...codex, id: 'b-healthy', capability: { docs: 0.9 } };
+  const d = routeDecide(
+    { category: 'docs' },
+    { lanes: [a, b], capHeadroom: { 'a-warn': 0.2 } }, // 80% used ⇒ warn
+    noPolicy,
+  );
+  assert.equal(d.laneId, 'b-healthy');
+  const warnScore = d.scores.find((s) => s.laneId === 'a-warn')!;
+  assert.ok(warnScore.factors.capPenalty > 0);
+});
+
+test('treats a critical-cap lane as last resort but still selectable when alone', () => {
+  const only: Lane = { ...claude, id: 'crit', capability: { feature: 0.95 } };
+  const d = routeDecide(
+    { category: 'feature' },
+    { lanes: [only], capHeadroom: { crit: 0.05 } }, // 95% used ⇒ critical
+    noPolicy,
+  );
+  assert.equal(d.laneId, 'crit');
+  assert.equal(d.scores[0]!.factors.capPenalty, 1);
+
+  // Against a healthy lower-capability lane, the critical lane is skipped.
+  const healthyWeak: Lane = { ...ollama, id: 'weak', capability: { feature: 0.5 } };
+  const d2 = routeDecide(
+    { category: 'feature' },
+    { lanes: [only, healthyWeak], capHeadroom: { crit: 0.05 } },
+    noPolicy,
+  );
+  assert.equal(d2.laneId, 'weak');
+});
+
+test('applies the warn penalty at exactly 70% used, even with float imprecision', () => {
+  // capHeadroom(700, 1000) === 0.30000000000000004, which must still count as warn.
+  const headroom = capHeadroom(700, 1000);
+  const lane: Lane = { ...codex, id: 'edge', capability: { docs: 0.9 } };
+  const d = routeDecide({ category: 'docs' }, { lanes: [lane], capHeadroom: { edge: headroom } }, noPolicy);
+  assert.ok(d.scores[0]!.factors.capPenalty > 0);
+});
+
+test('a lane absent from capHeadroom is treated as having full headroom', () => {
+  const d = routeDecide({ category: 'feature' }, { lanes: [claude], capHeadroom: {} }, noPolicy);
+  assert.equal(d.scores[0]!.factors.capPenalty, 0);
 });
 
 test('throws a clear error when no candidate lanes remain', () => {
