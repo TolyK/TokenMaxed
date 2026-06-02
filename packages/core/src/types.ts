@@ -23,6 +23,9 @@ export type LaneKind = 'cli' | 'api' | 'local';
  */
 export type TrustMode = 'full' | 'worker' | 'monitored' | 'blocked';
 
+/** All trust modes, canonical order. */
+export const TRUST_MODES: readonly TrustMode[] = ['full', 'worker', 'monitored', 'blocked'];
+
 /** Roles a lane may be assigned. `manager` reviews work and (re)assigns tasks. */
 export type LaneRole = 'manager' | 'worker';
 

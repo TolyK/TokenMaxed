@@ -16,7 +16,7 @@
 
 import { parse as parseYaml } from 'yaml';
 
-import { POLICY_VERDICTS, TASK_CATEGORIES } from './types.ts';
+import { POLICY_VERDICTS, TASK_CATEGORIES, TRUST_MODES } from './types.ts';
 import type {
   Lane,
   Policy,
@@ -27,12 +27,10 @@ import type {
   Sensitivity,
   Task,
   TaskCategory,
-  TrustMode,
 } from './types.ts';
 
 const REPO_CLASSES: readonly RepoClass[] = ['public', 'private', 'unknown'];
 const SENSITIVITIES: readonly Sensitivity[] = ['normal', 'sensitive', 'unknown'];
-const TRUST_MODES: readonly TrustMode[] = ['full', 'worker', 'monitored', 'blocked'];
 
 /** Raised for malformed/invalid policy configuration, with a clear message. */
 export class PolicyConfigError extends Error {

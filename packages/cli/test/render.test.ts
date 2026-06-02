@@ -63,6 +63,7 @@ function summary(over: Partial<LedgerSummary> = {}): LedgerSummary {
       metered_avoided_pct: 80,
     },
     actual_cost: 40,
+    metered_spent_total: 40,
     laneMix: { 'codex-cli': 2, 'ollama': 1 },
     blockCount: 0,
     ...over,

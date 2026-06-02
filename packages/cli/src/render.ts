@@ -139,7 +139,7 @@ export function formatSavings(args: {
   lines.push(
     `  Estimated ${money(s.frontier_avoided)} avoided vs the all-frontier baseline ` +
       `(${pct(s.frontier_avoided_pct)} of frontier cost)`,
-    `  Metered API — spent ${money(summary.savings.metered_spent)}, ` +
+    `  Metered API — spent ${money(summary.metered_spent_total)}, ` +
       `avoided ${money(s.metered_avoided)} (${pct(s.metered_avoided_pct)})`,
     '',
   );

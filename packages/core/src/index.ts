@@ -21,7 +21,10 @@ export type { ModelPrice, PriceTable, CostPrimitives, SavingsSummary } from './p
 export {
   LedgerError,
   EVENT_FIELDS,
+  OUTCOME_EVENT_FIELDS,
+  SCHEMA_VERSION,
   validateEventInput,
+  validateOutcomeInput,
   serializeEvent,
   parseEvent,
   filterEventsSince,
@@ -29,8 +32,15 @@ export {
   tokenStats,
 } from './ledger.ts';
 export type {
+  TaskStatus,
+  ReviewVerdict,
+  Voter,
+  SubjectType,
   TaskEvent,
   TaskEventInput,
+  OutcomeEvent,
+  OutcomeEventInput,
+  LedgerEvent,
   LedgerSummary,
   TokenBucket,
   TokenGroup,

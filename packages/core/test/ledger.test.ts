@@ -3,6 +3,8 @@ import { test } from 'node:test';
 
 import {
   EVENT_FIELDS,
+  OUTCOME_EVENT_FIELDS,
+  SCHEMA_VERSION,
   filterEventsSince,
   LedgerError,
   parseEvent,
@@ -10,17 +12,25 @@ import {
   summarize,
   tokenStats,
   validateEventInput,
+  validateOutcomeInput,
 } from '../src/ledger.ts';
-import type { TaskEvent } from '../src/ledger.ts';
+import type { OutcomeEvent, TaskEvent } from '../src/ledger.ts';
 
 function ev(overrides: Partial<TaskEvent> = {}): TaskEvent {
-  return {
+  const base: TaskEvent = {
+    event_type: 'task',
+    schema_version: SCHEMA_VERSION,
     id: 'id-0',
     seq: 0,
     ts: '2026-06-02T00:00:00.000Z',
+    task_id: 't-0',
+    attempt: 0,
     category: 'bugfix',
     laneId: 'codex-cli',
     model: 'gpt-5.5',
+    trust_mode: 'full',
+    provenance: 'openai',
+    status: 'ok',
     tokens_in: 100,
     tokens_out: 50,
     tokens_estimated: false,
@@ -32,12 +42,56 @@ function ev(overrides: Partial<TaskEvent> = {}): TaskEvent {
     policy_verdict: 'allow',
     ...overrides,
   };
+  // Keep avoided consistent with costs (as validateEventInput would derive them).
+  return { ...base, frontier_avoided: base.frontier_cost - base.actual_cost, metered_avoided: base.frontier_cost - base.metered_spent };
 }
 
-test('serializeEvent emits exactly the allowlisted fields, in order', () => {
-  const line = serializeEvent(ev());
-  const parsed = JSON.parse(line) as Record<string, unknown>;
-  assert.deepEqual(Object.keys(parsed), [...EVENT_FIELDS]);
+function outcome(overrides: Partial<OutcomeEvent> = {}): OutcomeEvent {
+  return {
+    event_type: 'outcome',
+    schema_version: SCHEMA_VERSION,
+    id: 'o-0',
+    seq: 0,
+    ts: '2026-06-02T00:00:00.000Z',
+    subject_id: 't-0',
+    subject_type: 'router_task',
+    task_id: 't-0',
+    review_id: 'r-0',
+    attempt: 0,
+    category: 'bugfix',
+    subject_lane_id: 'codex-cli',
+    subject_provenance: 'openai',
+    reviewer_lane_id: 'claude-native',
+    reviewer_model: 'claude-opus-4-7',
+    reviewer_trust_mode: 'full',
+    reviewer_provenance: 'anthropic',
+    verdict: 'pass',
+    voter: 'reviewer_model',
+    policy_verdict: 'allow',
+    ...overrides,
+  };
+}
+
+test('serializeEvent emits only allowlisted fields (no extras), incl. event discriminant', () => {
+  const keys = Object.keys(JSON.parse(serializeEvent(ev())));
+  const allow = new Set<string>(EVENT_FIELDS);
+  for (const k of keys) assert.ok(allow.has(k), `unexpected field ${k}`);
+  for (const required of ['event_type', 'schema_version', 'status', 'task_id']) {
+    assert.ok(keys.includes(required), `missing ${required}`);
+  }
+});
+
+test('outcome events round-trip and serialize within their allowlist', () => {
+  const round = parseEvent(JSON.parse(serializeEvent(outcome())));
+  assert.deepEqual(round, outcome());
+  const keys = Object.keys(JSON.parse(serializeEvent(outcome())));
+  const allow = new Set<string>(OUTCOME_EVENT_FIELDS);
+  for (const k of keys) assert.ok(allow.has(k), `unexpected field ${k}`);
+});
+
+test('validateOutcomeInput rejects a bad verdict and a non-object subject', () => {
+  assert.throws(() => validateOutcomeInput({ ...outcome(), verdict: 'great' as never }), { message: /verdict/ });
+  assert.throws(() => validateOutcomeInput({ ...outcome(), subject_type: 'nope' as never }), { message: /subject_type/ });
 });
 
 test('serializeEvent drops any non-allowlisted field (content can never leak)', () => {
@@ -141,20 +195,72 @@ test('filterEventsSince compares instants, not text (non-canonical ISO cutoffs w
   });
 });
 
-test('summarize reports dollars, percentages, lane mix, and block count', () => {
+test('summarize: savings count only ok tasks; spend includes all; blockCount by status', () => {
   const events = [
-    ev({ laneId: 'A', frontier_cost: 100, actual_cost: 0, metered_spent: 0, frontier_avoided: 100, metered_avoided: 100 }),
-    ev({ laneId: 'B', frontier_cost: 100, actual_cost: 40, metered_spent: 40, frontier_avoided: 60, metered_avoided: 60 }),
-    ev({ laneId: 'B', frontier_cost: 0, actual_cost: 0, metered_spent: 0, frontier_avoided: 0, metered_avoided: 0, policy_verdict: 'block' }),
+    ev({ laneId: 'A', status: 'ok', frontier_cost: 100, actual_cost: 0, metered_spent: 0 }),
+    ev({ laneId: 'B', status: 'ok', frontier_cost: 100, actual_cost: 40, metered_spent: 40 }),
+    ev({ laneId: 'B', status: 'blocked', frontier_cost: 0, actual_cost: 0, metered_spent: 0 }),
   ];
   const s = summarize(events);
   assert.equal(s.events, 3);
   assert.equal(s.actual_cost, 40);
+  assert.equal(s.metered_spent_total, 40);
   assert.equal(s.blockCount, 1);
   assert.deepEqual({ ...s.laneMix }, { A: 1, B: 2 });
+  // Savings over the two ok tasks only.
   assert.equal(s.savings.frontier_cost, 200);
   assert.equal(s.savings.frontier_avoided_pct, 80);
   assert.equal(s.savings.metered_avoided_pct, 80);
+});
+
+test('summarize: a failed worker attempt costs money but is excluded from savings claims', () => {
+  const events = [
+    // A failed metered attempt: real spend, but not counted as avoided savings.
+    ev({ laneId: 'W', status: 'failed', frontier_cost: 100, actual_cost: 30, metered_spent: 30 }),
+    // The successful trusted fallback (linked by parent_task_id): savings count this.
+    ev({ laneId: 'T', status: 'ok', parent_task_id: 't-0', frontier_cost: 100, actual_cost: 0, metered_spent: 0 }),
+  ];
+  const s = summarize(events);
+  assert.equal(s.actual_cost, 30); // failed attempt's spend is real
+  assert.equal(s.metered_spent_total, 30);
+  // Baseline is the delivered (ok) work (100); avoided subtracts ALL spend (30).
+  assert.equal(s.savings.frontier_cost, 100);
+  assert.equal(s.savings.frontier_avoided, 70);
+  assert.equal(s.savings.metered_avoided, 70);
+  assert.equal(s.savings.frontier_avoided_pct, 70);
+});
+
+test('parseEvent reads a legacy task row (no event_type/new fields) by backfilling', () => {
+  // A row as written by the pre-union schema.
+  const legacy = {
+    id: 'legacy-1',
+    seq: 0,
+    ts: '2026-06-01T00:00:00.000Z',
+    category: 'bugfix',
+    laneId: 'codex-cli',
+    model: 'gpt-5.5',
+    tokens_in: 100,
+    tokens_out: 50,
+    tokens_estimated: false,
+    actual_cost: 0,
+    frontier_cost: 1,
+    metered_spent: 0,
+    frontier_avoided: 1,
+    metered_avoided: 1,
+    policy_verdict: 'allow',
+  };
+  const e = parseEvent(legacy);
+  assert.equal(e.event_type, 'task');
+  assert.equal(e.schema_version, 0); // legacy
+  if (e.event_type === 'task') {
+    assert.equal(e.task_id, 'legacy-1'); // backfilled from id
+    assert.equal(e.status, 'ok');
+    assert.equal(e.trust_mode, 'full');
+    assert.equal(e.provenance, 'unknown');
+  }
+  // A legacy row with a block verdict backfills to status 'blocked' (preserves blockCount).
+  const blockedLegacy = parseEvent({ ...legacy, id: 'legacy-2', policy_verdict: 'block' });
+  assert.equal(blockedLegacy.event_type === 'task' && blockedLegacy.status, 'blocked');
 });
 
 test('summarize over no events is all zeros (no divide-by-zero)', () => {

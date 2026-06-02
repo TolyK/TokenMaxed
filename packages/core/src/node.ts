@@ -23,8 +23,21 @@ import type { SecretScanner } from './minimize.ts';
 import { buildUntrustedRequestBody } from './boundary.ts';
 import type { SafeUntrustedEnvelope } from './boundary.ts';
 import type { RawUsage } from './usage.ts';
-import { LedgerError, parseEvent, serializeEvent, validateEventInput } from './ledger.ts';
-import type { TaskEvent, TaskEventInput } from './ledger.ts';
+import {
+  LedgerError,
+  SCHEMA_VERSION,
+  parseEvent,
+  serializeEvent,
+  validateEventInput,
+  validateOutcomeInput,
+} from './ledger.ts';
+import type {
+  LedgerEvent,
+  OutcomeEvent,
+  OutcomeEventInput,
+  TaskEvent,
+  TaskEventInput,
+} from './ledger.ts';
 
 /**
  * Read, parse, and validate lane configuration from a file path or `file:` URL.
@@ -216,7 +229,7 @@ export function defaultLedgerPath(): string {
  */
 export class JsonlLedger {
   readonly path: string;
-  #events: TaskEvent[] | null = null;
+  #events: LedgerEvent[] | null = null;
   /** Whether the on-disk file is empty or already ends with a newline. */
   #fileEndsWithNewline = true;
 
@@ -224,7 +237,7 @@ export class JsonlLedger {
     this.path = path;
   }
 
-  #load(): TaskEvent[] {
+  #load(): LedgerEvent[] {
     if (this.#events) return this.#events;
     if (!existsSync(this.path)) {
       this.#events = [];
@@ -234,7 +247,7 @@ export class JsonlLedger {
     // If a pre-existing file's last record lacks a trailing newline, the next
     // append must insert one first or it would concatenate onto that line.
     this.#fileEndsWithNewline = text === '' || text.endsWith('\n');
-    const events: TaskEvent[] = [];
+    const events: LedgerEvent[] = [];
     const lines = text.split('\n');
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]!.trim();
@@ -246,34 +259,58 @@ export class JsonlLedger {
         const detail = err instanceof Error ? err.message : String(err);
         throw new LedgerError(`Ledger "${this.path}" has invalid JSON on line ${i + 1}: ${detail}`);
       }
-      // Freeze cached events so a reference handed back via readAll()/append()
-      // cannot be mutated to corrupt later summaries or seq assignment.
+      // Freeze cached events so a reference handed back cannot be mutated to
+      // corrupt later summaries or seq assignment.
       events.push(Object.freeze(parseEvent(obj)));
     }
     this.#events = events;
     return events;
   }
 
-  /** All events currently in the ledger (a defensive copy). */
-  readAll(): TaskEvent[] {
-    return [...this.#load()];
+  #nextSeq(events: readonly LedgerEvent[]): number {
+    return events.reduce((max, e) => Math.max(max, e.seq), -1) + 1;
   }
 
-  /** Append one task event; returns the persisted event with its id/seq/ts. */
-  append(input: TaskEventInput): TaskEvent {
-    const events = this.#load();
-    const nextSeq = events.reduce((max, e) => Math.max(max, e.seq), -1) + 1;
-    const event: TaskEvent = Object.freeze({
-      id: randomUUID(),
-      seq: nextSeq,
-      ts: new Date().toISOString(),
-      ...validateEventInput(input),
-    });
+  #write(event: LedgerEvent, events: LedgerEvent[]): void {
     mkdirSync(dirname(this.path), { recursive: true });
     const prefix = this.#fileEndsWithNewline ? '' : '\n';
     appendFileSync(this.path, prefix + serializeEvent(event) + '\n', 'utf8');
     this.#fileEndsWithNewline = true;
     events.push(event);
+  }
+
+  /** All events currently in the ledger (a defensive copy). */
+  readAll(): LedgerEvent[] {
+    return [...this.#load()];
+  }
+
+  /** Append one task event; returns the persisted event with its id/seq/ts. */
+  appendTask(input: TaskEventInput): TaskEvent {
+    const events = this.#load();
+    const event: TaskEvent = Object.freeze({
+      event_type: 'task',
+      schema_version: SCHEMA_VERSION,
+      id: randomUUID(),
+      seq: this.#nextSeq(events),
+      ts: new Date().toISOString(),
+      ...validateEventInput(input),
+    });
+    this.#write(event, events);
+    return event;
+  }
+
+  /** Append one outcome (review) event; returns the persisted event. */
+  appendOutcome(input: OutcomeEventInput): OutcomeEvent {
+    const events = this.#load();
+    const event: OutcomeEvent = Object.freeze({
+      event_type: 'outcome',
+      schema_version: SCHEMA_VERSION,
+      id: randomUUID(),
+      seq: this.#nextSeq(events),
+      ts: new Date().toISOString(),
+      ...validateOutcomeInput(input),
+    });
+    this.#write(event, events);
     return event;
   }
 }

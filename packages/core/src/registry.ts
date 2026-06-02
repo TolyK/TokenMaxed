@@ -14,7 +14,7 @@
 import { parse as parseYaml } from 'yaml';
 
 import { capabilityFor } from './route.ts';
-import { TASK_CATEGORIES } from './types.ts';
+import { TASK_CATEGORIES, TRUST_MODES } from './types.ts';
 import type {
   CostBasis,
   ExecutionMode,
@@ -22,11 +22,9 @@ import type {
   LaneKind,
   LaneRole,
   TaskCategory,
-  TrustMode,
 } from './types.ts';
 
 const LANE_KINDS: readonly LaneKind[] = ['cli', 'api', 'local'];
-const TRUST_MODES: readonly TrustMode[] = ['full', 'worker', 'monitored', 'blocked'];
 const COST_BASES: readonly CostBasis[] = ['subscription', 'metered', 'local'];
 const LANE_ROLES: readonly LaneRole[] = ['manager', 'worker'];
 const EXECUTION_MODES: readonly ExecutionMode[] = ['answer-only', 'agentic'];
