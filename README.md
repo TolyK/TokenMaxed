@@ -1,0 +1,106 @@
+# TokenMaxed
+
+> Route every coding task to the **cheapest capable, policy-allowed lane** — local-first, content-free, and honest about what it saves you.
+
+[![CI](https://github.com/TolyK/TokenMaxed/actions/workflows/ci.yml/badge.svg)](https://github.com/TolyK/TokenMaxed/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Status: v0 / early](https://img.shields.io/badge/status-v0%20early-orange.svg)](#project-status)
+
+TokenMaxed is a router for coding agents. You already pay flat-rate for tools
+like Claude Max and a ChatGPT/Codex subscription, and you may have a capable
+model running locally. TokenMaxed spends that **already-paid, flat-rate capacity
+first**, falls back to metered APIs only when it has to, and shows you — in real
+dollars — how much you avoided versus running everything on the most expensive
+frontier model.
+
+It is **local-first**: the routing brain, your prompts, and your code stay on
+your machine. Any hosted feature added later transmits only content-free
+metadata you explicitly opt into.
+
+---
+
+## Why
+
+- **Subsidy capture.** Subscriptions are flat-rate; their marginal cost is ~$0
+  until you hit caps. TokenMaxed defaults to that capacity before burning
+  metered API dollars.
+- **Data minimization (the moat).** Trusted lanes (Claude, Codex, local) can see
+  your repo and tools. Untrusted lanes receive only a scrubbed, bounded,
+  no-tool sub-request — never your repo, tokens, or paths.
+- **Honest accounting.** Two numbers, never one: an *estimated* savings headline
+  versus an all-frontier baseline, and a finance-grade *metered dollars avoided*
+  figure. We never claim caps don't exist.
+
+## Project status
+
+**v0 — early and incomplete.** The portable routing brain (`@tokenmaxed/core`)
+is taking shape; the Claude Code plugin adapter, lanes, and the
+minimization/policy gate are in progress. APIs will change. This is being built
+in small, reviewed commits in the open — see the [Roadmap](#roadmap).
+
+## Architecture
+
+A portable core with thin adapters around it:
+
+```
+packages/
+  core/     # the routing brain — pure, host-agnostic, no I/O, no network
+            #   route   · decide the cheapest capable lane (pure function)
+            #   registry· load locally-configured lanes
+            #   price   · canonical savings math
+            #   ledger  · append-only, content-free local event log
+  plugin/   # the Claude Code adapter (commands, hooks, subagents) — WIP
+```
+
+**Privacy invariant (absolute):** *No prompt or code content ever leaves your
+machine to a TokenMaxed-hosted backend. Downstream model lanes receive only
+minimized, policy-gated payloads.* The local event log is content-free by
+construction (integers, enums, model ids — never text), which is also what lets
+an optional web dashboard be added later as a pure forwarder, with zero schema
+changes and nothing new leaving the machine.
+
+## Requirements
+
+- **Node.js >= 22.18** (the test suite runs TypeScript directly via Node's
+  built-in type stripping, which is enabled by default from 22.18 — no extra
+  test runner). A `tsc` build emits plain JavaScript for publishing/consumption.
+
+## Quick start (development)
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git
+cd TokenMaxed
+npm install
+npm test         # run the test suite (TypeScript, no build needed)
+npm run typecheck
+npm run build    # emit JavaScript to packages/*/dist
+```
+
+## Roadmap
+
+v0 is built locally first; a hosted dashboard is purely additive on top of the
+same content-free event log.
+
+- [x] **P1-S1** — Scaffold + pure `routeDecide`
+- [ ] **P1-S2** — Lane registry (`lanes.yaml`)
+- [ ] **P1-S3** — Pricing + canonical savings math
+- [ ] **P1-S4** — Append-only JSONL ledger + token stats
+- [ ] **P1-S5** — Token estimation + subscription-cap tracking
+- [ ] **CLI** — `tokenmaxed savings` / `tokenmaxed tokens`
+- [ ] Claude Code plugin adapter (commands, hooks, trusted lanes)
+- [ ] Minimization + policy gate (before any untrusted/API lane)
+
+## Contributing
+
+Contributions are welcome. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) and
+our [Code of Conduct](./CODE_OF_CONDUCT.md). For anything security- or
+privacy-sensitive, see [SECURITY.md](./SECURITY.md).
+
+Two rules are non-negotiable and enforced in CI as they land:
+1. **No content → network.** Nothing derived from prompts or code may reach a
+   network client.
+2. **Honest savings.** Every savings figure carries its assumptions.
+
+## License
+
+[MIT](./LICENSE) © TokenMaxed contributors
