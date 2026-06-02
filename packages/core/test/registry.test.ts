@@ -9,7 +9,7 @@ lanes:
   - id: claude-native
     kind: cli
     model: claude-opus-4-7
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
@@ -19,7 +19,7 @@ lanes:
   - id: ollama-llama3
     kind: local
     model: llama3.1:8b
-    trust: trusted
+    trust_mode: full
     costBasis: local
     provenance: meta
     jurisdiction: US
@@ -70,12 +70,12 @@ test('the registry is deeply immutable (list, lanes, and capability maps frozen)
   assert.ok(Object.isFrozen(lane.capability));
   // Mutating a returned lane must not change later routing inputs.
   assert.throws(() => {
-    (lane as { trust: string }).trust = 'untrusted';
+    (lane as { trust_mode: string }).trust_mode = 'worker';
   });
   assert.throws(() => {
     (lane.capability as Record<string, number>).feature = 0;
   });
-  assert.equal(reg.byId('claude-native')?.trust, 'trusted');
+  assert.equal(reg.byId('claude-native')?.trust_mode, 'full');
   assert.equal(reg.byId('claude-native')?.capability?.feature, 0.95);
 });
 
@@ -102,7 +102,7 @@ test('rejects a missing required field', () => {
 lanes:
   - id: x
     kind: cli
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
@@ -116,12 +116,14 @@ lanes:
   - id: x
     kind: cli
     model: m
-    trust: sorta-trusted
+    trust_mode: sorta
     costBasis: subscription
     provenance: p
     jurisdiction: US
 `;
-  assert.throws(() => parseLaneConfig(cfg), { message: /trust must be one of: trusted, untrusted/ });
+  assert.throws(() => parseLaneConfig(cfg), {
+    message: /trust_mode must be one of: full, worker, monitored, blocked/,
+  });
 });
 
 test('rejects an unknown task category in capability', () => {
@@ -130,7 +132,7 @@ lanes:
   - id: x
     kind: cli
     model: m
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: p
     jurisdiction: US
@@ -146,7 +148,7 @@ lanes:
   - id: x
     kind: cli
     model: m
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: p
     jurisdiction: US
@@ -162,7 +164,7 @@ lanes:
   - id: x
     kind: cli
     model: m
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: p
     jurisdiction: US
@@ -171,20 +173,74 @@ lanes:
   assert.throws(() => parseLaneConfig(cfg), { message: /unknown field "capabilty"/ });
 });
 
+test('parses the new trust/role/execution fields', () => {
+  const cfg = `
+lanes:
+  - id: mgr
+    kind: cli
+    model: m
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    roles: [manager]
+    manager_allowed: true
+    execution_mode: agentic
+    attestation: false
+`;
+  const lane = parseLaneConfig(cfg).byId('mgr');
+  assert.ok(lane);
+  assert.deepEqual(lane.roles, ['manager']);
+  assert.equal(lane.manager_allowed, true);
+  assert.equal(lane.execution_mode, 'agentic');
+  assert.equal(lane.attestation, false);
+  // The roles array is frozen (deep immutability extends to it).
+  assert.ok(Object.isFrozen(lane.roles));
+  assert.throws(() => {
+    (lane.roles as string[]).push('worker');
+  });
+});
+
+test('rejects agentic execution_mode on a non-full lane (agentic ⊥ trust)', () => {
+  const cfg = `
+lanes:
+  - id: w
+    kind: api
+    model: m
+    trust_mode: worker
+    costBasis: metered
+    provenance: acme
+    jurisdiction: US
+    execution_mode: agentic
+`;
+  assert.throws(() => parseLaneConfig(cfg), {
+    message: /'agentic' is only allowed when trust_mode is 'full'/,
+  });
+});
+
+test('rejects bad role / boolean fields', () => {
+  const bad = (extra: string): string =>
+    `lanes:\n  - id: x\n    kind: cli\n    model: m\n    trust_mode: full\n    costBasis: subscription\n    provenance: p\n    jurisdiction: US\n${extra}`;
+  assert.throws(() => parseLaneConfig(bad('    roles: [boss]\n')), { message: /roles\[0\] must be one of: manager, worker/ });
+  assert.throws(() => parseLaneConfig(bad('    roles: notlist\n')), { message: /roles must be an array/ });
+  assert.throws(() => parseLaneConfig(bad('    manager_allowed: yes\n')), { message: /manager_allowed must be a boolean/ });
+  assert.throws(() => parseLaneConfig(bad('    attestation: 1\n')), { message: /attestation must be a boolean/ });
+});
+
 test('rejects duplicate lane ids', () => {
   const cfg = `
 lanes:
   - id: dup
     kind: cli
     model: m
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: p
     jurisdiction: US
   - id: dup
     kind: local
     model: n
-    trust: trusted
+    trust_mode: full
     costBasis: local
     provenance: q
     jurisdiction: US

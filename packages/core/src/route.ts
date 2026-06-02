@@ -12,7 +12,9 @@
  * before scoring once untrusted lanes exist. The shape returned here is stable.
  */
 
+import { TRUSTED_PROVENANCES } from './types.ts';
 import type {
+  ExecutionMode,
   Lane,
   LaneScore,
   Policy,
@@ -61,15 +63,47 @@ function capPenaltyFor(headroom: number | undefined): number {
 }
 
 /**
- * Enforcement order is law: until the minimization/policy gate (M3, P1-S9)
- * exists, only trusted, non-API lanes may ever be selected. This is a hard
- * structural guard, independent of policy config — an `untrusted` lane or any
- * `api` lane is excluded from candidacy regardless of how it scores. When the
- * gate ships, the policy engine takes over candidate filtering and this guard
- * is relaxed deliberately, not by accident.
+ * Enforcement order is law. A non-`full` lane (worker/monitored/blocked) may run
+ * ONLY once the minimization/policy gate is ready AND its executor is
+ * egress-certified. Until then, only `full`, non-`api` lanes are selectable —
+ * a hard structural guard independent of policy config. When the gate ships, the
+ * policy engine takes over candidate filtering and this guard is relaxed
+ * deliberately, not by accident.
+ *
+ * @param gateReady whether the minimization/policy gate is built + CI-green.
+ *   Defaults to `false`. In this step it only relaxes the pre-gate "no API lane"
+ *   restriction for full (trusted) lanes; worker admission lands with the policy
+ *   engine + egress certification.
  */
-export function isSelectablePreGate(lane: Lane): boolean {
-  return lane.trust === 'trusted' && lane.kind !== 'api';
+export function isSelectablePreGate(lane: Lane, gateReady = false): boolean {
+  if (lane.trust_mode === 'blocked') return false; // never selectable, period
+  // `monitored` is deferred (later phase) — no monitoring implementation yet.
+  if (lane.trust_mode === 'monitored') return false;
+  // Untrusted `worker` lanes require BOTH the policy gate (minimization) AND
+  // per-executor egress certification — neither exists yet — so they are never
+  // admitted by this structural guard, regardless of `gateReady`. Their
+  // admission is added by the policy-engine + certification steps, layered on top.
+  if (lane.trust_mode === 'worker') return false;
+  // Full (trusted, user-approved) lanes: CLI/local always selectable; an API lane
+  // only once the gate is ready (the blanket pre-gate "no API lane" guard relaxes).
+  return gateReady || lane.kind !== 'api';
+}
+
+/**
+ * Whether a lane is eligible to act as the manager/reviewer. Requires
+ * `trust_mode: 'full'` + `manager_allowed` + (trusted-by-provenance/local OR an
+ * explicit user attestation). Keeps an arbitrary BYOK lane from silently becoming
+ * the reviewer just because a user marked it `full`.
+ */
+export function isManagerEligible(lane: Lane): boolean {
+  if (lane.trust_mode !== 'full' || lane.manager_allowed !== true) return false;
+  const trustedByOrigin = lane.kind === 'local' || TRUSTED_PROVENANCES.includes(lane.provenance);
+  return trustedByOrigin || lane.attestation === true;
+}
+
+/** Resolve a lane's execution mode (defaults to `answer-only`). */
+export function executionModeOf(lane: Lane): ExecutionMode {
+  return lane.execution_mode ?? 'answer-only';
 }
 
 /** Clamp a number into [0, 1]. */
@@ -123,7 +157,7 @@ export function routeDecide(
 ): RouteDecision {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const candidates = ctx.lanes.filter(
-    (lane) => !disabled.has(lane.id) && isSelectablePreGate(lane),
+    (lane) => !disabled.has(lane.id) && isSelectablePreGate(lane, ctx.gateReady ?? false),
   );
 
   if (candidates.length === 0) {

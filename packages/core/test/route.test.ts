@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { isSelectablePreGate, routeDecide } from '../src/route.ts';
+import { executionModeOf, isManagerEligible, isSelectablePreGate, routeDecide } from '../src/route.ts';
 import { capHeadroom } from '../src/usage.ts';
 import type { Lane, Policy, RouteContext, Task } from '../src/types.ts';
 
@@ -9,7 +9,7 @@ const claude: Lane = {
   id: 'claude-native',
   kind: 'cli',
   model: 'claude-opus-4-7',
-  trust: 'trusted',
+  trust_mode: 'full',
   costBasis: 'subscription',
   provenance: 'anthropic',
   jurisdiction: 'US',
@@ -20,7 +20,7 @@ const codex: Lane = {
   id: 'codex-cli',
   kind: 'cli',
   model: 'gpt-5.5',
-  trust: 'trusted',
+  trust_mode: 'full',
   costBasis: 'subscription',
   provenance: 'openai',
   jurisdiction: 'US',
@@ -31,7 +31,7 @@ const ollama: Lane = {
   id: 'ollama-llama3',
   kind: 'local',
   model: 'llama3.1:8b',
-  trust: 'trusted',
+  trust_mode: 'full',
   costBasis: 'local',
   provenance: 'meta',
   jurisdiction: 'US',
@@ -97,42 +97,70 @@ test('excludes policy-disabled lanes from candidates', () => {
   assert.ok(!d.scores.some((s) => s.laneId === 'claude-native'));
 });
 
-test('never selects an untrusted lane, even when it scores highest', () => {
-  const cheapUntrusted: Lane = {
+test('never selects a worker lane before the gate, even when it scores highest', () => {
+  const cheapWorker: Lane = {
     id: 'deepseek-api',
     kind: 'api',
     model: 'deepseek-v3',
-    trust: 'untrusted',
+    trust_mode: 'worker',
     costBasis: 'metered',
     provenance: 'deepseek',
     jurisdiction: 'CN',
     capability: { codegen: 1, bugfix: 1, feature: 1, refactor: 1, boilerplate: 1, docs: 1, explain: 1 },
   };
-  const d = routeDecide({ category: 'codegen' }, { lanes: [cheapUntrusted, codex] }, noPolicy);
+  const d = routeDecide({ category: 'codegen' }, { lanes: [cheapWorker, codex] }, noPolicy);
   assert.equal(d.laneId, 'codex-cli');
   assert.ok(!d.scores.some((s) => s.laneId === 'deepseek-api'));
 });
 
-test('never selects an API lane before the gate, even a trusted-labeled one', () => {
-  const trustedApi: Lane = {
+test('never selects an API lane before the gate, even a full-trust one', () => {
+  const fullApi: Lane = {
     id: 'some-api',
     kind: 'api',
     model: 'whatever',
-    trust: 'trusted',
+    trust_mode: 'full',
     costBasis: 'metered',
     provenance: 'x',
     jurisdiction: 'US',
     capability: { docs: 1 },
   };
-  assert.equal(isSelectablePreGate(trustedApi), false);
-  const d = routeDecide({ category: 'docs' }, { lanes: [trustedApi, claude] }, noPolicy);
+  assert.equal(isSelectablePreGate(fullApi), false);
+  const d = routeDecide({ category: 'docs' }, { lanes: [fullApi, claude] }, noPolicy);
   assert.equal(d.laneId, 'claude-native');
+  // But once the gate is ready, a full (user-approved) API lane IS selectable.
+  assert.equal(isSelectablePreGate(fullApi, true), true);
 });
 
-test('isSelectablePreGate admits only trusted, non-API lanes', () => {
+test('isSelectablePreGate admits only full, non-API lanes while the gate is not ready', () => {
   assert.equal(isSelectablePreGate(claude), true);
   assert.equal(isSelectablePreGate(codex), true);
   assert.equal(isSelectablePreGate(ollama), true);
+  const worker: Lane = { ...ollama, id: 'w', trust_mode: 'worker' };
+  // Worker lanes are never admitted by this guard until the policy gate + egress
+  // certification exist — regardless of gateReady.
+  assert.equal(isSelectablePreGate(worker), false);
+  assert.equal(isSelectablePreGate(worker, true), false);
+  const blocked: Lane = { ...ollama, id: 'b', trust_mode: 'blocked' };
+  assert.equal(isSelectablePreGate(blocked, true), false); // blocked never runs
+  const monitored: Lane = { ...ollama, id: 'm', trust_mode: 'monitored' };
+  assert.equal(isSelectablePreGate(monitored, true), false); // monitored deferred — not yet selectable
+});
+
+test('routeDecide: workers stay excluded until policy+cert; full API relaxes only post-gate', () => {
+  const worker: Lane = { ...ollama, id: 'worker-lane', kind: 'api', trust_mode: 'worker', capability: { docs: 0.99 } };
+  // Worker excluded regardless of gateReady (no minimization/policy/cert yet).
+  assert.equal(routeDecide({ category: 'docs' }, { lanes: [worker, claude] }, noPolicy).laneId, 'claude-native');
+  assert.equal(
+    routeDecide({ category: 'docs' }, { lanes: [worker, claude], gateReady: true }, noPolicy).laneId,
+    'claude-native',
+  );
+  // A FULL (trusted) API lane is excluded pre-gate, selectable post-gate.
+  const fullApi: Lane = { ...claude, id: 'full-api', kind: 'api', capability: { docs: 0.99 } };
+  assert.equal(routeDecide({ category: 'docs' }, { lanes: [fullApi, claude] }, noPolicy).laneId, 'claude-native');
+  assert.equal(
+    routeDecide({ category: 'docs' }, { lanes: [fullApi, claude], gateReady: true }, noPolicy).laneId,
+    'full-api',
+  );
 });
 
 test('throws when only untrusted/API lanes are available (none selectable pre-gate)', () => {
@@ -140,7 +168,7 @@ test('throws when only untrusted/API lanes are available (none selectable pre-ga
     id: 'u',
     kind: 'api',
     model: 'm',
-    trust: 'untrusted',
+    trust_mode: 'worker',
     costBasis: 'metered',
     provenance: 'p',
     jurisdiction: 'CN',
@@ -207,4 +235,27 @@ test('throws a clear error when no candidate lanes remain', () => {
     () => decide('feature', ctx, { disabledLaneIds: ['claude-native', 'codex-cli', 'ollama-llama3'] }),
     /no candidate lanes/,
   );
+});
+
+test('isManagerEligible requires full trust + manager_allowed + trusted-origin/attestation', () => {
+  // Full + manager_allowed + first-party provenance ⇒ eligible.
+  assert.equal(isManagerEligible({ ...claude, manager_allowed: true }), true);
+  // Local lane (Ollama) is trusted-by-origin.
+  assert.equal(isManagerEligible({ ...ollama, manager_allowed: true }), true);
+  // manager_allowed not set ⇒ not eligible.
+  assert.equal(isManagerEligible(claude), false);
+  // A BYOK/non-first-party lane set full+manager_allowed is NOT eligible without attestation.
+  const byok: Lane = {
+    id: 'byok', kind: 'api', model: 'm', trust_mode: 'full', costBasis: 'metered',
+    provenance: 'acme-byok', jurisdiction: 'US', manager_allowed: true,
+  };
+  assert.equal(isManagerEligible(byok), false);
+  assert.equal(isManagerEligible({ ...byok, attestation: true }), true);
+  // A worker lane is never manager-eligible.
+  assert.equal(isManagerEligible({ ...byok, trust_mode: 'worker', attestation: true }), false);
+});
+
+test('executionModeOf defaults to answer-only', () => {
+  assert.equal(executionModeOf(claude), 'answer-only');
+  assert.equal(executionModeOf({ ...claude, execution_mode: 'agentic' }), 'agentic');
 });

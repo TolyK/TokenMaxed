@@ -91,7 +91,7 @@ mkdir -p config
 cp config/lanes.example.yaml config/lanes.yaml
 ```
 
-Each lane declares its `kind`, `model`, `trust` tier, `costBasis`, provenance,
+Each lane declares its `kind`, `model`, `trust_mode`, `costBasis`, provenance,
 and optional per-category `capability` scores in `[0, 1]`. See
 [`config/lanes.example.yaml`](./config/lanes.example.yaml) for the full,
 commented schema. Only **trusted, non-API** lanes are selectable until the

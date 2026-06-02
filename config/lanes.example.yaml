@@ -6,24 +6,38 @@
 # never create, enable, or re-trust one.
 #
 # Fields:
-#   id           unique local identifier for the lane
-#   kind         cli | api | local
-#   model        model id used for pricing / registry lookups
-#   trust        trusted | untrusted   (untrusted lanes get minimized payloads only)
-#   costBasis    subscription | metered | local
-#   provenance   vendor/org, e.g. anthropic, openai, meta
-#   jurisdiction legal jurisdiction of the provider, e.g. US, CN
-#   capability   optional per-category competence in [0, 1]; omit a category to
-#                use the default, or set it to 0 to opt the lane out entirely.
+#   id              unique local identifier for the lane
+#   kind            cli | api | local
+#   model           model id used for pricing / registry lookups
+#   trust_mode      full | worker | monitored | blocked
+#                     full     = may see repo + tools + broad context (trusted)
+#                     worker   = minimized, scrubbed, bounded task only (no repo/tools)
+#                     monitored= (deferred — later phase)
+#                     blocked  = never selected
+#                   Non-`full` lanes only run once the minimization/policy gate is ready.
+#   costBasis       subscription | metered | local
+#   provenance      vendor/org, e.g. anthropic, openai, google, meta
+#   jurisdiction    legal jurisdiction of the provider, e.g. US, CN
+#   roles           optional: [manager] / [worker]  (manager reviews + (re)assigns)
+#   manager_allowed optional bool: may this lane act as the manager/reviewer?
+#   execution_mode  answer-only (default) | agentic
+#                     agentic (lane edits files / runs commands) is ONLY allowed
+#                     when trust_mode is `full`.
+#   attestation     optional bool: explicit user attestation that a non-first-party
+#                     lane is trusted enough to be manager-eligible.
+#   capability      optional per-category competence in [0, 1]; omit a category to
+#                   use the default, or set it to 0 to opt the lane out entirely.
 
 lanes:
   - id: claude-native
     kind: cli
     model: claude-opus-4-7
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
+    roles: [manager]
+    manager_allowed: true
     capability:
       feature: 0.95
       refactor: 0.90
@@ -36,10 +50,11 @@ lanes:
   - id: codex-cli
     kind: cli
     model: gpt-5.5
-    trust: trusted
+    trust_mode: full
     costBasis: subscription
     provenance: openai
     jurisdiction: US
+    execution_mode: answer-only
     capability:
       bugfix: 0.92
       codegen: 0.90
@@ -49,7 +64,7 @@ lanes:
   - id: ollama-llama3
     kind: local
     model: llama3.1:8b
-    trust: trusted
+    trust_mode: full
     costBasis: local
     provenance: meta
     jurisdiction: US

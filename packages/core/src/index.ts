@@ -4,6 +4,8 @@ export * from './types.ts';
 export {
   routeDecide,
   isSelectablePreGate,
+  isManagerEligible,
+  executionModeOf,
   capabilityFor,
   DEFAULT_CAPABILITY,
 } from './route.ts';

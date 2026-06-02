@@ -15,11 +15,21 @@ import { parse as parseYaml } from 'yaml';
 
 import { capabilityFor } from './route.ts';
 import { TASK_CATEGORIES } from './types.ts';
-import type { CostBasis, Lane, LaneKind, TaskCategory } from './types.ts';
+import type {
+  CostBasis,
+  ExecutionMode,
+  Lane,
+  LaneKind,
+  LaneRole,
+  TaskCategory,
+  TrustMode,
+} from './types.ts';
 
 const LANE_KINDS: readonly LaneKind[] = ['cli', 'api', 'local'];
-const TRUSTS: readonly Lane['trust'][] = ['trusted', 'untrusted'];
+const TRUST_MODES: readonly TrustMode[] = ['full', 'worker', 'monitored', 'blocked'];
 const COST_BASES: readonly CostBasis[] = ['subscription', 'metered', 'local'];
+const LANE_ROLES: readonly LaneRole[] = ['manager', 'worker'];
+const EXECUTION_MODES: readonly ExecutionMode[] = ['answer-only', 'agentic'];
 const CATEGORIES = new Set<string>(TASK_CATEGORIES);
 
 /** Fields a lane entry may declare. Anything else is rejected as a likely typo. */
@@ -27,10 +37,14 @@ const ALLOWED_LANE_KEYS = new Set([
   'id',
   'kind',
   'model',
-  'trust',
+  'trust_mode',
   'costBasis',
   'provenance',
   'jurisdiction',
+  'roles',
+  'manager_allowed',
+  'execution_mode',
+  'attestation',
   'capability',
 ]);
 
@@ -104,16 +118,49 @@ function parseLane(entry: unknown, index: number): Lane {
     }
   }
   const id = requireString(entry.id, `${where}.id`);
+  const at = (field: string): string => `lanes[${index}] (${id}).${field}`;
+  const trust_mode = requireEnum(entry.trust_mode, TRUST_MODES, at('trust_mode'));
   const lane: Lane = {
     id,
-    kind: requireEnum(entry.kind, LANE_KINDS, `lanes[${index}] (${id}).kind`),
-    model: requireString(entry.model, `lanes[${index}] (${id}).model`),
-    trust: requireEnum(entry.trust, TRUSTS, `lanes[${index}] (${id}).trust`),
-    costBasis: requireEnum(entry.costBasis, COST_BASES, `lanes[${index}] (${id}).costBasis`),
-    provenance: requireString(entry.provenance, `lanes[${index}] (${id}).provenance`),
-    jurisdiction: requireString(entry.jurisdiction, `lanes[${index}] (${id}).jurisdiction`),
+    kind: requireEnum(entry.kind, LANE_KINDS, at('kind')),
+    model: requireString(entry.model, at('model')),
+    trust_mode,
+    costBasis: requireEnum(entry.costBasis, COST_BASES, at('costBasis')),
+    provenance: requireString(entry.provenance, at('provenance')),
+    jurisdiction: requireString(entry.jurisdiction, at('jurisdiction')),
   };
-  const capability = parseCapability(entry.capability, `lanes[${index}] (${id}).capability`);
+
+  if (entry.roles !== undefined) {
+    if (!Array.isArray(entry.roles)) {
+      throw new LaneConfigError(`${at('roles')} must be an array of: ${LANE_ROLES.join(', ')}.`);
+    }
+    lane.roles = entry.roles.map((r, i) => requireEnum(r, LANE_ROLES, `${at('roles')}[${i}]`));
+  }
+  if (entry.manager_allowed !== undefined) {
+    if (typeof entry.manager_allowed !== 'boolean') {
+      throw new LaneConfigError(`${at('manager_allowed')} must be a boolean.`);
+    }
+    lane.manager_allowed = entry.manager_allowed;
+  }
+  if (entry.attestation !== undefined) {
+    if (typeof entry.attestation !== 'boolean') {
+      throw new LaneConfigError(`${at('attestation')} must be a boolean.`);
+    }
+    lane.attestation = entry.attestation;
+  }
+  if (entry.execution_mode !== undefined) {
+    const mode = requireEnum(entry.execution_mode, EXECUTION_MODES, at('execution_mode'));
+    // Invariant: agentic autonomy is only permitted for full-trust lanes.
+    if (mode === 'agentic' && trust_mode !== 'full') {
+      throw new LaneConfigError(
+        `${at('execution_mode')}: 'agentic' is only allowed when trust_mode is 'full' ` +
+          `(got trust_mode '${trust_mode}'). Untrusted lanes are never agentic-with-access.`,
+      );
+    }
+    lane.execution_mode = mode;
+  }
+
+  const capability = parseCapability(entry.capability, at('capability'));
   if (capability) lane.capability = capability;
   return lane;
 }
@@ -122,6 +169,7 @@ function parseLane(entry: unknown, index: number): Lane {
 function freezeLane(lane: Lane): Lane {
   const clone: Lane = { ...lane };
   if (clone.capability) clone.capability = Object.freeze({ ...clone.capability });
+  if (clone.roles) clone.roles = Object.freeze([...clone.roles]) as Lane['roles'];
   return Object.freeze(clone);
 }
 
