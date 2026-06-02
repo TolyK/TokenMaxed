@@ -16,5 +16,25 @@ export {
   aggregateSavings,
 } from './price.ts';
 export type { ModelPrice, PriceTable, CostPrimitives, SavingsSummary } from './price.ts';
-// File I/O (loadLaneConfig, loadPriceTable) lives in the Node adapter: import
-// from "@tokenmaxed/core/node" so the core barrel stays free of node:fs.
+export {
+  LedgerError,
+  EVENT_FIELDS,
+  validateEventInput,
+  serializeEvent,
+  parseEvent,
+  filterEventsSince,
+  summarize,
+  tokenStats,
+} from './ledger.ts';
+export type {
+  PolicyVerdict,
+  TaskEvent,
+  TaskEventInput,
+  LedgerSummary,
+  TokenBucket,
+  TokenGroup,
+  TokenStats,
+} from './ledger.ts';
+// File I/O (loadLaneConfig, loadPriceTable, JsonlLedger) lives in the Node
+// adapter: import from "@tokenmaxed/core/node" so the core barrel stays free
+// of node:fs.

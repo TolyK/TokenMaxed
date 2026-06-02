@@ -137,7 +137,7 @@ same content-free event log.
 - [x] **P1-S1** — Scaffold + pure `routeDecide`
 - [x] **P1-S2** — Lane registry (`lanes.yaml`)
 - [x] **P1-S3** — Pricing + canonical savings math
-- [ ] **P1-S4** — Append-only JSONL ledger + token stats
+- [x] **P1-S4** — Append-only JSONL ledger + token stats
 - [ ] **P1-S5** — Token estimation + subscription-cap tracking
 - [ ] **CLI** — `tokenmaxed savings` / `tokenmaxed tokens`
 - [ ] Claude Code plugin adapter (commands, hooks, trusted lanes)
