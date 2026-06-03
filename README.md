@@ -17,6 +17,9 @@ It is **local-first**: the routing brain, your prompts, and your code stay on
 your machine. Any hosted feature added later transmits only content-free
 metadata you explicitly opt into.
 
+> **New here? Start with Claude Code →** [Use in Claude Code](#use-in-claude-code-plugin)
+> — install the plugin, run `/tokenmaxed:setup`, done.
+
 ---
 
 ## Why
@@ -37,7 +40,7 @@ metadata you explicitly opt into.
 data-minimization/policy gate + manager review, the `tokenmaxed` CLI, and the
 **Claude Code plugin** are in place; broadening lane coverage and other host
 adapters come next. APIs may still change. Built in small, reviewed commits in
-the open — see the [Roadmap](#roadmap).
+the open.
 
 ## Architecture
 
@@ -67,12 +70,74 @@ changes and nothing new leaving the machine.
   built-in type stripping, which is enabled by default from 22.18 — no extra
   test runner). A `tsc` build emits plain JavaScript for publishing/consumption.
 
-## Getting started
+## Use in Claude Code (plugin)
 
-> **Note:** v0 is early, but you can already use it two ways: the **`tokenmaxed`
-> CLI** (savings/token reports) and the **Claude Code plugin** (routing + review
-> as `/tokenmaxed:*` commands that record to the ledger). You can also drive the
-> routing brain (`@tokenmaxed/core`) programmatically. All three are shown below.
+**👉 First time here? This is where to start.** Using TokenMaxed in Claude Code is
+three steps: install the plugin, run `/tokenmaxed:setup`, then code as usual.
+(Requires [Node.js ≥ 22.18](#requirements).)
+
+### 1. Install the plugin
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git && cd TokenMaxed
+npm install
+npm run build:plugin                   # bundle the self-contained plugin server
+claude --plugin-dir packages/plugin    # load it into Claude Code for this session
+```
+
+> A marketplace install (`claude plugin install tokenmaxed@…`) ships with the
+> first published release. Until then use `--plugin-dir` (add it to your Claude
+> Code settings to load the plugin every session).
+
+### 2. Run setup — once
+
+Inside Claude Code, run:
+
+```
+/tokenmaxed:setup
+```
+
+It creates your config at `~/.tokenmaxed/lanes.yaml` and `policy.yaml` from
+starter templates (it never overwrites an existing file), validates it, and
+prints what's enabled and what to do next. **That's the whole required setup.**
+
+### 3. Use it
+
+Just code as usual: with routing on, Claude offloads bounded, well-specified
+subtasks to the cheapest capable lane automatically. Or drive it by hand:
+
+| Command | What it does |
+|---|---|
+| `/tokenmaxed:setup` | create/validate config and show status |
+| `/tokenmaxed:savings [7d]` | savings from the local ledger |
+| `/tokenmaxed:tokens [by lane]` | token usage (by model or lane) |
+| `/tokenmaxed:why <category>` | preview which lane would handle a category — nothing runs |
+| `/tokenmaxed:review` | manager review of your current working-tree changes |
+| `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
+
+### Configure & extend
+
+- **Where config lives.** The plugin reads **user-owned** `~/.tokenmaxed/lanes.yaml`
+  + `policy.yaml` — *not* the repo's `config/`, so a cloned repo can never
+  introduce an executable lane. Edit `~/.tokenmaxed/lanes.yaml` to add or trust
+  lanes: provider CLIs (Codex, Gemini, …), a local Ollama, the cheaper-Claude
+  lane, or a BYOK worker. (The `tokenmaxed` CLI instead uses in-repo `config/`.)
+- **BYOK API keys.** A BYOK `api` lane names an `authHandle`; put its key in env
+  var `TOKENMAXED_KEY_<authHandle>` (e.g. `TOKENMAXED_KEY_OPENAI`). Keys are never
+  stored by TokenMaxed.
+- **Optional, off by default** (trusted CLI/local offloads work without either):
+  - **Untrusted worker lanes** — install
+    [`gitleaks`](https://github.com/gitleaks/gitleaks) and start Claude Code with
+    `TOKENMAXED_GATE_READY=true`.
+  - **Turn-end review gate** — a trusted manager reviews your changes and can
+    require rework before Claude finishes; enable with `TOKENMAXED_REVIEW_ON_STOP=true`.
+
+## Getting started (CLI & core)
+
+> Prefer the command line or your own integration? The steps below cover the
+> `tokenmaxed` CLI (savings/token reports) and driving the routing brain
+> (`@tokenmaxed/core`) directly. **Using Claude Code? See
+> [Use in Claude Code](#use-in-claude-code-plugin) above — that's the fastest path.**
 
 ### 1. Install
 
@@ -161,64 +226,6 @@ your own `@tokenmaxed/core` integration); until then the report says "No tasks
 recorded yet", while `tokenmaxed lanes` works immediately off your
 `config/lanes.yaml`.
 
-### 5. Use in Claude Code (plugin)
-
-TokenMaxed ships as a Claude Code plugin: it exposes routing/review as MCP tools
-and `/tokenmaxed:*` commands, and records every routed task to the same ledger.
-
-**Install (local / dev):**
-
-```bash
-npm run build:plugin                  # bundle the self-contained plugin server
-claude --plugin-dir packages/plugin   # load it for the session
-```
-
-(Marketplace install — `claude plugin install tokenmaxed@…` — comes with the
-first published release.)
-
-**Set up once, from inside Claude Code:**
-
-```
-/tokenmaxed:setup
-```
-
-This creates your **user-owned** config at `~/.tokenmaxed/lanes.yaml` and
-`policy.yaml` (from starter templates — it never overwrites), validates it, and
-reports what's enabled.
-
-**Commands:**
-
-| Command | What |
-|---|---|
-| `/tokenmaxed:setup` | create/validate config and show status |
-| `/tokenmaxed:savings [7d]` | savings from the local ledger |
-| `/tokenmaxed:tokens [by lane]` | token usage (by model or lane) |
-| `/tokenmaxed:why <category>` | preview which lane would handle a category — no execution |
-| `/tokenmaxed:review` | manager review of the current working-tree diff |
-| `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
-
-With routing on, advisory `route` guidance lets Claude offload bounded subtasks
-to the cheapest capable lane via the `router_delegate` tool automatically.
-
-**Config location (important):** the **plugin** reads **user-owned**
-`~/.tokenmaxed/lanes.yaml` (+ `policy.yaml`), *not* the repo's `config/` — so a
-cloned repo can never introduce an executable lane (RCE-safe). The `tokenmaxed`
-**CLI** reads the in-repo `config/lanes.yaml` for local dev.
-
-**BYOK keys:** a metered/BYOK `api` lane names an `authHandle`; put its key in the
-env var `TOKENMAXED_KEY_<authHandle>` (e.g. `TOKENMAXED_KEY_OPENAI`). TokenMaxed
-never stores your keys.
-
-**Opt-in protections (off by default — trusted offloads work without them):**
-
-- **Untrusted worker lanes** (a BYOK API you don't fully trust) stay disabled
-  until you install [`gitleaks`](https://github.com/gitleaks/gitleaks) and start
-  Claude Code with `TOKENMAXED_GATE_READY=true`. Trusted CLI/local lanes (Codex,
-  Gemini, Ollama, cheaper-Claude) need none of this.
-- A **turn-end review gate** — a trusted manager reviews your changes and can
-  require rework before Claude finishes — turns on with
-  `TOKENMAXED_REVIEW_ON_STOP=true`.
-
 ### Surfaces (where you can use TokenMaxed)
 
 | Surface | Status | How |
@@ -237,29 +244,6 @@ npm test         # run the test suite (TypeScript, no build needed)
 npm run typecheck
 npm run build    # emit JavaScript to packages/*/dist
 ```
-
-## Roadmap
-
-v0 is built locally first; a hosted dashboard is purely additive on top of the
-same content-free event log.
-
-- [x] **P1-S1** — Scaffold + pure `routeDecide`
-- [x] **P1-S2** — Lane registry (`lanes.yaml`)
-- [x] **P1-S3** — Pricing + canonical savings math
-- [x] **P1-S4** — Append-only JSONL ledger + token stats
-- [x] **P1-S5** — Token estimation + subscription-cap tracking
-- [x] **CLI** — `tokenmaxed savings` / `tokenmaxed tokens`
-- [x] **Minimization + policy gate** (before any untrusted/API lane)
-  - [x] Trust model (`trust_mode`, roles, `execution_mode`, manager eligibility)
-  - [x] Policy engine (ordered rules + deny-by-default; routing filters by verdict)
-  - [x] Minimizer (branded `MinimizedPayload` boundary + scrub + gitleaks fail-safe)
-  - [x] Untrusted execution boundary (`executeUntrusted`) + egress-envelope CI
-  - [x] Manager review + reassignment; trust-preserving lane→lane fallback
-- [x] **Claude Code plugin adapter** — MCP server, `/tokenmaxed:*` skills,
-  `router_delegate` offload + cheaper-Claude lane, `PreToolUse` deny backstop,
-  opt-in `Stop` review gate, `/tokenmaxed:setup`
-- [ ] Broaden lane coverage + other host adapters (Codex, Gemini, Cursor, …)
-- [ ] Hosted dashboard (additive, over the same content-free event log)
 
 ## Contributing
 
