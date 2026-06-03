@@ -16,12 +16,17 @@
  */
 
 import { build } from 'esbuild';
+import { copyFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = dirname(fileURLToPath(import.meta.url));
 const entry = resolve(root, '../mcp/src/bin.ts');
 const outfile = resolve(root, 'server/index.mjs');
+
+// Ship a default price table with the plugin (reference data the delegate path
+// needs to cost routed work). plugin.json points TOKENMAXED_PRICES at it.
+copyFileSync(resolve(root, '../../config/prices.seed.json'), resolve(root, 'prices.seed.json'));
 
 await build({
   entryPoints: [entry],

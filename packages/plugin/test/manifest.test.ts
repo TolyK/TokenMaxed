@@ -34,10 +34,24 @@ test('manifest registers a single bundled stdio MCP server', () => {
   );
 });
 
-test('manifest points lane/policy config at the project dir', () => {
+test('manifest never points lane/policy config at the repo dir (RCE-safe)', () => {
+  // SECURITY: lanes/policy decide what executes + where data goes, so they must
+  // default to the user-owned ~/.tokenmaxed — never the repo. The manifest must
+  // NOT override them to a project path (which a cloned repo could control).
   const env = manifest.mcpServers.tokenmaxed!.env ?? {};
-  assert.match(env.TOKENMAXED_LANES ?? '', /\$\{CLAUDE_PROJECT_DIR\}/);
-  assert.match(env.TOKENMAXED_POLICY ?? '', /\$\{CLAUDE_PROJECT_DIR\}/);
+  assert.equal(env.TOKENMAXED_LANES, undefined, 'lanes must not be repo-controlled');
+  assert.equal(env.TOKENMAXED_POLICY, undefined, 'policy must not be repo-controlled');
+  for (const [k, v] of Object.entries(env)) {
+    if (v.includes('${CLAUDE_PROJECT_DIR}')) {
+      assert.equal(k, 'TOKENMAXED_PROJECT', `only the toggle key may use the project dir, not ${k}`);
+    }
+  }
+});
+
+test('manifest sources prices from the plugin root and state from plugin data', () => {
+  const env = manifest.mcpServers.tokenmaxed!.env ?? {};
+  assert.match(env.TOKENMAXED_PRICES ?? '', /\$\{CLAUDE_PLUGIN_ROOT\}/);
+  assert.match(env.TOKENMAXED_STATE ?? '', /\$\{CLAUDE_PLUGIN_DATA\}/);
 });
 
 test('the committed bundled server exists (the install artifact a fresh clone ships)', () => {

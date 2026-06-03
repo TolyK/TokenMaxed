@@ -9,34 +9,78 @@
  * test and the no-build tools.test.ts (which injects core via source).
  *
  * Config resolution (env overridable so the plugin can point at bundled paths):
- *   - lanes:  TOKENMAXED_LANES   (default config/lanes.yaml)
- *   - policy: TOKENMAXED_POLICY  (default config/policy.yaml)
+ *   - lanes:  TOKENMAXED_LANES   (default ~/.tokenmaxed/lanes.yaml)
+ *   - policy: TOKENMAXED_POLICY  (default ~/.tokenmaxed/policy.yaml)
+ *   - prices: TOKENMAXED_PRICES  (default config/prices.seed.json)
  *   - ledger: TOKENMAXED_LEDGER  (default ~/.tokenmaxed/ledger.jsonl)
  *   - state:  TOKENMAXED_STATE   (toggle file; default ~/.tokenmaxed/state.json)
  *   - project key: TOKENMAXED_PROJECT (default "default")
  * Config is loaded lazily per call so the server starts even before setup, and
  * picks up edits without a restart. Loader errors become isError tool results.
+ *
+ * SECURITY: lanes + policy decide WHAT executes (cli commands / API endpoints)
+ * and WHERE data may be sent, so they are read from a USER-OWNED location
+ * (~/.tokenmaxed), never the project/repo dir. Otherwise a cloned malicious repo
+ * could ship a `cli` lane with `command: sh` and a model-invoked offload would
+ * run it. The project dir only contributes the toggle KEY (never executed).
  */
 
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, evaluate, filterEventsSince, routeDecide, summarize, tokenStats } from '@tokenmaxed/core';
-import { JsonlLedger, loadLaneConfig, loadPolicyConfig } from '@tokenmaxed/core/node';
+import { TASK_CATEGORIES, evaluate, filterEventsSince, priceForModel, routeDecide, runTask, summarize, tokenStats } from '@tokenmaxed/core';
+import type { Lane, Policy, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import {
+  JsonlLedger,
+  executeUntrusted,
+  laneToUntrustedDTO,
+  loadLaneConfig,
+  loadPolicyConfig,
+  loadPriceTable,
+  makeGitleaksScanner,
+  makeTrustedApiExecutor,
+  makeTrustedExecutor,
+} from '@tokenmaxed/core/node';
 
 import { createTools, dispatch } from './tools.ts';
 import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
-import type { CorePort, ToolDef, ToolDeps } from './tools.ts';
+import type { CorePort, DelegateOutcome, DelegateRequest, ToolDef, ToolDeps } from './tools.ts';
 
-const DEFAULT_LANES = 'config/lanes.yaml';
-const DEFAULT_POLICY = 'config/policy.yaml';
+const HOME_TM = join(homedir(), '.tokenmaxed');
+// User-owned (NOT repo-controlled) — see the SECURITY note above.
+const DEFAULT_LANES = join(HOME_TM, 'lanes.yaml');
+const DEFAULT_POLICY = join(HOME_TM, 'policy.yaml');
+// Price seed shipped WITH this package, resolved module-relative (not cwd) so a
+// standalone `tokenmaxed-mcp` and the esbuild bundle both find it without env.
+// (../prices.seed.json sits next to dist/ in the package and next to server/ in
+// the plugin bundle.) reference data only — no execution.
+const DEFAULT_PRICES = fileURLToPath(new URL('../prices.seed.json', import.meta.url));
+
+/**
+ * Whether a lane can actually be used for an offload: a METERED lane whose model
+ * is absent from the price table can't be cost-recorded (runTask would throw after
+ * paying for it), so it's excluded from routing. Subscription/local lanes cost
+ * nothing to record (actual_cost 0) and need no price entry. Applied to BOTH
+ * preview and delegate so /tokenmaxed:why never advertises a lane delegate refuses.
+ */
+function recordableLane(lane: Lane, priceTable: PriceTable): boolean {
+  if (lane.native || lane.costBasis !== 'metered') return true;
+  try {
+    priceForModel(priceTable, lane.model, { tokens_in: 0, tokens_out: 0 });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** A JSON-file-backed {@link ToggleStore}; tolerant of a missing/corrupt file. */
 function fileToggleStore(statePath: string): ToggleStore {
@@ -62,19 +106,133 @@ const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, 
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
+  const lanesPathExplicit = env.TOKENMAXED_LANES !== undefined;
   const policyPath = env.TOKENMAXED_POLICY ?? DEFAULT_POLICY;
+  const policyPathExplicit = env.TOKENMAXED_POLICY !== undefined;
   const ledgerPath = env.TOKENMAXED_LEDGER; // undefined ⇒ JsonlLedger default (~/.tokenmaxed)
-  const statePath = env.TOKENMAXED_STATE ?? join(homedir(), '.tokenmaxed', 'state.json');
+  const statePath = env.TOKENMAXED_STATE ?? join(HOME_TM, 'state.json');
   const projectKey = env.TOKENMAXED_PROJECT ?? 'default';
+  const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
+  // Gate CLOSED by default: trusted CLI/local/native lanes (the common, safe
+  // offloads) always work, but UNTRUSTED worker (BYOK API) lanes stay off until
+  // explicitly enabled with TOKENMAXED_GATE_READY=true. Opening the gate is an
+  // opt-in that /tokenmaxed:setup (A-8) will perform after verifying a secret
+  // scanner is available — so router_preview and router_delegate agree, and
+  // neither advertises a worker lane the minimizer would then block.
+  const gateReady = env.TOKENMAXED_GATE_READY === 'true';
   const store = fileToggleStore(statePath);
+  // BYOK auth, namespaced to contain a supply-chain risk: a lane's `authHandle`
+  // resolves ONLY to env var `TOKENMAXED_KEY_<handle>`, never an arbitrary name.
+  // So a repo-supplied lanes.yaml cannot set e.g. `authHandle: GITHUB_TOKEN` and
+  // exfiltrate that secret to a lane endpoint. Unknown/unset ⇒ '' ⇒ the executor
+  // fails closed (auth_failed), never a leak. Handle must be a plain identifier.
+  const resolveAuth = (authHandle: string): string => {
+    if (!/^[A-Za-z0-9_]+$/.test(authHandle)) return '';
+    return env[`TOKENMAXED_KEY_${authHandle}`] ?? '';
+  };
+
+  // Load policy, FAILING CLOSED when an explicitly configured policy file is
+  // missing (typo / deleted / unmounted): silently using {} would allow more than
+  // the user intends (empty policy permits public/normal worker lanes). Only the
+  // DEFAULT path missing (pre-setup) falls back to {} — core deny-by-default still
+  // restricts everything but public/normal, and the gate is closed by default.
+  const loadPolicySafe = (): Policy => {
+    if (existsSync(policyPath)) return loadPolicyConfig(policyPath);
+    if (policyPathExplicit) throw new Error(`configured policy file not found: ${policyPath}`);
+    return {};
+  };
+
+  // The candidate set both preview and delegate route over: the category's
+  // candidate lanes minus any unpriceable metered lane (see recordableLane).
+  // A MISSING DEFAULT config (pre-setup) is not an error — it means "no lanes yet"
+  // (⇒ native), so the plugin works out of the box. But an EXPLICITLY configured
+  // path that's missing is a misconfiguration: surface it instead of silently
+  // disabling routing (mirrors loadPolicySafe).
+  const usableCandidates = (category: TaskCategory): Lane[] => {
+    if (!existsSync(lanesPath)) {
+      if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
+      return [];
+    }
+    const priceTable = loadPriceTable(pricesPath);
+    return loadLaneConfig(lanesPath)
+      .candidateLanes(category)
+      .filter((lane) => recordableLane(lane, priceTable));
+  };
+
+  const delegate = async (request: DelegateRequest): Promise<DelegateOutcome> => {
+    // No DEFAULT lane config yet ⇒ nothing to route to; do it on the host and tell
+    // the user how to set up, rather than erroring. But an EXPLICIT missing path is
+    // a misconfiguration — surface it (mirrors loadPolicySafe / usableCandidates).
+    if (!existsSync(lanesPath)) {
+      if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
+      return {
+        laneId: 'native',
+        status: 'ok',
+        native: true,
+        reason: `no lanes configured yet — create ${lanesPath} (see the README for a lanes.yaml example)`,
+      };
+    }
+    const registry = loadLaneConfig(lanesPath);
+    const policy = loadPolicySafe();
+    const priceTable = loadPriceTable(pricesPath);
+    const ledger = new JsonlLedger(ledgerPath);
+    // Same usable set preview sees: unpriceable metered lanes are already excluded,
+    // so runTask never picks one and can't throw on cost after paying for it.
+    const lanes = registry.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
+    const ctx = { lanes, gateReady, policyContext: request.policyContext ?? {} };
+
+    // Execute, THEN record as a separate step: a recording failure (corrupt /
+    // unwritable / unappendable ledger) must NEVER discard an already-paid-for
+    // result. runTask itself does the gate/minimize/execute; we append after and
+    // swallow ledger errors, returning the result with a recordingFailed flag.
+    const runDeps: RunDeps = {
+      executeTrusted: makeTrustedExecutor({ api: makeTrustedApiExecutor({ resolveAuth }) }),
+      executeUntrusted: (envelope) => executeUntrusted(envelope, { resolveAuth }),
+      untrustedLaneDTO: laneToUntrustedDTO,
+      scanSecrets: makeGitleaksScanner(),
+      priceTable,
+      newId: () => randomUUID(),
+    };
+    const result = await runTask(
+      {
+        category: request.category,
+        instruction: request.instruction,
+        ...(request.policyContext ? { policyContext: request.policyContext } : {}),
+      },
+      ctx,
+      policy,
+      runDeps,
+    );
+    let recordingFailed = false;
+    try {
+      for (const event of result.events) ledger.appendTask(event);
+    } catch {
+      recordingFailed = true; // keep the result; recording is best-effort
+    }
+    return {
+      laneId: result.laneId,
+      status: result.status,
+      ...(result.native ? { native: true } : {}),
+      ...(result.resultText !== undefined ? { resultText: result.resultText } : {}),
+      ...(registry.byId(result.laneId)?.model ? { model: registry.byId(result.laneId)!.model } : {}),
+      ...(result.failureKind ? { failureKind: result.failureKind } : {}),
+      ...(result.decision?.reason ? { reason: result.decision.reason } : {}),
+      ...(recordingFailed ? { recordingFailed: true } : {}),
+    };
+  };
+
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
-    // candidateLanes() is the documented route input (excludes capability-0
-    // opt-outs); loaded lazily per call so config edits are picked up live.
-    candidateLanes: (category) => loadLaneConfig(lanesPath).candidateLanes(category),
-    loadPolicy: () => loadPolicyConfig(policyPath),
+    // The documented route input (capability-0 opt-outs excluded) minus
+    // unpriceable metered lanes, so preview matches delegate. Lazy per call.
+    candidateLanes: usableCandidates,
+    loadPolicy: loadPolicySafe,
+    // Expose the server's effective gate posture so router_preview defaults to the
+    // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
+    gateReady,
     getEnabled: () => readEnabled(store, projectKey),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
+    delegate,
     now: () => Date.now(),
   };
 }
@@ -95,7 +253,7 @@ export function createServer(deps: ToolDeps): Server {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: advertisedTools(tools) }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
-    const result = dispatch(tools, deps, request.params.name, request.params.arguments);
+    const result = await dispatch(tools, deps, request.params.name, request.params.arguments);
     // ToolResult is structurally a CallToolResult; the SDK's tools/call return is
     // a union (with experimental task results) so we narrow with a cast.
     return result as CallToolResult;

@@ -25,6 +25,7 @@ import type {
   Sensitivity,
   Task,
   TaskCategory,
+  TaskStatus,
   TokenStats,
 } from '@tokenmaxed/core';
 
@@ -69,12 +70,49 @@ export interface ToolDeps {
   candidateLanes: (category: TaskCategory) => Lane[];
   /** The active routing policy (from policy.yaml via core/node). */
   loadPolicy: () => Policy;
+  /**
+   * The server's effective safety-gate posture. router_preview defaults to this
+   * (so /tokenmaxed:why matches what router_delegate would actually do); the
+   * caller can still override per-call with `gate_ready`.
+   */
+  gateReady: boolean;
   /** Whether routing/offloading is enabled for the current project (A-4 toggle). */
   getEnabled: () => boolean;
   /** Persist the project's enabled state (A-4 toggle). */
   setEnabled: (enabled: boolean) => void;
+  /**
+   * Run one bounded subtask through the core path (gate → minimize-if-worker →
+   * execute → record) and return its outcome (A-5). Injected so tools.ts stays
+   * free of core/node runtime imports; the server wires it to `runAndRecord`.
+   */
+  delegate: (request: DelegateRequest) => Promise<DelegateOutcome>;
   /** Current wall-clock in ms (injected so tests are deterministic). */
   now: () => number;
+}
+
+/** A single offload request handed to {@link ToolDeps.delegate}. */
+export interface DelegateRequest {
+  category: TaskCategory;
+  instruction: string;
+  policyContext?: PolicyContext;
+}
+
+/** The outcome of an offload (content-free; the host decides what to do with it). */
+export interface DelegateOutcome {
+  laneId: string;
+  status: TaskStatus;
+  /** true ⇒ the host should perform the task itself (no other lane ran it). */
+  native?: boolean;
+  /** The lane's result text, when a lane executed the task. */
+  resultText?: string;
+  /** The executing lane's model id, for display. */
+  model?: string;
+  /** Normalized failure category when status is failed/blocked. */
+  failureKind?: string;
+  /** Routing explanation (e.g. why it degraded to native). */
+  reason?: string;
+  /** true ⇒ the lane ran but its event could not be written to the ledger. */
+  recordingFailed?: boolean;
 }
 
 /** A declarative tool: advertised by the server, invoked via its handler. */
@@ -83,7 +121,7 @@ export interface ToolDef {
   description: string;
   /** JSON Schema (object) advertised to the MCP client for input validation. */
   inputSchema: Record<string, unknown>;
-  handler: (deps: ToolDeps, args: Record<string, unknown>) => ToolResult;
+  handler: (deps: ToolDeps, args: Record<string, unknown>) => ToolResult | Promise<ToolResult>;
 }
 
 /** Bad tool input (period string, unknown category, …). Caught → isError result. */
@@ -152,6 +190,16 @@ function failResult(message: string): ToolResult {
 function guarded(body: () => ToolResult): ToolResult {
   try {
     return body();
+  } catch (err) {
+    if (err instanceof ToolInputError) return failResult(err.message);
+    throw err;
+  }
+}
+
+/** Async variant of {@link guarded} for handlers that await injected I/O. */
+async function guardedAsync(body: () => Promise<ToolResult>): Promise<ToolResult> {
+  try {
+    return await body();
   } catch (err) {
     if (err instanceof ToolInputError) return failResult(err.message);
     throw err;
@@ -267,7 +315,7 @@ export function createTools(core: CorePort): ToolDef[] {
         gate_ready: {
           type: 'boolean',
           description:
-            'Whether the minimization/policy gate is ready. Default false — matching the core route, which excludes worker (and API) lanes until an adapter asserts the gate. Set true to preview post-gate routing.',
+            'Whether the minimization/policy gate is ready. Defaults to the server\'s current gate posture (the same state router_delegate routes with). Override to preview a different gate state.',
         },
       },
     },
@@ -277,9 +325,20 @@ export function createTools(core: CorePort): ToolDef[] {
         if (category === undefined) throw new ToolInputError('"category" is required.');
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
-        // Default false to mirror core's routeDecide (ctx.gateReady ?? false), so
-        // a preview never claims a lane the real route would exclude pre-gate.
-        const gateReady = optBool(args, 'gate_ready') ?? false;
+
+        // When routing is off for the project, router_delegate degrades to native;
+        // the preview must say the same so /tokenmaxed:why never advertises a lane
+        // delegation would not use.
+        if (!deps.getEnabled()) {
+          return ok(
+            `category "${category}": TokenMaxed routing is DISABLED for this project — it would run on the host (native). Run /tokenmaxed:on to re-enable.`,
+            { category, disabled: true, native: true, decision: null },
+          );
+        }
+
+        // Default to the server's gate posture so a preview never disagrees with
+        // what router_delegate would actually do; an explicit arg overrides.
+        const gateReady = optBool(args, 'gate_ready') ?? deps.gateReady;
 
         const policyContext: PolicyContext = {
           ...(repo_class ? { repo_class } : {}),
@@ -351,7 +410,89 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool];
+  const delegateTool: ToolDef = {
+    name: 'router_delegate',
+    description:
+      'Offload ONE bounded, self-contained coding subtask to the cheapest capable, policy-allowed lane. Returns either the lane\'s result (use it) OR a directive to handle the task yourself (native). Untrusted lanes receive only a minimized, scrubbed task — never the repo, secrets, or tools. Records a content-free ledger event. Use for well-specified work (boilerplate, codegen, docs, isolated bugfixes); keep everything the lane needs IN the instruction.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['category', 'instruction'],
+      properties: {
+        category: { type: 'string', enum: [...core.taskCategories], description: 'Task category (drives lane choice).' },
+        instruction: {
+          type: 'string',
+          description:
+            'The self-contained subtask to perform. Include all needed context IN this text — an untrusted lane receives nothing else (no repo, no files, no tools).',
+        },
+        repo_class: { type: 'string', enum: [...REPO_CLASSES], description: 'Repository class for policy (default unknown).' },
+        sensitivity: { type: 'string', enum: [...SENSITIVITIES], description: 'Content sensitivity for policy (default unknown).' },
+      },
+    },
+    handler: (deps, args) =>
+      guardedAsync(async () => {
+        const category = optEnum(args, 'category', core.taskCategories);
+        if (category === undefined) throw new ToolInputError('"category" is required.');
+        const instruction = optString(args, 'instruction');
+        if (!instruction || instruction.trim() === '') throw new ToolInputError('"instruction" is required (non-empty).');
+        const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
+        const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
+
+        // Respect the per-project toggle: when off, never offload — tell the host
+        // to do it itself (no config load, no execution).
+        if (!deps.getEnabled()) {
+          return ok(
+            'TokenMaxed routing is DISABLED for this project — handle this task yourself (native). Run /tokenmaxed:on to re-enable.',
+            { native: true, disabled: true },
+          );
+        }
+
+        const policyContext: PolicyContext = {
+          ...(repo_class ? { repo_class } : {}),
+          ...(sensitivity ? { sensitivity } : {}),
+        };
+        const outcome = await deps.delegate({
+          category,
+          instruction,
+          ...(Object.keys(policyContext).length ? { policyContext } : {}),
+        });
+        return renderDelegate(outcome);
+      }),
+  };
+
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool];
+}
+
+/** Render a {@link DelegateOutcome} as an advisory directive to the host. */
+function renderDelegate(o: DelegateOutcome): ToolResult {
+  // Anything that isn't a clean execution by another lane ⇒ the host does it.
+  if (o.native || o.status !== 'ok') {
+    const why =
+      o.status === 'blocked'
+        ? 'blocked by policy/minimization (sensitive content stays on the host)'
+        : o.status === 'failed'
+          ? `lane failed (${o.failureKind ?? 'error'})`
+          : (o.reason ?? 'no cheaper capable lane available');
+    // A failed metered attempt that also couldn't be recorded must be flagged, so
+    // the user isn't unaware that spend happened off-ledger.
+    const note = o.recordingFailed ? ' (note: this attempt could not be recorded to the ledger)' : '';
+    return ok(`Handle this task yourself (native): ${why}.${note}`, {
+      native: true,
+      status: o.status,
+      laneId: o.laneId,
+      ...(o.failureKind ? { failureKind: o.failureKind } : {}),
+      ...(o.recordingFailed ? { recordingFailed: true } : {}),
+    });
+  }
+  const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
+  const note = o.recordingFailed ? '\n\n(note: this offload could not be recorded to the ledger.)' : '';
+  return ok(`Offloaded to ${lane}. Use this result:\n\n${o.resultText ?? ''}${note}`, {
+    native: false,
+    laneId: o.laneId,
+    model: o.model,
+    status: o.status,
+    ...(o.recordingFailed ? { recordingFailed: true } : {}),
+  });
 }
 
 // --- dispatch (pure; testable without the SDK or a build) ----------------------
@@ -361,7 +502,12 @@ export function createTools(core: CorePort): ToolDef[] {
  * loader/config errors (e.g. a missing lanes.yaml) to a content-free isError
  * result rather than a throw — the MCP session stays alive.
  */
-export function dispatch(tools: readonly ToolDef[], deps: ToolDeps, name: string, rawArgs: unknown): ToolResult {
+export async function dispatch(
+  tools: readonly ToolDef[],
+  deps: ToolDeps,
+  name: string,
+  rawArgs: unknown,
+): Promise<ToolResult> {
   const tool = tools.find((t) => t.name === name);
   if (!tool) return failResult(`Unknown tool: ${name}`);
   const args =
@@ -372,7 +518,7 @@ export function dispatch(tools: readonly ToolDef[], deps: ToolDeps, name: string
   const unknown = unknownKeys(tool.inputSchema, args);
   if (unknown) return failResult(unknown);
   try {
-    return tool.handler(deps, args);
+    return await tool.handler(deps, args);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return failResult(message);

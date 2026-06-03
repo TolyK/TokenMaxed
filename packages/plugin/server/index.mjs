@@ -14226,9 +14226,11 @@ var require_dist2 = __commonJS({
 });
 
 // ../mcp/src/server.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
 import { dirname as dirname2, join as join2 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
 var _a;
@@ -22803,7 +22805,104 @@ var TASK_CATEGORIES = [
 ];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
+// ../core/src/minimize.ts
+var BRAND = /* @__PURE__ */ Symbol("MinimizedPayload");
+var GENUINE = /* @__PURE__ */ new WeakSet();
+function isMinimizedPayload(value) {
+  return typeof value === "object" && value !== null && GENUINE.has(value);
+}
+var LIMITS = {
+  maxInstructionChars: 8e3,
+  maxAttachmentChars: 8e3,
+  maxAttachments: 8,
+  maxTotalChars: 24e3
+};
+function blocked(reason) {
+  return { ok: false, reason };
+}
+function scrubText(text) {
+  return text.replace(/\b(?:git@|ssh:\/\/|https?:\/\/)[^\s'"`)]+/gi, "[url]").replace(/\\\\[^\s'"`)]+/g, "[path]").replace(/\b[A-Za-z]:\\[^\s'"`)]+/g, "[path]").replace(/(?<![A-Za-z0-9_])(?:\/[A-Za-z0-9_.@~-]+)+/g, "[path]").replace(/\b[\w.+-]+@[\w-]+\.[\w.-]+\b/g, "[email]");
+}
+function validateAttachment(a, i) {
+  if (typeof a !== "object" || a === null) return blocked(`attachment[${i}] must be an object`);
+  const rec = a;
+  if (typeof rec.content !== "string") return blocked(`attachment[${i}].content must be a string`);
+  if (rec.provenance !== "host-authored" && rec.provenance !== "user-pasted") {
+    return blocked(`attachment[${i}].provenance must be 'host-authored' or 'user-pasted'`);
+  }
+  if (typeof rec.repo_derived !== "boolean") {
+    return blocked(`attachment[${i}].repo_derived must be a boolean`);
+  }
+  return { content: rec.content, provenance: rec.provenance, repo_derived: rec.repo_derived };
+}
+async function minimize(request, scanSecrets) {
+  if (typeof request.instruction !== "string" || request.instruction.trim() === "") {
+    return blocked("instruction must be a non-empty string");
+  }
+  if (!TASK_CATEGORIES.includes(request.category)) {
+    return blocked(`category must be one of: ${TASK_CATEGORIES.join(", ")}`);
+  }
+  if (request.instruction.length > LIMITS.maxInstructionChars) {
+    return blocked(`instruction exceeds ${LIMITS.maxInstructionChars} chars`);
+  }
+  const repoClass = request.repo_class ?? "unknown";
+  const sensitivity = request.sensitivity ?? "unknown";
+  if (!(repoClass === "public" && sensitivity === "normal")) {
+    return blocked(
+      `context not safe for an untrusted lane (repo_class=${repoClass}, sensitivity=${sensitivity}); minimization to a worker requires public + normal`
+    );
+  }
+  const rawAttachments = request.attachments ?? [];
+  if (!Array.isArray(rawAttachments)) return blocked("attachments must be an array");
+  if (rawAttachments.length > LIMITS.maxAttachments) {
+    return blocked(`too many attachments (max ${LIMITS.maxAttachments})`);
+  }
+  const attachments = [];
+  for (let i = 0; i < rawAttachments.length; i++) {
+    const v = validateAttachment(rawAttachments[i], i);
+    if ("ok" in v) return v;
+    if (v.content.length > LIMITS.maxAttachmentChars) {
+      return blocked(`attachment[${i}] exceeds ${LIMITS.maxAttachmentChars} chars`);
+    }
+    attachments.push(v);
+  }
+  const instruction = scrubText(request.instruction);
+  const scrubbedAttachments = attachments.map((a) => ({ ...a, content: scrubText(a.content) }));
+  const total = instruction.length + scrubbedAttachments.reduce((n, a) => n + a.content.length, 0);
+  if (total > LIMITS.maxTotalChars) {
+    return blocked(`total payload exceeds ${LIMITS.maxTotalChars} chars`);
+  }
+  let scan;
+  try {
+    scan = await scanSecrets([instruction, ...scrubbedAttachments.map((a) => a.content)]);
+  } catch {
+    return blocked("secret scan failed \u2014 blocked from untrusted lane");
+  }
+  if (!scan.available) {
+    return blocked("secret scanner (gitleaks) unavailable \u2014 untrusted lane disabled");
+  }
+  if (scan.hasSecret) {
+    return blocked("secret detected in payload \u2014 blocked from untrusted lane");
+  }
+  const payload = Object.freeze({
+    instruction,
+    attachments: Object.freeze(scrubbedAttachments.map((a) => Object.freeze(a))),
+    category: request.category,
+    [BRAND]: true
+  });
+  GENUINE.add(payload);
+  return { ok: true, payload };
+}
+
 // ../core/src/boundary.ts
+function buildUntrustedRequestBody(env) {
+  if (!isMinimizedPayload(env.payload)) {
+    throw new Error("buildUntrustedRequestBody: payload was not produced by minimize()");
+  }
+  const { payload, lane } = env;
+  const content = [payload.instruction, ...payload.attachments.map((a) => a.content)].join("\n\n");
+  return { model: lane.model, messages: [{ role: "user", content }] };
+}
 function isExecutorCertified(lane) {
   return lane.kind === "api";
 }
@@ -23230,6 +23329,81 @@ function parseLaneConfig(text) {
   return new LaneRegistry(lanes);
 }
 
+// ../core/src/price.ts
+var PriceError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PriceError";
+  }
+};
+function isPlainObject5(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function requireNonNegativeNumber(value, where) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new PriceError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function validatePriceTable(data) {
+  if (!isPlainObject5(data)) {
+    throw new PriceError("Price table must be a JSON object.");
+  }
+  if (typeof data.schema_version !== "number") {
+    throw new PriceError('Price table "schema_version" must be a number.');
+  }
+  if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
+    throw new PriceError('Price table "frontier_model" must be a non-empty string.');
+  }
+  if (!isPlainObject5(data.models)) {
+    throw new PriceError('Price table "models" must be a mapping of model id to prices.');
+  }
+  const models = /* @__PURE__ */ Object.create(null);
+  for (const [model, raw] of Object.entries(data.models)) {
+    if (!isPlainObject5(raw)) {
+      throw new PriceError(`Price table models["${model}"] must be a mapping.`);
+    }
+    models[model] = {
+      inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
+      outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`)
+    };
+  }
+  if (!Object.hasOwn(models, data.frontier_model)) {
+    throw new PriceError(
+      `Price table frontier_model "${data.frontier_model}" has no entry in models.`
+    );
+  }
+  return { schema_version: data.schema_version, frontier_model: data.frontier_model, models };
+}
+function requireUsage(usage) {
+  for (const key of ["tokens_in", "tokens_out"]) {
+    const v = usage[key];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      throw new PriceError(`usage.${key} must be a finite number >= 0 (got ${JSON.stringify(v)}).`);
+    }
+  }
+}
+function priceForModel(table, model, usage) {
+  requireUsage(usage);
+  const p = Object.hasOwn(table.models, model) ? table.models[model] : void 0;
+  if (!p) {
+    throw new PriceError(`No price for model "${model}" in the price table.`);
+  }
+  return usage.tokens_in / 1e6 * p.inputPer1M + usage.tokens_out / 1e6 * p.outputPer1M;
+}
+function computeCostPrimitives(table, lane, usage) {
+  const frontier_cost = priceForModel(table, table.frontier_model, usage);
+  const actual_cost = lane.costBasis === "metered" ? priceForModel(table, lane.model, usage) : 0;
+  const metered_spent = lane.costBasis === "metered" ? actual_cost : 0;
+  return {
+    frontier_cost,
+    actual_cost,
+    metered_spent,
+    frontier_avoided: frontier_cost - actual_cost,
+    metered_avoided: frontier_cost - metered_spent
+  };
+}
+
 // ../core/src/ledger.ts
 var SCHEMA_VERSION = 1;
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback"];
@@ -23290,7 +23464,7 @@ var LedgerError = class extends Error {
     this.name = "LedgerError";
   }
 };
-function isPlainObject5(value) {
+function isPlainObject6(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireString2(value, where) {
@@ -23310,7 +23484,7 @@ function requireIsoTimestamp(value, where) {
   }
   return s;
 }
-function requireNonNegativeNumber(value, where) {
+function requireNonNegativeNumber2(value, where) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     throw new LedgerError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
   }
@@ -23335,9 +23509,9 @@ function requireEnum2(value, allowed, where) {
   return value;
 }
 function validateEventInput(input) {
-  const actual_cost = requireNonNegativeNumber(input.actual_cost, "task.actual_cost");
-  const frontier_cost = requireNonNegativeNumber(input.frontier_cost, "task.frontier_cost");
-  const metered_spent = requireNonNegativeNumber(input.metered_spent, "task.metered_spent");
+  const actual_cost = requireNonNegativeNumber2(input.actual_cost, "task.actual_cost");
+  const frontier_cost = requireNonNegativeNumber2(input.frontier_cost, "task.frontier_cost");
+  const metered_spent = requireNonNegativeNumber2(input.metered_spent, "task.metered_spent");
   const out = {
     task_id: requireString2(input.task_id, "task.task_id"),
     attempt: requireNonNegativeInt(input.attempt, "task.attempt"),
@@ -23421,7 +23595,7 @@ function backfillLegacyTask(obj) {
   };
 }
 function parseEvent(obj) {
-  if (!isPlainObject5(obj)) {
+  if (!isPlainObject6(obj)) {
     throw new LedgerError("Ledger record must be a JSON object.");
   }
   const meta2 = parseMeta(obj);
@@ -23508,7 +23682,166 @@ function tokenStats(events) {
   return { total, byModel, byLane };
 }
 
+// ../core/src/failure.ts
+var LaneFailure = class extends Error {
+  failureKind;
+  constructor(failureKind, message) {
+    super(message ?? failureKind);
+    this.name = "LaneFailure";
+    this.failureKind = failureKind;
+  }
+};
+function classifyHttpStatus(status) {
+  if (status === 408 || status === 504) return "timeout";
+  if (status === 429) return "rate_limited";
+  if (status === 402) return "quota_exhausted";
+  if (status === 401 || status === 403) return "auth_failed";
+  if (status >= 400 && status < 500) return "bad_request";
+  return "provider_error";
+}
+
+// ../core/src/usage.ts
+var UsageError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UsageError";
+  }
+};
+function estimateTokens(text) {
+  if (text.length === 0) return 0;
+  return Math.ceil(text.length / 4);
+}
+function reportedInt(value, where) {
+  if (value === void 0) return 0;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new UsageError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function resolveUsage(args) {
+  const { reported, promptText = "", resultText = "" } = args;
+  const hasReported = reported !== void 0 && typeof reported.tokens_in === "number" && typeof reported.tokens_out === "number";
+  if (hasReported) {
+    const baseIn = reportedInt(reported.tokens_in, "reported.tokens_in");
+    const out = reportedInt(reported.tokens_out, "reported.tokens_out");
+    const cacheRead = reportedInt(reported.cache_read_input_tokens, "reported.cache_read_input_tokens");
+    const cacheCreate = reportedInt(
+      reported.cache_creation_input_tokens,
+      "reported.cache_creation_input_tokens"
+    );
+    return {
+      // Cache tokens count as input usage; we never claim them as cache savings.
+      tokens_in: baseIn + cacheRead + cacheCreate,
+      tokens_out: out,
+      tokens_estimated: false
+    };
+  }
+  return {
+    tokens_in: estimateTokens(promptText),
+    tokens_out: estimateTokens(resultText),
+    tokens_estimated: true
+  };
+}
+function usageFromReported(reported) {
+  const toInt = (n) => {
+    const v = Math.floor(Number(n));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  };
+  const tokens_in = toInt(reported.tokens_in) + toInt(reported.cache_read_input_tokens) + toInt(reported.cache_creation_input_tokens);
+  return { tokens_in, tokens_out: toInt(reported.tokens_out), tokens_estimated: false };
+}
+
+// ../core/src/run.ts
+var ZERO_USAGE = { tokens_in: 0, tokens_out: 0, tokens_estimated: true };
+function combinedText(instruction, attachments) {
+  return attachments && attachments.length > 0 ? [instruction, ...attachments.map((a) => a.content)].join("\n") : instruction;
+}
+async function runTask(request, ctx, policy, deps) {
+  const effectiveCtx = request.policyContext ? { ...ctx, policyContext: request.policyContext } : ctx;
+  const policyContext = effectiveCtx.policyContext ?? {};
+  let decision;
+  try {
+    decision = routeDecide({ category: request.category }, effectiveCtx, policy);
+  } catch {
+    return { laneId: "native", status: "ok", native: true, events: [] };
+  }
+  const lane = effectiveCtx.lanes.find((l) => l.id === decision.laneId);
+  const task_id = request.task_id ?? deps.newId();
+  const event = (status, usage) => {
+    const prim = computeCostPrimitives(deps.priceTable, lane, {
+      tokens_in: usage.tokens_in,
+      tokens_out: usage.tokens_out
+    });
+    return {
+      task_id,
+      attempt: request.attempt ?? 0,
+      category: request.category,
+      laneId: lane.id,
+      model: lane.model,
+      trust_mode: lane.trust_mode,
+      provenance: lane.provenance,
+      status,
+      tokens_in: usage.tokens_in,
+      tokens_out: usage.tokens_out,
+      tokens_estimated: usage.tokens_estimated,
+      ...prim,
+      policy_verdict: decision.policyVerdict
+    };
+  };
+  if (lane.trust_mode === "full") {
+    try {
+      const r = await deps.executeTrusted(lane, request.instruction, request.attachments);
+      if (r.native) {
+        return { decision, laneId: lane.id, status: "ok", native: true, resultText: r.resultText, events: [] };
+      }
+      const usage = resolveUsage({
+        reported: r.reported,
+        promptText: combinedText(request.instruction, request.attachments),
+        resultText: r.resultText
+      });
+      return { decision, laneId: lane.id, status: "ok", resultText: r.resultText, events: [event("ok", usage)] };
+    } catch (err) {
+      const failureKind = err instanceof LaneFailure ? err.failureKind : "provider_error";
+      return { decision, laneId: lane.id, status: "failed", native: true, failureKind, events: [event("failed", ZERO_USAGE)] };
+    }
+  }
+  const min = await minimize(
+    {
+      instruction: request.instruction,
+      category: request.category,
+      ...request.attachments ? { attachments: request.attachments } : {},
+      ...policyContext.repo_class ? { repo_class: policyContext.repo_class } : {},
+      ...policyContext.sensitivity ? { sensitivity: policyContext.sensitivity } : {}
+    },
+    deps.scanSecrets
+  );
+  if (!min.ok) {
+    return { decision, laneId: lane.id, status: "blocked", native: true, failureKind: "policy_blocked", events: [event("blocked", ZERO_USAGE)] };
+  }
+  try {
+    const env = { payload: min.payload, lane: deps.untrustedLaneDTO(lane) };
+    const promptText = combinedText(min.payload.instruction, min.payload.attachments);
+    const r = await deps.executeUntrusted(env);
+    if (!r.ok) {
+      const usage2 = r.reported ? usageFromReported(r.reported) : ZERO_USAGE;
+      return {
+        decision,
+        laneId: lane.id,
+        status: "failed",
+        native: true,
+        failureKind: r.failureKind ?? "provider_error",
+        events: [event("failed", usage2)]
+      };
+    }
+    const usage = resolveUsage({ reported: r.reported, promptText, resultText: r.resultText });
+    return { decision, laneId: lane.id, status: "ok", resultText: r.resultText, events: [event("ok", usage)] };
+  } catch {
+    return { decision, laneId: lane.id, status: "failed", native: true, failureKind: "provider_error", events: [event("failed", ZERO_USAGE)] };
+  }
+}
+
 // ../core/src/node.ts
+import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -23525,6 +23858,24 @@ function loadLaneConfig(path) {
   }
   return parseLaneConfig(text);
 }
+function loadPriceTable(path) {
+  const filePath = typeof path === "string" ? path : fileURLToPath(path);
+  let text;
+  try {
+    text = readFileSync(filePath, "utf8");
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PriceError(`Could not read price table at "${filePath}": ${detail}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PriceError(`Could not parse price table at "${filePath}" as JSON: ${detail}`);
+  }
+  return validatePriceTable(parsed);
+}
 function loadPolicyConfig(path) {
   const filePath = typeof path === "string" ? path : fileURLToPath(path);
   let text;
@@ -23535,6 +23886,74 @@ function loadPolicyConfig(path) {
     throw new PolicyConfigError(`Could not read policy config at "${filePath}": ${detail}`);
   }
   return parsePolicyConfig(text);
+}
+function makeGitleaksScanner() {
+  return async (texts) => {
+    let dir;
+    try {
+      dir = mkdtempSync(join(tmpdir(), "tmx-scan-"));
+      texts.forEach((t, i) => writeFileSync(join(dir, `p${i}.txt`), t, "utf8"));
+      const res = spawnSync("gitleaks", ["detect", "--no-git", "--source", dir, "--redact"], {
+        encoding: "utf8"
+      });
+      if (res.error) {
+        const code = res.error.code;
+        if (code === "ENOENT") return { available: false, hasSecret: false };
+        return { available: true, hasSecret: true };
+      }
+      if (res.status === 0) return { available: true, hasSecret: false };
+      return { available: true, hasSecret: true };
+    } catch {
+      return { available: true, hasSecret: true };
+    } finally {
+      if (dir) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+        }
+      }
+    }
+  };
+}
+function extractText(data) {
+  const choices = data?.choices;
+  const content = choices?.[0]?.message?.content;
+  return typeof content === "string" ? content : "";
+}
+function extractUsage(data) {
+  const u = data?.usage;
+  if (!u) return void 0;
+  const num = (v) => typeof v === "number" ? v : void 0;
+  return { tokens_in: num(u.prompt_tokens), tokens_out: num(u.completion_tokens) };
+}
+async function executeUntrusted(env, deps = {}) {
+  if (!isMinimizedPayload(env.payload)) {
+    return { ok: false, error: "refused: payload was not produced by minimize()" };
+  }
+  const doFetch = deps.fetchImpl ?? globalThis.fetch;
+  if (!doFetch) return { ok: false, error: "no fetch implementation available" };
+  const headers = { "content-type": "application/json" };
+  if (env.lane.authHandle) {
+    let token = "";
+    try {
+      token = deps.resolveAuth ? deps.resolveAuth(env.lane.authHandle) : "";
+    } catch {
+      return { ok: false, error: "auth resolution failed for untrusted lane", failureKind: "auth_failed" };
+    }
+    if (!token) return { ok: false, error: "auth resolution failed for untrusted lane", failureKind: "auth_failed" };
+    headers.authorization = `Bearer ${token}`;
+  }
+  try {
+    const body = JSON.stringify(buildUntrustedRequestBody(env));
+    const res = await doFetch(env.lane.endpoint, { method: "POST", headers, body });
+    if (!res.ok) {
+      return { ok: false, error: `untrusted lane returned status ${res.status}`, failureKind: classifyHttpStatus(res.status) };
+    }
+    const data = await res.json();
+    return { ok: true, resultText: extractText(data), reported: extractUsage(data) };
+  } catch {
+    return { ok: false, error: "untrusted lane request failed", failureKind: "provider_error" };
+  }
 }
 function defaultLedgerPath() {
   return join(homedir(), ".tokenmaxed", "ledger.jsonl");
@@ -23615,6 +24034,84 @@ var JsonlLedger = class {
     return event;
   }
 };
+function combinedPrompt(instruction, attachments) {
+  return attachments && attachments.length > 0 ? [instruction, ...attachments.map((a) => a.content)].join("\n\n") : instruction;
+}
+var numOrUndef = (v) => typeof v === "number" ? v : void 0;
+function makeCliExecutor(spawnImpl) {
+  const spawn = spawnImpl ?? ((cmd, args, opts) => spawnSync(cmd, [...args], opts));
+  return async (lane, instruction, attachments) => {
+    if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
+    const input = combinedPrompt(instruction, attachments);
+    const res = spawn(lane.command, lane.args ?? [], { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    if (res.error) throw new LaneFailure("provider_error", `cli lane "${lane.id}" failed to spawn`);
+    if (res.status !== 0) throw new LaneFailure("provider_error", `cli lane "${lane.id}" exited with status ${res.status}`);
+    return { resultText: res.stdout ?? "" };
+  };
+}
+function makeOllamaExecutor(fetchImpl) {
+  const doFetch = fetchImpl ?? globalThis.fetch;
+  return async (lane, instruction, attachments) => {
+    const base = lane.endpoint ?? "http://localhost:11434";
+    const res = await doFetch(`${base}/api/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false })
+    });
+    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `ollama lane "${lane.id}" returned status ${res.status}`);
+    const data = await res.json();
+    return {
+      resultText: typeof data.response === "string" ? data.response : "",
+      reported: { tokens_in: numOrUndef(data.prompt_eval_count), tokens_out: numOrUndef(data.eval_count) }
+    };
+  };
+}
+function makeTrustedApiExecutor(deps = {}) {
+  const doFetch = deps.fetchImpl ?? globalThis.fetch;
+  return async (lane, instruction, attachments) => {
+    if (!lane.endpoint) throw new LaneFailure("bad_request", `api lane "${lane.id}" has no endpoint configured`);
+    if (!doFetch) throw new LaneFailure("provider_error", "no fetch implementation available");
+    const headers = { "content-type": "application/json" };
+    if (lane.authHandle) {
+      let token = "";
+      try {
+        token = deps.resolveAuth ? deps.resolveAuth(lane.authHandle) : "";
+      } catch {
+        throw new LaneFailure("auth_failed", `auth resolution failed for api lane "${lane.id}"`);
+      }
+      if (!token) throw new LaneFailure("auth_failed", `auth resolution failed for api lane "${lane.id}"`);
+      headers.authorization = `Bearer ${token}`;
+    }
+    const body = JSON.stringify({
+      model: lane.model,
+      messages: [{ role: "user", content: combinedPrompt(instruction, attachments) }]
+    });
+    const res = await doFetch(lane.endpoint, { method: "POST", headers, body });
+    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `api lane "${lane.id}" returned status ${res.status}`);
+    const data = await res.json();
+    const content = data.choices?.[0]?.message?.content;
+    return {
+      resultText: typeof content === "string" ? content : "",
+      reported: { tokens_in: numOrUndef(data.usage?.prompt_tokens), tokens_out: numOrUndef(data.usage?.completion_tokens) }
+    };
+  };
+}
+function makeTrustedExecutor(deps = {}) {
+  const cli = deps.cli ?? makeCliExecutor();
+  const ollama = deps.ollama ?? makeOllamaExecutor();
+  const api = deps.api ?? makeTrustedApiExecutor();
+  return async (lane, instruction, attachments) => {
+    if (lane.native) return { resultText: "", native: true };
+    if (lane.kind === "local") return ollama(lane, instruction, attachments);
+    if (lane.kind === "cli" && lane.command) return cli(lane, instruction, attachments);
+    if (lane.kind === "api" && lane.endpoint) return api(lane, instruction, attachments);
+    throw new Error(`lane "${lane.id}" has no executor configured (set native: true, or command / endpoint)`);
+  };
+}
+function laneToUntrustedDTO(lane) {
+  if (!lane.endpoint) throw new Error(`worker lane "${lane.id}" has no endpoint configured`);
+  return { id: lane.id, model: lane.model, endpoint: lane.endpoint, authHandle: lane.authHandle ?? "" };
+}
 
 // ../mcp/src/tools.ts
 var ToolInputError = class extends Error {
@@ -23664,6 +24161,14 @@ function failResult(message) {
 function guarded(body) {
   try {
     return body();
+  } catch (err) {
+    if (err instanceof ToolInputError) return failResult(err.message);
+    throw err;
+  }
+}
+async function guardedAsync(body) {
+  try {
+    return await body();
   } catch (err) {
     if (err instanceof ToolInputError) return failResult(err.message);
     throw err;
@@ -23757,7 +24262,7 @@ function createTools(core) {
         sensitivity: { type: "string", enum: [...SENSITIVITIES2], description: "Content sensitivity for policy (default unknown)." },
         gate_ready: {
           type: "boolean",
-          description: "Whether the minimization/policy gate is ready. Default false \u2014 matching the core route, which excludes worker (and API) lanes until an adapter asserts the gate. Set true to preview post-gate routing."
+          description: "Whether the minimization/policy gate is ready. Defaults to the server's current gate posture (the same state router_delegate routes with). Override to preview a different gate state."
         }
       }
     },
@@ -23766,7 +24271,13 @@ function createTools(core) {
       if (category === void 0) throw new ToolInputError('"category" is required.');
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
-      const gateReady = optBool(args, "gate_ready") ?? false;
+      if (!deps.getEnabled()) {
+        return ok(
+          `category "${category}": TokenMaxed routing is DISABLED for this project \u2014 it would run on the host (native). Run /tokenmaxed:on to re-enable.`,
+          { category, disabled: true, native: true, decision: null }
+        );
+      }
+      const gateReady = optBool(args, "gate_ready") ?? deps.gateReady;
       const policyContext = {
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
@@ -23825,16 +24336,82 @@ function createTools(core) {
       );
     })
   };
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool];
+  const delegateTool = {
+    name: "router_delegate",
+    description: "Offload ONE bounded, self-contained coding subtask to the cheapest capable, policy-allowed lane. Returns either the lane's result (use it) OR a directive to handle the task yourself (native). Untrusted lanes receive only a minimized, scrubbed task \u2014 never the repo, secrets, or tools. Records a content-free ledger event. Use for well-specified work (boilerplate, codegen, docs, isolated bugfixes); keep everything the lane needs IN the instruction.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["category", "instruction"],
+      properties: {
+        category: { type: "string", enum: [...core.taskCategories], description: "Task category (drives lane choice)." },
+        instruction: {
+          type: "string",
+          description: "The self-contained subtask to perform. Include all needed context IN this text \u2014 an untrusted lane receives nothing else (no repo, no files, no tools)."
+        },
+        repo_class: { type: "string", enum: [...REPO_CLASSES2], description: "Repository class for policy (default unknown)." },
+        sensitivity: { type: "string", enum: [...SENSITIVITIES2], description: "Content sensitivity for policy (default unknown)." }
+      }
+    },
+    handler: (deps, args) => guardedAsync(async () => {
+      const category = optEnum(args, "category", core.taskCategories);
+      if (category === void 0) throw new ToolInputError('"category" is required.');
+      const instruction = optString(args, "instruction");
+      if (!instruction || instruction.trim() === "") throw new ToolInputError('"instruction" is required (non-empty).');
+      const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
+      const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
+      if (!deps.getEnabled()) {
+        return ok(
+          "TokenMaxed routing is DISABLED for this project \u2014 handle this task yourself (native). Run /tokenmaxed:on to re-enable.",
+          { native: true, disabled: true }
+        );
+      }
+      const policyContext = {
+        ...repo_class ? { repo_class } : {},
+        ...sensitivity ? { sensitivity } : {}
+      };
+      const outcome = await deps.delegate({
+        category,
+        instruction,
+        ...Object.keys(policyContext).length ? { policyContext } : {}
+      });
+      return renderDelegate(outcome);
+    })
+  };
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool];
 }
-function dispatch(tools, deps, name, rawArgs) {
+function renderDelegate(o) {
+  if (o.native || o.status !== "ok") {
+    const why = o.status === "blocked" ? "blocked by policy/minimization (sensitive content stays on the host)" : o.status === "failed" ? `lane failed (${o.failureKind ?? "error"})` : o.reason ?? "no cheaper capable lane available";
+    const note2 = o.recordingFailed ? " (note: this attempt could not be recorded to the ledger)" : "";
+    return ok(`Handle this task yourself (native): ${why}.${note2}`, {
+      native: true,
+      status: o.status,
+      laneId: o.laneId,
+      ...o.failureKind ? { failureKind: o.failureKind } : {},
+      ...o.recordingFailed ? { recordingFailed: true } : {}
+    });
+  }
+  const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
+  const note = o.recordingFailed ? "\n\n(note: this offload could not be recorded to the ledger.)" : "";
+  return ok(`Offloaded to ${lane}. Use this result:
+
+${o.resultText ?? ""}${note}`, {
+    native: false,
+    laneId: o.laneId,
+    model: o.model,
+    status: o.status,
+    ...o.recordingFailed ? { recordingFailed: true } : {}
+  });
+}
+async function dispatch(tools, deps, name, rawArgs) {
   const tool = tools.find((t) => t.name === name);
   if (!tool) return failResult(`Unknown tool: ${name}`);
   const args = rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs) ? rawArgs : {};
   const unknown2 = unknownKeys(tool.inputSchema, args);
   if (unknown2) return failResult(unknown2);
   try {
-    return tool.handler(deps, args);
+    return await tool.handler(deps, args);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return failResult(message);
@@ -23870,8 +24447,19 @@ function writeEnabled(store, projectKey, enabled) {
 }
 
 // ../mcp/src/server.ts
-var DEFAULT_LANES = "config/lanes.yaml";
-var DEFAULT_POLICY = "config/policy.yaml";
+var HOME_TM = join2(homedir2(), ".tokenmaxed");
+var DEFAULT_LANES = join2(HOME_TM, "lanes.yaml");
+var DEFAULT_POLICY = join2(HOME_TM, "policy.yaml");
+var DEFAULT_PRICES = fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
+function recordableLane(lane, priceTable) {
+  if (lane.native || lane.costBasis !== "metered") return true;
+  try {
+    priceForModel(priceTable, lane.model, { tokens_in: 0, tokens_out: 0 });
+    return true;
+  } catch {
+    return false;
+  }
+}
 function fileToggleStore(statePath) {
   return {
     read: () => {
@@ -23891,19 +24479,95 @@ function fileToggleStore(statePath) {
 var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, evaluate, taskCategories: TASK_CATEGORIES };
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
+  const lanesPathExplicit = env.TOKENMAXED_LANES !== void 0;
   const policyPath = env.TOKENMAXED_POLICY ?? DEFAULT_POLICY;
+  const policyPathExplicit = env.TOKENMAXED_POLICY !== void 0;
   const ledgerPath = env.TOKENMAXED_LEDGER;
-  const statePath = env.TOKENMAXED_STATE ?? join2(homedir2(), ".tokenmaxed", "state.json");
+  const statePath = env.TOKENMAXED_STATE ?? join2(HOME_TM, "state.json");
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
+  const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
+  const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const store = fileToggleStore(statePath);
+  const resolveAuth = (authHandle) => {
+    if (!/^[A-Za-z0-9_]+$/.test(authHandle)) return "";
+    return env[`TOKENMAXED_KEY_${authHandle}`] ?? "";
+  };
+  const loadPolicySafe = () => {
+    if (existsSync2(policyPath)) return loadPolicyConfig(policyPath);
+    if (policyPathExplicit) throw new Error(`configured policy file not found: ${policyPath}`);
+    return {};
+  };
+  const usableCandidates = (category) => {
+    if (!existsSync2(lanesPath)) {
+      if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
+      return [];
+    }
+    const priceTable = loadPriceTable(pricesPath);
+    return loadLaneConfig(lanesPath).candidateLanes(category).filter((lane) => recordableLane(lane, priceTable));
+  };
+  const delegate = async (request) => {
+    if (!existsSync2(lanesPath)) {
+      if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
+      return {
+        laneId: "native",
+        status: "ok",
+        native: true,
+        reason: `no lanes configured yet \u2014 create ${lanesPath} (see the README for a lanes.yaml example)`
+      };
+    }
+    const registry2 = loadLaneConfig(lanesPath);
+    const policy = loadPolicySafe();
+    const priceTable = loadPriceTable(pricesPath);
+    const ledger = new JsonlLedger(ledgerPath);
+    const lanes = registry2.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
+    const ctx = { lanes, gateReady, policyContext: request.policyContext ?? {} };
+    const runDeps = {
+      executeTrusted: makeTrustedExecutor({ api: makeTrustedApiExecutor({ resolveAuth }) }),
+      executeUntrusted: (envelope) => executeUntrusted(envelope, { resolveAuth }),
+      untrustedLaneDTO: laneToUntrustedDTO,
+      scanSecrets: makeGitleaksScanner(),
+      priceTable,
+      newId: () => randomUUID2()
+    };
+    const result = await runTask(
+      {
+        category: request.category,
+        instruction: request.instruction,
+        ...request.policyContext ? { policyContext: request.policyContext } : {}
+      },
+      ctx,
+      policy,
+      runDeps
+    );
+    let recordingFailed = false;
+    try {
+      for (const event of result.events) ledger.appendTask(event);
+    } catch {
+      recordingFailed = true;
+    }
+    return {
+      laneId: result.laneId,
+      status: result.status,
+      ...result.native ? { native: true } : {},
+      ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
+      ...registry2.byId(result.laneId)?.model ? { model: registry2.byId(result.laneId).model } : {},
+      ...result.failureKind ? { failureKind: result.failureKind } : {},
+      ...result.decision?.reason ? { reason: result.decision.reason } : {},
+      ...recordingFailed ? { recordingFailed: true } : {}
+    };
+  };
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
-    // candidateLanes() is the documented route input (excludes capability-0
-    // opt-outs); loaded lazily per call so config edits are picked up live.
-    candidateLanes: (category) => loadLaneConfig(lanesPath).candidateLanes(category),
-    loadPolicy: () => loadPolicyConfig(policyPath),
+    // The documented route input (capability-0 opt-outs excluded) minus
+    // unpriceable metered lanes, so preview matches delegate. Lazy per call.
+    candidateLanes: usableCandidates,
+    loadPolicy: loadPolicySafe,
+    // Expose the server's effective gate posture so router_preview defaults to the
+    // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
+    gateReady,
     getEnabled: () => readEnabled(store, projectKey),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
+    delegate,
     now: () => Date.now()
   };
 }
@@ -23918,7 +24582,7 @@ function createServer(deps) {
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: advertisedTools(tools) }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const result = dispatch(tools, deps, request.params.name, request.params.arguments);
+    const result = await dispatch(tools, deps, request.params.name, request.params.arguments);
     return result;
   });
   return server;

@@ -8,7 +8,8 @@
     "tokenmaxed-mcp": "./dist/bin.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "prices.seed.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/bin.js', 0o755)\"",
