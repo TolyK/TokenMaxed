@@ -325,6 +325,22 @@ test('escalation: fail ⇒ escalate to a stronger lane, then accept_after_escala
   assert.equal(esc.target_lane_id, 'target');
 });
 
+test('escalation: the superseded (rejected) leg is marked, the delivered leg is not', async () => {
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: fail', 'VERDICT: pass']), { candidates: ePool });
+  assert.equal(r.final_action, 'accept_after_escalation');
+  const taskEvents = r.events.filter((e) => e.kind === 'task').map((e) => e.event as { laneId: string; superseded?: boolean });
+  assert.equal(taskEvents[0]!.superseded, true); // rejected cheap leg — not a saving
+  assert.notEqual(taskEvents[1]!.superseded, true); // delivered escalated leg
+});
+
+test('escalation: give_back marks every leg superseded (nothing delivered)', async () => {
+  // fail, but only cheap + manager ⇒ no escalation target ⇒ give_back.
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: fail']), { candidates: [eCheap, eMgr] });
+  assert.equal(r.final_action, 'give_back');
+  const taskEvents = r.events.filter((e) => e.kind === 'task').map((e) => e.event as { superseded?: boolean });
+  assert.ok(taskEvents.every((e) => e.superseded === true));
+});
+
 test('escalation: needs-rework ⇒ one same-lane rework, then accept_after_rework', async () => {
   const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: needs-rework', 'VERDICT: pass']), { candidates: ePool });
   assert.equal(r.final_action, 'accept_after_rework');

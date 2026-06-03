@@ -88,6 +88,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       gitleaksAvailable: false,
       gateReady: false,
       reviewOnStop: false,
+      escalate: false,
     }),
     now: () => FIXED_NOW,
     ...over,
@@ -261,6 +262,28 @@ test('delegate still returns the result when recording failed (no lost work)', a
   assert.equal(r.structuredContent!.recordingFailed as boolean, true);
 });
 
+test('delegate renders an accepted-after-escalation result with the lane + reason', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'strong', model: 'opus', status: 'ok', resultText: 'fixed', reason: 'after escalation' }) }),
+    { category: 'bugfix', instruction: 'x' },
+  );
+  assert.equal(r.structuredContent!.native as boolean, false);
+  assert.match(r.content[0]!.text, /Offloaded to strong \(opus\) \(after escalation\)/);
+  assert.match(r.content[0]!.text, /fixed/);
+});
+
+test('delegate flags a review-unavailable offload as UNREVIEWED (no "use this result")', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'cheap', status: 'ok', resultText: 'maybe ok', reviewUnavailable: true, reason: 'no eligible manager' }) }),
+    { category: 'bugfix', instruction: 'x' },
+  );
+  assert.equal(r.structuredContent!.reviewUnavailable as boolean, true);
+  assert.match(r.content[0]!.text, /UNREVIEWED/);
+  assert.doesNotMatch(r.content[0]!.text, /Use this result/);
+});
+
 test('delegate respects the OFF toggle without calling delegate', async () => {
   let called = false;
   const r = await call(
@@ -369,11 +392,13 @@ test('setup reports the manager + open gate when present', async () => {
         gitleaksAvailable: true,
         gateReady: true,
         reviewOnStop: true,
+        escalate: true,
       }),
     }),
   );
   assert.match(r.content[0]!.text, /manager: claude-haiku/);
   assert.match(r.content[0]!.text, /worker gate: open/);
+  assert.match(r.content[0]!.text, /quality escalation: on/);
   assert.match(r.content[0]!.text, /already present/);
 });
 

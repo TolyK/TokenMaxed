@@ -60,5 +60,8 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     gitleaksAvailable,
     gateReady,
     reviewOnStop: env.TOKENMAXED_REVIEW_ON_STOP === 'true',
+    // Mirror makeServerDeps: the global kill-switch disables escalation.
+    escalate:
+      env.TOKENMAXED_ESCALATE === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
   };
 }

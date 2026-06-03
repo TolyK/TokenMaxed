@@ -7791,7 +7791,8 @@ var EVENT_FIELDS = [
   "metered_spent",
   "frontier_avoided",
   "metered_avoided",
-  "policy_verdict"
+  "policy_verdict",
+  "superseded"
 ];
 var OUTCOME_EVENT_FIELDS = [
   "event_type",
@@ -7893,6 +7894,7 @@ function validateEventInput(input) {
   };
   const parent = optionalString(input.parent_task_id, "task.parent_task_id");
   if (parent !== void 0) out.parent_task_id = parent;
+  if (input.superseded !== void 0) out.superseded = requireBoolean(input.superseded, "task.superseded");
   return out;
 }
 function validateOutcomeInput(input) {

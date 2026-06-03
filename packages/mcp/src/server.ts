@@ -35,8 +35,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, evaluate, filterEventsSince, priceForModel, routeDecide, runTask, summarize, tokenStats } from '@tokenmaxed/core';
-import type { Lane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, evaluate, filterEventsSince, isManagerEligible, priceForModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeUntrusted,
@@ -83,6 +83,33 @@ function recordableLane(lane: Lane, priceTable: PriceTable): boolean {
   }
 }
 
+/** Map a C-13 EscalationResult onto the adapter's DelegateOutcome for rendering. */
+function escToOutcome(esc: EscalationResult, registry: LaneRegistry, recordingFailed: boolean): DelegateOutcome {
+  const r = esc.result;
+  const model = registry.byId(r.laneId)?.model;
+  const base: DelegateOutcome = {
+    laneId: r.laneId,
+    status: r.status,
+    ...(r.native ? { native: true } : {}),
+    ...(r.resultText !== undefined ? { resultText: r.resultText } : {}),
+    ...(model ? { model } : {}),
+    ...(r.failureKind ? { failureKind: r.failureKind } : {}),
+    ...(recordingFailed ? { recordingFailed: true } : {}),
+  };
+  switch (esc.final_action) {
+    case 'give_back':
+      return { ...base, native: true, reason: `manager review (${esc.verdict ?? 'fail'})${esc.notes ? ` — ${esc.notes}` : ''}` };
+    case 'review_unavailable':
+      return { ...base, reviewUnavailable: true, ...(esc.reason ? { reason: esc.reason } : {}) };
+    case 'accept_after_escalation':
+      return { ...base, reason: 'after escalation' };
+    case 'accept_after_rework':
+      return { ...base, reason: 'after rework' };
+    default:
+      return base; // 'accept'
+  }
+}
+
 /** A JSON-file-backed {@link ToggleStore}; tolerant of a missing/corrupt file. */
 function fileToggleStore(statePath: string): ToggleStore {
   return {
@@ -122,6 +149,15 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // Global kill-switch. Also set in spawned CLI children below, so a cheaper-Claude
   // lane (`claude -p`) can't re-enter routing and recurse (A-5b).
   const globallyDisabled = env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true';
+  // C-13 quality escalation — OPT-IN, off by default (adds manager-review + re-run
+  // cost). Never active under the global kill-switch. See escToOutcome / E-5.
+  const escalateEnabled = env.TOKENMAXED_ESCALATE === 'true' && !globallyDisabled;
+  // A lane is reserved from the initial offload only if it can ACTUALLY serve as
+  // the auto-review manager: manager-eligible AND marginal-free (the reviewer
+  // restriction in selectReviewManager). A metered manager-eligible lane can't
+  // auto-review, so it stays a normal offload candidate (never stranded).
+  const reservedForReview = (lane: Lane): boolean =>
+    isManagerEligible(lane) && (lane.costBasis === 'subscription' || lane.costBasis === 'local');
   const store = fileToggleStore(statePath);
   // Namespaced BYOK auth (see config.ts): a repo-supplied lanes.yaml can't name an
   // arbitrary secret env var; unknown ⇒ '' ⇒ the executor fails closed.
@@ -189,16 +225,42 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       priceTable,
       newId: () => randomUUID(),
     };
-    const result = await runTask(
-      {
-        category: request.category,
-        instruction: request.instruction,
-        ...(request.policyContext ? { policyContext: request.policyContext } : {}),
-      },
-      ctx,
-      policy,
-      runDeps,
-    );
+    const taskInput = {
+      category: request.category,
+      instruction: request.instruction,
+      ...(request.policyContext ? { policyContext: request.policyContext } : {}),
+    };
+
+    // C-13 (opt-in): offload → review → escalate/rework/give_back. The manager
+    // runs via the same trusted executor (core restricts managers to marginal-free
+    // lanes). Persist BOTH task + outcome events; a recording failure never
+    // discards an already-produced result. Latency per leg is bounded by the CLI
+    // spawn timeout; local/api legs are best-effort (abortable timeouts deferred).
+    if (escalateEnabled) {
+      const escDeps: EscalationDeps = {
+        ...runDeps,
+        runManager: (lane, prompt) => runDeps.executeTrusted(lane, prompt).then((res) => res.resultText),
+      };
+      // Reserve only lanes that can actually auto-review (manager-eligible AND
+      // marginal-free) from the FIRST offload, so a stronger reviewer doesn't win
+      // the initial pass leaving nothing to escalate to. A metered manager stays an
+      // offload candidate. The full set is still the escalation + manager pool. If
+      // every candidate is reserved, routing degrades to native — a safe give-back.
+      const offloadLanes = lanes.filter((lane) => !reservedForReview(lane));
+      const esc = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes }, policy, escDeps, { candidates: lanes });
+      let escRecordingFailed = false;
+      try {
+        for (const ev of esc.events) {
+          if (ev.kind === 'task') ledger.appendTask(ev.event);
+          else ledger.appendOutcome(ev.event);
+        }
+      } catch {
+        escRecordingFailed = true;
+      }
+      return escToOutcome(esc, registry, escRecordingFailed);
+    }
+
+    const result = await runTask(taskInput, ctx, policy, runDeps);
     let recordingFailed = false;
     try {
       for (const event of result.events) ledger.appendTask(event);
@@ -220,8 +282,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
     // The documented route input (capability-0 opt-outs excluded) minus
-    // unpriceable metered lanes, so preview matches delegate. Lazy per call.
-    candidateLanes: usableCandidates,
+    // unpriceable metered lanes. When escalation is on, ALSO reserve manager-
+    // eligible lanes (as delegate does), so /tokenmaxed:why mirrors the initial
+    // offload routing exactly. Lazy per call.
+    candidateLanes: (category) => {
+      const c = usableCandidates(category);
+      return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
+    },
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.

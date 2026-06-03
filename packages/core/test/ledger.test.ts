@@ -375,3 +375,25 @@ test('tokenStats: overall, per-model, per-lane with estimated/reported split', (
   assert.equal(sumModels, s.total.total);
   assert.equal(sumLanes, s.total.total);
 });
+
+// --- C-13 E-5: superseded legs excluded from savings (honesty) ----------------
+
+test('summarize: a superseded ok leg counts spend but never claims savings', () => {
+  // Delivered leg: frontier_cost 1, free ⇒ avoided 1. Superseded leg: frontier_cost
+  // 1 but discarded ⇒ must NOT add to the baseline; its metered spend still counts.
+  const events = [
+    ev({ id: 'a', seq: 0, frontier_cost: 1, actual_cost: 0, metered_spent: 0 }), // delivered
+    ev({ id: 'b', seq: 1, frontier_cost: 1, actual_cost: 0, metered_spent: 0, superseded: true }), // discarded
+  ];
+  const s = summarize(events);
+  assert.equal(s.events, 2); // both attempts recorded
+  assert.equal(s.savings.frontier_cost, 1); // only the delivered leg's baseline
+  assert.equal(s.savings.frontier_avoided, 1);
+  // A superseded leg's real spend still shows up (no hidden cost).
+  const withSpend = summarize([
+    ev({ id: 'a', frontier_cost: 1 }),
+    ev({ id: 'b', seq: 1, frontier_cost: 1, actual_cost: 0.5, metered_spent: 0.5, superseded: true }),
+  ]);
+  assert.equal(withSpend.savings.frontier_cost, 1); // superseded excluded from baseline
+  assert.equal(withSpend.metered_spent_total, 0.5); // but its spend counts
+});

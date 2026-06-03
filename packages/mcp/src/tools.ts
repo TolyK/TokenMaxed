@@ -105,6 +105,8 @@ export interface SetupReport {
   gitleaksAvailable: boolean;
   gateReady: boolean;
   reviewOnStop: boolean;
+  /** C-13: whether quality escalation is enabled (TOKENMAXED_ESCALATE). */
+  escalate: boolean;
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -136,10 +138,12 @@ export interface DelegateOutcome {
   model?: string;
   /** Normalized failure category when status is failed/blocked. */
   failureKind?: string;
-  /** Routing explanation (e.g. why it degraded to native). */
+  /** Routing explanation (e.g. why it degraded to native, or "escalated to X"). */
   reason?: string;
   /** true ⇒ the lane ran but its event could not be written to the ledger. */
   recordingFailed?: boolean;
+  /** C-13: the offload ran but the manager review couldn't (result is UNREVIEWED). */
+  reviewUnavailable?: boolean;
 }
 
 /** A declarative tool: advertised by the server, invoked via its handler. */
@@ -524,6 +528,7 @@ export function createTools(core: CorePort): ToolDef[] {
           `  secret scanner (gitleaks): ${r.gitleaksAvailable ? 'available' : 'NOT installed — untrusted worker lanes stay disabled until it is'}`,
           `  worker gate: ${r.gateReady ? 'open' : 'closed'} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? '' : ' — install gitleaks first'})`,
           `  review-on-stop: ${r.reviewOnStop ? 'on' : 'off'} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
+          `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
         ];
@@ -557,11 +562,22 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
   }
   const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
   const note = o.recordingFailed ? '\n\n(note: this offload could not be recorded to the ledger.)' : '';
-  return ok(`Offloaded to ${lane}. Use this result:\n\n${o.resultText ?? ''}${note}`, {
+  // C-13: the offload produced output but the manager review couldn't run — the
+  // result is UNREVIEWED, so do NOT tell the host to "use it"; flag it for review.
+  if (o.reviewUnavailable) {
+    return ok(
+      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${note}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.recordingFailed ? { recordingFailed: true } : {}) },
+    );
+  }
+  // C-13: `reason` may carry "escalated to X" / "reworked on X" (accept_after_*).
+  const how = o.reason ? ` (${o.reason})` : '';
+  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${note}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
     status: o.status,
+    ...(o.reason ? { reason: o.reason } : {}),
     ...(o.recordingFailed ? { recordingFailed: true } : {}),
   });
 }

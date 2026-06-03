@@ -76,6 +76,13 @@ export interface TaskEventInput {
   frontier_avoided: number;
   metered_avoided: number;
   policy_verdict: PolicyVerdict;
+  /**
+   * C-13: true ⇒ this attempt's output was SUPERSEDED (reworked away, rejected
+   * before an escalation, or part of a give_back) and never delivered. Its real
+   * spend (actual_cost/metered) + tokens still count, but it is EXCLUDED from the
+   * savings baseline (a discarded leg is not a saving). Optional; absent ⇒ false.
+   */
+  superseded?: boolean;
 }
 
 /** What a caller provides for an outcome (review) event. */
@@ -117,7 +124,7 @@ export const EVENT_FIELDS = [
   'trust_mode', 'provenance', 'status',
   'tokens_in', 'tokens_out', 'tokens_estimated',
   'actual_cost', 'frontier_cost', 'metered_spent', 'frontier_avoided', 'metered_avoided',
-  'policy_verdict',
+  'policy_verdict', 'superseded',
 ] as const satisfies readonly (keyof TaskEvent)[];
 
 /** Allowlisted outcome-event fields. */
@@ -220,6 +227,7 @@ export function validateEventInput(input: TaskEventInput): TaskEventInput {
   };
   const parent = optionalString(input.parent_task_id, 'task.parent_task_id');
   if (parent !== undefined) out.parent_task_id = parent;
+  if (input.superseded !== undefined) out.superseded = requireBoolean(input.superseded, 'task.superseded');
   return out;
 }
 
@@ -370,7 +378,10 @@ export function summarize(events: readonly LedgerEvent[]): LedgerSummary {
     actual_cost += e.actual_cost;
     metered_spent_total += e.metered_spent;
     if (e.status === 'blocked') blockCount += 1;
-    if (e.status === 'ok') frontier_cost += e.frontier_cost;
+    // Savings baseline counts only DELIVERED ok work — a superseded (reworked-away
+    // / rejected / given-back) leg consumed spend but delivered nothing, so it must
+    // not claim frontier_avoided. Its actual/metered spend above still counts.
+    if (e.status === 'ok' && e.superseded !== true) frontier_cost += e.frontier_cost;
     laneMix[e.laneId] = (laneMix[e.laneId] ?? 0) + 1;
   }
   const frontier_avoided = frontier_cost - actual_cost;

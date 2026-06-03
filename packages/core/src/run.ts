@@ -346,6 +346,29 @@ function instructionWithNotes(instruction: string, notes: string | undefined): s
 }
 
 /**
+ * Mark non-delivered task legs `superseded` for honest savings: only the FINAL
+ * leg is delivered on an accept (incl. after rework/escalation) or a
+ * review_unavailable; on give_back nothing is delivered. A superseded leg's
+ * spend/tokens still count, but it never claims frontier_avoided (see
+ * ledger.summarize). Mutates the events in place.
+ */
+function markSupersededLegs(events: EscalationEvent[], finalAction: EscalationFinalAction): void {
+  const taskEvents = events.filter((e): e is Extract<EscalationEvent, { kind: 'task' }> => e.kind === 'task');
+  if (taskEvents.length === 0) return;
+  const delivered = finalAction !== 'give_back';
+  const lastTask = taskEvents[taskEvents.length - 1];
+  for (const te of taskEvents) {
+    if (!(delivered && te === lastTask)) te.event.superseded = true;
+  }
+}
+
+/** Finalize an escalation result: mark superseded legs, then return it. */
+function complete(result: EscalationResult): EscalationResult {
+  markSupersededLegs(result.events, result.final_action);
+  return result;
+}
+
+/**
  * Run a task with quality-driven escalation. See the module banner. Pure over its
  * injected deps; bounded by maxReworks (default 1) + maxEscalations (default 1).
  */
@@ -385,7 +408,7 @@ export async function runWithEscalation(
     r.status === 'ok' && r.native !== true && typeof r.resultText === 'string' && r.resultText.trim() !== '';
 
   if (!resultReviewable(current) || subject === undefined) {
-    return { final_action: 'accept', subjectLaneId: current.laneId, result: current, events };
+    return complete({ final_action: 'accept', subjectLaneId: current.laneId, result: current, events });
   }
   // `subject` is narrowed to Lane here; keep a Lane-typed handle across the loop.
   let subjectLane: Lane = subject;
@@ -399,9 +422,11 @@ export async function runWithEscalation(
 
     const manager = selectReviewManager(candidates, subjectLane, request.category, effectiveCtx, policy);
     const unavailable = (reason: string): EscalationResult =>
-      stage === 0
-        ? { final_action: 'review_unavailable', reason, subjectLaneId: subjectLane.id, result: current, events }
-        : { final_action: 'give_back', reason: `${reason} (after a leg)`, subjectLaneId: subjectLane.id, result: current, events };
+      complete(
+        stage === 0
+          ? { final_action: 'review_unavailable', reason, subjectLaneId: subjectLane.id, result: current, events }
+          : { final_action: 'give_back', reason: `${reason} (after a leg)`, subjectLaneId: subjectLane.id, result: current, events },
+      );
     if (!manager) return unavailable('no eligible manager');
 
     let raw: string;
@@ -444,10 +469,10 @@ export async function runWithEscalation(
     if (action === 'accept') {
       const final_action: EscalationFinalAction =
         counters.escalations > 0 ? 'accept_after_escalation' : counters.reworks > 0 ? 'accept_after_rework' : 'accept';
-      return { final_action, verdict, ...(notes ? { notes } : {}), subjectLaneId: subjectLane.id, result: current, events };
+      return complete({ final_action, verdict, ...(notes ? { notes } : {}), subjectLaneId: subjectLane.id, result: current, events });
     }
     if (action === 'give_back') {
-      return { final_action: 'give_back', verdict, ...(notes ? { notes } : {}), subjectLaneId: subjectLane.id, result: current, events };
+      return complete({ final_action: 'give_back', verdict, ...(notes ? { notes } : {}), subjectLaneId: subjectLane.id, result: current, events });
     }
 
     // rework (same lane) or escalate (to target): re-run with the notes attached.
@@ -465,17 +490,17 @@ export async function runWithEscalation(
 
     // A non-reviewable re-run leg is never silently accepted ⇒ terminal give_back.
     if (!resultReviewable(reRun)) {
-      return {
+      return complete({
         final_action: 'give_back',
         reason: `${action} leg produced no reviewable output`,
         subjectLaneId: nextLane.id,
         result: reRun,
         events,
-      };
+      });
     }
     current = reRun;
     subjectLane = nextLane; // after escalation the target becomes the new subject (re-reviewed independently)
   }
 
-  return { final_action: 'give_back', reason: 'escalation budget exhausted', subjectLaneId: subjectLane.id, result: current, events };
+  return complete({ final_action: 'give_back', reason: 'escalation budget exhausted', subjectLaneId: subjectLane.id, result: current, events });
 }

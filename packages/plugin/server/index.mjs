@@ -23439,7 +23439,8 @@ var EVENT_FIELDS = [
   "metered_spent",
   "frontier_avoided",
   "metered_avoided",
-  "policy_verdict"
+  "policy_verdict",
+  "superseded"
 ];
 var OUTCOME_EVENT_FIELDS = [
   "event_type",
@@ -23541,6 +23542,7 @@ function validateEventInput(input) {
   };
   const parent = optionalString(input.parent_task_id, "task.parent_task_id");
   if (parent !== void 0) out.parent_task_id = parent;
+  if (input.superseded !== void 0) out.superseded = requireBoolean(input.superseded, "task.superseded");
   return out;
 }
 function validateOutcomeInput(input) {
@@ -23640,7 +23642,7 @@ function summarize(events) {
     actual_cost += e.actual_cost;
     metered_spent_total += e.metered_spent;
     if (e.status === "blocked") blockCount += 1;
-    if (e.status === "ok") frontier_cost += e.frontier_cost;
+    if (e.status === "ok" && e.superseded !== true) frontier_cost += e.frontier_cost;
     laneMix[e.laneId] = (laneMix[e.laneId] ?? 0) + 1;
   }
   const frontier_avoided = frontier_cost - actual_cost;
@@ -23693,6 +23695,49 @@ function tokenStats(events) {
     group(byLane, e.laneId, e);
   }
   return { total, byModel, byLane };
+}
+
+// ../core/src/reassign.ts
+var TRUST_RANK = {
+  blocked: 0,
+  worker: 1,
+  monitored: 2,
+  full: 3
+};
+function canReassign(from, to, task, ctx, policy) {
+  if (to.id === from.id) return false;
+  if ((policy.disabledLaneIds ?? []).includes(to.id)) return false;
+  if (TRUST_RANK[to.trust_mode] < TRUST_RANK[from.trust_mode]) return false;
+  if (!isSelectablePreGate(to, ctx.gateReady ?? false)) return false;
+  const { verdict } = evaluate(task, to, ctx.policyContext ?? {}, policy);
+  return laneAllowedByVerdict(to, verdict);
+}
+function escalationDecision(verdict, counters, caps = {}) {
+  const maxReworks = caps.maxReworks ?? 1;
+  const maxEscalations = caps.maxEscalations ?? 1;
+  if (verdict === "pass") return "accept";
+  if (verdict === "needs-rework" && counters.escalations === 0 && counters.reworks < maxReworks) {
+    return "rework";
+  }
+  if (counters.escalations < maxEscalations) return "escalate";
+  return "give_back";
+}
+function selectEscalationTarget(subject, candidates, task, ctx, policy, opts = {}) {
+  const minDelta = Math.max(0, opts.minDelta ?? 0.15);
+  const exclude = new Set(opts.excludeIds ?? []);
+  const fromCap = capabilityFor(subject, task.category);
+  const eligible = candidates.filter(
+    (c) => !exclude.has(c.id) && !c.native && (c.costBasis === "subscription" || c.costBasis === "local") && canReassign(subject, c, task, ctx, policy) && capabilityFor(c, task.category) >= fromCap + minDelta
+  );
+  if (eligible.length === 0) return null;
+  eligible.sort((a, b) => {
+    const byCap = capabilityFor(b, task.category) - capabilityFor(a, task.category);
+    if (byCap !== 0) return byCap;
+    const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
+    if (byRank !== 0) return byRank;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return eligible[0];
 }
 
 // ../core/src/failure.ts
@@ -23763,6 +23808,58 @@ async function review(request, deps) {
   if (out.notes !== void 0) result.notes = out.notes;
   if (out.suggested_lane_id !== void 0) result.suggested_lane_id = out.suggested_lane_id;
   return result;
+}
+var REVIEW_OUTPUT_MAX_CHARS = 32e3;
+function capText(s, max) {
+  return s.length > max ? `${s.slice(0, max)}
+
+[truncated for review]` : s;
+}
+function buildOutputReviewPrompt(subtask, output, maxChars = REVIEW_OUTPUT_MAX_CHARS) {
+  return [
+    "You are a senior code reviewer. A subtask was delegated to another model;",
+    "review its OUTPUT below for correctness, completeness, and obvious bugs. Be",
+    "concise \u2014 list only real, blocking issues (not subjective polish).",
+    "",
+    "End your reply with EXACTLY one final line, one of:",
+    "  VERDICT: pass            (acceptable as-is)",
+    "  VERDICT: needs-rework    (has blocking issues to fix)",
+    "  VERDICT: fail            (wrong / unusable)",
+    "",
+    "Subtask:",
+    capText(subtask, maxChars),
+    "",
+    "Output to review:",
+    capText(output, maxChars)
+  ].join("\n");
+}
+function parseManagerVerdictStrict(text) {
+  const lines = text.split("\n").map((l) => l.trim());
+  let last = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i] !== "") {
+      last = lines[i];
+      break;
+    }
+  }
+  const m = /^VERDICT:\s*(pass|needs-rework|fail)$/i.exec(last);
+  return m ? m[1].toLowerCase() : null;
+}
+function selectReviewManager(lanes, subject, category, ctx, policy) {
+  const subjectCap = capabilityFor(subject, category);
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const gateReady = ctx.gateReady ?? false;
+  const policyContext = ctx.policyContext ?? {};
+  const eligible = lanes.filter(
+    (m) => m.id !== subject.id && !m.native && isManagerEligible(m) && (m.costBasis === "subscription" || m.costBasis === "local") && capabilityFor(m, category) >= subjectCap && !disabled.has(m.id) && isSelectablePreGate(m, gateReady) && laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict)
+  );
+  if (eligible.length === 0) return null;
+  eligible.sort((a, b) => {
+    const byCap = capabilityFor(b, category) - capabilityFor(a, category);
+    if (byCap !== 0) return byCap;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return eligible[0];
 }
 
 // ../core/src/usage.ts
@@ -23903,6 +24000,117 @@ async function runTask(request, ctx, policy, deps) {
   } catch {
     return { decision, laneId: lane.id, status: "failed", native: true, failureKind: "provider_error", events: [event("failed", ZERO_USAGE)] };
   }
+}
+var isMarginalFree = (lane) => lane.costBasis === "subscription" || lane.costBasis === "local";
+function instructionWithNotes(instruction, notes) {
+  if (!notes) return instruction;
+  const capped = notes.length > REVIEW_OUTPUT_MAX_CHARS ? `${notes.slice(0, REVIEW_OUTPUT_MAX_CHARS)}
+[truncated]` : notes;
+  return `${instruction}
+
+Reviewer notes (address these; do not rewrite blindly):
+${capped}`;
+}
+function markSupersededLegs(events, finalAction) {
+  const taskEvents = events.filter((e) => e.kind === "task");
+  if (taskEvents.length === 0) return;
+  const delivered = finalAction !== "give_back";
+  const lastTask = taskEvents[taskEvents.length - 1];
+  for (const te of taskEvents) {
+    if (!(delivered && te === lastTask)) te.event.superseded = true;
+  }
+}
+function complete(result) {
+  markSupersededLegs(result.events, result.final_action);
+  return result;
+}
+async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
+  const maxReworks = opts.maxReworks ?? 1;
+  const maxEscalations = opts.maxEscalations ?? 1;
+  const minCapabilityDelta = opts.minCapabilityDelta ?? 0.15;
+  const task = { category: request.category };
+  const events = [];
+  const effectiveCtx = request.policyContext ? { ...ctx, policyContext: request.policyContext } : ctx;
+  const candidates = opts.candidates ?? effectiveCtx.lanes;
+  const task_id = request.task_id ?? deps.newId();
+  let attempt = request.attempt ?? 0;
+  let current = await runTask({ ...request, task_id, attempt }, effectiveCtx, policy, deps);
+  for (const e of current.events) events.push({ kind: "task", event: e });
+  let subject = effectiveCtx.lanes.find((l) => l.id === current.laneId);
+  const resultReviewable = (r) => r.status === "ok" && r.native !== true && typeof r.resultText === "string" && r.resultText.trim() !== "";
+  if (!resultReviewable(current) || subject === void 0) {
+    return complete({ final_action: "accept", subjectLaneId: current.laneId, result: current, events });
+  }
+  let subjectLane = subject;
+  const counters = { reworks: 0, escalations: 0 };
+  for (let round = 0; round < maxReworks + maxEscalations + 1; round++) {
+    const output = current.resultText;
+    const reviewedAttempt = attempt;
+    const stage = counters.reworks + counters.escalations;
+    const manager = selectReviewManager(candidates, subjectLane, request.category, effectiveCtx, policy);
+    const unavailable = (reason) => complete(
+      stage === 0 ? { final_action: "review_unavailable", reason, subjectLaneId: subjectLane.id, result: current, events } : { final_action: "give_back", reason: `${reason} (after a leg)`, subjectLaneId: subjectLane.id, result: current, events }
+    );
+    if (!manager) return unavailable("no eligible manager");
+    let raw;
+    try {
+      raw = await deps.runManager(manager, buildOutputReviewPrompt(combinedText(request.instruction, request.attachments), output));
+    } catch {
+      return unavailable("manager call failed");
+    }
+    const verdict = parseManagerVerdictStrict(raw);
+    if (!verdict) return unavailable("manager verdict unparseable");
+    let action = escalationDecision(verdict, counters, { maxReworks, maxEscalations });
+    if (action === "rework" && !isMarginalFree(subjectLane)) {
+      action = escalationDecision(verdict, { reworks: maxReworks, escalations: counters.escalations }, { maxReworks, maxEscalations });
+    }
+    let target = null;
+    if (action === "escalate") {
+      target = selectEscalationTarget(subjectLane, candidates, task, effectiveCtx, policy, {
+        minDelta: minCapabilityDelta,
+        excludeIds: [manager.id]
+      });
+      if (!target) action = "give_back";
+    }
+    const notes = raw.trim() === "" ? void 0 : raw;
+    const reviewRes = await review(
+      { task_id, attempt: reviewedAttempt, category: request.category, content: output, subjectLane },
+      { managerLane: manager, runManagerReview: async () => notes ? { verdict, notes } : { verdict }, newId: deps.newId }
+    );
+    const outcome = { ...reviewRes.event, action_taken: action };
+    if (target) outcome.target_lane_id = target.id;
+    events.push({ kind: "outcome", event: outcome });
+    if (action === "accept") {
+      const final_action = counters.escalations > 0 ? "accept_after_escalation" : counters.reworks > 0 ? "accept_after_rework" : "accept";
+      return complete({ final_action, verdict, ...notes ? { notes } : {}, subjectLaneId: subjectLane.id, result: current, events });
+    }
+    if (action === "give_back") {
+      return complete({ final_action: "give_back", verdict, ...notes ? { notes } : {}, subjectLaneId: subjectLane.id, result: current, events });
+    }
+    const nextLane = action === "escalate" ? target : subjectLane;
+    attempt += 1;
+    const reRun = await runTask(
+      { ...request, task_id, attempt, instruction: instructionWithNotes(request.instruction, notes) },
+      { ...effectiveCtx, lanes: [nextLane] },
+      policy,
+      deps
+    );
+    for (const e of reRun.events) events.push({ kind: "task", event: e });
+    if (action === "escalate") counters.escalations += 1;
+    else counters.reworks += 1;
+    if (!resultReviewable(reRun)) {
+      return complete({
+        final_action: "give_back",
+        reason: `${action} leg produced no reviewable output`,
+        subjectLaneId: nextLane.id,
+        result: reRun,
+        events
+      });
+    }
+    current = reRun;
+    subjectLane = nextLane;
+  }
+  return complete({ final_action: "give_back", reason: "escalation budget exhausted", subjectLaneId: subjectLane.id, result: current, events });
 }
 
 // ../core/src/node.ts
@@ -24349,7 +24557,9 @@ async function runSetup(env) {
     ...manager ? { managerLaneId: manager.id } : {},
     gitleaksAvailable,
     gateReady,
-    reviewOnStop: env.TOKENMAXED_REVIEW_ON_STOP === "true"
+    reviewOnStop: env.TOKENMAXED_REVIEW_ON_STOP === "true",
+    // Mirror makeServerDeps: the global kill-switch disables escalation.
+    escalate: env.TOKENMAXED_ESCALATE === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true")
   };
 }
 
@@ -24652,6 +24862,7 @@ ${r.notes}` : "";
         `  secret scanner (gitleaks): ${r.gitleaksAvailable ? "available" : "NOT installed \u2014 untrusted worker lanes stay disabled until it is"}`,
         `  worker gate: ${r.gateReady ? "open" : "closed"} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? "" : " \u2014 install gitleaks first"})`,
         `  review-on-stop: ${r.reviewOnStop ? "on" : "off"} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
+        `  quality escalation: ${r.escalate ? "on" : "off"} (enable with TOKENMAXED_ESCALATE=true \u2014 offloads a failed cheap result up to a stronger lane)`,
         "",
         `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
       ];
@@ -24674,13 +24885,23 @@ function renderDelegate(o) {
   }
   const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
   const note = o.recordingFailed ? "\n\n(note: this offload could not be recorded to the ledger.)" : "";
-  return ok(`Offloaded to ${lane}. Use this result:
+  if (o.reviewUnavailable) {
+    return ok(
+      `Offloaded to ${lane} \u2014 UNREVIEWED (${o.reason ?? "manager review unavailable"}). Inspect it yourself before using:
+
+${o.resultText ?? ""}${note}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.recordingFailed ? { recordingFailed: true } : {} }
+    );
+  }
+  const how = o.reason ? ` (${o.reason})` : "";
+  return ok(`Offloaded to ${lane}${how}. Use this result:
 
 ${o.resultText ?? ""}${note}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
     status: o.status,
+    ...o.reason ? { reason: o.reason } : {},
     ...o.recordingFailed ? { recordingFailed: true } : {}
   });
 }
@@ -24738,6 +24959,31 @@ function recordableLane(lane, priceTable) {
     return false;
   }
 }
+function escToOutcome(esc2, registry2, recordingFailed) {
+  const r = esc2.result;
+  const model = registry2.byId(r.laneId)?.model;
+  const base = {
+    laneId: r.laneId,
+    status: r.status,
+    ...r.native ? { native: true } : {},
+    ...r.resultText !== void 0 ? { resultText: r.resultText } : {},
+    ...model ? { model } : {},
+    ...r.failureKind ? { failureKind: r.failureKind } : {},
+    ...recordingFailed ? { recordingFailed: true } : {}
+  };
+  switch (esc2.final_action) {
+    case "give_back":
+      return { ...base, native: true, reason: `manager review (${esc2.verdict ?? "fail"})${esc2.notes ? ` \u2014 ${esc2.notes}` : ""}` };
+    case "review_unavailable":
+      return { ...base, reviewUnavailable: true, ...esc2.reason ? { reason: esc2.reason } : {} };
+    case "accept_after_escalation":
+      return { ...base, reason: "after escalation" };
+    case "accept_after_rework":
+      return { ...base, reason: "after rework" };
+    default:
+      return base;
+  }
+}
 function fileToggleStore(statePath) {
   return {
     read: () => {
@@ -24764,6 +25010,8 @@ function makeServerDeps(env = process.env) {
   const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
+  const escalateEnabled = env.TOKENMAXED_ESCALATE === "true" && !globallyDisabled;
+  const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
   const resolveAuth = makeResolveAuth(env);
   const loadPolicySafe = makeLoadPolicy(env);
@@ -24802,16 +25050,30 @@ function makeServerDeps(env = process.env) {
       priceTable,
       newId: () => randomUUID3()
     };
-    const result = await runTask(
-      {
-        category: request.category,
-        instruction: request.instruction,
-        ...request.policyContext ? { policyContext: request.policyContext } : {}
-      },
-      ctx,
-      policy,
-      runDeps
-    );
+    const taskInput = {
+      category: request.category,
+      instruction: request.instruction,
+      ...request.policyContext ? { policyContext: request.policyContext } : {}
+    };
+    if (escalateEnabled) {
+      const escDeps = {
+        ...runDeps,
+        runManager: (lane, prompt) => runDeps.executeTrusted(lane, prompt).then((res) => res.resultText)
+      };
+      const offloadLanes = lanes.filter((lane) => !reservedForReview(lane));
+      const esc2 = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes }, policy, escDeps, { candidates: lanes });
+      let escRecordingFailed = false;
+      try {
+        for (const ev of esc2.events) {
+          if (ev.kind === "task") ledger.appendTask(ev.event);
+          else ledger.appendOutcome(ev.event);
+        }
+      } catch {
+        escRecordingFailed = true;
+      }
+      return escToOutcome(esc2, registry2, escRecordingFailed);
+    }
+    const result = await runTask(taskInput, ctx, policy, runDeps);
     let recordingFailed = false;
     try {
       for (const event of result.events) ledger.appendTask(event);
@@ -24832,8 +25094,13 @@ function makeServerDeps(env = process.env) {
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
     // The documented route input (capability-0 opt-outs excluded) minus
-    // unpriceable metered lanes, so preview matches delegate. Lazy per call.
-    candidateLanes: usableCandidates,
+    // unpriceable metered lanes. When escalation is on, ALSO reserve manager-
+    // eligible lanes (as delegate does), so /tokenmaxed:why mirrors the initial
+    // offload routing exactly. Lazy per call.
+    candidateLanes: (category) => {
+      const c = usableCandidates(category);
+      return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
+    },
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
