@@ -164,6 +164,15 @@ export interface RouteContext {
    */
   capHeadroom?: Record<string, number>;
   /**
+   * Optional learned capability overlay (F-1). When present, routing,
+   * reassignment, and escalation-target selection use the EFFECTIVE capability
+   * (declared prior blended with observed review evidence) instead of the raw
+   * declared score. Absent ⇒ declared capability is used everywhere, identical to
+   * before the feedback loop. Reviewer-manager selection and the `capability: 0`
+   * opt-out always stay on the DECLARED score regardless of this overlay.
+   */
+  observedCapability?: ObservedCapabilityByLane;
+  /**
    * Whether the minimization/policy gate is built and CI-green. Defaults to
    * `false`. While false, only `full`, non-API lanes are selectable (non-`full`
    * lanes are rejected regardless of config).
@@ -235,12 +244,20 @@ export interface LaneScore {
   laneId: string;
   score: number;
   factors: {
-    /** Capability for the task category, in [0, 1]. */
+    /**
+     * The EFFECTIVE capability that drove the score, in [0, 1]: the declared
+     * prior blended with observed review evidence when a learned overlay is
+     * present, else exactly the declared score.
+     */
     capability: number;
     /** Cost-basis penalty (higher = more expensive marginal cost). */
     costPenalty: number;
     /** Weekly-cap penalty (0 when healthy; larger as the lane nears/exceeds its cap). */
     capPenalty: number;
+    /** The declared (config-prior) capability, before any learned adjustment. */
+    declared: number;
+    /** Decay-weighted review evidence behind the adjustment (0 ⇒ no evidence; capability == declared). */
+    evidenceN: number;
   };
 }
 

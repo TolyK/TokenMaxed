@@ -23047,6 +23047,7 @@ function parsePolicyConfig(text) {
 
 // ../core/src/route.ts
 var DEFAULT_CAPABILITY = 0.5;
+var DEFAULT_PRIOR_STRENGTH = 8;
 var COST_PENALTY = {
   local: 0,
   subscription: 0.05,
@@ -23087,20 +23088,45 @@ function declaredCapabilityFor(lane, category) {
   const declared = lane.capability?.[category];
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }
-function scoreLane(lane, task, capHeadroom2) {
-  const capability = declaredCapabilityFor(lane, task.category);
+function effectiveCapability(declared, observed, opts = {}) {
+  const prior = clamp01(declared);
+  if (prior === 0) return 0;
+  if (!observed) return prior;
+  const n = Number.isFinite(observed.n) && observed.n > 0 ? observed.n : 0;
+  if (n === 0) return prior;
+  const rate = clamp01(observed.rate);
+  const k = Number.isFinite(opts.priorStrength) && opts.priorStrength > 0 ? opts.priorStrength : DEFAULT_PRIOR_STRENGTH;
+  return clamp01((k * prior + n * rate) / (k + n));
+}
+function effectiveCapabilityFor(lane, category, overlay, opts) {
+  const declared = declaredCapabilityFor(lane, category);
+  return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
+}
+function scoreLane(lane, task, capHeadroom2, observedCapability) {
+  const declared = declaredCapabilityFor(lane, task.category);
+  const observed = observedCapability?.[lane.id]?.[task.category];
+  const capability = effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
-  return { laneId: lane.id, score, factors: { capability, costPenalty, capPenalty } };
+  return {
+    laneId: lane.id,
+    score,
+    factors: { capability, costPenalty, capPenalty, declared, evidenceN: observed?.n ?? 0 }
+  };
 }
 function compareScores(a, b) {
   if (b.score !== a.score) return b.score - a.score;
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
 function describe2(lane, best, task) {
-  const cap = best.factors.capability.toFixed(2);
-  return `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
+  const f = best.factors;
+  const cap = f.capability.toFixed(2);
+  let reason = `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
+  if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
+    reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
+  }
+  return reason;
 }
 function routeDecide(task, ctx, policy) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
@@ -23119,7 +23145,7 @@ function routeDecide(task, ctx, policy) {
       "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, or blocked/forced-trusted away by policy)."
     );
   }
-  const scores = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom)).sort(compareScores);
+  const scores = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability)).sort(compareScores);
   const winner = scores[0];
   const winningLane = candidates.find((lane) => lane.id === winner.laneId);
   return {
@@ -23725,13 +23751,14 @@ function escalationDecision(verdict, counters, caps = {}) {
 function selectEscalationTarget(subject, candidates, task, ctx, policy, opts = {}) {
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
-  const fromCap = declaredCapabilityFor(subject, task.category);
+  const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability);
+  const fromCap = cap(subject);
   const eligible = candidates.filter(
-    (c) => !exclude.has(c.id) && !c.native && (c.costBasis === "subscription" || c.costBasis === "local") && canReassign(subject, c, task, ctx, policy) && declaredCapabilityFor(c, task.category) >= fromCap + minDelta
+    (c) => !exclude.has(c.id) && !c.native && (c.costBasis === "subscription" || c.costBasis === "local") && canReassign(subject, c, task, ctx, policy) && cap(c) >= fromCap + minDelta
   );
   if (eligible.length === 0) return null;
   eligible.sort((a, b) => {
-    const byCap = declaredCapabilityFor(b, task.category) - declaredCapabilityFor(a, task.category);
+    const byCap = cap(b) - cap(a);
     if (byCap !== 0) return byCap;
     const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
     if (byRank !== 0) return byRank;

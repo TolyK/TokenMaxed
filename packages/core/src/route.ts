@@ -177,6 +177,10 @@ export function effectiveCapability(
   opts: EffectiveCapabilityOptions = {},
 ): number {
   const prior = clamp01(declared);
+  // An explicit declared 0 is a hard opt-out ("this lane cannot do this"), not a
+  // weak prior: no amount of observed success may resurrect it. (Belt-and-braces
+  // with LaneRegistry.candidateLanes, which also filters declared-0 lanes out.)
+  if (prior === 0) return 0;
   if (!observed) return prior;
   const n = Number.isFinite(observed.n) && observed.n > 0 ? observed.n : 0;
   if (n === 0) return prior;
@@ -204,12 +208,23 @@ export function effectiveCapabilityFor(
   return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
 }
 
-function scoreLane(lane: Lane, task: Task, capHeadroom?: Record<string, number>): LaneScore {
-  const capability = declaredCapabilityFor(lane, task.category);
+function scoreLane(
+  lane: Lane,
+  task: Task,
+  capHeadroom?: Record<string, number>,
+  observedCapability?: ObservedCapabilityByLane,
+): LaneScore {
+  const declared = declaredCapabilityFor(lane, task.category);
+  const observed = observedCapability?.[lane.id]?.[task.category];
+  const capability = effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
-  return { laneId: lane.id, score, factors: { capability, costPenalty, capPenalty } };
+  return {
+    laneId: lane.id,
+    score,
+    factors: { capability, costPenalty, capPenalty, declared, evidenceN: observed?.n ?? 0 },
+  };
 }
 
 /**
@@ -222,11 +237,17 @@ function compareScores(a: LaneScore, b: LaneScore): number {
 }
 
 function describe(lane: Lane, best: LaneScore, task: Task): string {
-  const cap = best.factors.capability.toFixed(2);
-  return (
+  const f = best.factors;
+  const cap = f.capability.toFixed(2);
+  let reason =
     `Selected ${lane.id} (${lane.model}) for ${task.category}: ` +
-    `capability ${cap} at ${lane.costBasis} cost.`
-  );
+    `capability ${cap} at ${lane.costBasis} cost.`;
+  // Annotate only when evidence actually moved the score (avoid overstating tiny
+  // samples): at least one weighted review AND a different rounded value.
+  if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
+    reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
+  }
+  return reason;
 }
 
 /**
@@ -262,7 +283,7 @@ export function routeDecide(
   }
 
   const scores = candidates
-    .map((lane) => scoreLane(lane, task, ctx.capHeadroom))
+    .map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability))
     .sort(compareScores);
   const winner = scores[0]!;
   const winningLane = candidates.find((lane) => lane.id === winner.laneId)!;

@@ -11,7 +11,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { declaredCapabilityFor, isSelectablePreGate } from './route.ts';
+import { effectiveCapabilityFor, isSelectablePreGate } from './route.ts';
 import type { ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, Task, TrustMode } from './types.ts';
 
@@ -74,19 +74,21 @@ export function reassignmentTarget(
   const max = opts.maxReassignments ?? 2;
   if (attempts >= max) return null;
 
+  // Use EFFECTIVE capability so an empirically-degrading lane isn't preferred.
+  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability);
   const fromRank = TRUST_RANK[from.trust_mode];
-  const fromCap = declaredCapabilityFor(from, task.category);
+  const fromCap = cap(from);
   const eligible = candidates.filter((c) => {
     if (!canReassign(from, c, task, ctx, policy)) return false;
     // An improvement: a stronger trust tier, or the same tier but more capable.
-    return TRUST_RANK[c.trust_mode] > fromRank || declaredCapabilityFor(c, task.category) > fromCap;
+    return TRUST_RANK[c.trust_mode] > fromRank || cap(c) > fromCap;
   });
   if (eligible.length === 0) return null;
 
   eligible.sort((a, b) => {
     const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
     if (byRank !== 0) return byRank;
-    const byCap = declaredCapabilityFor(b, task.category) - declaredCapabilityFor(a, task.category);
+    const byCap = cap(b) - cap(a);
     if (byCap !== 0) return byCap;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
@@ -173,18 +175,20 @@ export function selectEscalationTarget(
 ): Lane | null {
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
-  const fromCap = declaredCapabilityFor(subject, task.category);
+  // Use EFFECTIVE capability: don't escalate to an empirically-failing lane.
+  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability);
+  const fromCap = cap(subject);
   const eligible = candidates.filter(
     (c) =>
       !exclude.has(c.id) &&
       !c.native &&
       (c.costBasis === 'subscription' || c.costBasis === 'local') &&
       canReassign(subject, c, task, ctx, policy) &&
-      declaredCapabilityFor(c, task.category) >= fromCap + minDelta,
+      cap(c) >= fromCap + minDelta,
   );
   if (eligible.length === 0) return null;
   eligible.sort((a, b) => {
-    const byCap = declaredCapabilityFor(b, task.category) - declaredCapabilityFor(a, task.category);
+    const byCap = cap(b) - cap(a);
     if (byCap !== 0) return byCap;
     const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
     if (byRank !== 0) return byRank;
