@@ -73,6 +73,8 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     readLedger: () => [],
     candidateLanes: () => [lane({ id: 'claude-native', native: true })],
     loadPolicy: (): Policy => ({}),
+    getEnabled: () => true,
+    setEnabled: () => {},
     now: () => FIXED_NOW,
     ...over,
   };
@@ -85,10 +87,10 @@ function call(name: string, d: ToolDeps, args: Record<string, unknown> = {}) {
 
 // --- registry + dispatch -------------------------------------------------------
 
-test('builds exactly the three read-only tools with object input schemas', () => {
+test('builds the expected tool set with object input schemas', () => {
   assert.deepEqual(
     TOOLS.map((t) => t.name).sort(),
-    ['router_preview', 'router_savings', 'router_tokens'],
+    ['router_preview', 'router_savings', 'router_set_enabled', 'router_status', 'router_tokens'],
   );
   for (const t of TOOLS) {
     assert.equal((t.inputSchema as { type: string }).type, 'object');
@@ -177,6 +179,36 @@ test('tokens rejects an unknown grouping', () => {
   const r = call('router_tokens', deps(), { by: 'galaxy' });
   assert.equal(r.isError, true);
   assert.match(r.content[0]!.text, /must be one of/);
+});
+
+// --- router_status / router_set_enabled (A-4 toggle) ---------------------------
+
+test('status reports the current enabled state', () => {
+  const on = call('router_status', deps({ getEnabled: () => true }));
+  assert.equal(on.structuredContent!.enabled as boolean, true);
+  assert.match(on.content[0]!.text, /ENABLED/);
+
+  const off = call('router_status', deps({ getEnabled: () => false }));
+  assert.equal(off.structuredContent!.enabled as boolean, false);
+  assert.match(off.content[0]!.text, /DISABLED/);
+});
+
+test('set_enabled persists the requested state', () => {
+  const calls: boolean[] = [];
+  const r = call('router_set_enabled', deps({ setEnabled: (e) => calls.push(e) }), { enabled: false });
+  assert.notEqual(r.isError, true);
+  assert.deepEqual(calls, [false]);
+  assert.match(r.content[0]!.text, /DISABLED/);
+});
+
+test('set_enabled requires a boolean enabled and rejects other types', () => {
+  const missing = call('router_set_enabled', deps(), {});
+  assert.equal(missing.isError, true);
+  assert.match(missing.content[0]!.text, /required/);
+
+  const wrong = call('router_set_enabled', deps(), { enabled: 'yes' });
+  assert.equal(wrong.isError, true);
+  assert.match(wrong.content[0]!.text, /must be a boolean/);
 });
 
 // --- router_preview ------------------------------------------------------------

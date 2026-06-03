@@ -69,6 +69,10 @@ export interface ToolDeps {
   candidateLanes: (category: TaskCategory) => Lane[];
   /** The active routing policy (from policy.yaml via core/node). */
   loadPolicy: () => Policy;
+  /** Whether routing/offloading is enabled for the current project (A-4 toggle). */
+  getEnabled: () => boolean;
+  /** Persist the project's enabled state (A-4 toggle). */
+  setEnabled: (enabled: boolean) => void;
   /** Current wall-clock in ms (injected so tests are deterministic). */
   now: () => number;
 }
@@ -311,7 +315,43 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, previewTool];
+  const statusTool: ToolDef = {
+    name: 'router_status',
+    description:
+      'Report whether TokenMaxed routing/offloading is currently enabled for this project. Read-only.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} },
+    handler: (deps) => {
+      const enabled = deps.getEnabled();
+      return ok(
+        `TokenMaxed routing is ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`,
+        { enabled },
+      );
+    },
+  };
+
+  const setEnabledTool: ToolDef = {
+    name: 'router_set_enabled',
+    description:
+      'Enable or disable TokenMaxed routing/offloading for this project. The setting is persisted (project-keyed) and survives restarts. Powers /tokenmaxed:off and :on.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['enabled'],
+      properties: { enabled: { type: 'boolean', description: 'true to enable routing, false to disable.' } },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const enabled = optBool(args, 'enabled');
+        if (enabled === undefined) throw new ToolInputError('"enabled" is required (boolean).');
+        deps.setEnabled(enabled);
+        return ok(
+          `TokenMaxed routing ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`,
+          { enabled },
+        );
+      }),
+  };
+
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool];
 }
 
 // --- dispatch (pure; testable without the SDK or a build) ----------------------

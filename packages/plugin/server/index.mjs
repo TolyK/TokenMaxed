@@ -14225,6 +14225,11 @@ var require_dist2 = __commonJS({
   }
 });
 
+// ../mcp/src/server.ts
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { dirname as dirname2, join as join2 } from "node:path";
+
 // ../../node_modules/zod/v4/core/core.js
 var _a;
 // @__NO_SIDE_EFFECTS__
@@ -23789,7 +23794,38 @@ function createTools(core) {
       return ok(text, { category, gateReady, policyContext, decision, verdict, native: false });
     })
   };
-  return [savingsTool, tokensTool, previewTool];
+  const statusTool = {
+    name: "router_status",
+    description: "Report whether TokenMaxed routing/offloading is currently enabled for this project. Read-only.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    handler: (deps) => {
+      const enabled = deps.getEnabled();
+      return ok(
+        `TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`,
+        { enabled }
+      );
+    }
+  };
+  const setEnabledTool = {
+    name: "router_set_enabled",
+    description: "Enable or disable TokenMaxed routing/offloading for this project. The setting is persisted (project-keyed) and survives restarts. Powers /tokenmaxed:off and :on.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["enabled"],
+      properties: { enabled: { type: "boolean", description: "true to enable routing, false to disable." } }
+    },
+    handler: (deps, args) => guarded(() => {
+      const enabled = optBool(args, "enabled");
+      if (enabled === void 0) throw new ToolInputError('"enabled" is required (boolean).');
+      deps.setEnabled(enabled);
+      return ok(
+        `TokenMaxed routing ${enabled ? "ENABLED" : "DISABLED"} for this project.`,
+        { enabled }
+      );
+    })
+  };
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool];
 }
 function dispatch(tools, deps, name, rawArgs) {
   const tool = tools.find((t) => t.name === name);
@@ -23813,20 +23849,61 @@ function unknownKeys(inputSchema, args) {
   return `Unknown argument(s): ${extras.join(", ")}. Allowed: ${allowed.length ? allowed.join(", ") : "(none)"}.`;
 }
 
+// ../mcp/src/toggle.ts
+var ENABLED_BY_DEFAULT = true;
+function asMap(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "boolean") out[k] = v;
+  }
+  return out;
+}
+function readEnabled(store, projectKey) {
+  const map = asMap(store.read());
+  return Object.hasOwn(map, projectKey) ? map[projectKey] : ENABLED_BY_DEFAULT;
+}
+function writeEnabled(store, projectKey, enabled) {
+  const map = asMap(store.read());
+  map[projectKey] = enabled;
+  store.write(map);
+}
+
 // ../mcp/src/server.ts
 var DEFAULT_LANES = "config/lanes.yaml";
 var DEFAULT_POLICY = "config/policy.yaml";
+function fileToggleStore(statePath) {
+  return {
+    read: () => {
+      if (!existsSync2(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync2(statePath, "utf8"));
+      } catch {
+        return {};
+      }
+    },
+    write: (state) => {
+      mkdirSync2(dirname2(statePath), { recursive: true });
+      writeFileSync2(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+    }
+  };
+}
 var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, evaluate, taskCategories: TASK_CATEGORIES };
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
   const policyPath = env.TOKENMAXED_POLICY ?? DEFAULT_POLICY;
   const ledgerPath = env.TOKENMAXED_LEDGER;
+  const statePath = env.TOKENMAXED_STATE ?? join2(homedir2(), ".tokenmaxed", "state.json");
+  const projectKey = env.TOKENMAXED_PROJECT ?? "default";
+  const store = fileToggleStore(statePath);
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
     // candidateLanes() is the documented route input (excludes capability-0
     // opt-outs); loaded lazily per call so config edits are picked up live.
     candidateLanes: (category) => loadLaneConfig(lanesPath).candidateLanes(category),
     loadPolicy: () => loadPolicyConfig(policyPath),
+    getEnabled: () => readEnabled(store, projectKey),
+    setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
     now: () => Date.now()
   };
 }

@@ -15,6 +15,9 @@ const SKILLS: ReadonlyArray<{ name: string; tool: string }> = [
   { name: 'savings', tool: 'mcp__plugin_tokenmaxed_tokenmaxed__router_savings' },
   { name: 'tokens', tool: 'mcp__plugin_tokenmaxed_tokenmaxed__router_tokens' },
   { name: 'why', tool: 'mcp__plugin_tokenmaxed_tokenmaxed__router_preview' },
+  { name: 'off', tool: 'mcp__plugin_tokenmaxed_tokenmaxed__router_set_enabled' },
+  { name: 'on', tool: 'mcp__plugin_tokenmaxed_tokenmaxed__router_set_enabled' },
+  { name: 'status', tool: 'mcp__plugin_tokenmaxed_tokenmaxed__router_status' },
 ];
 
 function readSkill(name: string): string {
