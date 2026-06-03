@@ -1,0 +1,21 @@
+{
+  "name": "@tokenmaxed/mcp",
+  "version": "0.0.0",
+  "description": "TokenMaxed MCP server: thin stdio bridge exposing the core routing brain to Claude Code.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "tokenmaxed-mcp": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/bin.js', 0o755)\"",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@tokenmaxed/core": "0.0.0"
+  }
+}

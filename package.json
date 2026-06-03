@@ -12,7 +12,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @tokenmaxed/core && npm run build -w @tokenmaxed/cli",
+    "build": "npm run build -w @tokenmaxed/core && npm run build -w @tokenmaxed/cli && npm run build -w @tokenmaxed/mcp",
     "test": "node --test \"packages/**/test/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json"
   },
