@@ -92,3 +92,103 @@ export function reassignmentTarget(
   });
   return eligible[0]!;
 }
+
+// ---------------------------------------------------------------------------
+// C-13: quality-driven escalation (pure primitives). The orchestrator
+// (runWithEscalation) composes review() + these; the adapter only wires it.
+// ---------------------------------------------------------------------------
+
+/** The structural next move after a manager review of an offloaded subtask. */
+export type EscalationAction = 'accept' | 'rework' | 'escalate' | 'give_back';
+
+/** How many extra legs have already run this offload. */
+export interface EscalationCounters {
+  /** Same-lane reworks already done (pre-escalation only). */
+  reworks: number;
+  /** Escalations already done. */
+  escalations: number;
+}
+
+/** Loop-guard caps for {@link escalationDecision}. */
+export interface EscalationCaps {
+  /** Max same-lane reworks (default 1). */
+  maxReworks?: number;
+  /** Max escalations (default 1). */
+  maxEscalations?: number;
+}
+
+/**
+ * Decide the STRUCTURAL action from a review verdict + counters — pure, no lane
+ * or note inspection. `pass` ⇒ accept; initial `needs-rework` ⇒ one same-lane
+ * `rework` (pre-escalation only); `fail` (or `needs-rework` after the rework
+ * budget) ⇒ `escalate` while the escalation budget remains; once escalated, any
+ * non-`pass` ⇒ `give_back`. The orchestrator may further DOWNGRADE the result
+ * (rework→escalate→give_back) when lane constraints don't allow it (e.g. a
+ * metered subject can't be reworked, or no escalation target qualifies).
+ */
+export function escalationDecision(
+  verdict: ReviewVerdict,
+  counters: EscalationCounters,
+  caps: EscalationCaps = {},
+): EscalationAction {
+  const maxReworks = caps.maxReworks ?? 1;
+  const maxEscalations = caps.maxEscalations ?? 1;
+  if (verdict === 'pass') return 'accept';
+  // A same-lane rework is allowed only before any escalation, within budget.
+  if (verdict === 'needs-rework' && counters.escalations === 0 && counters.reworks < maxReworks) {
+    return 'rework';
+  }
+  // fail, or needs-rework past the rework budget ⇒ escalate while budget remains;
+  // once the escalation budget is spent, hand back (no silent acceptance).
+  if (counters.escalations < maxEscalations) return 'escalate';
+  return 'give_back';
+}
+
+/** Options for {@link selectEscalationTarget}. */
+export interface EscalationTargetOptions {
+  /** Required capability improvement over the subject (default 0.15; clamped ≥0). */
+  minDelta?: number;
+  /** Lane ids never eligible as a target — always includes the active manager. */
+  excludeIds?: readonly string[];
+}
+
+/**
+ * Choose the QUALITY escalation target: the **most capable** allowed lane that is
+ * a genuine capability improvement. Unlike {@link reassignmentTarget} (trust-first,
+ * for C-8), this is capability-first — a quality ladder, not trust remediation.
+ * A candidate must: pass {@link canReassign} (never down the trust ladder + gate +
+ * policy + not the subject), be **non-native** (the host is a terminal give-back,
+ * not an executed leg), be **marginal-free** (`subscription`/`local` — v1 adds no
+ * metered $), have `capability ≥ subject + minDelta` for the category, and not be
+ * in `excludeIds` (the active manager — preserves review independence). Returns the
+ * most capable (tie-break: higher trust, then id), or `null` ⇒ caller gives back.
+ */
+export function selectEscalationTarget(
+  subject: Lane,
+  candidates: readonly Lane[],
+  task: Task,
+  ctx: RouteContext,
+  policy: Policy,
+  opts: EscalationTargetOptions = {},
+): Lane | null {
+  const minDelta = Math.max(0, opts.minDelta ?? 0.15);
+  const exclude = new Set(opts.excludeIds ?? []);
+  const fromCap = capabilityFor(subject, task.category);
+  const eligible = candidates.filter(
+    (c) =>
+      !exclude.has(c.id) &&
+      !c.native &&
+      (c.costBasis === 'subscription' || c.costBasis === 'local') &&
+      canReassign(subject, c, task, ctx, policy) &&
+      capabilityFor(c, task.category) >= fromCap + minDelta,
+  );
+  if (eligible.length === 0) return null;
+  eligible.sort((a, b) => {
+    const byCap = capabilityFor(b, task.category) - capabilityFor(a, task.category);
+    if (byCap !== 0) return byCap;
+    const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
+    if (byRank !== 0) return byRank;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return eligible[0]!;
+}

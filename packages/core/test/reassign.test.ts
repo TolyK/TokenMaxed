@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { canReassign, reassignmentTarget, shouldReassign, TRUST_RANK } from '../src/reassign.ts';
+import {
+  canReassign,
+  escalationDecision,
+  reassignmentTarget,
+  selectEscalationTarget,
+  shouldReassign,
+  TRUST_RANK,
+} from '../src/reassign.ts';
 import type { Lane, Policy, RouteContext, Task } from '../src/types.ts';
 
 const lane = (over: Partial<Lane> & { id: string }): Lane => ({
@@ -81,4 +88,64 @@ test('reassignmentTarget returns null when no strictly-stronger lane is allowed'
 test('reassignmentTarget honors the loop-guard (max reassignments)', () => {
   assert.equal(reassignmentTarget(worker, [fullA], task, safeCtx, noPolicy, { attempts: 2, maxReassignments: 2 }), null);
   assert.ok(reassignmentTarget(worker, [fullA], task, safeCtx, noPolicy, { attempts: 1, maxReassignments: 2 }));
+});
+
+// --- C-13: quality-driven escalation primitives -------------------------------
+
+test('escalationDecision: pass accepts', () => {
+  assert.equal(escalationDecision('pass', { reworks: 0, escalations: 0 }), 'accept');
+});
+
+test('escalationDecision: initial needs-rework reworks once, then escalates', () => {
+  assert.equal(escalationDecision('needs-rework', { reworks: 0, escalations: 0 }), 'rework');
+  assert.equal(escalationDecision('needs-rework', { reworks: 1, escalations: 0 }), 'escalate');
+});
+
+test('escalationDecision: fail escalates while budget remains', () => {
+  assert.equal(escalationDecision('fail', { reworks: 0, escalations: 0 }), 'escalate');
+});
+
+test('escalationDecision: once escalated, any non-pass gives back (no fresh rework)', () => {
+  assert.equal(escalationDecision('needs-rework', { reworks: 0, escalations: 1 }), 'give_back');
+  assert.equal(escalationDecision('fail', { reworks: 0, escalations: 1 }), 'give_back');
+});
+
+test('escalationDecision: respects custom caps', () => {
+  // No rework budget ⇒ initial needs-rework escalates immediately.
+  assert.equal(escalationDecision('needs-rework', { reworks: 0, escalations: 0 }, { maxReworks: 0 }), 'escalate');
+  // No escalation budget ⇒ fail gives back.
+  assert.equal(escalationDecision('fail', { reworks: 0, escalations: 0 }, { maxEscalations: 0 }), 'give_back');
+});
+
+// capability-first target selection
+const cheap = lane({ id: 'cheap', capability: { bugfix: 0.5 } }); // full, subscription
+const strong = lane({ id: 'strong', capability: { bugfix: 0.9 } });
+const stronger = lane({ id: 'stronger', capability: { bugfix: 0.95 } });
+const tooClose = lane({ id: 'too-close', capability: { bugfix: 0.6 } }); // +0.10 < 0.15 delta
+const meteredStrong = lane({ id: 'metered', costBasis: 'metered', provenance: 'openai', capability: { bugfix: 0.97 } });
+const nativeStrong = lane({ id: 'host', native: true, capability: { bugfix: 0.99 } });
+
+test('selectEscalationTarget: picks the most capable lane past the delta', () => {
+  assert.equal(selectEscalationTarget(cheap, [strong, stronger, tooClose], task, safeCtx, noPolicy)?.id, 'stronger');
+});
+
+test('selectEscalationTarget: requires a real capability delta (no near-equal churn)', () => {
+  assert.equal(selectEscalationTarget(cheap, [tooClose], task, safeCtx, noPolicy), null);
+});
+
+test('selectEscalationTarget: never a metered, native, or excluded (manager) lane', () => {
+  assert.equal(selectEscalationTarget(cheap, [meteredStrong], task, safeCtx, noPolicy), null); // metered ⇒ no metered $
+  assert.equal(selectEscalationTarget(cheap, [nativeStrong], task, safeCtx, noPolicy), null); // native ⇒ terminal give_back
+  assert.equal(selectEscalationTarget(cheap, [strong], task, safeCtx, noPolicy, { excludeIds: ['strong'] }), null); // manager excluded
+});
+
+test('selectEscalationTarget: capability dominates trust (no quality regression)', () => {
+  // worker (bugfix 0.99) → full lane (bugfix 0.9): higher trust but LOWER capability ⇒ not chosen.
+  assert.equal(selectEscalationTarget(worker, [fullA], task, safeCtx, noPolicy), null);
+});
+
+test('selectEscalationTarget: minDelta is clamped non-negative', () => {
+  const equal = lane({ id: 'equal', capability: { bugfix: 0.5 } }); // == cheap's capability
+  // A negative delta clamps to 0 ⇒ equal-capability becomes eligible (still trust/policy-gated).
+  assert.equal(selectEscalationTarget(cheap, [equal], task, safeCtx, noPolicy, { minDelta: -5 })?.id, 'equal');
 });

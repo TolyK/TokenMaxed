@@ -56,6 +56,13 @@ export { buildUntrustedRequestBody, isExecutorCertified } from './boundary.ts';
 export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody } from './boundary.ts';
 export { canReassign, reassignmentTarget, shouldReassign, TRUST_RANK } from './reassign.ts';
 export type { ReassignOptions } from './reassign.ts';
+export { escalationDecision, selectEscalationTarget } from './reassign.ts';
+export type {
+  EscalationAction,
+  EscalationCounters,
+  EscalationCaps,
+  EscalationTargetOptions,
+} from './reassign.ts';
 export { FAILURE_KINDS, isTransient, shouldCooldown, classifyHttpStatus, LaneFailure } from './failure.ts';
 export type { FailureKind } from './failure.ts';
 export { review, ReviewError } from './review.ts';
