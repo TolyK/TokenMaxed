@@ -131,6 +131,14 @@ subtasks to the cheapest capable lane automatically. Or drive it by hand:
     `TOKENMAXED_GATE_READY=true`.
   - **Turn-end review gate** — a trusted manager reviews your changes and can
     require rework before Claude finishes; enable with `TOKENMAXED_REVIEW_ON_STOP=true`.
+  - **Quality escalation** — when an offloaded result fails its manager review,
+    retry it on a more capable lane (and ultimately give the task back to Claude
+    rather than ship something that failed review); enable with
+    `TOKENMAXED_ESCALATE=true`. The `router_delegate` outcome reports what
+    happened ("accepted after rework", "after escalation", or an unreviewed
+    give-back), and the per-offload escalation rate shows up in
+    `/tokenmaxed:savings`. Set `TOKENMAXED_DISABLE=true` to turn the whole
+    router off (kill-switch) regardless of the flags above.
 
 ## Getting started (CLI & core)
 

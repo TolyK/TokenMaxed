@@ -11,6 +11,20 @@ import { test } from 'node:test';
 
 const README = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
 const SKILLS_DIR = new URL('../skills/', import.meta.url);
+const BUNDLE = readFileSync(new URL('../server/index.mjs', import.meta.url), 'utf8');
+
+/**
+ * Behavioral opt-in env toggles (off by default) the plugin honors. Config-path
+ * vars (TOKENMAXED_LANES/POLICY/…) and BYOK keys are not feature toggles, so
+ * they're excluded — this set is the "Optional, off by default" surface plus the
+ * global kill-switch.
+ */
+const OPT_IN_FLAGS = [
+  'TOKENMAXED_GATE_READY',
+  'TOKENMAXED_REVIEW_ON_STOP',
+  'TOKENMAXED_ESCALATE',
+  'TOKENMAXED_DISABLE',
+] as const;
 
 /** Skill directory names (each is a /tokenmaxed:<name> command or model skill). */
 function skillNames(): string[] {
@@ -49,4 +63,22 @@ test('every manual command skill is documented in the README', () => {
       assert.ok(documented.has(name), `manual skill "${name}" is not documented in the README (Claude Code section)`);
     }
   }
+});
+
+test('every opt-in env toggle the README documents is one the shipped bundle honors', () => {
+  for (const flag of OPT_IN_FLAGS) {
+    if (README.includes(flag)) {
+      assert.ok(BUNDLE.includes(flag), `README documents ${flag} but the shipped server/index.mjs never reads it`);
+    }
+  }
+});
+
+test('the quality-escalation toggle is documented (C-13) and tied to the outcome it changes', () => {
+  // The bundle honors TOKENMAXED_ESCALATE, so the README must explain it...
+  assert.ok(BUNDLE.includes('TOKENMAXED_ESCALATE'), 'bundle should read TOKENMAXED_ESCALATE');
+  assert.ok(README.includes('TOKENMAXED_ESCALATE'), 'README must document the TOKENMAXED_ESCALATE opt-in');
+  // ...including what the user sees: escalation surfaces in the delegate outcome
+  // and the savings report, so the doc has to mention both, not just the flag.
+  assert.match(README, /router_delegate/, 'README escalation docs must reference the router_delegate outcome');
+  assert.match(README, /escalation rate/i, 'README escalation docs must mention the escalation rate in savings');
 });
