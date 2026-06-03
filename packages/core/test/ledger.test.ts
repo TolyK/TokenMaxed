@@ -294,6 +294,51 @@ test('outcomeStats tallies verdicts per reviewed lane with the dogfood success r
   assert.equal(withUnattributed.byLane['(host)'], undefined);
 });
 
+// --- C-13 E-2: escalation telemetry -------------------------------------------
+
+test('validateOutcomeInput accepts + validates action_taken/target_lane_id', () => {
+  const v = validateOutcomeInput({ ...outcome(), action_taken: 'escalate', target_lane_id: 'strong' });
+  assert.equal(v.action_taken, 'escalate');
+  assert.equal(v.target_lane_id, 'strong');
+  // omitted ⇒ absent (legacy rows stay valid)
+  const none = validateOutcomeInput(outcome());
+  assert.equal(none.action_taken, undefined);
+  assert.equal(none.target_lane_id, undefined);
+  // bad action rejected
+  assert.throws(() => validateOutcomeInput({ ...outcome(), action_taken: 'nope' as never }), { message: /action_taken/ });
+});
+
+test('serializeEvent includes action_taken/target_lane_id only when present (content-free)', () => {
+  const withAction = JSON.parse(serializeEvent(outcome({ action_taken: 'escalate', target_lane_id: 'strong' })));
+  assert.equal(withAction.action_taken, 'escalate');
+  assert.equal(withAction.target_lane_id, 'strong');
+  const without = JSON.parse(serializeEvent(outcome()));
+  assert.ok(!('action_taken' in without));
+  assert.ok(!('target_lane_id' in without));
+});
+
+test('outcomeStats: per-offload escalation rate by distinct task_id (host-turn never dilutes)', () => {
+  const events = [
+    // offload t-1: initial needs-rework (rework) then escalate ⇒ counts once as escalated.
+    outcome({ task_id: 't-1', subject_id: 't-1', verdict: 'needs-rework', action_taken: 'rework' }),
+    outcome({ task_id: 't-1', subject_id: 't-1', verdict: 'fail', action_taken: 'escalate', target_lane_id: 'strong' }),
+    // offload t-2: accepted, never escalated.
+    outcome({ task_id: 't-2', subject_id: 't-2', verdict: 'pass', action_taken: 'accept' }),
+    // a host-turn review must NOT count toward the offload denominator.
+    outcome({ subject_type: 'host_turn', task_id: undefined, turn_id: 'turn-1', subject_lane_id: undefined, verdict: 'fail' }),
+  ];
+  const s = outcomeStats(events);
+  assert.equal(s.escalation.offloadsReviewed, 2); // t-1, t-2 (not the host turn)
+  assert.equal(s.escalation.escalated, 1); // t-1
+  assert.equal(s.escalation.rate, 0.5);
+});
+
+test('outcomeStats: escalation rate is 0 with no router-task reviews', () => {
+  const s = outcomeStats([outcome({ subject_type: 'host_turn', task_id: undefined, turn_id: 'x', subject_lane_id: undefined })]);
+  assert.equal(s.escalation.offloadsReviewed, 0);
+  assert.equal(s.escalation.rate, 0);
+});
+
 test('tokenStats: overall, per-model, per-lane with estimated/reported split', () => {
   const events = [
     ev({ model: 'gpt-5.5', laneId: 'codex-cli', tokens_in: 100, tokens_out: 50, tokens_estimated: false }),

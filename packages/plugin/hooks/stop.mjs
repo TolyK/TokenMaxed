@@ -7767,6 +7767,7 @@ var TASK_STATUSES = ["ok", "failed", "blocked", "fallback"];
 var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
 var VOTERS = ["reviewer_model", "user"];
 var SUBJECT_TYPES = ["router_task", "host_turn"];
+var OUTCOME_ACTIONS = ["accept", "rework", "escalate", "give_back"];
 var EVENT_FIELDS = [
   "event_type",
   "schema_version",
@@ -7813,7 +7814,9 @@ var OUTCOME_EVENT_FIELDS = [
   "reviewer_provenance",
   "verdict",
   "voter",
-  "policy_verdict"
+  "policy_verdict",
+  "action_taken",
+  "target_lane_id"
 ];
 var LedgerError = class extends Error {
   constructor(message) {
@@ -7915,6 +7918,11 @@ function validateOutcomeInput(input) {
   if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
   const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
   if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
+  if (input.action_taken !== void 0) {
+    out.action_taken = requireEnum2(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
+  }
+  const target_lane_id = optionalString(input.target_lane_id, "outcome.target_lane_id");
+  if (target_lane_id !== void 0) out.target_lane_id = target_lane_id;
   return out;
 }
 function serializeFields(event, fields) {

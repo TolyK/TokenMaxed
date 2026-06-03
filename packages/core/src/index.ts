@@ -48,6 +48,8 @@ export type {
   TokenStats,
   OutcomeGroup,
   OutcomeStats,
+  OutcomeAction,
+  EscalationStats,
 } from './ledger.ts';
 export { evaluate, laneAllowedByVerdict, parsePolicyConfig, PolicyConfigError } from './policy.ts';
 export type { PolicyDecision } from './policy.ts';

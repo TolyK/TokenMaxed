@@ -143,6 +143,7 @@ test('formatOutcomes renders verdict tallies + success rate per lane', () => {
       'worker-a': { pass: 1, needs_rework: 1, fail: 1, total: 3, success_rate: 0.5 },
       '(host)': { pass: 1, needs_rework: 0, fail: 0, total: 1, success_rate: 1 },
     },
+    escalation: { offloadsReviewed: 0, escalated: 0, rate: 0 },
   };
   const out = formatOutcomes({ outcomes, periodLabel: 'all time' });
   assert.match(out, /outcomes \(all time\)/);
@@ -153,7 +154,11 @@ test('formatOutcomes renders verdict tallies + success rate per lane', () => {
 });
 
 test('formatOutcomes handles no reviews', () => {
-  const empty: OutcomeStats = { total: { pass: 0, needs_rework: 0, fail: 0, total: 0, success_rate: 0 }, byLane: {} };
+  const empty: OutcomeStats = {
+    total: { pass: 0, needs_rework: 0, fail: 0, total: 0, success_rate: 0 },
+    byLane: {},
+    escalation: { offloadsReviewed: 0, escalated: 0, rate: 0 },
+  };
   assert.match(formatOutcomes({ outcomes: empty, periodLabel: 'all time' }), /No reviews recorded yet/);
 });
 

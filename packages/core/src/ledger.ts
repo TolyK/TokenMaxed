@@ -35,6 +35,14 @@ const VOTERS: readonly Voter[] = ['reviewer_model', 'user'];
 export type SubjectType = 'router_task' | 'host_turn';
 const SUBJECT_TYPES: readonly SubjectType[] = ['router_task', 'host_turn'];
 
+/**
+ * The escalation action a review caused (C-13). Mirrors `EscalationAction` in
+ * reassign.ts (kept as a local list to avoid a runtime import cycle). Content-free
+ * routing metadata — never any task content.
+ */
+export type OutcomeAction = 'accept' | 'rework' | 'escalate' | 'give_back';
+const OUTCOME_ACTIONS: readonly OutcomeAction[] = ['accept', 'rework', 'escalate', 'give_back'];
+
 /** Identity/ordering the ledger assigns to every event. */
 interface EventMeta {
   event_type: 'task' | 'outcome';
@@ -88,6 +96,10 @@ export interface OutcomeEventInput {
   verdict: ReviewVerdict;
   voter: Voter;
   policy_verdict: PolicyVerdict;
+  /** C-13: the escalation action this review caused (content-free; optional). */
+  action_taken?: OutcomeAction;
+  /** C-13: lane id escalated TO, when `action_taken` is `escalate` (optional). */
+  target_lane_id?: string;
 }
 
 export interface TaskEvent extends TaskEventInput, EventMeta {
@@ -114,7 +126,7 @@ export const OUTCOME_EVENT_FIELDS = [
   'subject_id', 'subject_type', 'task_id', 'turn_id', 'review_id', 'attempt', 'category',
   'subject_lane_id', 'subject_provenance',
   'reviewer_lane_id', 'reviewer_model', 'reviewer_trust_mode', 'reviewer_provenance',
-  'verdict', 'voter', 'policy_verdict',
+  'verdict', 'voter', 'policy_verdict', 'action_taken', 'target_lane_id',
 ] as const satisfies readonly (keyof OutcomeEvent)[];
 
 /** Raised for a malformed ledger line or an invalid event input. */
@@ -235,6 +247,12 @@ export function validateOutcomeInput(input: OutcomeEventInput): OutcomeEventInpu
   if (subject_lane_id !== undefined) out.subject_lane_id = subject_lane_id;
   const subject_provenance = optionalString(input.subject_provenance, 'outcome.subject_provenance');
   if (subject_provenance !== undefined) out.subject_provenance = subject_provenance;
+  // C-13 escalation telemetry (optional, content-free).
+  if (input.action_taken !== undefined) {
+    out.action_taken = requireEnum(input.action_taken, OUTCOME_ACTIONS, 'outcome.action_taken');
+  }
+  const target_lane_id = optionalString(input.target_lane_id, 'outcome.target_lane_id');
+  if (target_lane_id !== undefined) out.target_lane_id = target_lane_id;
   return out;
 }
 
@@ -447,10 +465,21 @@ export interface OutcomeGroup {
   success_rate: number;
 }
 
-/** Outcome stats overall and per reviewed lane. */
+/** Per-offload escalation stats (C-13), measured per distinct router-task `task_id`. */
+export interface EscalationStats {
+  /** Distinct offloads that got at least one router-task review. */
+  offloadsReviewed: number;
+  /** Of those, how many escalated at least once. */
+  escalated: number;
+  /** escalated / offloadsReviewed — 0 when none reviewed. */
+  rate: number;
+}
+
+/** Outcome stats overall and per reviewed lane, plus per-offload escalation. */
 export interface OutcomeStats {
   total: OutcomeGroup;
   byLane: Record<string, OutcomeGroup>;
+  escalation: EscalationStats;
 }
 
 /** Bucket keys when a review has no subject lane: host-turn vs an unattributed router task. */
@@ -477,6 +506,11 @@ function tallyVerdict(g: OutcomeGroup, verdict: ReviewVerdict): void {
 export function outcomeStats(events: readonly LedgerEvent[]): OutcomeStats {
   const total = emptyOutcomeGroup();
   const byLane: Record<string, OutcomeGroup> = Object.create(null);
+  // Per-offload escalation rate: distinct router-task offloads (by task_id) that
+  // got any review vs. those that escalated at least once. Host-turn reviews never
+  // dilute it.
+  const reviewedOffloads = new Set<string>();
+  const escalatedOffloads = new Set<string>();
   for (const e of events) {
     if (e.event_type !== 'outcome') continue;
     tallyVerdict(total, e.verdict);
@@ -485,6 +519,15 @@ export function outcomeStats(events: readonly LedgerEvent[]): OutcomeStats {
     const key = e.subject_lane_id ?? (e.subject_type === 'host_turn' ? HOST_SUBJECT : UNATTRIBUTED_SUBJECT);
     if (!byLane[key]) byLane[key] = emptyOutcomeGroup();
     tallyVerdict(byLane[key]!, e.verdict);
+    if (e.subject_type === 'router_task' && e.task_id) {
+      reviewedOffloads.add(e.task_id);
+      if (e.action_taken === 'escalate') escalatedOffloads.add(e.task_id);
+    }
   }
-  return { total, byLane };
+  const escalation: EscalationStats = {
+    offloadsReviewed: reviewedOffloads.size,
+    escalated: escalatedOffloads.size,
+    rate: reviewedOffloads.size === 0 ? 0 : escalatedOffloads.size / reviewedOffloads.size,
+  };
+  return { total, byLane, escalation };
 }
