@@ -23156,6 +23156,58 @@ function routeDecide(task, ctx, policy) {
   };
 }
 
+// ../core/src/feedback.ts
+var MS_PER_DAY = 864e5;
+var SEP = "\0";
+var DEFAULT_HALF_LIFE_DAYS = 30;
+function verdictValue(verdict) {
+  if (verdict === "pass") return 1;
+  if (verdict === "needs-rework") return 0.5;
+  return 0;
+}
+function isLearnableOutcome(e) {
+  return e.event_type === "outcome" && e.subject_type === "router_task" && e.voter === "reviewer_model" && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
+}
+function dedupKey(e) {
+  return [e.task_id, e.attempt, e.subject_lane_id, e.category].join(SEP);
+}
+function outcomeCapability(events, now, opts = {}) {
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const latest = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (!isLearnableOutcome(e)) continue;
+    if (!Number.isFinite(Date.parse(e.ts))) continue;
+    const key = dedupKey(e);
+    const prev = latest.get(key);
+    if (!prev || e.seq > prev.seq) latest.set(key, e);
+  }
+  const acc = /* @__PURE__ */ new Map();
+  for (const e of latest.values()) {
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+    const laneId = e.subject_lane_id;
+    const accKey = [laneId, e.category].join(SEP);
+    let a = acc.get(accKey);
+    if (!a) {
+      a = { laneId, category: e.category, weightSum: 0, weightedValueSum: 0 };
+      acc.set(accKey, a);
+    }
+    a.weightSum += weight;
+    a.weightedValueSum += weight * verdictValue(e.verdict);
+  }
+  const overlay = /* @__PURE__ */ Object.create(null);
+  for (const a of acc.values()) {
+    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
+    const observed = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
+    const inner = overlay[a.laneId] ?? (overlay[a.laneId] = /* @__PURE__ */ Object.create(null));
+    inner[a.category] = observed;
+  }
+  return overlay;
+}
+
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist2(), 1);
 var LANE_KINDS = ["cli", "api", "local"];
@@ -24598,7 +24650,9 @@ async function runSetup(env) {
     gateReady,
     reviewOnStop: env.TOKENMAXED_REVIEW_ON_STOP === "true",
     // Mirror makeServerDeps: the global kill-switch disables escalation.
-    escalate: env.TOKENMAXED_ESCALATE === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true")
+    escalate: env.TOKENMAXED_ESCALATE === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
+    // F-1 learned capability; also disabled by the global kill-switch.
+    learnCapability: env.TOKENMAXED_LEARN_CAPABILITY === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true")
   };
 }
 
@@ -24773,7 +24827,13 @@ function createTools(core) {
       };
       const lanes = deps.candidateLanes(category);
       const policy = deps.loadPolicy();
-      const ctx = { lanes, gateReady, policyContext };
+      const observedCapability = deps.observedCapability();
+      const ctx = {
+        lanes,
+        gateReady,
+        policyContext,
+        ...observedCapability ? { observedCapability } : {}
+      };
       let decision;
       try {
         decision = core.routeDecide({ category }, ctx, policy);
@@ -24902,6 +24962,7 @@ ${r.notes}` : "";
         `  worker gate: ${r.gateReady ? "open" : "closed"} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? "" : " \u2014 install gitleaks first"})`,
         `  review-on-stop: ${r.reviewOnStop ? "on" : "off"} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
         `  quality escalation: ${r.escalate ? "on" : "off"} (enable with TOKENMAXED_ESCALATE=true \u2014 offloads a failed cheap result up to a stronger lane)`,
+        `  learned capability: ${r.learnCapability ? "on" : "off"} (enable with TOKENMAXED_LEARN_CAPABILITY=true \u2014 review outcomes adjust routing over time)`,
         "",
         `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
       ];
@@ -25050,6 +25111,15 @@ function makeServerDeps(env = process.env) {
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
   const escalateEnabled = env.TOKENMAXED_ESCALATE === "true" && !globallyDisabled;
+  const learnEnabled = env.TOKENMAXED_LEARN_CAPABILITY === "true" && !globallyDisabled;
+  const buildObserved = () => {
+    if (!learnEnabled) return void 0;
+    try {
+      return outcomeCapability(new JsonlLedger(ledgerPath).readAll(), Date.now());
+    } catch {
+      return void 0;
+    }
+  };
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
   const resolveAuth = makeResolveAuth(env);
@@ -25077,7 +25147,13 @@ function makeServerDeps(env = process.env) {
     const priceTable = loadPriceTable(pricesPath);
     const ledger = new JsonlLedger(ledgerPath);
     const lanes = registry2.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
-    const ctx = { lanes, gateReady, policyContext: request.policyContext ?? {} };
+    const observedCapability = buildObserved();
+    const ctx = {
+      lanes,
+      gateReady,
+      policyContext: request.policyContext ?? {},
+      ...observedCapability ? { observedCapability } : {}
+    };
     const runDeps = {
       executeTrusted: makeTrustedExecutor({
         cli: makeCliExecutor(makeCliSpawn()),
@@ -25140,6 +25216,9 @@ function makeServerDeps(env = process.env) {
       const c = usableCandidates(category);
       return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
     },
+    // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
+    // /tokenmaxed:why reflects the effective capability, not the stale prior.
+    observedCapability: buildObserved,
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.

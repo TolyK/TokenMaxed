@@ -16,6 +16,7 @@ import type {
   LedgerEvent,
   LedgerSummary,
   Lane,
+  ObservedCapabilityByLane,
   Policy,
   PolicyContext,
   PolicyDecision,
@@ -68,6 +69,14 @@ export interface ToolDeps {
    * opted-out lane win, so preview must use this, matching the real run path.
    */
   candidateLanes: (category: TaskCategory) => Lane[];
+  /**
+   * The learned capability overlay (F-1), or `undefined` when learning is off
+   * (TOKENMAXED_LEARN_CAPABILITY) — in which case routing uses declared scores
+   * exactly as before. Built server-side from the ledger + clock so router_preview
+   * and router_delegate apply the SAME overlay (no divergence between /why and the
+   * real run path).
+   */
+  observedCapability: () => ObservedCapabilityByLane | undefined;
   /** The active routing policy (from policy.yaml via core/node). */
   loadPolicy: () => Policy;
   /**
@@ -107,6 +116,8 @@ export interface SetupReport {
   reviewOnStop: boolean;
   /** C-13: whether quality escalation is enabled (TOKENMAXED_ESCALATE). */
   escalate: boolean;
+  /** F-1: whether learned capability feedback is enabled (TOKENMAXED_LEARN_CAPABILITY). */
+  learnCapability: boolean;
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -379,7 +390,15 @@ export function createTools(core: CorePort): ToolDef[] {
         // matching the documented run path — never the full lane set.
         const lanes = deps.candidateLanes(category);
         const policy = deps.loadPolicy();
-        const ctx: RouteContext = { lanes, gateReady, policyContext };
+        // Apply the learned overlay (F-1) so /tokenmaxed:why reflects the same
+        // effective capability router_delegate routes with. Undefined ⇒ declared.
+        const observedCapability = deps.observedCapability();
+        const ctx: RouteContext = {
+          lanes,
+          gateReady,
+          policyContext,
+          ...(observedCapability ? { observedCapability } : {}),
+        };
 
         let decision: RouteDecision;
         try {
@@ -529,6 +548,7 @@ export function createTools(core: CorePort): ToolDef[] {
           `  worker gate: ${r.gateReady ? 'open' : 'closed'} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? '' : ' — install gitleaks first'})`,
           `  review-on-stop: ${r.reviewOnStop ? 'on' : 'off'} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
           `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
+          `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
         ];

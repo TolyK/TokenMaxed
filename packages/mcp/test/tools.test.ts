@@ -73,6 +73,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
   return {
     readLedger: () => [],
     candidateLanes: () => [lane({ id: 'claude-native', native: true })],
+    observedCapability: () => undefined,
     loadPolicy: (): Policy => ({}),
     gateReady: true,
     getEnabled: () => true,
@@ -89,6 +90,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       gateReady: false,
       reviewOnStop: false,
       escalate: false,
+      learnCapability: false,
     }),
     now: () => FIXED_NOW,
     ...over,
@@ -393,12 +395,14 @@ test('setup reports the manager + open gate when present', async () => {
         gateReady: true,
         reviewOnStop: true,
         escalate: true,
+        learnCapability: true,
       }),
     }),
   );
   assert.match(r.content[0]!.text, /manager: claude-haiku/);
   assert.match(r.content[0]!.text, /worker gate: open/);
   assert.match(r.content[0]!.text, /quality escalation: on/);
+  assert.match(r.content[0]!.text, /learned capability: on/);
   assert.match(r.content[0]!.text, /already present/);
 });
 
@@ -411,6 +415,21 @@ test('preview routes a category to a lane without executing', async () => {
   assert.equal(r.structuredContent!.native as boolean, false);
   assert.match(r.content[0]!.text, /category "bugfix" → lane "claude-native"/);
   assert.match(r.content[0]!.text, /policy verdict:/);
+});
+
+test('preview applies the learned overlay (F-1); flag-off is identical to declared', async () => {
+  const strong = lane({ id: 'strong', costBasis: 'subscription', capability: { bugfix: 0.85 } });
+  const cheap = lane({ id: 'cheap', costBasis: 'local', capability: { bugfix: 0.6 } });
+  const lanes = [strong, cheap];
+  // Flag off (overlay undefined) ⇒ declared scores ⇒ the stronger lane wins.
+  const off = await call('router_preview', deps({ candidateLanes: () => lanes, observedCapability: () => undefined }), { category: 'bugfix' });
+  assert.equal((off.structuredContent!.decision as { laneId: string }).laneId, 'strong');
+  assert.doesNotMatch(off.content[0]!.text, /learned/);
+  // Overlay with strong evidence lifts the cheap lane ⇒ it wins, and /why says so.
+  const overlay = { cheap: { bugfix: { rate: 1.0, n: 100_000 } } };
+  const on = await call('router_preview', deps({ candidateLanes: () => lanes, observedCapability: () => overlay }), { category: 'bugfix' });
+  assert.equal((on.structuredContent!.decision as { laneId: string }).laneId, 'cheap');
+  assert.match(on.content[0]!.text, /learned/);
 });
 
 test('preview defaults gate_ready to the server posture (matches what delegate would do)', async () => {

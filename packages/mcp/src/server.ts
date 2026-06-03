@@ -35,8 +35,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, evaluate, filterEventsSince, isManagerEligible, priceForModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, evaluate, filterEventsSince, isManagerEligible, outcomeCapability, priceForModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeUntrusted,
@@ -152,6 +152,25 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // C-13 quality escalation — OPT-IN, off by default (adds manager-review + re-run
   // cost). Never active under the global kill-switch. See escToOutcome / E-5.
   const escalateEnabled = env.TOKENMAXED_ESCALATE === 'true' && !globallyDisabled;
+  // F-1 learned capability — OPT-IN, off by default. When on, observed manager-
+  // review outcomes adjust the EFFECTIVE capability routing scores by. Never active
+  // under the kill-switch. Off ⇒ overlay is undefined ⇒ declared scores, unchanged.
+  const learnEnabled = env.TOKENMAXED_LEARN_CAPABILITY === 'true' && !globallyDisabled;
+  // Shared overlay builder so router_delegate and router_preview apply the SAME
+  // learned adjustment (no /why-vs-run divergence). Built from the ledger + clock
+  // the adapter owns; undefined when learning is off. Lazy per call (cheap: local
+  // JSONL, opt-in).
+  const buildObserved = (): ObservedCapabilityByLane | undefined => {
+    if (!learnEnabled) return undefined;
+    // Fail OPEN: a malformed/unreadable ledger must never block routing (mirrors
+    // the best-effort recording path). On any read/parse error, fall back to
+    // declared capability by returning undefined.
+    try {
+      return outcomeCapability(new JsonlLedger(ledgerPath).readAll(), Date.now());
+    } catch {
+      return undefined;
+    }
+  };
   // A lane is reserved from the initial offload only if it can ACTUALLY serve as
   // the auto-review manager: manager-eligible AND marginal-free (the reviewer
   // restriction in selectReviewManager). A metered manager-eligible lane can't
@@ -205,7 +224,16 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Same usable set preview sees: unpriceable metered lanes are already excluded,
     // so runTask never picks one and can't throw on cost after paying for it.
     const lanes = registry.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
-    const ctx = { lanes, gateReady, policyContext: request.policyContext ?? {} };
+    // F-1: apply the learned overlay (undefined when off ⇒ declared scores). The
+    // core selectors read ctx.observedCapability; runWithEscalation preserves it
+    // through its effective-context spread, so escalation/reassign also benefit.
+    const observedCapability = buildObserved();
+    const ctx = {
+      lanes,
+      gateReady,
+      policyContext: request.policyContext ?? {},
+      ...(observedCapability ? { observedCapability } : {}),
+    };
 
     // Execute, THEN record as a separate step: a recording failure (corrupt /
     // unwritable / unappendable ledger) must NEVER discard an already-paid-for
@@ -289,6 +317,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       const c = usableCandidates(category);
       return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
     },
+    // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
+    // /tokenmaxed:why reflects the effective capability, not the stale prior.
+    observedCapability: buildObserved,
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.

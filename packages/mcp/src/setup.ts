@@ -63,5 +63,8 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     // Mirror makeServerDeps: the global kill-switch disables escalation.
     escalate:
       env.TOKENMAXED_ESCALATE === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
+    // F-1 learned capability; also disabled by the global kill-switch.
+    learnCapability:
+      env.TOKENMAXED_LEARN_CAPABILITY === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
   };
 }
