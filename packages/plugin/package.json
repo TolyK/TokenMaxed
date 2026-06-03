@@ -1,0 +1,15 @@
+{
+  "name": "@tokenmaxed/plugin",
+  "version": "0.0.0",
+  "private": true,
+  "description": "TokenMaxed Claude Code plugin: bundles the MCP server into a self-contained single file.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@tokenmaxed/core": "0.0.0",
+    "@tokenmaxed/mcp": "0.0.0"
+  }
+}

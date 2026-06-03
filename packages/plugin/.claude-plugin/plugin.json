@@ -1,0 +1,21 @@
+{
+  "name": "tokenmaxed",
+  "displayName": "TokenMaxed",
+  "version": "0.0.0",
+  "description": "Route each coding task to the cheapest capable, policy-allowed lane — local-first, content-free.",
+  "author": { "name": "TolyK", "url": "https://github.com/TolyK" },
+  "homepage": "https://github.com/TolyK/TokenMaxed",
+  "repository": "https://github.com/TolyK/TokenMaxed",
+  "license": "MIT",
+  "keywords": ["router", "cost", "claude-code", "mcp", "tokens"],
+  "mcpServers": {
+    "tokenmaxed": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/index.mjs"],
+      "env": {
+        "TOKENMAXED_LANES": "${CLAUDE_PROJECT_DIR}/config/lanes.yaml",
+        "TOKENMAXED_POLICY": "${CLAUDE_PROJECT_DIR}/config/policy.yaml"
+      }
+    }
+  }
+}

@@ -4,6 +4,9 @@ node_modules/
 # Build output
 dist/
 *.tsbuildinfo
+# NOTE: packages/plugin/server/index.mjs is intentionally COMMITTED (it is the
+# self-contained install artifact the plugin launches); rebuild it with
+# `npm run build:plugin` whenever the MCP server or core changes.
 
 # Local runtime data (the ledger lives in the user's home dir, never in the repo)
 *.jsonl

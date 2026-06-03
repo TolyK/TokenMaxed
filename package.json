@@ -13,11 +13,13 @@
   ],
   "scripts": {
     "build": "npm run build -w @tokenmaxed/core && npm run build -w @tokenmaxed/cli && npm run build -w @tokenmaxed/mcp",
+    "build:plugin": "npm run build && npm run build -w @tokenmaxed/plugin",
     "test": "node --test \"packages/**/test/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "^0.28.0",
     "typescript": "^5.7.0"
   }
 }
