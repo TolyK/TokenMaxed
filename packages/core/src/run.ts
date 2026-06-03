@@ -19,6 +19,9 @@ import { routeDecide } from './route.ts';
 import { resolveUsage, usageFromReported } from './usage.ts';
 import type { RawUsage, ResolvedUsage } from './usage.ts';
 import type { SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
+import { isTransient, LaneFailure, shouldCooldown } from './failure.ts';
+import type { FailureKind } from './failure.ts';
+import { TRUST_RANK } from './reassign.ts';
 import type { TaskEventInput, TaskStatus } from './ledger.ts';
 import type { Lane, Policy, PolicyContext, RouteContext, RouteDecision, TaskCategory } from './types.ts';
 
@@ -26,6 +29,8 @@ import type { Lane, Policy, PolicyContext, RouteContext, RouteDecision, TaskCate
 export interface RunRequest {
   /** Logical task id; one is generated if absent (groups retries/reassignments). */
   task_id?: string;
+  /** Attempt index for this logical task (default 0); set by fallback for retries. */
+  attempt?: number;
   category: TaskCategory;
   /** The scoped instruction to perform. */
   instruction: string;
@@ -46,6 +51,8 @@ export interface UntrustedExecResultLite {
   resultText?: string;
   reported?: RawUsage;
   error?: string;
+  /** Normalized failure category (drives trust-preserving fallback). */
+  failureKind?: FailureKind;
 }
 
 /** Injected dependencies (all I/O). */
@@ -69,6 +76,8 @@ export interface RunResult {
   resultText?: string;
   /** true ⇒ degraded/assigned to native: the host should perform the task itself. */
   native?: boolean;
+  /** Normalized failure category when status is failed/blocked (drives fallback). */
+  failureKind?: FailureKind;
   /** Content-free task events to append to the ledger (attempt records). */
   events: TaskEventInput[];
 }
@@ -113,7 +122,7 @@ export async function runTask(
     });
     return {
       task_id,
-      attempt: 0,
+      attempt: request.attempt ?? 0,
       category: request.category,
       laneId: lane.id,
       model: lane.model,
@@ -142,8 +151,11 @@ export async function runTask(
         resultText: r.resultText,
       });
       return { decision, laneId: lane.id, status: 'ok', resultText: r.resultText, events: [event('ok', usage)] };
-    } catch {
-      return { decision, laneId: lane.id, status: 'failed', native: true, events: [event('failed', ZERO_USAGE)] };
+    } catch (err) {
+      // Preserve a typed lane failure (e.g. 402/429/401) so fallback can cool down
+      // or stop; otherwise treat an unknown throw as a transient provider error.
+      const failureKind: FailureKind = err instanceof LaneFailure ? err.failureKind : 'provider_error';
+      return { decision, laneId: lane.id, status: 'failed', native: true, failureKind, events: [event('failed', ZERO_USAGE)] };
     }
   }
 
@@ -160,7 +172,8 @@ export async function runTask(
   );
   if (!min.ok) {
     // Could not safely minimize ⇒ degrade to native; record a blocked attempt.
-    return { decision, laneId: lane.id, status: 'blocked', native: true, events: [event('blocked', ZERO_USAGE)] };
+    // policy_blocked is permanent (not a health issue), so it won't trigger fallback.
+    return { decision, laneId: lane.id, status: 'blocked', native: true, failureKind: 'policy_blocked', events: [event('blocked', ZERO_USAGE)] };
   }
 
   try {
@@ -171,11 +184,99 @@ export async function runTask(
       // Preserve any spend the lane reported before failing (even partial), rather
       // than estimating — so failed metered attempts are never under-reported.
       const usage = r.reported ? usageFromReported(r.reported) : ZERO_USAGE;
-      return { decision, laneId: lane.id, status: 'failed', native: true, events: [event('failed', usage)] };
+      return {
+        decision,
+        laneId: lane.id,
+        status: 'failed',
+        native: true,
+        failureKind: r.failureKind ?? 'provider_error',
+        events: [event('failed', usage)],
+      };
     }
     const usage = resolveUsage({ reported: r.reported, promptText, resultText: r.resultText });
     return { decision, laneId: lane.id, status: 'ok', resultText: r.resultText, events: [event('ok', usage)] };
   } catch {
-    return { decision, laneId: lane.id, status: 'failed', native: true, events: [event('failed', ZERO_USAGE)] };
+    return { decision, laneId: lane.id, status: 'failed', native: true, failureKind: 'provider_error', events: [event('failed', ZERO_USAGE)] };
   }
+}
+
+/** Options for {@link runWithFallback}. */
+export interface FallbackOptions {
+  /** Max fallback hops after the first attempt (loop-guard; default 2). */
+  maxFallbacks?: number;
+  /** Lanes currently on cooldown (excluded from the start) — e.g. recent quota/rate hits. */
+  cooldownLaneIds?: ReadonlySet<string>;
+}
+
+/** Result of {@link runWithFallback}: the final run plus aggregated events + cooldown adds. */
+export interface FallbackResult extends RunResult {
+  /** Total attempts made (1 + fallbacks). */
+  attempts: number;
+  /** Lanes that hit quota/rate this run and should be put on cooldown by the caller. */
+  cooldownAdds: string[];
+}
+
+/**
+ * Run a task with **trust-preserving** lane→lane fallback. On a TRANSIENT failure
+ * (timeout / rate-limit / out-of-credits / provider 5xx), retry on a different
+ * lane — but NEVER below the failed lane's trust tier (a trusted lane being out
+ * of credits never falls back to a cheaper/less-trusted model). When no eligible
+ * lane remains, or the failure is permanent (auth/bad-request/policy), it stops
+ * and degrades to native. Loop-guarded; quota/rate failures suggest a cooldown.
+ *
+ * Pure: composes {@link runTask}; the caller persists cooldowns and appends events.
+ */
+export async function runWithFallback(
+  request: RunRequest,
+  ctx: RouteContext,
+  policy: Policy,
+  deps: RunDeps,
+  opts: FallbackOptions = {},
+): Promise<FallbackResult> {
+  const maxFallbacks = opts.maxFallbacks ?? 2;
+  const excluded = new Set<string>(opts.cooldownLaneIds ?? []);
+  const cooldownAdds: string[] = [];
+  const allEvents: TaskEventInput[] = [];
+  let trustFloor = 0; // never reassign below this rank (set to a failed lane's rank)
+  let last: RunResult | undefined;
+  let attempts = 0;
+  // One logical task id across all attempts, with an incrementing attempt index,
+  // so the failed + successful fallback events correlate in the ledger.
+  const task_id = request.task_id ?? deps.newId();
+
+  for (let i = 0; i <= maxFallbacks; i++) {
+    const lanes = ctx.lanes.filter(
+      (l) => !excluded.has(l.id) && TRUST_RANK[l.trust_mode] >= trustFloor,
+    );
+    const result = await runTask({ ...request, task_id, attempt: i }, { ...ctx, lanes }, policy, deps);
+
+    // A FALLBACK iteration that found no routable candidate (decision undefined —
+    // remaining lanes are gated/monitored/empty) didn't really run; keep the real
+    // prior failure rather than overwriting it with a native degrade.
+    if (i > 0 && result.decision === undefined) break;
+
+    last = result;
+    attempts += 1;
+    allEvents.push(...result.events);
+
+    // Success (executed or host-native) ⇒ done.
+    if (result.status === 'ok') break;
+
+    // Failure: only TRANSIENT failures are eligible for lane→lane fallback.
+    const kind = result.failureKind;
+    if (!kind || !isTransient(kind)) break; // permanent ⇒ no fallback
+
+    // Cool down a quota/rate-exhausted lane EVEN on the last attempt, so the
+    // caller doesn't immediately route the next task back to it.
+    if (shouldCooldown(kind)) cooldownAdds.push(result.laneId);
+    if (i >= maxFallbacks) break; // loop-guard
+
+    // Exclude the failed lane; never fall below its trust tier (trust-preserving).
+    excluded.add(result.laneId);
+    const failedRank = TRUST_RANK[ctx.lanes.find((l) => l.id === result.laneId)?.trust_mode ?? 'blocked'];
+    trustFloor = Math.max(trustFloor, failedRank);
+    // Loop: re-route over the remaining, trust-floored lanes (or degrade to native).
+  }
+
+  return { ...(last as RunResult), events: allEvents, attempts, cooldownAdds };
 }

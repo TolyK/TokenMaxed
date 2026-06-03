@@ -56,17 +56,19 @@ export { buildUntrustedRequestBody, isExecutorCertified } from './boundary.ts';
 export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody } from './boundary.ts';
 export { canReassign, reassignmentTarget, shouldReassign, TRUST_RANK } from './reassign.ts';
 export type { ReassignOptions } from './reassign.ts';
-export { FAILURE_KINDS, isTransient, shouldCooldown, classifyHttpStatus } from './failure.ts';
+export { FAILURE_KINDS, isTransient, shouldCooldown, classifyHttpStatus, LaneFailure } from './failure.ts';
 export type { FailureKind } from './failure.ts';
 export { review, ReviewError } from './review.ts';
 export type { ReviewRequest, ReviewResult, ReviewDeps, ManagerReviewOutput } from './review.ts';
-export { runTask } from './run.ts';
+export { runTask, runWithFallback } from './run.ts';
 export type {
   RunRequest,
   RunResult,
   RunDeps,
   TrustedExecResult,
   UntrustedExecResultLite,
+  FallbackOptions,
+  FallbackResult,
 } from './run.ts';
 export type {
   MinimizedAttachment,

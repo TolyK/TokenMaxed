@@ -55,6 +55,20 @@ export function shouldCooldown(kind: FailureKind): boolean {
   return kind === 'rate_limited' || kind === 'quota_exhausted';
 }
 
+/**
+ * An execution failure that carries its normalized {@link FailureKind}. Executors
+ * throw this so callers (runTask) can preserve the category (e.g. quota/auth)
+ * instead of flattening everything to a transient provider error.
+ */
+export class LaneFailure extends Error {
+  readonly failureKind: FailureKind;
+  constructor(failureKind: FailureKind, message?: string) {
+    super(message ?? failureKind);
+    this.name = 'LaneFailure';
+    this.failureKind = failureKind;
+  }
+}
+
 /** Map an HTTP status to a {@link FailureKind} (the common provider signals). */
 export function classifyHttpStatus(status: number): FailureKind {
   if (status === 408 || status === 504) return 'timeout';

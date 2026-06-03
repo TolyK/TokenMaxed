@@ -25,6 +25,8 @@ import type { RawUsage } from './usage.ts';
 import { runTask } from './run.ts';
 import type { RunDeps, RunRequest, RunResult, TrustedExecResult } from './run.ts';
 import type { Lane, Policy, RouteContext } from './types.ts';
+import { classifyHttpStatus, LaneFailure } from './failure.ts';
+import type { FailureKind } from './failure.ts';
 import {
   LedgerError,
   SCHEMA_VERSION,
@@ -160,6 +162,7 @@ export interface UntrustedExecResult {
   resultText?: string;
   reported?: RawUsage;
   error?: string;
+  failureKind?: FailureKind;
 }
 
 function extractText(data: unknown): string {
@@ -193,26 +196,31 @@ export async function executeUntrusted(
   const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as FetchLike | undefined);
   if (!doFetch) return { ok: false, error: 'no fetch implementation available' };
 
-  try {
-    // Auth resolution + body build are part of the egress path: any failure here
-    // (e.g. a missing/locked keychain entry) must also fail content-free.
-    const headers: Record<string, string> = { 'content-type': 'application/json' };
-    if (env.lane.authHandle) {
-      // A non-empty authHandle means auth is required: fail closed (before sending)
-      // if it cannot be resolved to a token.
-      const token = deps.resolveAuth ? deps.resolveAuth(env.lane.authHandle) : '';
-      if (!token) return { ok: false, error: 'auth resolution failed for untrusted lane' };
-      headers.authorization = `Bearer ${token}`;
+  // Resolve auth FIRST and classify its failure as auth_failed (permanent) — a
+  // missing/locked keychain entry must not be retried as a transient provider error.
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (env.lane.authHandle) {
+    let token = '';
+    try {
+      token = deps.resolveAuth ? deps.resolveAuth(env.lane.authHandle) : '';
+    } catch {
+      return { ok: false, error: 'auth resolution failed for untrusted lane', failureKind: 'auth_failed' };
     }
-    const body = JSON.stringify(buildUntrustedRequestBody(env));
+    if (!token) return { ok: false, error: 'auth resolution failed for untrusted lane', failureKind: 'auth_failed' };
+    headers.authorization = `Bearer ${token}`;
+  }
 
+  try {
+    const body = JSON.stringify(buildUntrustedRequestBody(env));
     const res = await doFetch(env.lane.endpoint, { method: 'POST', headers, body });
-    if (!res.ok) return { ok: false, error: `untrusted lane returned status ${res.status}` };
+    if (!res.ok) {
+      return { ok: false, error: `untrusted lane returned status ${res.status}`, failureKind: classifyHttpStatus(res.status) };
+    }
     const data = await res.json();
     return { ok: true, resultText: extractText(data), reported: extractUsage(data) };
   } catch {
     // Content-free: never surface payload/repo text (or a resolver's raw error).
-    return { ok: false, error: 'untrusted lane request failed' };
+    return { ok: false, error: 'untrusted lane request failed', failureKind: 'provider_error' };
   }
 }
 
@@ -350,8 +358,8 @@ export function makeCliExecutor(spawnImpl?: SpawnLike): TrustedExecFn {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
     const res = spawn(lane.command, lane.args ?? [], { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    if (res.error) throw new Error(`cli lane "${lane.id}" failed to spawn`);
-    if (res.status !== 0) throw new Error(`cli lane "${lane.id}" exited with status ${res.status}`);
+    if (res.error) throw new LaneFailure('provider_error', `cli lane "${lane.id}" failed to spawn`);
+    if (res.status !== 0) throw new LaneFailure('provider_error', `cli lane "${lane.id}" exited with status ${res.status}`);
     return { resultText: res.stdout ?? '' }; // CLIs rarely report tokens ⇒ estimated downstream
   };
 }
@@ -368,7 +376,7 @@ export function makeOllamaExecutor(fetchImpl?: OllamaFetch): TrustedExecFn {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false }),
     });
-    if (!res.ok) throw new Error(`ollama lane "${lane.id}" returned status ${res.status}`);
+    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `ollama lane "${lane.id}" returned status ${res.status}`);
     const data = (await res.json()) as { response?: unknown; prompt_eval_count?: unknown; eval_count?: unknown };
     return {
       resultText: typeof data.response === 'string' ? data.response : '',
@@ -388,12 +396,17 @@ export function makeTrustedApiExecutor(
 ): TrustedExecFn {
   const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as FetchLike | undefined);
   return async (lane, instruction, attachments) => {
-    if (!lane.endpoint) throw new Error(`api lane "${lane.id}" has no endpoint configured`);
-    if (!doFetch) throw new Error('no fetch implementation available');
+    if (!lane.endpoint) throw new LaneFailure('bad_request', `api lane "${lane.id}" has no endpoint configured`);
+    if (!doFetch) throw new LaneFailure('provider_error', 'no fetch implementation available');
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (lane.authHandle) {
-      const token = deps.resolveAuth ? deps.resolveAuth(lane.authHandle) : '';
-      if (!token) throw new Error(`auth resolution failed for api lane "${lane.id}"`);
+      let token = '';
+      try {
+        token = deps.resolveAuth ? deps.resolveAuth(lane.authHandle) : '';
+      } catch {
+        throw new LaneFailure('auth_failed', `auth resolution failed for api lane "${lane.id}"`);
+      }
+      if (!token) throw new LaneFailure('auth_failed', `auth resolution failed for api lane "${lane.id}"`);
       headers.authorization = `Bearer ${token}`;
     }
     const body = JSON.stringify({
@@ -401,7 +414,7 @@ export function makeTrustedApiExecutor(
       messages: [{ role: 'user', content: combinedPrompt(instruction, attachments) }],
     });
     const res = await doFetch(lane.endpoint, { method: 'POST', headers, body });
-    if (!res.ok) throw new Error(`api lane "${lane.id}" returned status ${res.status}`);
+    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `api lane "${lane.id}" returned status ${res.status}`);
     const data = (await res.json()) as { choices?: { message?: { content?: unknown } }[]; usage?: Record<string, unknown> };
     const content = data.choices?.[0]?.message?.content;
     return {

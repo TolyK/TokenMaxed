@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { runTask } from '../src/run.ts';
+import { runTask, runWithFallback } from '../src/run.ts';
 import type { RunDeps } from '../src/run.ts';
+import { LaneFailure } from '../src/failure.ts';
 import type { PriceTable } from '../src/price.ts';
 import type { SecretScanner } from '../src/minimize.ts';
 import type { Lane, Policy, RouteContext } from '../src/types.ts';
@@ -159,4 +160,118 @@ test('usage estimation includes attachment content when usage is unreported', as
     deps({ executeTrusted: async () => ({ resultText: '' }) }),
   );
   assert.ok((withAttach.events[0]?.tokens_in ?? 0) > (noAttach.events[0]?.tokens_in ?? 0));
+});
+
+// ---- C-12: trust-preserving fallback ------------------------------------
+
+const fullA: Lane = {
+  id: 'full-a', kind: 'cli', model: 'gpt-5.5', trust_mode: 'full',
+  costBasis: 'subscription', provenance: 'openai', jurisdiction: 'US', command: 'a', capability: { bugfix: 0.9 },
+};
+const fullB: Lane = {
+  id: 'full-b', kind: 'cli', model: 'claude-opus-4-7', trust_mode: 'full',
+  costBasis: 'subscription', provenance: 'anthropic', jurisdiction: 'US', command: 'b', capability: { bugfix: 0.85 },
+};
+
+test('fallback: a transient failure on one lane retries on another (trusted) lane', async () => {
+  // full-a (higher capability) is chosen first, fails transiently; falls back to full-b.
+  const d = deps({
+    executeTrusted: async (lane) => {
+      if (lane.id === 'full-a') throw new Error('boom'); // provider_error (transient)
+      return { resultText: 'b did it' };
+    },
+  });
+  const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, { lanes: [fullA, fullB] }, noPolicy, d);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.laneId, 'full-b');
+  assert.equal(r.attempts, 2);
+  // Both the failed attempt and the successful one are recorded.
+  assert.equal(r.events.length, 2);
+  assert.equal(r.events[0]?.status, 'failed');
+  assert.equal(r.events[1]?.status, 'ok');
+  // Both events correlate: one task_id, incrementing attempt index.
+  assert.equal(r.events[0]?.task_id, r.events[1]?.task_id);
+  assert.equal(r.events[0]?.attempt, 0);
+  assert.equal(r.events[1]?.attempt, 1);
+});
+
+test('fallback is trust-preserving: a failed full lane never falls to a worker', async () => {
+  // full-a fails transiently; a capable worker exists, but fallback must NOT drop to it.
+  const workerLane: Lane = { ...worker, id: 'cheap-worker', capability: { bugfix: 1 } };
+  const d = deps({
+    executeTrusted: async () => {
+      throw new Error('boom'); // full lane fails
+    },
+    executeUntrusted: async () => ({ ok: true, resultText: 'worker' }),
+  });
+  const ctx: RouteContext = {
+    lanes: [fullA, workerLane],
+    gateReady: true,
+    policyContext: { repo_class: 'public', sensitivity: 'normal' },
+  };
+  const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, ctx, noPolicy, d);
+  // No other full lane ⇒ degrade to native; never the worker.
+  assert.notEqual(r.laneId, 'cheap-worker');
+  assert.equal(r.native, true);
+});
+
+test('a permanent failure does not trigger fallback', async () => {
+  // Worker minimize blocks (policy_blocked = permanent) ⇒ no retry on other lanes.
+  const d = deps({ scanSecrets: unavailableScan });
+  const ctx: RouteContext = { lanes: [worker], gateReady: true, policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+  const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, ctx, noPolicy, d);
+  assert.equal(r.attempts, 1); // no fallback attempt
+  assert.equal(r.native, true);
+});
+
+test('a trusted lane throwing a typed LaneFailure preserves its kind (e.g. quota ⇒ cooldown)', async () => {
+  // A full API lane out of credits: executor throws LaneFailure('quota_exhausted').
+  const d = deps({
+    executeTrusted: async () => {
+      throw new LaneFailure('quota_exhausted', 'out of credits');
+    },
+  });
+  const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, { lanes: [fullA] }, noPolicy, d);
+  assert.equal(r.failureKind, 'quota_exhausted'); // not flattened to provider_error
+  assert.ok(r.cooldownAdds.includes('full-a')); // quota ⇒ cooled down
+});
+
+test('a trusted lane throwing an auth LaneFailure is permanent (no fallback)', async () => {
+  const d = deps({
+    executeTrusted: async () => {
+      throw new LaneFailure('auth_failed', 'bad key');
+    },
+  });
+  const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, { lanes: [fullA, fullB] }, noPolicy, d);
+  assert.equal(r.attempts, 1); // auth is permanent ⇒ no fallback to full-b
+  assert.equal(r.native, true);
+});
+
+test('fallback preserves the real failure when remaining lanes are not routable', async () => {
+  // Worker hits quota; the only other lane is monitored (passes the trust floor
+  // but is never selectable) ⇒ keep the worker failure, do not overwrite with native.
+  const w: Lane = { ...worker, id: 'w', capability: { bugfix: 0.9 } };
+  const mon: Lane = { ...worker, id: 'mon', trust_mode: 'monitored', capability: { bugfix: 1 } };
+  const d = deps({ executeUntrusted: async () => ({ ok: false, failureKind: 'quota_exhausted', error: 'out' }) });
+  const ctx: RouteContext = { lanes: [w, mon], gateReady: true, policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+  const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, ctx, noPolicy, d);
+  assert.equal(r.failureKind, 'quota_exhausted'); // real failure preserved, not native-ok
+  assert.equal(r.laneId, 'w');
+  assert.equal(r.attempts, 1);
+  assert.ok(r.cooldownAdds.includes('w'));
+});
+
+test('fallback honors the loop-guard and reports cooldowns for quota/rate', async () => {
+  // Both full lanes return quota_exhausted (transient + cooldown); guard caps attempts.
+  const d = deps({
+    executeTrusted: async () => ({ resultText: '' }), // unused (workers below)
+    executeUntrusted: async () => ({ ok: false, failureKind: 'quota_exhausted', error: 'out of credits' }),
+  });
+  const w1: Lane = { ...worker, id: 'w1', capability: { bugfix: 0.9 } };
+  const w2: Lane = { ...worker, id: 'w2', capability: { bugfix: 0.8 } };
+  const ctx: RouteContext = { lanes: [w1, w2], gateReady: true, policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+  const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, ctx, noPolicy, d, { maxFallbacks: 1 });
+  assert.equal(r.attempts, 2); // initial + 1 fallback (loop-guard)
+  assert.ok(r.cooldownAdds.includes('w1')); // quota_exhausted ⇒ cooldown the lane
+  assert.equal(r.native, true); // both exhausted ⇒ degrade to native
 });
