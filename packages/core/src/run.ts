@@ -21,9 +21,10 @@ import type { RawUsage, ResolvedUsage } from './usage.ts';
 import type { SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
 import { isTransient, LaneFailure, shouldCooldown } from './failure.ts';
 import type { FailureKind } from './failure.ts';
-import { TRUST_RANK } from './reassign.ts';
-import type { TaskEventInput, TaskStatus } from './ledger.ts';
-import type { Lane, Policy, PolicyContext, RouteContext, RouteDecision, TaskCategory } from './types.ts';
+import { escalationDecision, selectEscalationTarget, TRUST_RANK } from './reassign.ts';
+import { buildOutputReviewPrompt, parseManagerVerdictStrict, review, selectReviewManager, REVIEW_OUTPUT_MAX_CHARS } from './review.ts';
+import type { OutcomeEventInput, ReviewVerdict, TaskEventInput, TaskStatus } from './ledger.ts';
+import type { Lane, Policy, PolicyContext, RouteContext, RouteDecision, Task, TaskCategory } from './types.ts';
 
 /** A unit of work to run (the content the lane needs, beyond the routing category). */
 export interface RunRequest {
@@ -279,4 +280,202 @@ export async function runWithFallback(
   }
 
   return { ...(last as RunResult), events: allEvents, attempts, cooldownAdds };
+}
+
+// ===========================================================================
+// C-13: quality-driven escalation orchestrator (pure; executors + manager
+// INJECTED). Offload → review the OUTPUT with an independent manager → on a
+// non-pass verdict, one same-lane rework and/or escalate UP the capability
+// ladder, bounded; else give back to the host. Latency is bounded by the
+// injected executors (e.g. CLI spawn timeout) + an adapter-level guard (E-5);
+// this core stays clock-free for deterministic testing.
+// ===========================================================================
+
+/** A causal-order ledger event from an escalation run (discriminated). */
+export type EscalationEvent =
+  | { kind: 'task'; event: TaskEventInput }
+  | { kind: 'outcome'; event: OutcomeEventInput };
+
+/** Top-level disposition of an escalation run (for the adapter to render). */
+export type EscalationFinalAction =
+  | 'accept'
+  | 'accept_after_rework'
+  | 'accept_after_escalation'
+  | 'give_back'
+  | 'review_unavailable';
+
+/** Injected deps for {@link runWithEscalation}: run deps + a raw manager executor. */
+export interface EscalationDeps extends RunDeps {
+  /** Run the manager lane over a prompt, returning its raw text reply. */
+  runManager: (managerLane: Lane, prompt: string) => Promise<string>;
+}
+
+/** Tuning for {@link runWithEscalation}. */
+export interface EscalationOptions {
+  /** Max same-lane reworks (default 1). */
+  maxReworks?: number;
+  /** Max escalations (default 1). */
+  maxEscalations?: number;
+  /** Required capability improvement for an escalation target (default 0.15). */
+  minCapabilityDelta?: number;
+  /** Candidate lanes for manager + target selection (default ctx.lanes). */
+  candidates?: readonly Lane[];
+}
+
+/** The outcome of an escalation run. */
+export interface EscalationResult {
+  final_action: EscalationFinalAction;
+  reason?: string;
+  verdict?: ReviewVerdict;
+  notes?: string;
+  subjectLaneId: string;
+  targetLaneId?: string;
+  /** The final RunResult (accepted offload, or the give-back/native result). */
+  result: RunResult;
+  /** Task + outcome events in CAUSAL order; the caller persists them in order. */
+  events: EscalationEvent[];
+}
+
+const isMarginalFree = (lane: Lane): boolean => lane.costBasis === 'subscription' || lane.costBasis === 'local';
+
+/** Append the manager's notes to the instruction for a rework/escalation re-run. */
+function instructionWithNotes(instruction: string, notes: string | undefined): string {
+  if (!notes) return instruction;
+  const capped = notes.length > REVIEW_OUTPUT_MAX_CHARS ? `${notes.slice(0, REVIEW_OUTPUT_MAX_CHARS)}\n[truncated]` : notes;
+  return `${instruction}\n\nReviewer notes (address these; do not rewrite blindly):\n${capped}`;
+}
+
+/**
+ * Run a task with quality-driven escalation. See the module banner. Pure over its
+ * injected deps; bounded by maxReworks (default 1) + maxEscalations (default 1).
+ */
+export async function runWithEscalation(
+  request: RunRequest,
+  ctx: RouteContext,
+  policy: Policy,
+  deps: EscalationDeps,
+  opts: EscalationOptions = {},
+): Promise<EscalationResult> {
+  const maxReworks = opts.maxReworks ?? 1;
+  const maxEscalations = opts.maxEscalations ?? 1;
+  const minCapabilityDelta = opts.minCapabilityDelta ?? 0.15;
+  const task: Task = { category: request.category };
+  const events: EscalationEvent[] = [];
+
+  // A request.policyContext overrides ctx.policyContext (as runTask does). Use the
+  // EFFECTIVE context for manager + target selection and every re-run, so a
+  // sensitive/private request can't pick a manager/target the policy would block.
+  const effectiveCtx: RouteContext = request.policyContext
+    ? { ...ctx, policyContext: request.policyContext }
+    : ctx;
+  const candidates = opts.candidates ?? effectiveCtx.lanes;
+
+  const task_id = request.task_id ?? deps.newId();
+  let attempt = request.attempt ?? 0;
+
+  // Initial offload.
+  let current = await runTask({ ...request, task_id, attempt }, effectiveCtx, policy, deps);
+  for (const e of current.events) events.push({ kind: 'task', event: e });
+  let subject = effectiveCtx.lanes.find((l) => l.id === current.laneId);
+
+  // Status gate: review ONLY an ok, non-native, non-empty offload. Anything else
+  // (native/host, failed, blocked, empty) is NOT a quality signal — return it as
+  // produced (the adapter maps native/failed to its existing directives).
+  const resultReviewable = (r: RunResult): boolean =>
+    r.status === 'ok' && r.native !== true && typeof r.resultText === 'string' && r.resultText.trim() !== '';
+
+  if (!resultReviewable(current) || subject === undefined) {
+    return { final_action: 'accept', subjectLaneId: current.laneId, result: current, events };
+  }
+  // `subject` is narrowed to Lane here; keep a Lane-typed handle across the loop.
+  let subjectLane: Lane = subject;
+
+  const counters = { reworks: 0, escalations: 0 };
+  // ≤ maxReworks + maxEscalations review rounds; the +1 is a hard safety bound.
+  for (let round = 0; round < maxReworks + maxEscalations + 1; round++) {
+    const output = current.resultText as string;
+    const reviewedAttempt = attempt;
+    const stage = counters.reworks + counters.escalations; // 0 = initial review
+
+    const manager = selectReviewManager(candidates, subjectLane, request.category, effectiveCtx, policy);
+    const unavailable = (reason: string): EscalationResult =>
+      stage === 0
+        ? { final_action: 'review_unavailable', reason, subjectLaneId: subjectLane.id, result: current, events }
+        : { final_action: 'give_back', reason: `${reason} (after a leg)`, subjectLaneId: subjectLane.id, result: current, events };
+    if (!manager) return unavailable('no eligible manager');
+
+    let raw: string;
+    try {
+      // Review the FULL subtask the lane saw (instruction + attachments), so the
+      // gate never judges attachment-backed work on partial context. The manager
+      // is trusted (sees content).
+      raw = await deps.runManager(manager, buildOutputReviewPrompt(combinedText(request.instruction, request.attachments), output));
+    } catch {
+      return unavailable('manager call failed');
+    }
+    const verdict = parseManagerVerdictStrict(raw);
+    if (!verdict) return unavailable('manager verdict unparseable');
+
+    // Decide the structural action, then downgrade per lane constraints.
+    let action = escalationDecision(verdict, counters, { maxReworks, maxEscalations });
+    if (action === 'rework' && !isMarginalFree(subjectLane)) {
+      // A metered subject can't be reworked free ⇒ skip straight to escalate/give_back.
+      action = escalationDecision(verdict, { reworks: maxReworks, escalations: counters.escalations }, { maxReworks, maxEscalations });
+    }
+    let target: Lane | null = null;
+    if (action === 'escalate') {
+      target = selectEscalationTarget(subjectLane, candidates, task, effectiveCtx, policy, {
+        minDelta: minCapabilityDelta,
+        excludeIds: [manager.id],
+      });
+      if (!target) action = 'give_back';
+    }
+
+    // Record a content-free outcome event tagged with the action this review caused.
+    const notes = raw.trim() === '' ? undefined : raw;
+    const reviewRes = await review(
+      { task_id, attempt: reviewedAttempt, category: request.category, content: output, subjectLane },
+      { managerLane: manager, runManagerReview: async () => (notes ? { verdict, notes } : { verdict }), newId: deps.newId },
+    );
+    const outcome: OutcomeEventInput = { ...reviewRes.event, action_taken: action };
+    if (target) outcome.target_lane_id = target.id;
+    events.push({ kind: 'outcome', event: outcome });
+
+    if (action === 'accept') {
+      const final_action: EscalationFinalAction =
+        counters.escalations > 0 ? 'accept_after_escalation' : counters.reworks > 0 ? 'accept_after_rework' : 'accept';
+      return { final_action, verdict, ...(notes ? { notes } : {}), subjectLaneId: subjectLane.id, result: current, events };
+    }
+    if (action === 'give_back') {
+      return { final_action: 'give_back', verdict, ...(notes ? { notes } : {}), subjectLaneId: subjectLane.id, result: current, events };
+    }
+
+    // rework (same lane) or escalate (to target): re-run with the notes attached.
+    const nextLane: Lane = action === 'escalate' ? (target as Lane) : subjectLane;
+    attempt += 1;
+    const reRun = await runTask(
+      { ...request, task_id, attempt, instruction: instructionWithNotes(request.instruction, notes) },
+      { ...effectiveCtx, lanes: [nextLane] },
+      policy,
+      deps,
+    );
+    for (const e of reRun.events) events.push({ kind: 'task', event: e });
+    if (action === 'escalate') counters.escalations += 1;
+    else counters.reworks += 1;
+
+    // A non-reviewable re-run leg is never silently accepted ⇒ terminal give_back.
+    if (!resultReviewable(reRun)) {
+      return {
+        final_action: 'give_back',
+        reason: `${action} leg produced no reviewable output`,
+        subjectLaneId: nextLane.id,
+        result: reRun,
+        events,
+      };
+    }
+    current = reRun;
+    subjectLane = nextLane; // after escalation the target becomes the new subject (re-reviewed independently)
+  }
+
+  return { final_action: 'give_back', reason: 'escalation budget exhausted', subjectLaneId: subjectLane.id, result: current, events };
 }

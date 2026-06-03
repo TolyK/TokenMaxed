@@ -75,7 +75,7 @@ export {
   buildOutputReviewPrompt,
   REVIEW_OUTPUT_MAX_CHARS,
 } from './review.ts';
-export { runTask, runWithFallback } from './run.ts';
+export { runTask, runWithFallback, runWithEscalation } from './run.ts';
 export type {
   RunRequest,
   RunResult,
@@ -84,6 +84,11 @@ export type {
   UntrustedExecResultLite,
   FallbackOptions,
   FallbackResult,
+  EscalationDeps,
+  EscalationOptions,
+  EscalationResult,
+  EscalationEvent,
+  EscalationFinalAction,
 } from './run.ts';
 export type {
   MinimizedAttachment,

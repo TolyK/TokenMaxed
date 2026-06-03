@@ -275,3 +275,90 @@ test('fallback honors the loop-guard and reports cooldowns for quota/rate', asyn
   assert.ok(r.cooldownAdds.includes('w1')); // quota_exhausted ⇒ cooldown the lane
   assert.equal(r.native, true); // both exhausted ⇒ degrade to native
 });
+
+// --- C-13 E-4: runWithEscalation orchestrator ---------------------------------
+
+import { runWithEscalation } from '../src/run.ts';
+import type { EscalationDeps } from '../src/run.ts';
+
+const elane = (over: Partial<Lane> & { id: string }): Lane => ({
+  kind: 'cli', model: 'gpt-5.5', trust_mode: 'full', costBasis: 'subscription',
+  provenance: 'anthropic', jurisdiction: 'US', ...over,
+});
+const eCheap = elane({ id: 'cheap', capability: { bugfix: 0.5 } });
+const eTarget = elane({ id: 'target', model: 'deepseek-v3', capability: { bugfix: 0.8 } });
+const eMgr = elane({ id: 'mgr', model: 'claude-opus-4-7', manager_allowed: true, capability: { bugfix: 0.95 } });
+
+// Initial offload routes to `cheap` only; the escalation/manager pool is wider.
+const eCtx: RouteContext = { lanes: [eCheap], policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+const ePool = [eCheap, eTarget, eMgr];
+const eReq = { category: 'bugfix' as const, instruction: 'fix the bug', task_id: 't-esc' };
+
+function edeps(verdicts: string[], over: Partial<EscalationDeps> = {}): EscalationDeps {
+  let i = 0;
+  return {
+    ...deps({ executeTrusted: async (l) => ({ resultText: `out:${l.id}` }) }),
+    runManager: async () => verdicts[Math.min(i++, verdicts.length - 1)] ?? 'VERDICT: pass',
+    ...over,
+  };
+}
+
+test('escalation: pass on the first review ⇒ accept (no escalation)', async () => {
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: pass']), { candidates: ePool });
+  assert.equal(r.final_action, 'accept');
+  assert.equal(r.subjectLaneId, 'cheap');
+  assert.equal(r.result.resultText, 'out:cheap');
+  // 1 task (cheap) + 1 outcome (accept)
+  assert.deepEqual(r.events.map((e) => e.kind), ['task', 'outcome']);
+  assert.equal((r.events[1]!.event as { action_taken?: string }).action_taken, 'accept');
+});
+
+test('escalation: fail ⇒ escalate to a stronger lane, then accept_after_escalation', async () => {
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: fail', 'VERDICT: pass']), { candidates: ePool });
+  assert.equal(r.final_action, 'accept_after_escalation');
+  assert.equal(r.subjectLaneId, 'target');
+  assert.equal(r.result.resultText, 'out:target');
+  // task(cheap), outcome(escalate→target), task(target), outcome(accept)
+  assert.deepEqual(r.events.map((e) => e.kind), ['task', 'outcome', 'task', 'outcome']);
+  const esc = r.events[1]!.event as { action_taken?: string; target_lane_id?: string };
+  assert.equal(esc.action_taken, 'escalate');
+  assert.equal(esc.target_lane_id, 'target');
+});
+
+test('escalation: needs-rework ⇒ one same-lane rework, then accept_after_rework', async () => {
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: needs-rework', 'VERDICT: pass']), { candidates: ePool });
+  assert.equal(r.final_action, 'accept_after_rework');
+  assert.equal(r.subjectLaneId, 'cheap'); // reworked on the same lane
+  assert.deepEqual(r.events.map((e) => e.kind), ['task', 'outcome', 'task', 'outcome']);
+  assert.equal((r.events[1]!.event as { action_taken?: string }).action_taken, 'rework');
+});
+
+test('escalation: no eligible manager ⇒ review_unavailable, original result kept', async () => {
+  // Pool has no manager_allowed lane.
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: fail']), { candidates: [eCheap, eTarget] });
+  assert.equal(r.final_action, 'review_unavailable');
+  assert.equal(r.result.resultText, 'out:cheap');
+  // No outcome event recorded (no review ran).
+  assert.deepEqual(r.events.map((e) => e.kind), ['task']);
+});
+
+test('escalation: fail but no qualifying target ⇒ give_back', async () => {
+  // Only cheap + mgr; mgr is the manager (excluded as target), no other ≥capable lane.
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: fail']), { candidates: [eCheap, eMgr] });
+  assert.equal(r.final_action, 'give_back');
+  assert.equal((r.events[1]!.event as { action_taken?: string }).action_taken, 'give_back');
+});
+
+test('escalation: unparseable verdict ⇒ review_unavailable (never a silent pass)', async () => {
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['I cannot decide']), { candidates: ePool });
+  assert.equal(r.final_action, 'review_unavailable');
+  assert.deepEqual(r.events.map((e) => e.kind), ['task']);
+});
+
+test('escalation: a native/host offload is not reviewed (accept as-is)', async () => {
+  const d = edeps(['VERDICT: fail'], { executeTrusted: async () => ({ resultText: '', native: true }) });
+  const r = await runWithEscalation(eReq, eCtx, noPolicy, d, { candidates: ePool });
+  assert.equal(r.final_action, 'accept');
+  assert.equal(r.result.native, true);
+  assert.deepEqual(r.events.map((e) => e.kind), []); // native records nothing
+});
