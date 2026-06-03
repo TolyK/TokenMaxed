@@ -3,6 +3,7 @@
   "frontier_model": "claude-opus-4-7",
   "models": {
     "claude-opus-4-7": { "inputPer1M": 15, "outputPer1M": 75 },
+    "claude-haiku-4-5-20251001": { "inputPer1M": 1, "outputPer1M": 5 },
     "gpt-5.5": { "inputPer1M": 10, "outputPer1M": 30 },
     "llama3.1:8b": { "inputPer1M": 0, "outputPer1M": 0 }
   }

@@ -272,10 +272,15 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   // Pass the file: URL directly; loadLaneConfig handles URL→path (and spaces).
   const examplePath = new URL('../../../config/lanes.example.yaml', import.meta.url);
   const reg = loadLaneConfig(examplePath);
-  assert.equal(reg.lanes.length, 3);
+  assert.equal(reg.lanes.length, 4);
   assert.ok(reg.byId('claude-native'));
   assert.ok(reg.byId('codex-cli'));
   assert.ok(reg.byId('ollama-llama3'));
+  // Cheaper-Claude in-family lane (A-5b): a trusted `claude -p` CLI lane.
+  const haiku = reg.byId('claude-haiku');
+  assert.ok(haiku);
+  assert.equal(haiku!.command, 'claude');
+  assert.equal(haiku!.provenance, 'anthropic');
   assert.ok(reg instanceof LaneRegistry);
 });
 

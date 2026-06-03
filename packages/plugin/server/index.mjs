@@ -14226,6 +14226,7 @@ var require_dist2 = __commonJS({
 });
 
 // ../mcp/src/server.ts
+import { spawnSync as spawnSync2 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
@@ -24487,6 +24488,7 @@ function makeServerDeps(env = process.env) {
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
   const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
+  const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
   const store = fileToggleStore(statePath);
   const resolveAuth = (authHandle) => {
     if (!/^[A-Za-z0-9_]+$/.test(authHandle)) return "";
@@ -24521,8 +24523,12 @@ function makeServerDeps(env = process.env) {
     const ledger = new JsonlLedger(ledgerPath);
     const lanes = registry2.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
     const ctx = { lanes, gateReady, policyContext: request.policyContext ?? {} };
+    const cliSpawn = (command, args, options) => spawnSync2(command, [...args], { ...options, env: { ...process.env, TOKENMAXED_DISABLE: "1" } });
     const runDeps = {
-      executeTrusted: makeTrustedExecutor({ api: makeTrustedApiExecutor({ resolveAuth }) }),
+      executeTrusted: makeTrustedExecutor({
+        cli: makeCliExecutor(cliSpawn),
+        api: makeTrustedApiExecutor({ resolveAuth })
+      }),
       executeUntrusted: (envelope) => executeUntrusted(envelope, { resolveAuth }),
       untrustedLaneDTO: laneToUntrustedDTO,
       scanSecrets: makeGitleaksScanner(),
@@ -24565,7 +24571,9 @@ function makeServerDeps(env = process.env) {
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
     gateReady,
-    getEnabled: () => readEnabled(store, projectKey),
+    // TOKENMAXED_DISABLE forces routing off (kill-switch + recursion guard),
+    // overriding the per-project toggle.
+    getEnabled: () => globallyDisabled ? false : readEnabled(store, projectKey),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
     delegate,
     now: () => Date.now()

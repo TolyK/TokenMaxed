@@ -75,3 +75,24 @@ lanes:
       boilerplate: 0.70
       docs: 0.60
       explain: 0.60
+
+  # Cheaper-same-family lane (Claude Code): hand a bounded subtask to a cheaper
+  # Claude (Haiku) via `claude -p` instead of running it on the Opus main session.
+  # Fully trusted (100% Anthropic), so NO minimization — and it spends the same
+  # subscription, not metered $. The cheapest, safest offload. (Spawned children
+  # run with TOKENMAXED_DISABLE=1 so they never re-enter routing / recurse.)
+  - id: claude-haiku
+    kind: cli
+    model: claude-haiku-4-5-20251001
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    execution_mode: answer-only
+    command: claude
+    args: ["-p", "--model", "claude-haiku-4-5-20251001"]
+    capability:
+      boilerplate: 0.82
+      docs: 0.85
+      explain: 0.82
+      codegen: 0.72

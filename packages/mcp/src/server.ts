@@ -25,6 +25,7 @@
  * run it. The project dir only contributes the toggle KEY (never executed).
  */
 
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -45,6 +46,7 @@ import {
   loadLaneConfig,
   loadPolicyConfig,
   loadPriceTable,
+  makeCliExecutor,
   makeGitleaksScanner,
   makeTrustedApiExecutor,
   makeTrustedExecutor,
@@ -120,6 +122,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // scanner is available — so router_preview and router_delegate agree, and
   // neither advertises a worker lane the minimizer would then block.
   const gateReady = env.TOKENMAXED_GATE_READY === 'true';
+  // Global kill-switch. Also set in spawned CLI children below, so a cheaper-Claude
+  // lane (`claude -p`) can't re-enter routing and recurse (A-5b).
+  const globallyDisabled = env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true';
   const store = fileToggleStore(statePath);
   // BYOK auth, namespaced to contain a supply-chain risk: a lane's `authHandle`
   // resolves ONLY to env var `TOKENMAXED_KEY_<handle>`, never an arbitrary name.
@@ -185,8 +190,24 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // unwritable / unappendable ledger) must NEVER discard an already-paid-for
     // result. runTask itself does the gate/minimize/execute; we append after and
     // swallow ledger errors, returning the result with a recordingFailed flag.
+    //
+    // CLI children run with TOKENMAXED_DISABLE=1 so a cheaper-Claude lane
+    // (`claude -p --model <haiku>`) can't load this plugin and recurse (A-5b).
+    const cliSpawn = (
+      command: string,
+      args: readonly string[],
+      options: { input: string; encoding: 'utf8'; maxBuffer: number },
+    ) =>
+      spawnSync(command, [...args], { ...options, env: { ...process.env, TOKENMAXED_DISABLE: '1' } }) as {
+        status: number | null;
+        stdout?: string;
+        error?: Error;
+      };
     const runDeps: RunDeps = {
-      executeTrusted: makeTrustedExecutor({ api: makeTrustedApiExecutor({ resolveAuth }) }),
+      executeTrusted: makeTrustedExecutor({
+        cli: makeCliExecutor(cliSpawn),
+        api: makeTrustedApiExecutor({ resolveAuth }),
+      }),
       executeUntrusted: (envelope) => executeUntrusted(envelope, { resolveAuth }),
       untrustedLaneDTO: laneToUntrustedDTO,
       scanSecrets: makeGitleaksScanner(),
@@ -230,7 +251,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
     gateReady,
-    getEnabled: () => readEnabled(store, projectKey),
+    // TOKENMAXED_DISABLE forces routing off (kill-switch + recursion guard),
+    // overriding the per-project toggle.
+    getEnabled: () => (globallyDisabled ? false : readEnabled(store, projectKey)),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
     delegate,
     now: () => Date.now(),
