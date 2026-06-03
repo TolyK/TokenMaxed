@@ -134,6 +134,25 @@ export interface Usage {
 }
 
 /** Inputs to a routing decision beyond the task itself. */
+/**
+ * Observed review evidence for one lane × category (F-1 capability feedback).
+ * Content-free: derived purely from manager-review verdict counts in the ledger.
+ */
+export interface ObservedCapability {
+  /** Recency-decayed success rate in [0, 1] — the dogfood scale `(pass + ½·needs-rework)/total`. */
+  rate: number;
+  /** Effective (decay-weighted) sample count: the confidence mass behind `rate`. */
+  n: number;
+}
+
+/**
+ * Observed capability evidence keyed by lane id then task category. A learned
+ * overlay on top of the declared config prior; absent entries fall back to
+ * declared capability. Sparse by construction (only lanes/categories with
+ * evidence appear).
+ */
+export type ObservedCapabilityByLane = Record<string, Partial<Record<TaskCategory, ObservedCapability>>>;
+
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];

@@ -19,6 +19,8 @@ import type {
   ExecutionMode,
   Lane,
   LaneScore,
+  ObservedCapability,
+  ObservedCapabilityByLane,
   Policy,
   PolicyVerdict,
   RouteContext,
@@ -28,6 +30,14 @@ import type {
 
 /** Capability assumed for a lane that declares no score for a category. */
 export const DEFAULT_CAPABILITY = 0.5;
+
+/**
+ * Default shrinkage prior strength (pseudo-count) for {@link effectiveCapability}.
+ * It takes roughly this much weighted review evidence to move the effective score
+ * halfway from the declared prior toward the observed rate. Kept as a code
+ * constant in v1 (not policy/env config) until real data shows tuning pressure.
+ */
+export const DEFAULT_PRIOR_STRENGTH = 8;
 
 /**
  * Marginal-cost penalty per cost basis. Local and subscription lanes are ~free
@@ -116,14 +126,86 @@ function clamp01(n: number): number {
   return n;
 }
 
-/** The lane's capability for a task category, defaulting when unspecified. */
-export function capabilityFor(lane: Lane, category: Task['category']): number {
+/**
+ * The lane's DECLARED capability for a task category (the config prior),
+ * defaulting when unspecified. This is the hand-assigned score from lane config;
+ * it is never mutated by feedback. Use this where the declared value is the
+ * intended semantics: reviewer/manager authority and the `capability: 0` opt-out.
+ * For routing/reassignment/escalation-target selection, prefer
+ * {@link effectiveCapabilityFor}, which blends in observed evidence.
+ */
+export function declaredCapabilityFor(lane: Lane, category: Task['category']): number {
   const declared = lane.capability?.[category];
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }
 
+/**
+ * @deprecated Use {@link declaredCapabilityFor} (the config prior) or
+ * {@link effectiveCapabilityFor} (prior blended with observed evidence). Retained
+ * as a back-compat alias for external `@tokenmaxed/core` consumers; identical to
+ * `declaredCapabilityFor`.
+ */
+export const capabilityFor = declaredCapabilityFor;
+
+/** Options for {@link effectiveCapability}. */
+export interface EffectiveCapabilityOptions {
+  /**
+   * Shrinkage prior strength (pseudo-count). Higher ⇒ more evidence required to
+   * move away from the declared prior. Must be finite and > 0; otherwise
+   * {@link DEFAULT_PRIOR_STRENGTH} is used.
+   */
+  priorStrength?: number;
+}
+
+/**
+ * Blend a declared capability prior with observed review evidence via shrinkage
+ * toward the prior (F-1 capability feedback). Pure and total:
+ *
+ *   effective = (k·declared + n·rate) / (k + n)
+ *
+ * - No/low evidence (`n ≤ 0` or no `observed`) ⇒ returns the declared prior, so a
+ *   single review can never swing routing and config still rules by default.
+ * - Lots of evidence (`n ≫ k`) ⇒ converges toward the observed `rate`.
+ *
+ * All inputs are clamped: `declared`/`rate` into [0, 1]; a non-finite or
+ * non-positive `n` is treated as 0 (⇒ declared); a non-finite or non-positive
+ * `priorStrength` falls back to the default. Never divides by zero.
+ */
+export function effectiveCapability(
+  declared: number,
+  observed: ObservedCapability | undefined,
+  opts: EffectiveCapabilityOptions = {},
+): number {
+  const prior = clamp01(declared);
+  if (!observed) return prior;
+  const n = Number.isFinite(observed.n) && observed.n > 0 ? observed.n : 0;
+  if (n === 0) return prior;
+  const rate = clamp01(observed.rate);
+  const k =
+    Number.isFinite(opts.priorStrength) && (opts.priorStrength as number) > 0
+      ? (opts.priorStrength as number)
+      : DEFAULT_PRIOR_STRENGTH;
+  return clamp01((k * prior + n * rate) / (k + n));
+}
+
+/**
+ * A lane's EFFECTIVE capability for a category: its declared prior blended with
+ * observed evidence from `overlay` (if any) for that lane×category. With no
+ * overlay entry this is exactly {@link declaredCapabilityFor}, so callers that
+ * pass no overlay (or `undefined`) behave identically to before the feedback loop.
+ */
+export function effectiveCapabilityFor(
+  lane: Lane,
+  category: Task['category'],
+  overlay?: ObservedCapabilityByLane,
+  opts?: EffectiveCapabilityOptions,
+): number {
+  const declared = declaredCapabilityFor(lane, category);
+  return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
+}
+
 function scoreLane(lane: Lane, task: Task, capHeadroom?: Record<string, number>): LaneScore {
-  const capability = capabilityFor(lane, task.category);
+  const capability = declaredCapabilityFor(lane, task.category);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;

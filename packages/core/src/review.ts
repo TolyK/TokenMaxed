@@ -10,7 +10,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { capabilityFor, isManagerEligible, isSelectablePreGate } from './route.ts';
+import { declaredCapabilityFor, isManagerEligible, isSelectablePreGate } from './route.ts';
 import type { OutcomeEventInput, ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, TaskCategory } from './types.ts';
 
@@ -190,7 +190,7 @@ export function selectReviewManager(
   ctx: RouteContext,
   policy: Policy,
 ): Lane | null {
-  const subjectCap = capabilityFor(subject, category);
+  const subjectCap = declaredCapabilityFor(subject, category);
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const gateReady = ctx.gateReady ?? false;
   const policyContext = ctx.policyContext ?? {};
@@ -200,14 +200,14 @@ export function selectReviewManager(
       !m.native &&
       isManagerEligible(m) &&
       (m.costBasis === 'subscription' || m.costBasis === 'local') &&
-      capabilityFor(m, category) >= subjectCap &&
+      declaredCapabilityFor(m, category) >= subjectCap &&
       !disabled.has(m.id) &&
       isSelectablePreGate(m, gateReady) &&
       laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict),
   );
   if (eligible.length === 0) return null;
   eligible.sort((a, b) => {
-    const byCap = capabilityFor(b, category) - capabilityFor(a, category);
+    const byCap = declaredCapabilityFor(b, category) - declaredCapabilityFor(a, category);
     if (byCap !== 0) return byCap;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });

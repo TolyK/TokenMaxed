@@ -13,7 +13,7 @@
 
 import { parse as parseYaml } from 'yaml';
 
-import { capabilityFor } from './route.ts';
+import { declaredCapabilityFor } from './route.ts';
 import { TASK_CATEGORIES, TRUST_MODES } from './types.ts';
 import type {
   CostBasis,
@@ -237,7 +237,7 @@ export class LaneRegistry {
    * therefore eligible. (Trust/API gating is applied later by routing, not here.)
    */
   candidateLanes(category: TaskCategory): Lane[] {
-    return this.lanes.filter((lane) => capabilityFor(lane, category) > 0);
+    return this.lanes.filter((lane) => declaredCapabilityFor(lane, category) > 0);
   }
 }
 

@@ -11,7 +11,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { capabilityFor, isSelectablePreGate } from './route.ts';
+import { declaredCapabilityFor, isSelectablePreGate } from './route.ts';
 import type { ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, Task, TrustMode } from './types.ts';
 
@@ -75,18 +75,18 @@ export function reassignmentTarget(
   if (attempts >= max) return null;
 
   const fromRank = TRUST_RANK[from.trust_mode];
-  const fromCap = capabilityFor(from, task.category);
+  const fromCap = declaredCapabilityFor(from, task.category);
   const eligible = candidates.filter((c) => {
     if (!canReassign(from, c, task, ctx, policy)) return false;
     // An improvement: a stronger trust tier, or the same tier but more capable.
-    return TRUST_RANK[c.trust_mode] > fromRank || capabilityFor(c, task.category) > fromCap;
+    return TRUST_RANK[c.trust_mode] > fromRank || declaredCapabilityFor(c, task.category) > fromCap;
   });
   if (eligible.length === 0) return null;
 
   eligible.sort((a, b) => {
     const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
     if (byRank !== 0) return byRank;
-    const byCap = capabilityFor(b, task.category) - capabilityFor(a, task.category);
+    const byCap = declaredCapabilityFor(b, task.category) - declaredCapabilityFor(a, task.category);
     if (byCap !== 0) return byCap;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
@@ -173,18 +173,18 @@ export function selectEscalationTarget(
 ): Lane | null {
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
-  const fromCap = capabilityFor(subject, task.category);
+  const fromCap = declaredCapabilityFor(subject, task.category);
   const eligible = candidates.filter(
     (c) =>
       !exclude.has(c.id) &&
       !c.native &&
       (c.costBasis === 'subscription' || c.costBasis === 'local') &&
       canReassign(subject, c, task, ctx, policy) &&
-      capabilityFor(c, task.category) >= fromCap + minDelta,
+      declaredCapabilityFor(c, task.category) >= fromCap + minDelta,
   );
   if (eligible.length === 0) return null;
   eligible.sort((a, b) => {
-    const byCap = capabilityFor(b, task.category) - capabilityFor(a, task.category);
+    const byCap = declaredCapabilityFor(b, task.category) - declaredCapabilityFor(a, task.category);
     if (byCap !== 0) return byCap;
     const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
     if (byRank !== 0) return byRank;

@@ -7,8 +7,13 @@ export {
   isManagerEligible,
   executionModeOf,
   capabilityFor,
+  declaredCapabilityFor,
+  effectiveCapability,
+  effectiveCapabilityFor,
   DEFAULT_CAPABILITY,
+  DEFAULT_PRIOR_STRENGTH,
 } from './route.ts';
+export type { EffectiveCapabilityOptions } from './route.ts';
 export { LaneRegistry, LaneConfigError, parseLaneConfig } from './registry.ts';
 export {
   PriceError,

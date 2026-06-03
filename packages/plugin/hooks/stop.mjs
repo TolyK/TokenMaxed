@@ -7552,7 +7552,7 @@ function clamp01(n) {
   if (n > 1) return 1;
   return n;
 }
-function capabilityFor(lane, category) {
+function declaredCapabilityFor(lane, category) {
   const declared = lane.capability?.[category];
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }
@@ -7733,7 +7733,7 @@ var LaneRegistry = class {
    * therefore eligible. (Trust/API gating is applied later by routing, not here.)
    */
   candidateLanes(category) {
-    return this.lanes.filter((lane) => capabilityFor(lane, category) > 0);
+    return this.lanes.filter((lane) => declaredCapabilityFor(lane, category) > 0);
   }
 };
 function parseLaneConfig(text) {
