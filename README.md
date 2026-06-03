@@ -10,8 +10,8 @@ TokenMaxed is a router for coding agents. You already pay flat-rate for tools
 like Claude Max and a ChatGPT/Codex subscription, and you may have a capable
 model running locally. TokenMaxed spends that **already-paid, flat-rate capacity
 first**, falls back to metered APIs only when it has to, and shows you — in real
-dollars — how much you avoided versus running everything on the most expensive
-frontier model.
+dollars — what you *actually* spent and how much metered API cost you avoided (with
+the all-frontier comparison kept as a clearly-labeled hypothetical, not the headline).
 
 It is **local-first**: the routing brain, your prompts, and your code stay on
 your machine. Any hosted feature added later transmits only content-free
@@ -30,9 +30,10 @@ metadata you explicitly opt into.
 - **Data minimization (the moat).** Trusted lanes (Claude, Codex, local) can see
   your repo and tools. Untrusted lanes receive only a scrubbed, bounded,
   no-tool sub-request — never your repo, tokens, or paths.
-- **Honest accounting.** Two numbers, never one: an *estimated* savings headline
-  versus an all-frontier baseline, and a finance-grade *metered dollars avoided*
-  figure. We never claim caps don't exist.
+- **Honest accounting.** The headline is the finance-grade number — what you
+  *actually* spent and the metered dollars avoided; the all-frontier baseline
+  (every task on the top model) is shown too but clearly labeled a *hypothetical*,
+  never the headline. We never claim caps don't exist.
 
 ## Project status
 
@@ -219,7 +220,7 @@ After `npm run build`, the `tokenmaxed` command reads your local, content-free
 ledger (`~/.tokenmaxed/ledger.jsonl` by default) and reports on it:
 
 ```bash
-npx tokenmaxed savings              # estimated $ avoided + honest metered $ + token summary
+npx tokenmaxed savings              # actual spend + metered $ avoided (headline) + baseline context + tokens
 npx tokenmaxed tokens --by lane     # full per-lane token breakdown (--by model is the default)
 npx tokenmaxed outcomes             # manager-review verdicts (pass/needs-rework/fail) + success rate per lane
 npx tokenmaxed lanes                # your configured lanes: trust mode, autonomy, roles, manager eligibility
@@ -230,8 +231,8 @@ npx tokenmaxed help                 # full usage
 ```
 TokenMaxed — savings (all time)
 
-  Estimated $139.50 avoided vs the all-frontier baseline (100.0% of frontier cost)
-  Metered API — spent $0.00, avoided $139.50 (100.0%)
+  Actual API spend $0.00 — saved $139.50 (100.0% of the frontier-equivalent cost)
+  Baseline context: $139.50 avoided vs an all-frontier baseline (100.0%) — a hypothetical ceiling, not cash you'd otherwise have paid
 
   Lanes: claude-native ×1, codex-cli ×1, ollama-llama3 ×1
   Sensitive sends blocked: 0
@@ -242,8 +243,10 @@ TokenMaxed — savings (all time)
   → full breakdown: tokenmaxed tokens
 ```
 
-The headline is always labeled *estimated vs the all-frontier baseline*, and the
-token block is explicitly a usage count (not dollars), with estimated figures
+The headline is the honest, finance-grade figure — what you *actually* spent and
+the metered dollars avoided — while the all-frontier baseline (every task on the
+top model) is demoted to a clearly-labeled *hypothetical*, never the headline.
+The token block is explicitly a usage count (not dollars), with estimated figures
 marked. The ledger fills as you route tasks (via the Claude Code plugin below, or
 your own `@tokenmaxed/core` integration); until then the report says "No tasks
 recorded yet", while `tokenmaxed lanes` works immediately off your

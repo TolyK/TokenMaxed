@@ -159,7 +159,12 @@ test('savings aggregates avoided spend and tokens from the ledger', async () => 
   const summary = r.structuredContent!.summary as { events: number; savings: { frontier_avoided: number } };
   assert.equal(summary.events, 2);
   assert.ok(Math.abs(summary.savings.frontier_avoided - 0.018) < 1e-9);
-  assert.match(r.content[0]!.text, /frontier-equivalent avoided/);
+  // Honest headline leads (actual spend + finance-grade metered avoided); the
+  // all-frontier baseline is demoted to a clearly-labeled hypothetical.
+  assert.match(r.content[0]!.text, /actual API spend/);
+  assert.match(r.content[0]!.text, /metered spend avoided/);
+  assert.match(r.content[0]!.text, /baseline context \(hypothetical/);
+  assert.ok(r.content[0]!.text.indexOf('actual API spend') < r.content[0]!.text.indexOf('all-frontier baseline'));
 });
 
 test('savings renders percentages already in percent units (no 100x double-scale)', async () => {

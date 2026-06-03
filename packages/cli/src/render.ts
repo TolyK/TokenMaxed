@@ -142,8 +142,9 @@ function sortedGroups(groups: Record<string, TokenGroup>): [string, TokenGroup][
 }
 
 /**
- * The savings report: an estimated frontier-equivalent headline, the honest
- * metered numbers, lane mix, block count, and a compact top-N token block. The
+ * The savings report: the honest finance-grade headline (actual API spend +
+ * metered avoided), then the all-frontier baseline as a clearly-labeled
+ * hypothetical, lane mix, block count, and a compact top-N token block. The
  * token block is explicitly labeled a usage count, never dollars.
  */
 export function formatSavings(args: {
@@ -161,11 +162,15 @@ export function formatSavings(args: {
   }
 
   const s = summary.savings;
+  // HEADLINE = the honest, finance-grade numbers: what you actually paid, and the
+  // metered spend avoided. The all-frontier baseline is a hypothetical ceiling
+  // (every task on the top model) — real arithmetic, unreal baseline — so it is
+  // demoted to a clearly-labeled secondary line, not the headline.
   lines.push(
-    `  Estimated ${money(s.frontier_avoided)} avoided vs the all-frontier baseline ` +
-      `(${pct(s.frontier_avoided_pct)} of frontier cost)`,
-    `  Metered API — spent ${money(summary.metered_spent_total)}, ` +
-      `avoided ${money(s.metered_avoided)} (${pct(s.metered_avoided_pct)})`,
+    `  Actual API spend ${money(summary.metered_spent_total)} — saved ${money(s.metered_avoided)} ` +
+      `(${pct(s.metered_avoided_pct)} of the frontier-equivalent cost)`,
+    `  Baseline context: ${money(s.frontier_avoided)} avoided vs an all-frontier baseline ` +
+      `(${pct(s.frontier_avoided_pct)}) — a hypothetical ceiling, not cash you'd otherwise have paid`,
     '',
   );
 

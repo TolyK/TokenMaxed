@@ -24728,11 +24728,10 @@ function renderSavings(summary, tokens, period) {
   if (summary.events === 0) return `No tasks recorded yet${scope}. Run some routed work to populate savings.`;
   const lines = [
     `Savings${scope} \u2014 ${summary.events} event(s)`,
-    // *_pct are already in percent units (aggregateSavings multiplies by 100).
-    `  frontier-equivalent avoided: $${s.frontier_avoided.toFixed(4)} (${pct(s.frontier_avoided_pct)})`,
-    `  metered spend avoided:       $${s.metered_avoided.toFixed(4)} (${pct(s.metered_avoided_pct)})`,
-    `  actual spend (all tasks):    $${summary.actual_cost.toFixed(4)}`,
-    `  metered spend (all tasks):   $${summary.metered_spent_total.toFixed(4)}`,
+    `  actual API spend:            $${summary.metered_spent_total.toFixed(4)}`,
+    `  metered spend avoided:       $${s.metered_avoided.toFixed(4)} (${pct(s.metered_avoided_pct)}) \u2014 finance-grade`,
+    `  \u2014 baseline context (hypothetical: every task on the frontier model) \u2014`,
+    `  vs all-frontier baseline:    $${s.frontier_avoided.toFixed(4)} (${pct(s.frontier_avoided_pct)})`,
     `  tokens: ${tokens.total.in} in / ${tokens.total.out} out`
   ];
   if (summary.blockCount > 0) lines.push(`  blocked tasks: ${summary.blockCount}`);

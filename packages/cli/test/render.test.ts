@@ -99,8 +99,12 @@ function stats(): TokenStats {
 
 test('formatSavings shows the honest, labeled headline and a usage-not-$ token block', () => {
   const out = formatSavings({ summary: summary(), tokens: stats(), periodLabel: 'all time' });
-  assert.match(out, /Estimated \$160\.00 avoided vs the all-frontier baseline \(80\.0% of frontier cost\)/);
-  assert.match(out, /Metered API — spent \$40\.00, avoided \$160\.00 \(80\.0%\)/);
+  // Headline = honest finance-grade (actual spend + metered avoided).
+  assert.match(out, /Actual API spend \$40\.00 — saved \$160\.00 \(80\.0% of the frontier-equivalent cost\)/);
+  // All-frontier baseline demoted to a clearly-labeled hypothetical.
+  assert.match(out, /Baseline context: \$160\.00 avoided vs an all-frontier baseline \(80\.0%\) — a hypothetical ceiling/);
+  // The headline (actual spend) appears before the baseline context line.
+  assert.ok(out.indexOf('Actual API spend') < out.indexOf('Baseline context'));
   assert.match(out, /Tokens \(usage, not \$\)/);
   // Top model sorted by total desc: llama3.1:8b (200) before gpt-5.5 (170).
   const llamaIdx = out.indexOf('llama3.1:8b');
