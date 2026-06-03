@@ -15,6 +15,7 @@ const manifest = JSON.parse(
 ) as {
   name: string;
   mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
+  hooks?: { PreToolUse?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
 };
 
 test('manifest declares the tokenmaxed plugin with required identity', () => {
@@ -52,6 +53,25 @@ test('manifest sources prices from the plugin root and state from plugin data', 
   const env = manifest.mcpServers.tokenmaxed!.env ?? {};
   assert.match(env.TOKENMAXED_PRICES ?? '', /\$\{CLAUDE_PLUGIN_ROOT\}/);
   assert.match(env.TOKENMAXED_STATE ?? '', /\$\{CLAUDE_PLUGIN_DATA\}/);
+});
+
+test('manifest registers a PreToolUse backstop on router_delegate', () => {
+  const pre = manifest.hooks?.PreToolUse ?? [];
+  const entry = pre.find((e) => /router_delegate/.test(e.matcher));
+  assert.ok(entry, 'a PreToolUse matcher for router_delegate must exist');
+  // Must match the full plugin tool-name format Claude Code exposes (A-2).
+  assert.equal(entry!.matcher, 'mcp__plugin_tokenmaxed_tokenmaxed__router_delegate');
+  const cmd = entry!.hooks[0]!.command;
+  assert.match(cmd, /\$\{CLAUDE_PLUGIN_ROOT\}\/hooks\/pretooluse\.mjs/);
+  // SECURITY: the user-controlled project dir must NOT be spliced into the shell
+  // command (it could contain $(...)/backticks); the hook reads it from env.
+  assert.doesNotMatch(cmd, /\$\{CLAUDE_PROJECT_DIR\}/);
+});
+
+test('the committed bundled hook exists', () => {
+  const hook = readFileSync(new URL('../hooks/pretooluse.mjs', import.meta.url), 'utf8');
+  assert.ok(hook.length > 500, 'hook bundle should be a non-trivial file');
+  assert.match(hook, /TokenMaxed PreToolUse hook/);
 });
 
 test('the committed bundled server exists (the install artifact a fresh clone ships)', () => {

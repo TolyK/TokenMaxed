@@ -18,5 +18,18 @@
         "TOKENMAXED_PROJECT": "${CLAUDE_PROJECT_DIR}"
       }
     }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_tokenmaxed_tokenmaxed__router_delegate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs\""
+          }
+        ]
+      }
+    ]
   }
 }
