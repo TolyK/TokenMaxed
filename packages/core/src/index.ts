@@ -14,6 +14,8 @@ export {
   DEFAULT_PRIOR_STRENGTH,
 } from './route.ts';
 export type { EffectiveCapabilityOptions } from './route.ts';
+export { outcomeCapability, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
+export type { OutcomeCapabilityOptions } from './feedback.ts';
 export { LaneRegistry, LaneConfigError, parseLaneConfig } from './registry.ts';
 export {
   PriceError,
