@@ -91,6 +91,16 @@ export interface Lane {
   manager_allowed?: boolean;
   /** Lane autonomy; defaults to `answer-only`. `agentic` requires `trust_mode: 'full'`. */
   execution_mode?: ExecutionMode;
+  /** For `cli` lanes: the executable to spawn (e.g. "codex", "gemini"). */
+  command?: string;
+  /** For `cli` lanes: argument template passed to the command. */
+  args?: string[];
+  /** For `api`/`local` lanes: the endpoint URL (e.g. an OpenAI-compatible URL or Ollama). */
+  endpoint?: string;
+  /** For `api` lanes: opaque reference to a credential (resolved to a token at send time). */
+  authHandle?: string;
+  /** Marks the host/"do it yourself" lane (e.g. Claude in Claude Code) — executed natively, not recorded. */
+  native?: boolean;
   /**
    * Explicit, high-friction user attestation that an otherwise non-trusted-
    * provenance lane is trusted enough to be manager-eligible. Default false.

@@ -43,6 +43,11 @@ const ALLOWED_LANE_KEYS = new Set([
   'manager_allowed',
   'execution_mode',
   'attestation',
+  'command',
+  'args',
+  'endpoint',
+  'authHandle',
+  'native',
   'capability',
 ]);
 
@@ -158,8 +163,43 @@ function parseLane(entry: unknown, index: number): Lane {
     lane.execution_mode = mode;
   }
 
+  if (entry.native !== undefined) {
+    if (typeof entry.native !== 'boolean') throw new LaneConfigError(`${at('native')} must be a boolean.`);
+    // `native` is the host/do-it-yourself lane — inherently full trust. Reject it
+    // on non-full lanes (e.g. a worker+native lane would be contradictory: routing
+    // would still send it through the untrusted path).
+    if (entry.native && lane.trust_mode !== 'full') {
+      throw new LaneConfigError(`${at('native')}: native is only valid on a full-trust lane (got trust_mode '${lane.trust_mode}').`);
+    }
+    lane.native = entry.native;
+  }
+  if (entry.command !== undefined) lane.command = requireString(entry.command, at('command'));
+  if (entry.endpoint !== undefined) lane.endpoint = requireString(entry.endpoint, at('endpoint'));
+  if (entry.authHandle !== undefined) lane.authHandle = requireString(entry.authHandle, at('authHandle'));
+  if (entry.args !== undefined) {
+    if (!Array.isArray(entry.args) || entry.args.some((a) => typeof a !== 'string')) {
+      throw new LaneConfigError(`${at('args')} must be an array of strings.`);
+    }
+    lane.args = entry.args as string[];
+  }
+
   const capability = parseCapability(entry.capability, at('capability'));
   if (capability) lane.capability = capability;
+
+  // A SELECTABLE (full/worker), non-native lane must be executable: cli needs a
+  // command, api needs an endpoint (local defaults to localhost). Reject at load
+  // so an unexecutable lane can never be selected and silently degrade. Blocked
+  // and (deferred) monitored lanes are never selectable, so a disabled stub may
+  // omit executor config.
+  const selectable = lane.trust_mode === 'full' || lane.trust_mode === 'worker';
+  if (selectable && !lane.native) {
+    if (lane.kind === 'cli' && lane.command === undefined) {
+      throw new LaneConfigError(`${at('command')}: a non-native cli lane requires a command (or set native: true).`);
+    }
+    if (lane.kind === 'api' && lane.endpoint === undefined) {
+      throw new LaneConfigError(`${at('endpoint')}: an api lane requires an endpoint.`);
+    }
+  }
   return lane;
 }
 
@@ -168,6 +208,7 @@ function freezeLane(lane: Lane): Lane {
   const clone: Lane = { ...lane };
   if (clone.capability) clone.capability = Object.freeze({ ...clone.capability });
   if (clone.roles) clone.roles = Object.freeze([...clone.roles]) as Lane['roles'];
+  if (clone.args) clone.args = Object.freeze([...clone.args]) as Lane['args'];
   return Object.freeze(clone);
 }
 

@@ -17,12 +17,14 @@ import { LaneConfigError, LaneRegistry, parseLaneConfig } from './registry.ts';
 import { PriceError, validatePriceTable } from './price.ts';
 import type { PriceTable } from './price.ts';
 import { PolicyConfigError, parsePolicyConfig } from './policy.ts';
-import type { Policy } from './types.ts';
 import { isMinimizedPayload } from './minimize.ts';
 import type { SecretScanner } from './minimize.ts';
 import { buildUntrustedRequestBody } from './boundary.ts';
-import type { SafeUntrustedEnvelope } from './boundary.ts';
+import type { SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
 import type { RawUsage } from './usage.ts';
+import { runTask } from './run.ts';
+import type { RunDeps, RunRequest, RunResult, TrustedExecResult } from './run.ts';
+import type { Lane, Policy, RouteContext } from './types.ts';
 import {
   LedgerError,
   SCHEMA_VERSION,
@@ -313,4 +315,159 @@ export class JsonlLedger {
     this.#write(event, events);
     return event;
   }
+}
+
+// ---- lane executors (C-9) + runTask wiring ------------------------------
+
+type SpawnLike = (
+  command: string,
+  args: readonly string[],
+  options: { input: string; encoding: 'utf8'; maxBuffer: number },
+) => { status: number | null; stdout?: string; error?: Error };
+
+/**
+ * Generic CLI-lane executor (answer-only): spawn the lane's `command` with its
+ * `args`, pass the instruction on stdin, return stdout as the result. Any
+ * provider CLI (Codex, Gemini, Kimi Code, …) plugs in by config. Throws on
+ * spawn/non-zero exit so runTask records a failed attempt and degrades.
+ */
+/** A trusted-lane executor: trusted lanes receive the full instruction + attachments. */
+type TrustedExecFn = (lane: Lane, instruction: string, attachments?: readonly { content: string }[]) => Promise<TrustedExecResult>;
+
+/** Combine the instruction with attachment contents into a single prompt (trusted lanes get full context). */
+function combinedPrompt(instruction: string, attachments?: readonly { content: string }[]): string {
+  return attachments && attachments.length > 0
+    ? [instruction, ...attachments.map((a) => a.content)].join('\n\n')
+    : instruction;
+}
+
+const numOrUndef = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+
+export function makeCliExecutor(spawnImpl?: SpawnLike): TrustedExecFn {
+  const spawn: SpawnLike =
+    spawnImpl ?? ((cmd, args, opts) => spawnSync(cmd, [...args], opts) as ReturnType<SpawnLike>);
+  return async (lane, instruction, attachments) => {
+    if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
+    const input = combinedPrompt(instruction, attachments);
+    const res = spawn(lane.command, lane.args ?? [], { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    if (res.error) throw new Error(`cli lane "${lane.id}" failed to spawn`);
+    if (res.status !== 0) throw new Error(`cli lane "${lane.id}" exited with status ${res.status}`);
+    return { resultText: res.stdout ?? '' }; // CLIs rarely report tokens ⇒ estimated downstream
+  };
+}
+
+type OllamaFetch = (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<FetchLikeResponse>;
+
+/** Local Ollama executor: POST /api/generate; uses reported eval counts when present. */
+export function makeOllamaExecutor(fetchImpl?: OllamaFetch): TrustedExecFn {
+  const doFetch = fetchImpl ?? (globalThis.fetch as unknown as OllamaFetch);
+  return async (lane, instruction, attachments) => {
+    const base = lane.endpoint ?? 'http://localhost:11434';
+    const res = await doFetch(`${base}/api/generate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false }),
+    });
+    if (!res.ok) throw new Error(`ollama lane "${lane.id}" returned status ${res.status}`);
+    const data = (await res.json()) as { response?: unknown; prompt_eval_count?: unknown; eval_count?: unknown };
+    return {
+      resultText: typeof data.response === 'string' ? data.response : '',
+      reported: { tokens_in: numOrUndef(data.prompt_eval_count), tokens_out: numOrUndef(data.eval_count) },
+    };
+  };
+}
+
+/**
+ * Trusted API executor (OpenAI-compatible): sends the FULL instruction +
+ * attachments (no minimization — a `full`/trusted lane the user approved). Auth
+ * is resolved from the lane's authHandle; a lane that needs auth without a
+ * resolver fails closed (throws ⇒ runTask degrades).
+ */
+export function makeTrustedApiExecutor(
+  deps: { fetchImpl?: FetchLike; resolveAuth?: (authHandle: string) => string } = {},
+): TrustedExecFn {
+  const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as FetchLike | undefined);
+  return async (lane, instruction, attachments) => {
+    if (!lane.endpoint) throw new Error(`api lane "${lane.id}" has no endpoint configured`);
+    if (!doFetch) throw new Error('no fetch implementation available');
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (lane.authHandle) {
+      const token = deps.resolveAuth ? deps.resolveAuth(lane.authHandle) : '';
+      if (!token) throw new Error(`auth resolution failed for api lane "${lane.id}"`);
+      headers.authorization = `Bearer ${token}`;
+    }
+    const body = JSON.stringify({
+      model: lane.model,
+      messages: [{ role: 'user', content: combinedPrompt(instruction, attachments) }],
+    });
+    const res = await doFetch(lane.endpoint, { method: 'POST', headers, body });
+    if (!res.ok) throw new Error(`api lane "${lane.id}" returned status ${res.status}`);
+    const data = (await res.json()) as { choices?: { message?: { content?: unknown } }[]; usage?: Record<string, unknown> };
+    const content = data.choices?.[0]?.message?.content;
+    return {
+      resultText: typeof content === 'string' ? content : '',
+      reported: { tokens_in: numOrUndef(data.usage?.prompt_tokens), tokens_out: numOrUndef(data.usage?.completion_tokens) },
+    };
+  };
+}
+
+/**
+ * Trusted-lane dispatcher: local ⇒ Ollama; cli with a command ⇒ generic CLI;
+ * api with an endpoint ⇒ trusted API; anything else (no command/endpoint — the
+ * host model) ⇒ native directive (the host does it). Sub-executors are injectable.
+ */
+export function makeTrustedExecutor(deps: { cli?: TrustedExecFn; ollama?: TrustedExecFn; api?: TrustedExecFn } = {}): TrustedExecFn {
+  const cli = deps.cli ?? makeCliExecutor();
+  const ollama = deps.ollama ?? makeOllamaExecutor();
+  const api = deps.api ?? makeTrustedApiExecutor();
+  return async (lane, instruction, attachments) => {
+    if (lane.native) return { resultText: '', native: true }; // explicit host lane ⇒ host performs it
+    if (lane.kind === 'local') return ollama(lane, instruction, attachments);
+    if (lane.kind === 'cli' && lane.command) return cli(lane, instruction, attachments);
+    if (lane.kind === 'api' && lane.endpoint) return api(lane, instruction, attachments);
+    // A non-native lane with no executor config is MISCONFIGURED — throw so runTask
+    // records a failed attempt and degrades, rather than silently running natively.
+    throw new Error(`lane "${lane.id}" has no executor configured (set native: true, or command / endpoint)`);
+  };
+}
+
+/** Build the narrow untrusted DTO for a worker lane (requires a configured endpoint). */
+export function laneToUntrustedDTO(lane: Lane): UntrustedLaneDTO {
+  if (!lane.endpoint) throw new Error(`worker lane "${lane.id}" has no endpoint configured`);
+  return { id: lane.id, model: lane.model, endpoint: lane.endpoint, authHandle: lane.authHandle ?? '' };
+}
+
+/** Options for {@link runAndRecord}. */
+export interface RunAndRecordOptions {
+  ledger: JsonlLedger;
+  priceTable: PriceTable;
+  executeTrusted?: RunDeps['executeTrusted'];
+  scanSecrets?: RunDeps['scanSecrets'];
+  resolveAuth?: (authHandle: string) => string;
+}
+
+/**
+ * Wire {@link runTask} with the real executors + gitleaks scanner, run the task,
+ * and append its content-free events to the ledger. Returns the run result.
+ */
+export async function runAndRecord(
+  request: RunRequest,
+  ctx: RouteContext,
+  policy: Policy,
+  opts: RunAndRecordOptions,
+): Promise<RunResult> {
+  const resolveAuth = opts.resolveAuth;
+  const deps: RunDeps = {
+    executeTrusted:
+      opts.executeTrusted ??
+      makeTrustedExecutor(resolveAuth ? { api: makeTrustedApiExecutor({ resolveAuth }) } : {}),
+    executeUntrusted: (env) => executeUntrusted(env, resolveAuth ? { resolveAuth } : {}),
+    untrustedLaneDTO: laneToUntrustedDTO,
+    scanSecrets: opts.scanSecrets ?? makeGitleaksScanner(),
+    priceTable: opts.priceTable,
+    newId: () => randomUUID(),
+  };
+  const result = await runTask(request, ctx, policy, deps);
+  for (const event of result.events) opts.ledger.appendTask(event);
+  return result;
 }

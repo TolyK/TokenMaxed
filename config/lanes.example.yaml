@@ -36,6 +36,7 @@ lanes:
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
+    native: true          # the host model (do-it-yourself lane)
     roles: [manager]
     manager_allowed: true
     capability:
@@ -55,6 +56,8 @@ lanes:
     provenance: openai
     jurisdiction: US
     execution_mode: answer-only
+    command: codex          # the provider CLI to spawn (exact flags verified per tool)
+    args: [exec]
     capability:
       bugfix: 0.92
       codegen: 0.90

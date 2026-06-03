@@ -13,6 +13,7 @@ lanes:
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
+    native: true
     capability:
       feature: 0.95
       explain: 0
@@ -183,6 +184,7 @@ lanes:
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
+    command: claude
     roles: [manager]
     manager_allowed: true
     execution_mode: agentic
@@ -231,10 +233,10 @@ test('rejects duplicate lane ids', () => {
   const cfg = `
 lanes:
   - id: dup
-    kind: cli
+    kind: local
     model: m
     trust_mode: full
-    costBasis: subscription
+    costBasis: local
     provenance: p
     jurisdiction: US
   - id: dup
@@ -246,6 +248,24 @@ lanes:
     jurisdiction: US
 `;
   assert.throws(() => parseLaneConfig(cfg), { message: /Duplicate lane id "dup"/ });
+});
+
+test('rejects a non-executable lane (cli without command, api without endpoint)', () => {
+  const cli = `lanes:\n  - id: x\n    kind: cli\n    model: m\n    trust_mode: full\n    costBasis: subscription\n    provenance: p\n    jurisdiction: US\n`;
+  assert.throws(() => parseLaneConfig(cli), { message: /non-native cli lane requires a command/ });
+  const api = `lanes:\n  - id: x\n    kind: api\n    model: m\n    trust_mode: worker\n    costBasis: metered\n    provenance: p\n    jurisdiction: US\n`;
+  assert.throws(() => parseLaneConfig(api), { message: /api lane requires an endpoint/ });
+  // native lanes need no executor config; local defaults to localhost.
+  const native = `lanes:\n  - id: h\n    kind: cli\n    model: m\n    trust_mode: full\n    costBasis: subscription\n    provenance: p\n    jurisdiction: US\n    native: true\n`;
+  assert.equal(parseLaneConfig(native).byId('h')?.native, true);
+  // A blocked lane stub can omit executor config (never selectable).
+  const blocked = `lanes:\n  - id: off\n    kind: cli\n    model: m\n    trust_mode: blocked\n    costBasis: subscription\n    provenance: p\n    jurisdiction: US\n`;
+  assert.equal(parseLaneConfig(blocked).byId('off')?.trust_mode, 'blocked');
+});
+
+test('rejects native on a non-full lane (contradictory)', () => {
+  const cfg = `lanes:\n  - id: w\n    kind: api\n    model: m\n    trust_mode: worker\n    costBasis: metered\n    provenance: p\n    jurisdiction: US\n    endpoint: https://w\n    native: true\n`;
+  assert.throws(() => parseLaneConfig(cfg), { message: /native is only valid on a full-trust lane/ });
 });
 
 test('loadLaneConfig reads and validates the shipped example file', () => {
