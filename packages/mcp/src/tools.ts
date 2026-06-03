@@ -86,8 +86,20 @@ export interface ToolDeps {
    * free of core/node runtime imports; the server wires it to `runAndRecord`.
    */
   delegate: (request: DelegateRequest) => Promise<DelegateOutcome>;
+  /** Have the configured manager review the turn's working-tree diff (A-7). */
+  review: () => Promise<ReviewOutcome>;
   /** Current wall-clock in ms (injected so tests are deterministic). */
   now: () => number;
+}
+
+/** Outcome of a manager review (content-free; the diff is never returned/stored). */
+export interface ReviewOutcome {
+  /** false ⇒ no review ran (no changes, no manager configured, …); see reason. */
+  reviewed: boolean;
+  verdict?: 'pass' | 'needs-rework' | 'fail';
+  notes?: string;
+  managerLaneId?: string;
+  reason?: string;
 }
 
 /** A single offload request handed to {@link ToolDeps.delegate}. */
@@ -460,7 +472,28 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool];
+  const reviewTool: ToolDef = {
+    name: 'router_review',
+    description:
+      'Have the configured trusted manager lane review the current working-tree changes (git diff vs HEAD) and return a verdict (pass | needs-rework | fail) with notes. Records a content-free outcome. The diff is sent only to the trusted manager and is never stored.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} },
+    handler: (deps) =>
+      guardedAsync(async () => {
+        const r = await deps.review();
+        if (!r.reviewed) {
+          return ok(`No review run: ${r.reason ?? 'unavailable'}.`, { reviewed: false, ...(r.reason ? { reason: r.reason } : {}) });
+        }
+        const head = `Manager review (${r.managerLaneId ?? 'manager'}): ${r.verdict}`;
+        const body = r.notes ? `\n\n${r.notes}` : '';
+        return ok(`${head}${body}`, {
+          reviewed: true,
+          verdict: r.verdict,
+          ...(r.managerLaneId ? { managerLaneId: r.managerLaneId } : {}),
+        });
+      }),
+  };
+
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

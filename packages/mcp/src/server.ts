@@ -25,11 +25,9 @@
  * run it. The project dir only contributes the toggle KEY (never executed).
  */
 
-import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -38,13 +36,12 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { TASK_CATEGORIES, evaluate, filterEventsSince, priceForModel, routeDecide, runTask, summarize, tokenStats } from '@tokenmaxed/core';
-import type { Lane, Policy, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import type { Lane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeUntrusted,
   laneToUntrustedDTO,
   loadLaneConfig,
-  loadPolicyConfig,
   loadPriceTable,
   makeCliExecutor,
   makeGitleaksScanner,
@@ -52,15 +49,16 @@ import {
   makeTrustedExecutor,
 } from '@tokenmaxed/core/node';
 
+import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
+import { makeHostReviewDeps, runHostTurnReview } from './host-review.ts';
 import { createTools, dispatch } from './tools.ts';
 import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
-import type { CorePort, DelegateOutcome, DelegateRequest, ToolDef, ToolDeps } from './tools.ts';
+import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
 
-const HOME_TM = join(homedir(), '.tokenmaxed');
-// User-owned (NOT repo-controlled) — see the SECURITY note above.
-const DEFAULT_LANES = join(HOME_TM, 'lanes.yaml');
-const DEFAULT_POLICY = join(HOME_TM, 'policy.yaml');
+// User-owned (NOT repo-controlled) — see the SECURITY note above. HOME_TM and the
+// auth/spawn helpers come from config.ts so they have one shared definition.
+const DEFAULT_LANES = homeFile('lanes.yaml');
 // Price seed shipped WITH this package, resolved module-relative (not cwd) so a
 // standalone `tokenmaxed-mcp` and the esbuild bundle both find it without env.
 // (../prices.seed.json sits next to dist/ in the package and next to server/ in
@@ -109,10 +107,8 @@ const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, 
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
   const lanesPathExplicit = env.TOKENMAXED_LANES !== undefined;
-  const policyPath = env.TOKENMAXED_POLICY ?? DEFAULT_POLICY;
-  const policyPathExplicit = env.TOKENMAXED_POLICY !== undefined;
   const ledgerPath = env.TOKENMAXED_LEDGER; // undefined ⇒ JsonlLedger default (~/.tokenmaxed)
-  const statePath = env.TOKENMAXED_STATE ?? join(HOME_TM, 'state.json');
+  const statePath = env.TOKENMAXED_STATE ?? homeFile('state.json');
   const projectKey = env.TOKENMAXED_PROJECT ?? 'default';
   const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
   // Gate CLOSED by default: trusted CLI/local/native lanes (the common, safe
@@ -126,26 +122,14 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // lane (`claude -p`) can't re-enter routing and recurse (A-5b).
   const globallyDisabled = env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true';
   const store = fileToggleStore(statePath);
-  // BYOK auth, namespaced to contain a supply-chain risk: a lane's `authHandle`
-  // resolves ONLY to env var `TOKENMAXED_KEY_<handle>`, never an arbitrary name.
-  // So a repo-supplied lanes.yaml cannot set e.g. `authHandle: GITHUB_TOKEN` and
-  // exfiltrate that secret to a lane endpoint. Unknown/unset ⇒ '' ⇒ the executor
-  // fails closed (auth_failed), never a leak. Handle must be a plain identifier.
-  const resolveAuth = (authHandle: string): string => {
-    if (!/^[A-Za-z0-9_]+$/.test(authHandle)) return '';
-    return env[`TOKENMAXED_KEY_${authHandle}`] ?? '';
-  };
+  // Namespaced BYOK auth (see config.ts): a repo-supplied lanes.yaml can't name an
+  // arbitrary secret env var; unknown ⇒ '' ⇒ the executor fails closed.
+  const resolveAuth = makeResolveAuth(env);
 
-  // Load policy, FAILING CLOSED when an explicitly configured policy file is
-  // missing (typo / deleted / unmounted): silently using {} would allow more than
-  // the user intends (empty policy permits public/normal worker lanes). Only the
-  // DEFAULT path missing (pre-setup) falls back to {} — core deny-by-default still
-  // restricts everything but public/normal, and the gate is closed by default.
-  const loadPolicySafe = (): Policy => {
-    if (existsSync(policyPath)) return loadPolicyConfig(policyPath);
-    if (policyPathExplicit) throw new Error(`configured policy file not found: ${policyPath}`);
-    return {};
-  };
+  // Fail-closed policy loader (shared with the review path via config.ts): an
+  // explicitly configured but missing policy throws; the default path missing
+  // (pre-setup) falls back to {} (core deny-by-default + closed gate still apply).
+  const loadPolicySafe = makeLoadPolicy(env);
 
   // The candidate set both preview and delegate route over: the category's
   // candidate lanes minus any unpriceable metered lane (see recordableLane).
@@ -193,19 +177,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     //
     // CLI children run with TOKENMAXED_DISABLE=1 so a cheaper-Claude lane
     // (`claude -p --model <haiku>`) can't load this plugin and recurse (A-5b).
-    const cliSpawn = (
-      command: string,
-      args: readonly string[],
-      options: { input: string; encoding: 'utf8'; maxBuffer: number },
-    ) =>
-      spawnSync(command, [...args], { ...options, env: { ...process.env, TOKENMAXED_DISABLE: '1' } }) as {
-        status: number | null;
-        stdout?: string;
-        error?: Error;
-      };
     const runDeps: RunDeps = {
       executeTrusted: makeTrustedExecutor({
-        cli: makeCliExecutor(cliSpawn),
+        cli: makeCliExecutor(makeCliSpawn()),
         api: makeTrustedApiExecutor({ resolveAuth }),
       }),
       executeUntrusted: (envelope) => executeUntrusted(envelope, { resolveAuth }),
@@ -256,6 +230,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     getEnabled: () => (globallyDisabled ? false : readEnabled(store, projectKey)),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
     delegate,
+    // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
+    // same runHostTurnReview path independently. Honor the global kill-switch so a
+    // recursion-guarded child (TOKENMAXED_DISABLE=1) can't review + spawn again.
+    review: (): Promise<ReviewOutcome> =>
+      globallyDisabled
+        ? Promise.resolve({ reviewed: false, reason: 'routing is disabled (TOKENMAXED_DISABLE)' })
+        : runHostTurnReview(randomUUID(), makeHostReviewDeps(env)),
     now: () => Date.now(),
   };
 }

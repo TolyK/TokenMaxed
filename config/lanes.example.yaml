@@ -91,6 +91,12 @@ lanes:
     execution_mode: answer-only
     command: claude
     args: ["-p", "--model", "claude-haiku-4-5-20251001"]
+    # In-family manager: /tokenmaxed:review (and the opt-in Stop gate) send the
+    # working-tree diff here for a verdict. Trusted + Anthropic, so the review
+    # stays in-family. Point this at a stronger model (e.g. Sonnet/Opus or Codex)
+    # via /tokenmaxed:setup if you want deeper reviews.
+    roles: [manager]
+    manager_allowed: true
     capability:
       boilerplate: 0.82
       docs: 0.85

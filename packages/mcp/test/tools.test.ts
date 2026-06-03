@@ -23,7 +23,7 @@ import {
 import type { Lane, LedgerEvent, Policy } from '../../core/src/index.ts';
 
 import { createTools, dispatch } from '../src/tools.ts';
-import type { CorePort, DelegateOutcome, ToolDeps } from '../src/tools.ts';
+import type { CorePort, DelegateOutcome, ReviewOutcome, ToolDeps } from '../src/tools.ts';
 
 // --- harness -------------------------------------------------------------------
 
@@ -78,6 +78,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     getEnabled: () => true,
     setEnabled: () => {},
     delegate: async (): Promise<DelegateOutcome> => ({ laneId: 'native', status: 'ok', native: true }),
+    review: async (): Promise<ReviewOutcome> => ({ reviewed: false, reason: 'no manager' }),
     now: () => FIXED_NOW,
     ...over,
   };
@@ -93,7 +94,7 @@ function call(name: string, d: ToolDeps, args: Record<string, unknown> = {}) {
 test('builds the expected tool set with object input schemas', () => {
   assert.deepEqual(
     TOOLS.map((t) => t.name).sort(),
-    ['router_delegate', 'router_preview', 'router_savings', 'router_set_enabled', 'router_status', 'router_tokens'],
+    ['router_delegate', 'router_preview', 'router_review', 'router_savings', 'router_set_enabled', 'router_status', 'router_tokens'],
   );
   for (const t of TOOLS) {
     assert.equal((t.inputSchema as { type: string }).type, 'object');
@@ -301,6 +302,27 @@ test('delegate forwards repo_class/sensitivity as policy context', async () => {
     { category: 'bugfix', instruction: 'fix', repo_class: 'private', sensitivity: 'sensitive' },
   );
   assert.deepEqual(seen, { repo_class: 'private', sensitivity: 'sensitive' });
+});
+
+// --- router_review (A-7) -------------------------------------------------------
+
+test('review reports the manager verdict and notes', async () => {
+  const r = await call(
+    'router_review',
+    deps({ review: async () => ({ reviewed: true, verdict: 'needs-rework', notes: 'fix the null check', managerLaneId: 'codex-cli' }) }),
+  );
+  assert.notEqual(r.isError, true);
+  assert.equal(r.structuredContent!.reviewed as boolean, true);
+  assert.equal(r.structuredContent!.verdict as string, 'needs-rework');
+  assert.match(r.content[0]!.text, /codex-cli\): needs-rework/);
+  assert.match(r.content[0]!.text, /fix the null check/);
+});
+
+test('review explains when nothing was reviewed', async () => {
+  const r = await call('router_review', deps({ review: async () => ({ reviewed: false, reason: 'no working-tree changes to review' }) }));
+  assert.notEqual(r.isError, true);
+  assert.equal(r.structuredContent!.reviewed as boolean, false);
+  assert.match(r.content[0]!.text, /No review run: no working-tree changes/);
 });
 
 // --- router_preview ------------------------------------------------------------

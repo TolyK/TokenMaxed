@@ -14226,11 +14226,9 @@ var require_dist2 = __commonJS({
 });
 
 // ../mcp/src/server.ts
-import { spawnSync as spawnSync2 } from "node:child_process";
-import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { randomUUID as randomUUID3 } from "node:crypto";
+import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname as dirname2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
@@ -22804,6 +22802,7 @@ var TASK_CATEGORIES = [
   "codegen",
   "docs"
 ];
+var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
 // ../core/src/minimize.ts
@@ -23072,6 +23071,11 @@ function isSelectablePreGate(lane, gateReady = false) {
   if (lane.trust_mode === "monitored") return false;
   if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
   return gateReady || lane.kind !== "api";
+}
+function isManagerEligible(lane) {
+  if (lane.trust_mode !== "full" || lane.manager_allowed !== true) return false;
+  const trustedByOrigin = lane.kind === "local" || TRUSTED_PROVENANCES.includes(lane.provenance);
+  return trustedByOrigin || lane.attestation === true;
 }
 function clamp01(n) {
   if (Number.isNaN(n)) return 0;
@@ -23701,6 +23705,58 @@ function classifyHttpStatus(status) {
   return "provider_error";
 }
 
+// ../core/src/review.ts
+var ReviewError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ReviewError";
+  }
+};
+async function review(request, deps) {
+  if (!isManagerEligible(deps.managerLane)) {
+    throw new ReviewError(
+      `manager lane "${deps.managerLane.id}" is not manager-eligible (needs full trust + manager_allowed + trusted origin/attestation)`
+    );
+  }
+  const isNonEmpty = (s) => typeof s === "string" && s.trim() !== "";
+  const hasTask = isNonEmpty(request.task_id);
+  const hasTurn = isNonEmpty(request.turn_id);
+  if (hasTask === hasTurn) {
+    throw new ReviewError(
+      "review requires exactly one non-empty id: task_id (router_task) or turn_id (host_turn)"
+    );
+  }
+  const subject_type = hasTask ? "router_task" : "host_turn";
+  const subject_id = hasTask ? request.task_id : request.turn_id;
+  const out = await deps.runManagerReview(deps.managerLane, request.content, request.category);
+  const m = deps.managerLane;
+  const event = {
+    subject_id,
+    subject_type,
+    review_id: deps.newId(),
+    attempt: request.attempt ?? 0,
+    category: request.category,
+    reviewer_lane_id: m.id,
+    reviewer_model: m.model,
+    reviewer_trust_mode: m.trust_mode,
+    reviewer_provenance: m.provenance,
+    verdict: out.verdict,
+    voter: "reviewer_model",
+    policy_verdict: "allow"
+    // the manager is trusted and may see the content
+  };
+  if (hasTask) event.task_id = request.task_id;
+  if (hasTurn) event.turn_id = request.turn_id;
+  if (request.subjectLane) {
+    event.subject_lane_id = request.subjectLane.id;
+    event.subject_provenance = request.subjectLane.provenance;
+  }
+  const result = { verdict: out.verdict, event };
+  if (out.notes !== void 0) result.notes = out.notes;
+  if (out.suggested_lane_id !== void 0) result.suggested_lane_id = out.suggested_lane_id;
+  return result;
+}
+
 // ../core/src/usage.ts
 var UsageError = class extends Error {
   constructor(message) {
@@ -24114,6 +24170,141 @@ function laneToUntrustedDTO(lane) {
   return { id: lane.id, model: lane.model, endpoint: lane.endpoint, authHandle: lane.authHandle ?? "" };
 }
 
+// ../mcp/src/config.ts
+import { spawnSync as spawnSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { join as join2 } from "node:path";
+var HOME_TM = join2(homedir2(), ".tokenmaxed");
+function homeFile(name) {
+  return join2(HOME_TM, name);
+}
+function makeLoadPolicy(env) {
+  const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
+  const explicit = env.TOKENMAXED_POLICY !== void 0;
+  return () => {
+    if (existsSync2(policyPath)) return loadPolicyConfig(policyPath);
+    if (explicit) throw new Error(`configured policy file not found: ${policyPath}`);
+    return {};
+  };
+}
+function makeResolveAuth(env) {
+  return (authHandle) => {
+    if (!/^[A-Za-z0-9_]+$/.test(authHandle)) return "";
+    return env[`TOKENMAXED_KEY_${authHandle}`] ?? "";
+  };
+}
+var DEFAULT_CLI_TIMEOUT_MS = 3e5;
+function makeCliSpawn(timeoutMs = DEFAULT_CLI_TIMEOUT_MS) {
+  return (command, args, options) => spawnSync2(command, [...args], {
+    ...options,
+    env: { ...process.env, TOKENMAXED_DISABLE: "1" },
+    timeout: timeoutMs
+  });
+}
+
+// ../mcp/src/host-review.ts
+import { spawnSync as spawnSync3 } from "node:child_process";
+import { randomUUID as randomUUID2 } from "node:crypto";
+import { existsSync as existsSync3 } from "node:fs";
+
+// ../mcp/src/reviewer.ts
+var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
+function buildReviewPrompt(diff) {
+  return [
+    "You are a senior code reviewer. Review the following working-tree diff for",
+    "correctness, security, and obvious bugs. Be concise \u2014 list only real issues.",
+    "",
+    "End your reply with EXACTLY one final line, one of:",
+    "  VERDICT: pass            (acceptable to ship)",
+    "  VERDICT: needs-rework    (has issues that should be fixed)",
+    "  VERDICT: fail            (seriously wrong; do not ship)",
+    "",
+    "Diff:",
+    diff
+  ].join("\n");
+}
+function parseManagerVerdict(text) {
+  let verdict = "pass";
+  let matched = false;
+  for (const m of text.matchAll(VERDICT_RE)) {
+    verdict = m[1].toLowerCase();
+    matched = true;
+  }
+  const notes = text.replace(VERDICT_RE, "").trim();
+  const out = { verdict };
+  if (notes) out.notes = notes;
+  void matched;
+  return out;
+}
+
+// ../mcp/src/host-review.ts
+async function runHostTurnReview(turnId, deps) {
+  const diff = deps.readDiff();
+  if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };
+  const lanes = deps.loadLanes();
+  if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
+  const policy = deps.loadPolicy();
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
+  const manager = lanes.find(
+    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, deps.gateReady) && !disabled.has(l.id) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+  );
+  if (!manager) {
+    return {
+      reviewed: false,
+      reason: "no usable manager lane configured (needs manager_allowed on a trusted CLI/local lane, not policy-blocked; an API manager needs the safety gate open)"
+    };
+  }
+  const result = await review(
+    { turn_id: turnId, category: "refactor", content: diff },
+    {
+      managerLane: manager,
+      runManagerReview: async (lane, content) => parseManagerVerdict(await deps.runManager(lane, buildReviewPrompt(content))),
+      newId: deps.newId
+    }
+  );
+  try {
+    deps.appendOutcome(result.event);
+  } catch {
+  }
+  const out = { reviewed: true, verdict: result.verdict, managerLaneId: manager.id };
+  if (result.notes) out.notes = result.notes;
+  return out;
+}
+var MAX_DIFF_BYTES = 256 * 1024;
+var GIT_MAX_BUFFER = 64 * 1024 * 1024;
+var GIT_TIMEOUT_MS = 15e3;
+var REVIEW_CLI_TIMEOUT_MS = 9e4;
+function makeHostReviewDeps(env) {
+  const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
+  const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
+  const ledgerPath = env.TOKENMAXED_LEDGER;
+  const resolveAuth = makeResolveAuth(env);
+  const executor = makeTrustedExecutor({
+    cli: makeCliExecutor(makeCliSpawn(REVIEW_CLI_TIMEOUT_MS)),
+    api: makeTrustedApiExecutor({ resolveAuth })
+  });
+  return {
+    readDiff: () => {
+      const res = spawnSync3("git", ["diff", "HEAD"], { cwd, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
+      if (res.status !== 0 || typeof res.stdout !== "string") return "";
+      const diff = res.stdout;
+      return diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}
+
+[diff truncated for review]` : diff;
+    },
+    loadLanes: () => existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    loadPolicy: makeLoadPolicy(env),
+    runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
+    appendOutcome: (event) => {
+      new JsonlLedger(ledgerPath).appendOutcome(event);
+    },
+    gateReady: env.TOKENMAXED_GATE_READY === "true",
+    newId: () => randomUUID2()
+  };
+}
+
 // ../mcp/src/tools.ts
 var ToolInputError = class extends Error {
   constructor(message) {
@@ -24379,7 +24570,27 @@ function createTools(core) {
       return renderDelegate(outcome);
     })
   };
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool];
+  const reviewTool = {
+    name: "router_review",
+    description: "Have the configured trusted manager lane review the current working-tree changes (git diff vs HEAD) and return a verdict (pass | needs-rework | fail) with notes. Records a content-free outcome. The diff is sent only to the trusted manager and is never stored.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    handler: (deps) => guardedAsync(async () => {
+      const r = await deps.review();
+      if (!r.reviewed) {
+        return ok(`No review run: ${r.reason ?? "unavailable"}.`, { reviewed: false, ...r.reason ? { reason: r.reason } : {} });
+      }
+      const head = `Manager review (${r.managerLaneId ?? "manager"}): ${r.verdict}`;
+      const body = r.notes ? `
+
+${r.notes}` : "";
+      return ok(`${head}${body}`, {
+        reviewed: true,
+        verdict: r.verdict,
+        ...r.managerLaneId ? { managerLaneId: r.managerLaneId } : {}
+      });
+    })
+  };
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool];
 }
 function renderDelegate(o) {
   if (o.native || o.status !== "ok") {
@@ -24448,9 +24659,7 @@ function writeEnabled(store, projectKey, enabled) {
 }
 
 // ../mcp/src/server.ts
-var HOME_TM = join2(homedir2(), ".tokenmaxed");
-var DEFAULT_LANES = join2(HOME_TM, "lanes.yaml");
-var DEFAULT_POLICY = join2(HOME_TM, "policy.yaml");
+var DEFAULT_LANES = homeFile("lanes.yaml");
 var DEFAULT_PRICES = fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
 function recordableLane(lane, priceTable) {
   if (lane.native || lane.costBasis !== "metered") return true;
@@ -24464,7 +24673,7 @@ function recordableLane(lane, priceTable) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync2(statePath)) return {};
+      if (!existsSync4(statePath)) return {};
       try {
         return JSON.parse(readFileSync2(statePath, "utf8"));
       } catch {
@@ -24481,26 +24690,17 @@ var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, evaluate, ta
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
   const lanesPathExplicit = env.TOKENMAXED_LANES !== void 0;
-  const policyPath = env.TOKENMAXED_POLICY ?? DEFAULT_POLICY;
-  const policyPathExplicit = env.TOKENMAXED_POLICY !== void 0;
   const ledgerPath = env.TOKENMAXED_LEDGER;
-  const statePath = env.TOKENMAXED_STATE ?? join2(HOME_TM, "state.json");
+  const statePath = env.TOKENMAXED_STATE ?? homeFile("state.json");
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
   const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
   const store = fileToggleStore(statePath);
-  const resolveAuth = (authHandle) => {
-    if (!/^[A-Za-z0-9_]+$/.test(authHandle)) return "";
-    return env[`TOKENMAXED_KEY_${authHandle}`] ?? "";
-  };
-  const loadPolicySafe = () => {
-    if (existsSync2(policyPath)) return loadPolicyConfig(policyPath);
-    if (policyPathExplicit) throw new Error(`configured policy file not found: ${policyPath}`);
-    return {};
-  };
+  const resolveAuth = makeResolveAuth(env);
+  const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync2(lanesPath)) {
+    if (!existsSync4(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
@@ -24508,7 +24708,7 @@ function makeServerDeps(env = process.env) {
     return loadLaneConfig(lanesPath).candidateLanes(category).filter((lane) => recordableLane(lane, priceTable));
   };
   const delegate = async (request) => {
-    if (!existsSync2(lanesPath)) {
+    if (!existsSync4(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -24523,17 +24723,16 @@ function makeServerDeps(env = process.env) {
     const ledger = new JsonlLedger(ledgerPath);
     const lanes = registry2.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
     const ctx = { lanes, gateReady, policyContext: request.policyContext ?? {} };
-    const cliSpawn = (command, args, options) => spawnSync2(command, [...args], { ...options, env: { ...process.env, TOKENMAXED_DISABLE: "1" } });
     const runDeps = {
       executeTrusted: makeTrustedExecutor({
-        cli: makeCliExecutor(cliSpawn),
+        cli: makeCliExecutor(makeCliSpawn()),
         api: makeTrustedApiExecutor({ resolveAuth })
       }),
       executeUntrusted: (envelope) => executeUntrusted(envelope, { resolveAuth }),
       untrustedLaneDTO: laneToUntrustedDTO,
       scanSecrets: makeGitleaksScanner(),
       priceTable,
-      newId: () => randomUUID2()
+      newId: () => randomUUID3()
     };
     const result = await runTask(
       {
@@ -24576,6 +24775,10 @@ function makeServerDeps(env = process.env) {
     getEnabled: () => globallyDisabled ? false : readEnabled(store, projectKey),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
     delegate,
+    // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
+    // same runHostTurnReview path independently. Honor the global kill-switch so a
+    // recursion-guarded child (TOKENMAXED_DISABLE=1) can't review + spawn again.
+    review: () => globallyDisabled ? Promise.resolve({ reviewed: false, reason: "routing is disabled (TOKENMAXED_DISABLE)" }) : runHostTurnReview(randomUUID3(), makeHostReviewDeps(env)),
     now: () => Date.now()
   };
 }

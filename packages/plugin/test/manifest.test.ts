@@ -15,7 +15,10 @@ const manifest = JSON.parse(
 ) as {
   name: string;
   mcpServers: Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
-  hooks?: { PreToolUse?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
+  hooks?: {
+    PreToolUse?: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }>;
+    Stop?: Array<{ matcher?: string; hooks: Array<{ type: string; command: string }> }>;
+  };
 };
 
 test('manifest declares the tokenmaxed plugin with required identity', () => {
@@ -68,10 +71,20 @@ test('manifest registers a PreToolUse backstop on router_delegate', () => {
   assert.doesNotMatch(cmd, /\$\{CLAUDE_PROJECT_DIR\}/);
 });
 
-test('the committed bundled hook exists', () => {
-  const hook = readFileSync(new URL('../hooks/pretooluse.mjs', import.meta.url), 'utf8');
-  assert.ok(hook.length > 500, 'hook bundle should be a non-trivial file');
-  assert.match(hook, /TokenMaxed PreToolUse hook/);
+test('the committed bundled hooks exist', () => {
+  const pre = readFileSync(new URL('../hooks/pretooluse.mjs', import.meta.url), 'utf8');
+  assert.ok(pre.length > 500, 'PreToolUse hook bundle should be a non-trivial file');
+  assert.match(pre, /TokenMaxed PreToolUse hook/);
+  const stop = readFileSync(new URL('../hooks/stop.mjs', import.meta.url), 'utf8');
+  assert.ok(stop.length > 500, 'Stop hook bundle should be a non-trivial file');
+  assert.match(stop, /TokenMaxed Stop gate/);
+});
+
+test('manifest registers a Stop hook (no matcher) pointing at the bundled gate', () => {
+  const stop = manifest.hooks?.Stop ?? [];
+  assert.equal(stop.length, 1, 'exactly one Stop hook group');
+  assert.equal(stop[0]!.matcher, undefined, 'Stop is not tool-scoped — no matcher');
+  assert.match(stop[0]!.hooks[0]!.command, /\$\{CLAUDE_PLUGIN_ROOT\}\/hooks\/stop\.mjs/);
 });
 
 test('the committed bundled server exists (the install artifact a fresh clone ships)', () => {
