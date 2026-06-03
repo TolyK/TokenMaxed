@@ -69,6 +69,12 @@ export { FAILURE_KINDS, isTransient, shouldCooldown, classifyHttpStatus, LaneFai
 export type { FailureKind } from './failure.ts';
 export { review, ReviewError } from './review.ts';
 export type { ReviewRequest, ReviewResult, ReviewDeps, ManagerReviewOutput } from './review.ts';
+export {
+  selectReviewManager,
+  parseManagerVerdictStrict,
+  buildOutputReviewPrompt,
+  REVIEW_OUTPUT_MAX_CHARS,
+} from './review.ts';
 export { runTask, runWithFallback } from './run.ts';
 export type {
   RunRequest,

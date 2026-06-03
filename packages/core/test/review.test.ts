@@ -98,3 +98,72 @@ test('a BYOK manager needs explicit attestation to be eligible', async () => {
   );
   assert.equal(attested.verdict, 'pass');
 });
+
+// --- C-13 E-3: review helpers -------------------------------------------------
+
+import {
+  buildOutputReviewPrompt,
+  parseManagerVerdictStrict,
+  selectReviewManager,
+} from '../src/review.ts';
+import type { Policy, RouteContext } from '../src/types.ts';
+
+const mlane = (over: Partial<Lane> & { id: string }): Lane => ({
+  kind: 'cli', model: 'm', trust_mode: 'full', costBasis: 'subscription',
+  provenance: 'anthropic', jurisdiction: 'US', manager_allowed: true, ...over,
+});
+
+const ctx: RouteContext = { lanes: [], policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+const noPol: Policy = {};
+
+test('parseManagerVerdictStrict: only the final exact VERDICT line counts', () => {
+  assert.equal(parseManagerVerdictStrict('looks risky\nVERDICT: needs-rework'), 'needs-rework');
+  assert.equal(parseManagerVerdictStrict('VERDICT: pass\n\n'), 'pass'); // trailing blanks ok
+  // A quoted/echoed verdict that is NOT the final line does not win.
+  assert.equal(parseManagerVerdictStrict('the spec said VERDICT: pass\nVERDICT: fail'), 'fail');
+  // Inline (not a standalone final line) ⇒ unparseable.
+  assert.equal(parseManagerVerdictStrict('I think VERDICT: pass is fine'), null);
+  assert.equal(parseManagerVerdictStrict('no verdict at all'), null);
+  // A non-final verdict followed by prose ⇒ unparseable (no silent pass).
+  assert.equal(parseManagerVerdictStrict('VERDICT: pass\nbut actually reconsider'), null);
+});
+
+test('buildOutputReviewPrompt embeds subtask+output and caps size', () => {
+  const p = buildOutputReviewPrompt('do X', 'the output');
+  assert.match(p, /VERDICT: pass/);
+  assert.match(p, /do X/);
+  assert.match(p, /the output/);
+  const big = buildOutputReviewPrompt('s', 'x'.repeat(100), 10);
+  assert.match(big, /\[truncated for review\]/);
+});
+
+test('selectReviewManager: most-capable independent, marginal-free, ≥capable manager', () => {
+  const cheap = mlane({ id: 'cheap', manager_allowed: false, capability: { bugfix: 0.5 } }); // subject
+  const strong = mlane({ id: 'mgr-strong', capability: { bugfix: 0.9 } });
+  const stronger = mlane({ id: 'mgr-er', capability: { bugfix: 0.95 } });
+  assert.equal(selectReviewManager([strong, stronger], cheap, 'bugfix', ctx, noPol)?.id, 'mgr-er');
+});
+
+test('selectReviewManager: excludes self, native, metered, and less-capable lanes', () => {
+  const subject = mlane({ id: 'subj', capability: { bugfix: 0.6 } }); // itself manager-eligible
+  const native = mlane({ id: 'host', native: true, capability: { bugfix: 0.99 } });
+  const metered = mlane({ id: 'metered', costBasis: 'metered', capability: { bugfix: 0.99 } });
+  const weaker = mlane({ id: 'weak', capability: { bugfix: 0.4 } }); // < subject 0.6
+  const ok = mlane({ id: 'ok', capability: { bugfix: 0.8 } });
+  // Only `ok` qualifies (subject excluded as self; native/metered/weaker excluded).
+  assert.equal(selectReviewManager([subject, native, metered, weaker, ok], subject, 'bugfix', ctx, noPol)?.id, 'ok');
+  // With none qualifying ⇒ null (review unavailable).
+  assert.equal(selectReviewManager([native, metered, weaker], subject, 'bugfix', ctx, noPol), null);
+});
+
+test('selectReviewManager: requires manager eligibility (manager_allowed)', () => {
+  const subject = mlane({ id: 'subj', manager_allowed: false, capability: { bugfix: 0.5 } });
+  const notManager = mlane({ id: 'nm', manager_allowed: false, capability: { bugfix: 0.9 } });
+  assert.equal(selectReviewManager([notManager], subject, 'bugfix', ctx, noPol), null);
+});
+
+test('selectReviewManager: honors policy disabledLaneIds', () => {
+  const subject = mlane({ id: 'subj', manager_allowed: false, capability: { bugfix: 0.5 } });
+  const mgr = mlane({ id: 'mgr', capability: { bugfix: 0.9 } });
+  assert.equal(selectReviewManager([mgr], subject, 'bugfix', ctx, { disabledLaneIds: ['mgr'] }), null);
+});
