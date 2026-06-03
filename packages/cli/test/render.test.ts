@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import type { LedgerSummary, TokenStats } from '@tokenmaxed/core';
+import type { LedgerSummary, OutcomeStats, TokenStats } from '@tokenmaxed/core';
 
 import {
   CliArgError,
+  formatLanes,
+  formatOutcomes,
   formatSavings,
   formatTokens,
   parseArgs,
   periodLabel,
   resolvePeriodSince,
 } from '../src/render.ts';
+import type { LaneView } from '../src/render.ts';
 
 test('parseArgs defaults to help with no args', () => {
   assert.deepEqual(parseArgs([]), { command: 'help', period: 'all', by: 'model' });
@@ -22,6 +25,16 @@ test('parseArgs reads command, period, by, and ledger', () => {
     period: '7d',
     by: 'lane',
     ledgerPath: '/tmp/l.jsonl',
+  });
+});
+
+test('parseArgs accepts the outcomes and lanes commands (+ --lanes)', () => {
+  assert.equal(parseArgs(['outcomes']).command, 'outcomes');
+  assert.deepEqual(parseArgs(['lanes', '--lanes', '/tmp/lanes.yaml']), {
+    command: 'lanes',
+    period: 'all',
+    by: 'model',
+    lanesPath: '/tmp/lanes.yaml',
   });
 });
 
@@ -121,4 +134,38 @@ test('formatTokens by lane lists lanes including the $0 local one', () => {
   assert.match(out, /by lane/);
   assert.match(out, /ollama/);
   assert.match(out, /codex-cli/);
+});
+
+test('formatOutcomes renders verdict tallies + success rate per lane', () => {
+  const outcomes: OutcomeStats = {
+    total: { pass: 2, needs_rework: 1, fail: 1, total: 4, success_rate: 0.625 },
+    byLane: {
+      'worker-a': { pass: 1, needs_rework: 1, fail: 1, total: 3, success_rate: 0.5 },
+      '(host)': { pass: 1, needs_rework: 0, fail: 0, total: 1, success_rate: 1 },
+    },
+  };
+  const out = formatOutcomes({ outcomes, periodLabel: 'all time' });
+  assert.match(out, /outcomes \(all time\)/);
+  assert.match(out, /worker-a/);
+  assert.match(out, /\(host\)/);
+  assert.match(out, /50\.0%/); // worker-a success rate
+  assert.match(out, /total/);
+});
+
+test('formatOutcomes handles no reviews', () => {
+  const empty: OutcomeStats = { total: { pass: 0, needs_rework: 0, fail: 0, total: 0, success_rate: 0 }, byLane: {} };
+  assert.match(formatOutcomes({ outcomes: empty, periodLabel: 'all time' }), /No reviews recorded yet/);
+});
+
+test('formatLanes shows trust mode, exec mode, roles, and manager eligibility', () => {
+  const views: LaneView[] = [
+    { id: 'claude-native', kind: 'cli', model: 'claude-opus-4-7', trust_mode: 'full', roles: ['manager'], managerEligible: true, executionMode: 'answer-only' },
+    { id: 'deepseek-api', kind: 'api', model: 'deepseek-v3', trust_mode: 'worker', roles: [], managerEligible: false, executionMode: 'answer-only' },
+  ];
+  const out = formatLanes(views);
+  assert.match(out, /claude-native/);
+  assert.match(out, /full/);
+  assert.match(out, /eligible/);
+  assert.match(out, /worker/);
+  assert.match(out, /\bno\b/);
 });

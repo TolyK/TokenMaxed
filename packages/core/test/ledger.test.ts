@@ -7,6 +7,7 @@ import {
   SCHEMA_VERSION,
   filterEventsSince,
   LedgerError,
+  outcomeStats,
   parseEvent,
   serializeEvent,
   summarize,
@@ -268,6 +269,29 @@ test('summarize over no events is all zeros (no divide-by-zero)', () => {
   assert.equal(s.events, 0);
   assert.equal(s.savings.frontier_avoided_pct, 0);
   assert.deepEqual({ ...s.laneMix }, {});
+});
+
+test('outcomeStats tallies verdicts per reviewed lane with the dogfood success rate', () => {
+  const events = [
+    ev(), // a task event — ignored by outcomeStats
+    outcome({ subject_lane_id: 'worker-a', verdict: 'pass' }),
+    outcome({ subject_lane_id: 'worker-a', verdict: 'needs-rework' }),
+    outcome({ subject_lane_id: 'worker-a', verdict: 'fail' }),
+    outcome({ subject_type: 'host_turn', task_id: undefined, turn_id: 'turn-1', subject_lane_id: undefined, verdict: 'pass' }),
+  ];
+  const s = outcomeStats(events);
+  assert.equal(s.total.total, 4);
+  assert.equal(s.total.pass, 2);
+  assert.equal(s.total.needs_rework, 1);
+  assert.equal(s.total.fail, 1);
+  // worker-a: (1 pass + 0.5*1 rework) / 3 = 0.5
+  assert.equal(s.byLane['worker-a']?.success_rate, 0.5);
+  // host-turn review buckets under (host).
+  assert.equal(s.byLane['(host)']?.pass, 1);
+  // A router_task review with no subject lane is unattributed, NOT host.
+  const withUnattributed = outcomeStats([outcome({ subject_lane_id: undefined, verdict: 'fail' })]);
+  assert.equal(withUnattributed.byLane['(unattributed)']?.fail, 1);
+  assert.equal(withUnattributed.byLane['(host)'], undefined);
 });
 
 test('tokenStats: overall, per-model, per-lane with estimated/reported split', () => {

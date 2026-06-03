@@ -127,9 +127,12 @@ After `npm run build`, the `tokenmaxed` command reads your local, content-free
 ledger (`~/.tokenmaxed/ledger.jsonl` by default) and reports on it:
 
 ```bash
-npx tokenmaxed savings            # estimated $ avoided + honest metered $ + token summary
-npx tokenmaxed tokens --by lane   # full per-lane token breakdown (--by model is the default)
-npx tokenmaxed savings --period 7d
+npx tokenmaxed savings              # estimated $ avoided + honest metered $ + token summary
+npx tokenmaxed tokens --by lane     # full per-lane token breakdown (--by model is the default)
+npx tokenmaxed outcomes             # manager-review verdicts (pass/needs-rework/fail) + success rate per lane
+npx tokenmaxed lanes                # your configured lanes: trust mode, autonomy, roles, manager eligibility
+npx tokenmaxed savings --period 7d  # any command takes --period all|Nd|Nh
+npx tokenmaxed help                 # full usage
 ```
 
 ```
@@ -150,7 +153,19 @@ TokenMaxed — savings (all time)
 The headline is always labeled *estimated vs the all-frontier baseline*, and the
 token block is explicitly a usage count (not dollars), with estimated figures
 marked. Until the Claude Code adapter lands to record tasks automatically, the
-ledger starts empty (the report says "No tasks recorded yet").
+ledger starts empty (the report says "No tasks recorded yet"); `tokenmaxed lanes`
+works immediately off your `config/lanes.yaml`.
+
+### Surfaces (where you can use TokenMaxed)
+
+| Surface | Status | How |
+|---|---|---|
+| **CLI** (`tokenmaxed`) | available | the commands above, after `npm run build` |
+| **Claude Code plugin** | in progress | installs as a plugin; records tasks + exposes `/router:*` commands |
+| Other hosts (Codex, Gemini, Cursor, Kimi Code, Pi, …) | planned | same core, thin per-host adapters |
+
+Setup is intentionally minimal: copy `config/lanes.example.yaml`, edit it, and
+go. The Claude Code adapter will add a `/router:setup` wizard for the same config.
 
 ### Development
 

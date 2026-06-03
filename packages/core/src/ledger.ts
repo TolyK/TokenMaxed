@@ -436,3 +436,55 @@ export function tokenStats(events: readonly LedgerEvent[]): TokenStats {
   }
   return { total, byModel, byLane };
 }
+
+/** Verdict tallies for a group of outcome (review) events. */
+export interface OutcomeGroup {
+  pass: number;
+  needs_rework: number;
+  fail: number;
+  total: number;
+  /** (pass + ½·needs_rework) / total — the dogfood success scale; 0 when empty. */
+  success_rate: number;
+}
+
+/** Outcome stats overall and per reviewed lane. */
+export interface OutcomeStats {
+  total: OutcomeGroup;
+  byLane: Record<string, OutcomeGroup>;
+}
+
+/** Bucket keys when a review has no subject lane: host-turn vs an unattributed router task. */
+const HOST_SUBJECT = '(host)';
+const UNATTRIBUTED_SUBJECT = '(unattributed)';
+
+function emptyOutcomeGroup(): OutcomeGroup {
+  return { pass: 0, needs_rework: 0, fail: 0, total: 0, success_rate: 0 };
+}
+
+function tallyVerdict(g: OutcomeGroup, verdict: ReviewVerdict): void {
+  if (verdict === 'pass') g.pass += 1;
+  else if (verdict === 'needs-rework') g.needs_rework += 1;
+  else g.fail += 1;
+  g.total += 1;
+  g.success_rate = g.total === 0 ? 0 : (g.pass + 0.5 * g.needs_rework) / g.total;
+}
+
+/**
+ * Pure verdict aggregation over the outcome (review) events: overall and per
+ * reviewed lane (`subject_lane_id`, or `(host)` for host-turn reviews). Task
+ * events are ignored.
+ */
+export function outcomeStats(events: readonly LedgerEvent[]): OutcomeStats {
+  const total = emptyOutcomeGroup();
+  const byLane: Record<string, OutcomeGroup> = Object.create(null);
+  for (const e of events) {
+    if (e.event_type !== 'outcome') continue;
+    tallyVerdict(total, e.verdict);
+    // Only host-turn reviews bucket under (host); a lane-less router task is
+    // unattributed, never conflated with host work.
+    const key = e.subject_lane_id ?? (e.subject_type === 'host_turn' ? HOST_SUBJECT : UNATTRIBUTED_SUBJECT);
+    if (!byLane[key]) byLane[key] = emptyOutcomeGroup();
+    tallyVerdict(byLane[key]!, e.verdict);
+  }
+  return { total, byLane };
+}

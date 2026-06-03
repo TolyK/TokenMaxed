@@ -4,17 +4,30 @@
  * have no runtime dependency on the built core package.
  */
 
-import type { LedgerSummary, TokenGroup, TokenStats } from '@tokenmaxed/core';
+import type { LedgerSummary, OutcomeStats, TokenGroup, TokenStats } from '@tokenmaxed/core';
 
 export type GroupBy = 'model' | 'lane';
 
 export interface CliArgs {
-  command: 'savings' | 'tokens' | 'help';
+  command: 'savings' | 'tokens' | 'outcomes' | 'lanes' | 'help';
   /** 'all' or a relative window like '7d' / '24h'. */
   period: string;
   by: GroupBy;
   /** Optional explicit ledger path (else the core default is used). */
   ledgerPath?: string;
+  /** Lane config path for the `lanes` command (default config/lanes.yaml). */
+  lanesPath?: string;
+}
+
+/** A flattened view of a lane's trust config, for the `lanes` command. */
+export interface LaneView {
+  id: string;
+  kind: string;
+  model: string;
+  trust_mode: string;
+  roles: string[];
+  managerEligible: boolean;
+  executionMode: string;
 }
 
 /** Raised for invalid CLI arguments (callers print the message and exit non-zero). */
@@ -35,10 +48,12 @@ function takeValue(argv: readonly string[], i: number, flag: string): string {
 
 /** Parse argv (already sliced past `node script`). */
 export function parseArgs(argv: readonly string[]): CliArgs {
+  const COMMANDS = ['savings', 'tokens', 'outcomes', 'lanes', 'help'] as const;
   let command: CliArgs['command'] | undefined;
   let period = 'all';
   let by: GroupBy = 'model';
   let ledgerPath: string | undefined;
+  let lanesPath: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
@@ -63,6 +78,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
         ledgerPath = takeValue(argv, i, '--ledger');
         i++;
         break;
+      case '--lanes':
+        lanesPath = takeValue(argv, i, '--lanes');
+        i++;
+        break;
       default:
         if (arg.startsWith('-')) {
           throw new CliArgError(`Unknown option "${arg}".`);
@@ -70,13 +89,19 @@ export function parseArgs(argv: readonly string[]): CliArgs {
         if (command !== undefined) {
           throw new CliArgError(`Unexpected argument "${arg}".`);
         }
-        if (arg !== 'savings' && arg !== 'tokens' && arg !== 'help') {
-          throw new CliArgError(`Unknown command "${arg}". Try "savings", "tokens", or "help".`);
+        if (!(COMMANDS as readonly string[]).includes(arg)) {
+          throw new CliArgError(`Unknown command "${arg}". Try one of: ${COMMANDS.join(', ')}.`);
         }
-        command = arg;
+        command = arg as CliArgs['command'];
     }
   }
-  return { command: command ?? 'help', period, by, ...(ledgerPath ? { ledgerPath } : {}) };
+  return {
+    command: command ?? 'help',
+    period,
+    by,
+    ...(ledgerPath ? { ledgerPath } : {}),
+    ...(lanesPath ? { lanesPath } : {}),
+  };
 }
 
 /** Resolve a period string to an ISO cutoff (or undefined for "all"), given now in ms. */
@@ -194,5 +219,55 @@ export function formatTokens(args: { tokens: TokenStats; by: GroupBy; periodLabe
     return lines.join('\n');
   }
   lines.push(fmtRow(header), sep, ...rows.map(fmtRow), sep, fmtRow(totalRow));
+  return lines.join('\n');
+}
+
+/** Render an aligned, left-justified table (rows[0] is the header). */
+function table(rows: string[][]): string[] {
+  const cols = rows[0]?.length ?? 0;
+  const widths = Array.from({ length: cols }, (_, c) => Math.max(...rows.map((r) => (r[c] ?? '').length)));
+  return rows.map((r) => '  ' + r.map((cell, c) => (cell ?? '').padEnd(widths[c]!)).join('  ').trimEnd());
+}
+
+/** The review-outcome report: pass/needs-rework/fail tallies + success rate per lane. */
+export function formatOutcomes(args: { outcomes: OutcomeStats; periodLabel: string }): string {
+  const { outcomes, periodLabel: label } = args;
+  const lines = [`TokenMaxed — outcomes (${label})`, ''];
+  if (outcomes.total.total === 0) {
+    lines.push('  No reviews recorded yet.');
+    return lines.join('\n');
+  }
+  const rows: string[][] = [['lane', 'pass', 'rework', 'fail', 'total', 'success']];
+  const entries = Object.entries(outcomes.byLane).sort((a, b) => b[1].total - a[1].total || (a[0] < b[0] ? -1 : 1));
+  for (const [laneId, g] of entries) {
+    rows.push([laneId, `${g.pass}`, `${g.needs_rework}`, `${g.fail}`, `${g.total}`, pct(g.success_rate * 100)]);
+  }
+  const t = outcomes.total;
+  rows.push(['total', `${t.pass}`, `${t.needs_rework}`, `${t.fail}`, `${t.total}`, pct(t.success_rate * 100)]);
+  lines.push(...table(rows));
+  lines.push('', '  (success = (pass + ½·needs-rework) / total; reviewer + user votes)');
+  return lines.join('\n');
+}
+
+/** The lanes report: each configured lane's trust mode, autonomy, roles, and manager eligibility. */
+export function formatLanes(views: readonly LaneView[]): string {
+  const lines = ['TokenMaxed — lanes', ''];
+  if (views.length === 0) {
+    lines.push('  No lanes configured.');
+    return lines.join('\n');
+  }
+  const rows: string[][] = [['id', 'kind', 'model', 'trust_mode', 'exec', 'roles', 'manager']];
+  for (const v of views) {
+    rows.push([
+      v.id,
+      v.kind,
+      v.model,
+      v.trust_mode,
+      v.executionMode,
+      v.roles.length ? v.roles.join(',') : '-',
+      v.managerEligible ? 'eligible' : 'no',
+    ]);
+  }
+  lines.push(...table(rows));
   return lines.join('\n');
 }
