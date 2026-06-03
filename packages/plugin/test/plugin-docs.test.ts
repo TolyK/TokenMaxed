@@ -23,6 +23,7 @@ const OPT_IN_FLAGS = [
   'TOKENMAXED_GATE_READY',
   'TOKENMAXED_REVIEW_ON_STOP',
   'TOKENMAXED_ESCALATE',
+  'TOKENMAXED_LEARN_CAPABILITY',
   'TOKENMAXED_DISABLE',
 ] as const;
 
@@ -81,4 +82,13 @@ test('the quality-escalation toggle is documented (C-13) and tied to the outcome
   // and the savings report, so the doc has to mention both, not just the flag.
   assert.match(README, /router_delegate/, 'README escalation docs must reference the router_delegate outcome');
   assert.match(README, /escalation rate/i, 'README escalation docs must mention the escalation rate in savings');
+});
+
+test('the learned-capability toggle is documented (F-1) with its prior + explainability surface', () => {
+  // The bundle honors TOKENMAXED_LEARN_CAPABILITY, so the README must explain it...
+  assert.ok(BUNDLE.includes('TOKENMAXED_LEARN_CAPABILITY'), 'bundle should read TOKENMAXED_LEARN_CAPABILITY');
+  assert.match(README, /TOKENMAXED_LEARN_CAPABILITY/, 'README must document the learned-capability opt-in');
+  // ...including the prior framing and where the user sees the adjustment.
+  assert.match(README, /prior/i, 'README must frame declared capability as a prior');
+  assert.match(README, /learned: declared/, 'README must show the /tokenmaxed:why learned annotation example');
 });

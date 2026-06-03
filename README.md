@@ -137,8 +137,23 @@ subtasks to the cheapest capable lane automatically. Or drive it by hand:
     `TOKENMAXED_ESCALATE=true`. The `router_delegate` outcome reports what
     happened ("accepted after rework", "after escalation", or an unreviewed
     give-back), and the per-offload escalation rate shows up in
-    `/tokenmaxed:savings`. Set `TOKENMAXED_DISABLE=true` to turn the whole
-    router off (kill-switch) regardless of the flags above.
+    `/tokenmaxed:savings`.
+  - **Learned capability** — let observed manager-review outcomes adjust routing
+    over time; enable with `TOKENMAXED_LEARN_CAPABILITY=true`. Each lane's
+    hand-assigned per-category `capability` score is treated as a **prior**; the
+    recent pass/needs-rework/fail rate for that lane×category (recency-decayed,
+    ~30-day half-life) shrinks it toward what's actually observed. A cheap lane
+    that keeps passing earns more traffic; a once-best lane that starts failing
+    loses it — and `/tokenmaxed:why` shows `(learned: declared 0.70, n=12)` when
+    evidence moved a score. It moves slowly: the declared prior dominates until
+    evidence accumulates (one or two reviews barely shift a score), an explicit
+    `capability: 0` opt-out is never resurrected, and the config file is never
+    modified (the adjustment is computed in memory from the ledger). Caveat: review success is an empirical
+    signal, not a true model-quality measure (it's confounded by task difficulty
+    and reviewer strictness), and lanes that win routing accrue more samples — so
+    this is a useful heuristic, not unbiased benchmarking.
+  - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
+    regardless of the flags above.
 
 ## Getting started (CLI & core)
 
