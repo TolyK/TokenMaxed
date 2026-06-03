@@ -51,6 +51,7 @@ import {
 
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { makeHostReviewDeps, runHostTurnReview } from './host-review.ts';
+import { runSetup } from './setup.ts';
 import { createTools, dispatch } from './tools.ts';
 import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
@@ -237,6 +238,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       globallyDisabled
         ? Promise.resolve({ reviewed: false, reason: 'routing is disabled (TOKENMAXED_DISABLE)' })
         : runHostTurnReview(randomUUID(), makeHostReviewDeps(env)),
+    // Create/validate user config + report status (A-8).
+    setup: () => runSetup(env),
     now: () => Date.now(),
   };
 }

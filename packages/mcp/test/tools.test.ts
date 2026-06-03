@@ -23,7 +23,7 @@ import {
 import type { Lane, LedgerEvent, Policy } from '../../core/src/index.ts';
 
 import { createTools, dispatch } from '../src/tools.ts';
-import type { CorePort, DelegateOutcome, ReviewOutcome, ToolDeps } from '../src/tools.ts';
+import type { CorePort, DelegateOutcome, ReviewOutcome, SetupReport, ToolDeps } from '../src/tools.ts';
 
 // --- harness -------------------------------------------------------------------
 
@@ -79,6 +79,16 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     setEnabled: () => {},
     delegate: async (): Promise<DelegateOutcome> => ({ laneId: 'native', status: 'ok', native: true }),
     review: async (): Promise<ReviewOutcome> => ({ reviewed: false, reason: 'no manager' }),
+    setup: async (): Promise<SetupReport> => ({
+      lanesPath: '/home/.tokenmaxed/lanes.yaml',
+      policyPath: '/home/.tokenmaxed/policy.yaml',
+      lanesCreated: true,
+      policyCreated: true,
+      laneCount: 3,
+      gitleaksAvailable: false,
+      gateReady: false,
+      reviewOnStop: false,
+    }),
     now: () => FIXED_NOW,
     ...over,
   };
@@ -94,7 +104,16 @@ function call(name: string, d: ToolDeps, args: Record<string, unknown> = {}) {
 test('builds the expected tool set with object input schemas', () => {
   assert.deepEqual(
     TOOLS.map((t) => t.name).sort(),
-    ['router_delegate', 'router_preview', 'router_review', 'router_savings', 'router_set_enabled', 'router_status', 'router_tokens'],
+    [
+      'router_delegate',
+      'router_preview',
+      'router_review',
+      'router_savings',
+      'router_set_enabled',
+      'router_setup',
+      'router_status',
+      'router_tokens',
+    ],
   );
   for (const t of TOOLS) {
     assert.equal((t.inputSchema as { type: string }).type, 'object');
@@ -323,6 +342,39 @@ test('review explains when nothing was reviewed', async () => {
   assert.notEqual(r.isError, true);
   assert.equal(r.structuredContent!.reviewed as boolean, false);
   assert.match(r.content[0]!.text, /No review run: no working-tree changes/);
+});
+
+// --- router_setup (A-8) --------------------------------------------------------
+
+test('setup reports created config + status', async () => {
+  const r = await call('router_setup', deps());
+  assert.notEqual(r.isError, true);
+  assert.match(r.content[0]!.text, /created from starter/);
+  assert.match(r.content[0]!.text, /gitleaks\): NOT installed/);
+  assert.match(r.content[0]!.text, /TOKENMAXED_KEY_/);
+  assert.equal(r.structuredContent!.laneCount as number, 3);
+});
+
+test('setup reports the manager + open gate when present', async () => {
+  const r = await call(
+    'router_setup',
+    deps({
+      setup: async () => ({
+        lanesPath: '/h/lanes.yaml',
+        policyPath: '/h/policy.yaml',
+        lanesCreated: false,
+        policyCreated: false,
+        laneCount: 4,
+        managerLaneId: 'claude-haiku',
+        gitleaksAvailable: true,
+        gateReady: true,
+        reviewOnStop: true,
+      }),
+    }),
+  );
+  assert.match(r.content[0]!.text, /manager: claude-haiku/);
+  assert.match(r.content[0]!.text, /worker gate: open/);
+  assert.match(r.content[0]!.text, /already present/);
 });
 
 // --- router_preview ------------------------------------------------------------

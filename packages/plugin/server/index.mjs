@@ -14227,9 +14227,9 @@ var require_dist2 = __commonJS({
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname2 } from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname as dirname3 } from "node:path";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
 var _a;
@@ -24239,17 +24239,19 @@ function parseManagerVerdict(text) {
 }
 
 // ../mcp/src/host-review.ts
+function selectManagerLane(lanes, policy, gateReady) {
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
+  return lanes.find(
+    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+  );
+}
 async function runHostTurnReview(turnId, deps) {
   const diff = deps.readDiff();
   if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
-  const policy = deps.loadPolicy();
-  const disabled = new Set(policy.disabledLaneIds ?? []);
-  const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
-  const manager = lanes.find(
-    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, deps.gateReady) && !disabled.has(l.id) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
-  );
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady);
   if (!manager) {
     return {
       reviewed: false,
@@ -24302,6 +24304,44 @@ function makeHostReviewDeps(env) {
     },
     gateReady: env.TOKENMAXED_GATE_READY === "true",
     newId: () => randomUUID2()
+  };
+}
+
+// ../mcp/src/setup.ts
+import { copyFileSync, existsSync as existsSync4, mkdirSync as mkdirSync2 } from "node:fs";
+import { dirname as dirname2 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+var LANES_STARTER = fileURLToPath2(new URL("../lanes.starter.yaml", import.meta.url));
+var POLICY_STARTER = fileURLToPath2(new URL("../policy.starter.yaml", import.meta.url));
+async function runSetup(env) {
+  const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
+  const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
+  const lanesExisted = existsSync4(lanesPath);
+  if (!lanesExisted) {
+    mkdirSync2(dirname2(lanesPath), { recursive: true });
+    copyFileSync(LANES_STARTER, lanesPath);
+  }
+  const policyExisted = existsSync4(policyPath);
+  if (!policyExisted) {
+    mkdirSync2(dirname2(policyPath), { recursive: true });
+    copyFileSync(POLICY_STARTER, policyPath);
+  }
+  const registry2 = loadLaneConfig(lanesPath);
+  const policy = loadPolicyConfig(policyPath);
+  const gateReady = env.TOKENMAXED_GATE_READY === "true";
+  const manager = selectManagerLane(registry2.lanes, policy, gateReady);
+  const scan = await makeGitleaksScanner()([""]);
+  const gitleaksAvailable = scan.available && !scan.hasSecret;
+  return {
+    lanesPath,
+    policyPath,
+    lanesCreated: !lanesExisted,
+    policyCreated: !policyExisted,
+    laneCount: registry2.lanes.length,
+    ...manager ? { managerLaneId: manager.id } : {},
+    gitleaksAvailable,
+    gateReady,
+    reviewOnStop: env.TOKENMAXED_REVIEW_ON_STOP === "true"
   };
 }
 
@@ -24590,7 +24630,27 @@ ${r.notes}` : "";
       });
     })
   };
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool];
+  const setupTool = {
+    name: "router_setup",
+    description: "Set up TokenMaxed: create the user-owned config (~/.tokenmaxed/lanes.yaml + policy.yaml) from starter templates if missing (never overwrites), validate it, and report status \u2014 configured lanes, the manager lane, whether a secret scanner (gitleaks) is installed, and the worker-gate / review-on-stop state. Powers /tokenmaxed:setup.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    handler: (deps) => guardedAsync(async () => {
+      const r = await deps.setup();
+      const lines = [
+        "TokenMaxed setup:",
+        `  lanes:  ${r.lanesPath} (${r.lanesCreated ? "created from starter" : "already present"})`,
+        `  policy: ${r.policyPath} (${r.policyCreated ? "created from starter" : "already present"})`,
+        `  ${r.laneCount} lane(s) configured; manager: ${r.managerLaneId ?? "none (set manager_allowed on a trusted CLI/local lane)"}`,
+        `  secret scanner (gitleaks): ${r.gitleaksAvailable ? "available" : "NOT installed \u2014 untrusted worker lanes stay disabled until it is"}`,
+        `  worker gate: ${r.gateReady ? "open" : "closed"} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? "" : " \u2014 install gitleaks first"})`,
+        `  review-on-stop: ${r.reviewOnStop ? "on" : "off"} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
+        "",
+        `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
+      ];
+      return ok(lines.join("\n"), { ...r });
+    })
+  };
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
 }
 function renderDelegate(o) {
   if (o.native || o.status !== "ok") {
@@ -24660,7 +24720,7 @@ function writeEnabled(store, projectKey, enabled) {
 
 // ../mcp/src/server.ts
 var DEFAULT_LANES = homeFile("lanes.yaml");
-var DEFAULT_PRICES = fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
+var DEFAULT_PRICES = fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
 function recordableLane(lane, priceTable) {
   if (lane.native || lane.costBasis !== "metered") return true;
   try {
@@ -24673,7 +24733,7 @@ function recordableLane(lane, priceTable) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync4(statePath)) return {};
+      if (!existsSync5(statePath)) return {};
       try {
         return JSON.parse(readFileSync2(statePath, "utf8"));
       } catch {
@@ -24681,7 +24741,7 @@ function fileToggleStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync2(dirname2(statePath), { recursive: true });
+      mkdirSync3(dirname3(statePath), { recursive: true });
       writeFileSync2(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -24700,7 +24760,7 @@ function makeServerDeps(env = process.env) {
   const resolveAuth = makeResolveAuth(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync4(lanesPath)) {
+    if (!existsSync5(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
@@ -24708,7 +24768,7 @@ function makeServerDeps(env = process.env) {
     return loadLaneConfig(lanesPath).candidateLanes(category).filter((lane) => recordableLane(lane, priceTable));
   };
   const delegate = async (request) => {
-    if (!existsSync4(lanesPath)) {
+    if (!existsSync5(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -24779,6 +24839,8 @@ function makeServerDeps(env = process.env) {
     // same runHostTurnReview path independently. Honor the global kill-switch so a
     // recursion-guarded child (TOKENMAXED_DISABLE=1) can't review + spawn again.
     review: () => globallyDisabled ? Promise.resolve({ reviewed: false, reason: "routing is disabled (TOKENMAXED_DISABLE)" }) : runHostTurnReview(randomUUID3(), makeHostReviewDeps(env)),
+    // Create/validate user config + report status (A-8).
+    setup: () => runSetup(env),
     now: () => Date.now()
   };
 }

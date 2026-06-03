@@ -88,8 +88,23 @@ export interface ToolDeps {
   delegate: (request: DelegateRequest) => Promise<DelegateOutcome>;
   /** Have the configured manager review the turn's working-tree diff (A-7). */
   review: () => Promise<ReviewOutcome>;
+  /** Create/validate user config and report setup status (A-8). */
+  setup: () => Promise<SetupReport>;
   /** Current wall-clock in ms (injected so tests are deterministic). */
   now: () => number;
+}
+
+/** Status returned by the setup flow (A-8). */
+export interface SetupReport {
+  lanesPath: string;
+  policyPath: string;
+  lanesCreated: boolean;
+  policyCreated: boolean;
+  laneCount: number;
+  managerLaneId?: string;
+  gitleaksAvailable: boolean;
+  gateReady: boolean;
+  reviewOnStop: boolean;
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -493,7 +508,30 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool];
+  const setupTool: ToolDef = {
+    name: 'router_setup',
+    description:
+      'Set up TokenMaxed: create the user-owned config (~/.tokenmaxed/lanes.yaml + policy.yaml) from starter templates if missing (never overwrites), validate it, and report status — configured lanes, the manager lane, whether a secret scanner (gitleaks) is installed, and the worker-gate / review-on-stop state. Powers /tokenmaxed:setup.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} },
+    handler: (deps) =>
+      guardedAsync(async () => {
+        const r = await deps.setup();
+        const lines = [
+          'TokenMaxed setup:',
+          `  lanes:  ${r.lanesPath} (${r.lanesCreated ? 'created from starter' : 'already present'})`,
+          `  policy: ${r.policyPath} (${r.policyCreated ? 'created from starter' : 'already present'})`,
+          `  ${r.laneCount} lane(s) configured; manager: ${r.managerLaneId ?? 'none (set manager_allowed on a trusted CLI/local lane)'}`,
+          `  secret scanner (gitleaks): ${r.gitleaksAvailable ? 'available' : 'NOT installed — untrusted worker lanes stay disabled until it is'}`,
+          `  worker gate: ${r.gateReady ? 'open' : 'closed'} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? '' : ' — install gitleaks first'})`,
+          `  review-on-stop: ${r.reviewOnStop ? 'on' : 'off'} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
+          '',
+          `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
+        ];
+        return ok(lines.join('\n'), { ...r });
+      }),
+  };
+
+  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

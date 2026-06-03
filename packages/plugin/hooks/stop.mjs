@@ -8287,17 +8287,19 @@ function stopGateDecision(verdict, priorBlocks, maxAttempts) {
 }
 
 // ../mcp/src/host-review.ts
+function selectManagerLane(lanes, policy, gateReady) {
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
+  return lanes.find(
+    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+  );
+}
 async function runHostTurnReview(turnId, deps) {
   const diff = deps.readDiff();
   if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
-  const policy = deps.loadPolicy();
-  const disabled = new Set(policy.disabledLaneIds ?? []);
-  const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
-  const manager = lanes.find(
-    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, deps.gateReady) && !disabled.has(l.id) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
-  );
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady);
   if (!manager) {
     return {
       reviewed: false,

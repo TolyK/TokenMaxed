@@ -9,7 +9,9 @@
   },
   "files": [
     "dist",
-    "prices.seed.json"
+    "prices.seed.json",
+    "lanes.starter.yaml",
+    "policy.starter.yaml"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/bin.js', 0o755)\"",

@@ -1,0 +1,104 @@
+# TokenMaxed lane registry (example).
+#
+# Copy this file to config/lanes.yaml and edit it for your machine.
+# Lane identity and trust live ONLY here. The hosted registry feed may later
+# overlay reference data (prices, capability scores) onto a lane, but it can
+# never create, enable, or re-trust one.
+#
+# Fields:
+#   id              unique local identifier for the lane
+#   kind            cli | api | local
+#   model           model id used for pricing / registry lookups
+#   trust_mode      full | worker | monitored | blocked
+#                     full     = may see repo + tools + broad context (trusted)
+#                     worker   = minimized, scrubbed, bounded task only (no repo/tools)
+#                     monitored= (deferred — later phase)
+#                     blocked  = never selected
+#                   Non-`full` lanes only run once the minimization/policy gate is ready.
+#   costBasis       subscription | metered | local
+#   provenance      vendor/org, e.g. anthropic, openai, google, meta
+#   jurisdiction    legal jurisdiction of the provider, e.g. US, CN
+#   roles           optional: [manager] / [worker]  (manager reviews + (re)assigns)
+#   manager_allowed optional bool: may this lane act as the manager/reviewer?
+#   execution_mode  answer-only (default) | agentic
+#                     agentic (lane edits files / runs commands) is ONLY allowed
+#                     when trust_mode is `full`.
+#   attestation     optional bool: explicit user attestation that a non-first-party
+#                     lane is trusted enough to be manager-eligible.
+#   capability      optional per-category competence in [0, 1]; omit a category to
+#                   use the default, or set it to 0 to opt the lane out entirely.
+
+lanes:
+  - id: claude-native
+    kind: cli
+    model: claude-opus-4-7
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    native: true          # the host model (do-it-yourself lane)
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      feature: 0.95
+      refactor: 0.90
+      bugfix: 0.88
+      boilerplate: 0.90
+      explain: 0.90
+      codegen: 0.88
+      docs: 0.85
+
+  - id: codex-cli
+    kind: cli
+    model: gpt-5.5
+    trust_mode: full
+    costBasis: subscription
+    provenance: openai
+    jurisdiction: US
+    execution_mode: answer-only
+    command: codex          # the provider CLI to spawn (exact flags verified per tool)
+    args: [exec]
+    capability:
+      bugfix: 0.92
+      codegen: 0.90
+      feature: 0.85
+      refactor: 0.82
+
+  - id: ollama-llama3
+    kind: local
+    model: llama3.1:8b
+    trust_mode: full
+    costBasis: local
+    provenance: meta
+    jurisdiction: US
+    capability:
+      boilerplate: 0.70
+      docs: 0.60
+      explain: 0.60
+
+  # Cheaper-same-family lane (Claude Code): hand a bounded subtask to a cheaper
+  # Claude (Haiku) via `claude -p` instead of running it on the Opus main session.
+  # Fully trusted (100% Anthropic), so NO minimization — and it spends the same
+  # subscription, not metered $. The cheapest, safest offload. (Spawned children
+  # run with TOKENMAXED_DISABLE=1 so they never re-enter routing / recurse.)
+  - id: claude-haiku
+    kind: cli
+    model: claude-haiku-4-5-20251001
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    execution_mode: answer-only
+    command: claude
+    args: ["-p", "--model", "claude-haiku-4-5-20251001"]
+    # In-family manager: /tokenmaxed:review (and the opt-in Stop gate) send the
+    # working-tree diff here for a verdict. Trusted + Anthropic, so the review
+    # stays in-family. Point this at a stronger model (e.g. Sonnet/Opus or Codex)
+    # via /tokenmaxed:setup if you want deeper reviews.
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      boilerplate: 0.82
+      docs: 0.85
+      explain: 0.82
+      codegen: 0.72

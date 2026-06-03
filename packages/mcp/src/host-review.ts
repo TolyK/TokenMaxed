@@ -54,6 +54,28 @@ export interface HostReviewDeps {
   newId: () => string;
 }
 
+/**
+ * The manager lane the review path will actually use, applying ALL the same
+ * filters as routing so /tokenmaxed:setup and the review never disagree:
+ *  - manager-eligible (full trust + manager_allowed + trusted origin/attestation)
+ *  - EXECUTABLE (not the native host — we can't run the host from here)
+ *  - gate-selectable (an API manager only once the safety gate is open — egress)
+ *  - not policy-disabled / blocked. The diff IS the user's real code, so egress is
+ *    evaluated as the most sensitive context (private + sensitive).
+ */
+export function selectManagerLane(lanes: readonly Lane[], policy: Policy, gateReady: boolean): Lane | undefined {
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const reviewContext = { repo_class: 'private' as const, sensitivity: 'sensitive' as const };
+  return lanes.find(
+    (l) =>
+      isManagerEligible(l) &&
+      !l.native &&
+      isSelectablePreGate(l, gateReady) &&
+      !disabled.has(l.id) &&
+      laneAllowedByVerdict(l, evaluate({ category: 'refactor' }, l, reviewContext, policy).verdict),
+  );
+}
+
 /** Review the turn's diff with a configured manager. Pure over its injected deps. */
 export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): Promise<HostReviewResult> {
   const diff = deps.readDiff();
@@ -62,25 +84,7 @@ export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): P
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: 'no lanes configured yet — run /tokenmaxed:setup' };
 
-  // Need an EXECUTABLE manager (native/host can't be run from here) that is also
-  // gate-selectable AND policy-allowed — so the diff is never sent to a lane the
-  // user disabled/blocked, and an API manager only receives it once the gate is
-  // open (egress protection), exactly like the router gate.
-  const policy = deps.loadPolicy();
-  const disabled = new Set(policy.disabledLaneIds ?? []);
-  // The diff IS the user's real working code, so evaluate manager egress as the
-  // most sensitive context (private + sensitive). A policy that blocks, say, a
-  // non-Anthropic API manager for sensitive content then correctly applies — we
-  // never send the diff to a lane the user's policy meant to exclude.
-  const reviewContext = { repo_class: 'private' as const, sensitivity: 'sensitive' as const };
-  const manager = lanes.find(
-    (l) =>
-      isManagerEligible(l) &&
-      !l.native &&
-      isSelectablePreGate(l, deps.gateReady) &&
-      !disabled.has(l.id) &&
-      laneAllowedByVerdict(l, evaluate({ category: 'refactor' }, l, reviewContext, policy).verdict),
-  );
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady);
   if (!manager) {
     return {
       reviewed: false,
