@@ -115,3 +115,51 @@ test('loadPolicyConfig errors clearly for a missing file', () => {
     message: /Could not read policy config/,
   });
 });
+
+// --- F2-S3: the un-overridable reader hard cap -------------------------------
+
+const readerLane: Lane = {
+  id: 'gemini', kind: 'api', model: 'gemini-3.5-flash', trust_mode: 'reader',
+  costBasis: 'subscription', provenance: 'google', jurisdiction: 'US',
+};
+// A user rule that tries to allow the reader lane in ANY context.
+const allowReader: Policy = { rules: [{ trust_mode: 'reader', verdict: 'allow' }] };
+
+test('reader hard cap: an explicit allow rule cannot loosen an unknown repo_class', () => {
+  const d = evaluate(task, readerLane, { sensitivity: 'normal' }, allowReader); // repo_class unknown
+  assert.equal(d.verdict, 'force-trusted');
+  assert.equal(laneAllowedByVerdict(readerLane, d.verdict), false); // reader excluded
+});
+
+test('reader hard cap: non-normal sensitivity is never allowed for a reader', () => {
+  for (const sensitivity of ['sensitive', 'unknown'] as const) {
+    const d = evaluate(task, readerLane, { repo_class: 'private', sensitivity }, allowReader);
+    assert.equal(d.verdict, 'force-trusted');
+  }
+});
+
+test('reader hard cap: a detected secret is never allowed for a reader', () => {
+  const d = evaluate(task, readerLane, { repo_class: 'public', sensitivity: 'normal', secretHit: true }, allowReader);
+  assert.equal(d.verdict, 'force-trusted');
+});
+
+test('reader hard cap allows the intended use: known repo + normal + no secret', () => {
+  // public + normal ⇒ baseline allow, cap does not trigger.
+  assert.equal(evaluate(task, readerLane, { repo_class: 'public', sensitivity: 'normal' }, noRules).verdict, 'allow');
+  // private + normal with an explicit allow rule ⇒ allow (the documented opt-in).
+  const d = evaluate(task, readerLane, { repo_class: 'private', sensitivity: 'normal' }, allowReader);
+  assert.equal(d.verdict, 'allow');
+  assert.equal(laneAllowedByVerdict(readerLane, d.verdict), true);
+});
+
+test('reader hard cap preserves an explicit block (only tightens, never loosens)', () => {
+  const blockReader: Policy = { rules: [{ trust_mode: 'reader', verdict: 'block' }] };
+  assert.equal(evaluate(task, readerLane, { repo_class: 'unknown' }, blockReader).verdict, 'block');
+});
+
+test('reader hard cap does not affect non-reader lanes', () => {
+  // A worker on unknown context is force-trusted by the normal baseline (not the
+  // reader cap); a full lane on the same allow rule is unaffected.
+  const allowAny: Policy = { rules: [{ verdict: 'allow' }] };
+  assert.equal(evaluate(task, fullLane, { repo_class: 'unknown', sensitivity: 'unknown' }, allowAny).verdict, 'allow');
+});

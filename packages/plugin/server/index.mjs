@@ -22960,7 +22960,13 @@ function evaluate(task, lane, ctx, policy) {
     };
   }
   if (ctx.secretHit === true && decision.verdict === "allow") {
-    return { verdict: "force-trusted", reason: "secret detected: trusted/local lanes only" };
+    decision = { verdict: "force-trusted", reason: "secret detected: trusted/local lanes only" };
+  }
+  if (lane.trust_mode === "reader" && decision.verdict !== "block" && (sensitivity !== "normal" || repoClass === "unknown" || ctx.secretHit === true)) {
+    return {
+      verdict: "force-trusted",
+      reason: "reader hard cap: reader lanes require a known repo + normal sensitivity + no secret"
+    };
   }
   return decision;
 }

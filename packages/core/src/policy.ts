@@ -97,7 +97,25 @@ export function evaluate(task: Task, lane: Lane, ctx: PolicyContext, policy: Pol
   // A detected secret can never be `allow`: upgrade to at least force-trusted.
   // A stricter `block` (rule) is preserved — secret only tightens, never loosens.
   if (ctx.secretHit === true && decision.verdict === 'allow') {
-    return { verdict: 'force-trusted', reason: 'secret detected: trusted/local lanes only' };
+    decision = { verdict: 'force-trusted', reason: 'secret detected: trusted/local lanes only' };
+  }
+
+  // READER HARD CAP (F-2) — un-overridable by user rules. A `reader` lane may NEVER
+  // take an unsafe context: an unknown repo_class, a non-normal sensitivity, or a
+  // detected secret. This mirrors the minimizeForReader boundary floor (defense in
+  // depth) and cannot be loosened by an explicit `allow` rule. We force-trusted
+  // (so only a full lane may take the work) rather than block, unless a rule already
+  // blocked it. Reader on a known (public/private) + normal + no-secret context is
+  // unaffected — that is the tier's intended use.
+  if (
+    lane.trust_mode === 'reader' &&
+    decision.verdict !== 'block' &&
+    (sensitivity !== 'normal' || repoClass === 'unknown' || ctx.secretHit === true)
+  ) {
+    return {
+      verdict: 'force-trusted',
+      reason: 'reader hard cap: reader lanes require a known repo + normal sensitivity + no secret',
+    };
   }
   return decision;
 }
