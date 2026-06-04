@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { buildUntrustedRequestBody, isExecutorCertified } from '../src/boundary.ts';
-import { minimize } from '../src/minimize.ts';
+import {
+  buildReaderRequestBody,
+  buildUntrustedRequestBody,
+  isExecutorCertified,
+  isReaderExecutorCertified,
+  READER_SYSTEM_FRAMING,
+} from '../src/boundary.ts';
+import { minimize, minimizeForReader } from '../src/minimize.ts';
 import type { SecretScanner } from '../src/minimize.ts';
 import { executeUntrusted } from '../src/node.ts';
 import type { Lane } from '../src/types.ts';
@@ -149,4 +155,57 @@ test('executeUntrusted reports upstream non-2xx as a content-free error', async 
   );
   assert.equal(r.ok, false);
   assert.match(String(r.error), /status 503/);
+});
+
+// --- F2-S4a: the reader execution boundary -----------------------------------
+
+async function genuineReaderPayload() {
+  const r = await minimizeForReader(
+    { instruction: 'explain this module', category: 'explain', repo_class: 'private', sensitivity: 'normal' },
+    clean,
+  );
+  assert.ok(r.ok);
+  return r.payload;
+}
+
+test('isReaderExecutorCertified: api certified; cli/local are not (API-only in v1)', () => {
+  assert.equal(isReaderExecutorCertified(laneOf('api')), true);
+  assert.equal(isReaderExecutorCertified(laneOf('cli')), false);
+  assert.equal(isReaderExecutorCertified(laneOf('local')), false);
+});
+
+test('buildReaderRequestBody allowlists model + answer-only framing + content only', async () => {
+  const payload = await genuineReaderPayload();
+  const env = { payload, lane: { id: 'LANEID_SENT', model: 'gemini-x', endpoint: 'https://fake.invalid', authHandle: 'AUTH_SENT' } };
+  const body = buildReaderRequestBody(env);
+  assert.deepEqual(Object.keys(body), ['model', 'messages']);
+  assert.equal(body.model, 'gemini-x');
+  assert.equal(body.messages[0]!.role, 'system');
+  assert.equal(body.messages[0]!.content, READER_SYSTEM_FRAMING);
+  assert.equal(body.messages[1]!.role, 'user');
+  assert.ok(body.messages[1]!.content.includes('explain this module'));
+  const json = JSON.stringify(body);
+  assert.ok(!json.includes('LANEID_SENT'));
+  assert.ok(!json.includes('AUTH_SENT'));
+});
+
+test('buildReaderRequestBody refuses a spread/cloned reader payload', async () => {
+  const payload = await genuineReaderPayload();
+  const forged = { ...payload, instruction: 'raw repo text' };
+  assert.throws(
+    () => buildReaderRequestBody({ payload: forged, lane: { id: 'x', model: 'm', endpoint: 'https://x', authHandle: 'h' } }),
+    /not produced by minimizeForReader/,
+  );
+});
+
+test('buildReaderRequestBody refuses a worker payload (wrong brand — no cross-path mixup)', async () => {
+  const worker = await minimize(
+    { instruction: 'x', category: 'codegen', repo_class: 'public', sensitivity: 'normal' },
+    clean,
+  );
+  assert.ok(worker.ok);
+  assert.throws(
+    () => buildReaderRequestBody({ payload: worker.payload as never, lane: { id: 'x', model: 'm', endpoint: 'https://x', authHandle: 'h' } }),
+    /not produced by minimizeForReader/,
+  );
 });

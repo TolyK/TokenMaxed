@@ -61,8 +61,8 @@ export type {
 export { evaluate, laneAllowedByVerdict, parsePolicyConfig, PolicyConfigError } from './policy.ts';
 export type { PolicyDecision } from './policy.ts';
 export { minimize, minimizeForReader, isMinimizedPayload, isReaderPayload, scrubText, LIMITS } from './minimize.ts';
-export { buildUntrustedRequestBody, isExecutorCertified } from './boundary.ts';
-export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody } from './boundary.ts';
+export { buildUntrustedRequestBody, isExecutorCertified, buildReaderRequestBody, isReaderExecutorCertified, READER_SYSTEM_FRAMING } from './boundary.ts';
+export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody, SafeReaderEnvelope, ReaderRequestBody } from './boundary.ts';
 export { canReassign, reassignmentTarget, shouldReassign, TRUST_RANK } from './reassign.ts';
 export type { ReassignOptions } from './reassign.ts';
 export { escalationDecision, selectEscalationTarget } from './reassign.ts';
