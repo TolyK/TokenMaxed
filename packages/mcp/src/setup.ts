@@ -11,15 +11,18 @@ import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadLaneConfig, loadPolicyConfig, makeGitleaksScanner } from '@tokenmaxed/core/node';
+import { isManagerEligible, resolveLaneModel } from '@tokenmaxed/core';
+import { loadLaneConfig, loadPolicyConfig, loadPriceTable, makeGitleaksScanner } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile } from './config.ts';
+import type { LaneSetupRow } from './lane-setup.ts';
 import { selectManagerLane } from './manager-select.ts';
 import type { SetupReport } from './tools.ts';
 
 const LANES_STARTER = fileURLToPath(new URL('../lanes.starter.yaml', import.meta.url));
 const POLICY_STARTER = fileURLToPath(new URL('../policy.starter.yaml', import.meta.url));
+const DEFAULT_PRICES = fileURLToPath(new URL('../prices.seed.json', import.meta.url));
 
 /** Create missing config from starters, validate, and report status. Idempotent. */
 export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
@@ -47,6 +50,32 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
   const gateReady = env.TOKENMAXED_GATE_READY === 'true';
   const available = new Set(await makeAvailabilityProbe(env)([...registry.lanes]));
   const manager = selectManagerLane(registry.lanes, policy, gateReady, available);
+
+  // SETUP-1: a per-lane confirmation — model (resolved if @latest), trust/permissions,
+  // role, availability, declared capability. Role uses the REAL selectors (active
+  // reviewer = selectManagerLane; else manager-eligible) — never raw `roles`.
+  let priceTable: ReturnType<typeof loadPriceTable> | undefined;
+  try {
+    priceTable = loadPriceTable(env.TOKENMAXED_PRICES ?? DEFAULT_PRICES);
+  } catch {
+    priceTable = undefined; // no price table ⇒ show raw model ids (no @latest resolution)
+  }
+  const laneRows: LaneSetupRow[] = registry.lanes.map((l) => {
+    const resolved = priceTable ? resolveLaneModel(l, priceTable).model : l.model;
+    const role: LaneSetupRow['role'] =
+      manager && manager.id === l.id ? 'active-reviewer' : isManagerEligible(l) ? 'manager-eligible' : 'none';
+    return {
+      id: l.id,
+      kind: l.kind,
+      model: resolved,
+      ...(resolved !== l.model ? { rawModel: l.model } : {}),
+      trustMode: l.trust_mode,
+      executionMode: (l.execution_mode ?? 'answer-only') as 'answer-only' | 'agentic',
+      role,
+      available: !!l.native || available.has(l.id),
+      ...(l.capability ? { capability: l.capability } : {}),
+    };
+  });
   // Probe scanner health with a benign input (never sends anything). makeGitleaksScanner
   // fails CLOSED (available:true, hasSecret:true) when the probe itself errors, so a
   // benign input flagged as a "secret" means the scanner is broken — report unusable.
@@ -75,5 +104,6 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
     tiered:
       env.TOKENMAXED_TIERED === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
+    lanes: laneRows,
   };
 }

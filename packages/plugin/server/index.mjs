@@ -25443,6 +25443,7 @@ import { dirname as dirname4 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 var LANES_STARTER = fileURLToPath3(new URL("../lanes.starter.yaml", import.meta.url));
 var POLICY_STARTER = fileURLToPath3(new URL("../policy.starter.yaml", import.meta.url));
+var DEFAULT_PRICES = fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
@@ -25461,6 +25462,27 @@ async function runSetup(env) {
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const available = new Set(await makeAvailabilityProbe(env)([...registry2.lanes]));
   const manager = selectManagerLane(registry2.lanes, policy, gateReady, available);
+  let priceTable;
+  try {
+    priceTable = loadPriceTable(env.TOKENMAXED_PRICES ?? DEFAULT_PRICES);
+  } catch {
+    priceTable = void 0;
+  }
+  const laneRows = registry2.lanes.map((l) => {
+    const resolved = priceTable ? resolveLaneModel(l, priceTable).model : l.model;
+    const role = manager && manager.id === l.id ? "active-reviewer" : isManagerEligible(l) ? "manager-eligible" : "none";
+    return {
+      id: l.id,
+      kind: l.kind,
+      model: resolved,
+      ...resolved !== l.model ? { rawModel: l.model } : {},
+      trustMode: l.trust_mode,
+      executionMode: l.execution_mode ?? "answer-only",
+      role,
+      available: !!l.native || available.has(l.id),
+      ...l.capability ? { capability: l.capability } : {}
+    };
+  });
   const scan = await makeGitleaksScanner()([""]);
   const gitleaksAvailable = scan.available && !scan.hasSecret;
   return {
@@ -25480,8 +25502,42 @@ async function runSetup(env) {
     // F-2 reader egress; also disabled by the global kill-switch.
     readerEgress: env.TOKENMAXED_READER_EGRESS === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
-    tiered: env.TOKENMAXED_TIERED === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true")
+    tiered: env.TOKENMAXED_TIERED === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
+    lanes: laneRows
   };
+}
+
+// ../mcp/src/lane-setup.ts
+function permissionFor(trustMode, executionMode) {
+  switch (trustMode) {
+    case "full":
+      return executionMode === "agentic" ? "repo + tools, may edit files / run commands (agentic)" : "repo + tools, answer-only";
+    case "reader":
+      return "repo-READ only (no secrets/shell/tools) \u2014 needs gate + TOKENMAXED_READER_EGRESS + repo_read_attestation + policy allow";
+    case "worker":
+      return "minimized, scrubbed, NO repo/tools \u2014 needs the safety gate";
+    case "blocked":
+      return "never selected (opt-in: change trust_mode)";
+    default:
+      return String(trustMode);
+  }
+}
+var ROLE_LABEL = {
+  "active-reviewer": "reviewer (active)",
+  "manager-eligible": "manager-eligible",
+  none: "\u2014"
+};
+function formatLaneSetup(rows) {
+  if (rows.length === 0) return ["  (no lanes configured)"];
+  const lines = ["Lanes (what each may see/do, and whether it can run now):"];
+  for (const r of rows) {
+    const model = r.rawModel && r.rawModel !== r.model ? `${r.rawModel} \u2192 ${r.model}` : r.model;
+    const caps = r.capability && Object.keys(r.capability).length > 0 ? " \xB7 caps " + Object.entries(r.capability).map(([c, v]) => `${c}=${v}`).join(",") : "";
+    lines.push(
+      `  \u2022 ${r.id} [${r.kind}] ${model} \xB7 trust=${r.trustMode} \u2192 ${permissionFor(r.trustMode, r.executionMode)} \xB7 role=${ROLE_LABEL[r.role]} \xB7 ${r.available ? "available" : "unavailable now"}${caps}`
+    );
+  }
+  return lines;
 }
 
 // ../mcp/src/tools.ts
@@ -25826,6 +25882,8 @@ ${r.notes}` : "";
         `  reader egress: ${r.readerEgress ? "on" : "off"} (enable with TOKENMAXED_READER_EGRESS=true \u2014 lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
         `  tiered routing: ${r.tiered ? "on" : "off"} (enable with TOKENMAXED_TIERED=true \u2014 start on the cheapest lane clearing the capability floor, step up on review failure)`,
         "",
+        ...formatLaneSetup(r.lanes),
+        "",
         `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
       ];
       return ok(lines.join("\n"), { ...r });
@@ -25896,7 +25954,7 @@ function unknownKeys(inputSchema, args) {
 
 // ../mcp/src/server.ts
 var DEFAULT_LANES = homeFile("lanes.yaml");
-var DEFAULT_PRICES = fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
+var DEFAULT_PRICES2 = fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
 function recordableLane(lane, priceTable) {
   if (lane.native || lane.costBasis !== "metered") return true;
   try {
@@ -25955,7 +26013,7 @@ function makeServerDeps(env = process.env) {
   const ledgerPath = env.TOKENMAXED_LEDGER;
   const statePath = env.TOKENMAXED_STATE ?? homeFile("state.json");
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
-  const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
+  const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES2;
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
   const escalateEnabled = env.TOKENMAXED_ESCALATE === "true" && !globallyDisabled;

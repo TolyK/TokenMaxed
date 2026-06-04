@@ -104,6 +104,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       learnCapability: false,
       readerEgress: false,
       tiered: false,
+      lanes: [],
     }),
     now: () => FIXED_NOW,
     ...over,
@@ -487,12 +488,20 @@ test('setup reports the manager + open gate when present', async () => {
         learnCapability: true,
         readerEgress: true,
         tiered: true,
+        lanes: [
+          { id: 'codex-cli', kind: 'cli', model: 'gpt-5.5', trustMode: 'full', executionMode: 'answer-only', role: 'active-reviewer', available: true },
+          { id: 'minimax-api', kind: 'api', model: 'minimax-m3', rawModel: 'minimax@latest', trustMode: 'worker', executionMode: 'answer-only', role: 'none', available: false },
+        ],
       }),
     }),
   );
   assert.match(r.content[0]!.text, /reader egress: on/);
+  assert.match(r.content[0]!.text, /tiered routing: on/);
   assert.match(r.content[0]!.text, /manager: claude-haiku/);
   assert.match(r.content[0]!.text, /worker gate: open/);
+  // SETUP-1: the per-lane confirmation is rendered (model resolved, trust→permission, role).
+  assert.match(r.content[0]!.text, /codex-cli \[cli\] gpt-5\.5 · trust=full.*role=reviewer \(active\)/);
+  assert.match(r.content[0]!.text, /minimax-api \[api\] minimax@latest → minimax-m3 · trust=worker.*unavailable now/);
   assert.match(r.content[0]!.text, /quality escalation: on/);
   assert.match(r.content[0]!.text, /learned capability: on/);
   assert.match(r.content[0]!.text, /already present/);

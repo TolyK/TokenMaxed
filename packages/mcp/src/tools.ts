@@ -32,6 +32,8 @@ import type {
 
 import { renderStalenessWarnings } from './freshness-report.ts';
 import type { StalenessWarning } from './freshness-report.ts';
+import { formatLaneSetup } from './lane-setup.ts';
+import type { LaneSetupRow } from './lane-setup.ts';
 import { formatSummaryBanner } from './summary.ts';
 import type { SummaryData } from './summary.ts';
 
@@ -165,6 +167,8 @@ export interface SetupReport {
   readerEgress: boolean;
   /** MODEL-TIERS: whether tiered routing is enabled (TOKENMAXED_TIERED). */
   tiered: boolean;
+  /** SETUP-1: per-lane confirmation rows (model/trust/permissions/role/availability). */
+  lanes: LaneSetupRow[];
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -653,6 +657,8 @@ export function createTools(core: CorePort): ToolDef[] {
           `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
           `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
           `  tiered routing: ${r.tiered ? 'on' : 'off'} (enable with TOKENMAXED_TIERED=true — start on the cheapest lane clearing the capability floor, step up on review failure)`,
+          '',
+          ...formatLaneSetup(r.lanes),
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
         ];
