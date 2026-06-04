@@ -24,6 +24,7 @@ const OPT_IN_FLAGS = [
   'TOKENMAXED_REVIEW_ON_STOP',
   'TOKENMAXED_ESCALATE',
   'TOKENMAXED_LEARN_CAPABILITY',
+  'TOKENMAXED_READER_EGRESS',
   'TOKENMAXED_DISABLE',
 ] as const;
 
@@ -91,4 +92,13 @@ test('the learned-capability toggle is documented (F-1) with its prior + explain
   // ...including the prior framing and where the user sees the adjustment.
   assert.match(README, /prior/i, 'README must frame declared capability as a prior');
   assert.match(README, /learned: declared/, 'README must show the /tokenmaxed:why learned annotation example');
+});
+
+test('the reader trust tier is documented (F-2) with its high-friction opt-ins', () => {
+  // The bundle honors TOKENMAXED_READER_EGRESS, so the README must explain it...
+  assert.ok(BUNDLE.includes('TOKENMAXED_READER_EGRESS'), 'bundle should read TOKENMAXED_READER_EGRESS');
+  assert.match(README, /TOKENMAXED_READER_EGRESS/, 'README must document the reader-egress opt-in');
+  // ...including the per-lane attestation and the repo-read framing.
+  assert.match(README, /repo_read_attestation/, 'README must mention the per-lane reader attestation');
+  assert.match(README, /reader-derived/, 'README must mention the reader-derived taint');
 });

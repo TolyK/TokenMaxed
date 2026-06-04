@@ -172,9 +172,12 @@ test('loadPriceTable reads and validates the shipped seed file', () => {
   const seedPath = new URL('../../../config/prices.seed.json', import.meta.url);
   const t = loadPriceTable(seedPath);
   assert.equal(t.frontier_model, 'claude-opus-4-7');
-  assert.equal(Object.keys(t.models).length, 4);
+  assert.equal(Object.keys(t.models).length, 8);
   assert.equal(t.models['claude-opus-4-7']?.inputPer1M, 15);
   assert.equal(t.models['claude-haiku-4-5-20251001']?.outputPer1M, 5);
+  // F2-S5: metered vendor models priced so opted-up reader/worker lanes are routable.
+  assert.ok(t.models['glm-5.1']);
+  assert.ok(t.models['minimax-m2']);
 });
 
 test('loadPriceTable gives a clear error for a missing file', () => {

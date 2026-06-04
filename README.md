@@ -153,6 +153,23 @@ subtasks to the cheapest capable lane automatically. Or drive it by hand:
     signal, not a true model-quality measure (it's confounded by task difficulty
     and reviewer strictness), and lanes that win routing accrue more samples — so
     this is a useful heuristic, not unbiased benchmarking.
+  - **Reader lanes (middle trust tier)** — a vendor you trust with your *code*
+    but not your secrets/shell. A `reader` lane receives bounded, secret-scanned
+    **repo-read** context (no secrets, no shell, no tools, answer-only) so
+    repo-aware work can offload without marking the vendor fully trusted. This
+    deliberately sends (possibly private) repo code to that vendor — secret egress
+    is fail-closed and scanner-gated, *not* proven impossible, and the vendor's
+    terms govern code once it's in the prompt — so it is **high-friction**:
+    selectable only with **all** of `TOKENMAXED_GATE_READY=true` (the safety gate,
+    needs gitleaks) + `TOKENMAXED_READER_EGRESS=true` (global),
+    `repo_read_attestation: true` on that lane, an API/BYOK lane (reader execution
+    is API-only), and a policy `allow` rule for the repo. Results are flagged
+    *reader-derived* and must not be re-delegated to a worker. First-class vendor
+    lanes (Gemini, Kimi, GLM, MiniMax) ship as safe `blocked` templates in
+    `lanes.example.yaml` — you opt each one up deliberately. Note the executor
+    constraint: **CLI** lanes can only be `full` (or `blocked`); `worker`/`reader`
+    are **API/BYOK-only** (the certified executors are HTTP). So a CLI vendor is
+    full-or-nothing, while an API vendor can be `worker`/`reader`/`full`.
   - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
     regardless of the flags above.
 

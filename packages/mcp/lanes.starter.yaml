@@ -104,3 +104,71 @@ lanes:
       docs: 0.85
       explain: 0.82
       codegen: 0.72
+
+  # --- Other provider lanes (SUPPORTED) ---------------------------------------
+  # Popular vendors, shipped as SAFE inert TEMPLATES: each is `blocked` (never
+  # selected) until YOU pick a trust_mode. (The lanes ABOVE — codex-cli, ollama —
+  # are illustrative `full` examples; in your own config, set every lane's trust
+  # deliberately. The vendor lanes here add nothing to your trust surface until
+  # you change `blocked`.) Trust ladder: blocked < worker < reader < full.
+  #   • worker — cheapest safe offload: a minimized, scrubbed, no-repo task. API/BYOK only.
+  #   • reader — repo-READ context (no secrets/shell/tools, answer-only) for a vendor you
+  #              trust with CODE but not secrets. Sends repo code to the vendor. API/BYOK
+  #              only, and needs ALL of: `repo_read_attestation: true` here, the env flags
+  #              TOKENMAXED_GATE_READY=true (safety gate; needs gitleaks) AND
+  #              TOKENMAXED_READER_EGRESS=true, and an allow rule in policy.yaml for the
+  #              repo. worker/reader executors are API-only in v1.
+  #   • full   — repo + tools (+ optional agentic). For a vendor you FULLY trust. CLIs can
+  #              only be `full` (or blocked). NOTE: a full *api* lane also needs
+  #              TOKENMAXED_GATE_READY=true (the pre-gate guard blocks api lanes until the
+  #              safety gate is open); full CLI/local lanes need no flag.
+  # BYOK api lanes: put the key in env TOKENMAXED_KEY_<authHandle> (never in this file).
+  # api lanes speak the OpenAI /chat/completions schema — point `endpoint` at your
+  # provider's OpenAI-COMPATIBLE chat-completions URL (not a vendor-proprietary one).
+  # CLI lanes (gemini-cli, kimi-cli) can only be `full` or `blocked` — worker/reader
+  # executors are API-only, so a CLI lane set to worker/reader loads but never routes.
+
+  - id: gemini-cli              # Google Gemini CLI (subscription). CLI ⇒ full or blocked.
+    kind: cli
+    model: gemini-3.5-flash
+    trust_mode: blocked         # → full to enable (trusts Google with repo + tools)
+    costBasis: subscription
+    provenance: google
+    jurisdiction: US
+    command: gemini
+    args: [generate]
+    capability: { boilerplate: 0.80, docs: 0.80, explain: 0.78, codegen: 0.75 }
+
+  - id: kimi-cli                # Moonshot Kimi CLI (subscription). CLI ⇒ full or blocked.
+    kind: cli
+    model: kimi-k2
+    trust_mode: blocked         # → full to enable (trusts Moonshot with repo + tools)
+    costBasis: subscription
+    provenance: moonshot
+    jurisdiction: CN
+    command: kimi
+    args: [code]
+    capability: { bugfix: 0.80, codegen: 0.80, refactor: 0.76 }
+
+  - id: glm-api                 # Zhipu GLM via BYOK API. Can be worker / reader / full.
+    kind: api
+    model: glm-5.1
+    trust_mode: blocked         # → worker (no repo) or reader (repo-read; see above) or full
+    # repo_read_attestation: true   # uncomment + set trust_mode: reader to allow repo-read egress
+    costBasis: metered
+    provenance: zhipu
+    jurisdiction: CN
+    endpoint: https://open.bigmodel.cn/api/paas/v4/chat/completions
+    authHandle: ZHIPU
+    capability: { codegen: 0.82, bugfix: 0.80, refactor: 0.78 }
+
+  - id: minimax-api             # MiniMax via BYOK API. Can be worker / reader / full.
+    kind: api
+    model: minimax-m2
+    trust_mode: blocked         # → worker (no repo) or reader (repo-read; see above) or full
+    costBasis: metered
+    provenance: minimax
+    jurisdiction: CN
+    endpoint: https://api.minimax.io/v1/chat/completions   # use the OpenAI-compatible URL
+    authHandle: MINIMAX
+    capability: { codegen: 0.80, boilerplate: 0.80, docs: 0.76 }

@@ -272,7 +272,7 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   // Pass the file: URL directly; loadLaneConfig handles URL→path (and spaces).
   const examplePath = new URL('../../../config/lanes.example.yaml', import.meta.url);
   const reg = loadLaneConfig(examplePath);
-  assert.equal(reg.lanes.length, 4);
+  assert.equal(reg.lanes.length, 8);
   assert.ok(reg.byId('claude-native'));
   assert.ok(reg.byId('codex-cli'));
   assert.ok(reg.byId('ollama-llama3'));
@@ -282,6 +282,11 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   assert.equal(haiku!.command, 'claude');
   assert.equal(haiku!.provenance, 'anthropic');
   assert.ok(reg instanceof LaneRegistry);
+  // F2-S5: the named vendor lanes ship as SAFE inert templates (blocked) — only
+  // the native host + manager are trusted out of the box; vendors are user's choice.
+  for (const id of ['gemini-cli', 'kimi-cli', 'glm-api', 'minimax-api']) {
+    assert.equal(reg.byId(id)?.trust_mode, 'blocked', `${id} must ship blocked`);
+  }
 });
 
 test('loadLaneConfig gives a clear error for a missing file', () => {
