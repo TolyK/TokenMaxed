@@ -24498,6 +24498,32 @@ function makeGitleaksScanner() {
     }
   };
 }
+function wrapWithFetchTimeout(fn, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    let settled = false;
+    const done = (cb) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cb();
+    };
+    const timer = setTimeout(() => {
+      controller.abort();
+      done(() => reject(new LaneFailure("timeout")));
+    }, timeoutMs);
+    Promise.resolve().then(() => fn(controller.signal)).then(
+      (v) => done(() => resolve(v)),
+      (e) => done(() => {
+        if (e && typeof e === "object" && "name" in e && e.name === "AbortError") {
+          reject(new LaneFailure("timeout"));
+        } else {
+          reject(e);
+        }
+      })
+    );
+  });
+}
 function extractText(data) {
   const choices = data?.choices;
   const content = choices?.[0]?.message?.content;
@@ -24661,17 +24687,25 @@ function makeCliExecutor(spawnImpl) {
     return { resultText: res.stdout ?? "" };
   };
 }
-function makeOllamaExecutor(fetchImpl) {
+var DEFAULT_FETCH_TIMEOUT_MS = 9e4;
+function makeOllamaExecutor(fetchImpl, opts) {
   const doFetch = fetchImpl ?? globalThis.fetch;
+  const fetchTimeoutMs = opts?.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   return async (lane, instruction, attachments) => {
     const base = lane.endpoint ?? "http://localhost:11434";
-    const res = await doFetch(`${base}/api/generate`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false })
-    });
-    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `ollama lane "${lane.id}" returned status ${res.status}`);
-    const data = await res.json();
+    const body = JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false });
+    const { ok: ok2, status, data } = await wrapWithFetchTimeout(async (signal) => {
+      const res = await doFetch(`${base}/api/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal
+      });
+      if (!res.ok) return { ok: false, status: res.status, data: void 0 };
+      const data2 = await res.json();
+      return { ok: true, status: res.status, data: data2 };
+    }, fetchTimeoutMs);
+    if (!ok2) throw new LaneFailure(classifyHttpStatus(status), `ollama lane "${lane.id}" returned status ${status}`);
     return {
       resultText: typeof data.response === "string" ? data.response : "",
       reported: { tokens_in: numOrUndef(data.prompt_eval_count), tokens_out: numOrUndef(data.eval_count) }
@@ -24680,6 +24714,7 @@ function makeOllamaExecutor(fetchImpl) {
 }
 function makeTrustedApiExecutor(deps = {}) {
   const doFetch = deps.fetchImpl ?? globalThis.fetch;
+  const fetchTimeoutMs = deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   return async (lane, instruction, attachments) => {
     if (!lane.endpoint) throw new LaneFailure("bad_request", `api lane "${lane.id}" has no endpoint configured`);
     if (!doFetch) throw new LaneFailure("provider_error", "no fetch implementation available");
@@ -24698,9 +24733,13 @@ function makeTrustedApiExecutor(deps = {}) {
       model: lane.model,
       messages: [{ role: "user", content: combinedPrompt(instruction, attachments) }]
     });
-    const res = await doFetch(lane.endpoint, { method: "POST", headers, body });
-    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `api lane "${lane.id}" returned status ${res.status}`);
-    const data = await res.json();
+    const { ok: ok2, status, data } = await wrapWithFetchTimeout(async (signal) => {
+      const res = await doFetch(lane.endpoint, { method: "POST", headers, body, signal });
+      if (!res.ok) return { ok: false, status: res.status, data: void 0 };
+      const data2 = await res.json();
+      return { ok: true, status: res.status, data: data2 };
+    }, fetchTimeoutMs);
+    if (!ok2) throw new LaneFailure(classifyHttpStatus(status), `api lane "${lane.id}" returned status ${status}`);
     const content = data.choices?.[0]?.message?.content;
     return {
       resultText: typeof content === "string" ? content : "",
@@ -25208,6 +25247,9 @@ async function runHostTurnReview(turnId, deps) {
   if (result.notes) out.notes = result.notes;
   return out;
 }
+function makeReviewRunner(deps) {
+  return (turnId) => runHostTurnReview(turnId, deps);
+}
 var MAX_DIFF_BYTES = 256 * 1024;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var GIT_TIMEOUT_MS = 15e3;
@@ -25240,6 +25282,43 @@ function makeHostReviewDeps(env) {
     gateReady: env.TOKENMAXED_GATE_READY === "true",
     newId: () => randomUUID2()
   };
+}
+
+// ../mcp/src/review-budget.ts
+async function runReviewWithBudget(runner, newId, opts) {
+  const totalBudgetMs = opts?.totalBudgetMs ?? 12e4;
+  const maxRetries = opts?.maxRetries ?? 1;
+  const nAttempts = maxRetries + 1;
+  const perAttemptMs = Math.floor(totalBudgetMs / nAttempts);
+  if (perAttemptMs <= 0) {
+    return { reviewed: false, reason: "review budget too small" };
+  }
+  const turnId = newId();
+  const deadlineAt = Date.now() + totalBudgetMs;
+  let lastReason = "review timed out";
+  const TIMEOUT = /* @__PURE__ */ Symbol("timeout");
+  const SLOT_JITTER_MS = 50;
+  for (let i = 0; i < nAttempts; i++) {
+    const remaining = deadlineAt - Date.now();
+    const slotMs = Math.min(perAttemptMs, remaining);
+    if (slotMs < perAttemptMs - SLOT_JITTER_MS) break;
+    const result = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(TIMEOUT), slotMs);
+      Promise.resolve().then(() => runner(turnId)).then(
+        (r) => {
+          clearTimeout(timer);
+          resolve(r);
+        },
+        (e) => {
+          clearTimeout(timer);
+          lastReason = e instanceof Error ? `review failed: ${e.message}` : "review failed";
+          resolve(TIMEOUT);
+        }
+      );
+    });
+    if (result !== TIMEOUT) return result;
+  }
+  return { reviewed: false, reason: lastReason };
 }
 
 // ../mcp/src/setup.ts
@@ -25913,10 +25992,11 @@ function makeServerDeps(env = process.env) {
       );
     },
     delegate,
-    // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
-    // same runHostTurnReview path independently. Honor the global kill-switch so a
-    // recursion-guarded child (TOKENMAXED_DISABLE=1) can't review + spawn again.
-    review: () => globallyDisabled ? Promise.resolve({ reviewed: false, reason: "routing is disabled (TOKENMAXED_DISABLE)" }) : runHostTurnReview(randomUUID3(), makeHostReviewDeps(env)),
+    // Manual manager review of the turn's diff (A-7); the Stop gate reuses the same
+    // path independently. Honor the global kill-switch so a recursion-guarded child
+    // (TOKENMAXED_DISABLE=1) can't review + spawn again. runReviewWithBudget bounds
+    // the call (total deadline + retry) so a hung manager never stalls the turn.
+    review: () => globallyDisabled ? Promise.resolve({ reviewed: false, reason: "routing is disabled (TOKENMAXED_DISABLE)" }) : runReviewWithBudget(makeReviewRunner(makeHostReviewDeps(env)), randomUUID3),
     // Create/validate user config + report status (A-8).
     setup: () => runSetup(env),
     now: () => Date.now()

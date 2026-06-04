@@ -146,8 +146,54 @@ interface FetchLikeResponse {
   ok: boolean;
   status: number;
   json: () => Promise<unknown>;
+  /** Optional text body accessor (unused today; present so richer mocks compile). */
+  text?: () => Promise<string>;
 }
-type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<FetchLikeResponse>;
+type FetchLike = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<FetchLikeResponse>;
+
+/**
+ * Wrap an async operation with a hard timeout + cooperative AbortSignal. When the
+ * timer fires it:
+ *   1. Calls `controller.abort()` so a well-behaved fetch can cancel early.
+ *   2. Rejects the returned Promise with `LaneFailure('timeout')`.
+ * When the operation finishes first the timer is cleared. Synchronous throws from
+ * `fn` are caught via `Promise.resolve().then(fn)` so they never leak the timer.
+ *
+ * This is the ONLY real backstop for a stalled fetch: `Promise.race` alone cannot
+ * interrupt a pending network call — an AbortSignal must be passed to `fetch` for
+ * cooperative cancellation, and the wrapper timer provides the hard deadline.
+ */
+function wrapWithFetchTimeout<T>(fn: (signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const controller = new AbortController();
+    let settled = false;
+    const done = (cb: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cb();
+    };
+    // Arrow function keeps correct `this`; fires abort + rejection in one place.
+    const timer = setTimeout(() => {
+      controller.abort();
+      done(() => reject(new LaneFailure('timeout')));
+    }, timeoutMs);
+    // Wrap in Promise.resolve().then() so synchronous throws become rejections.
+    Promise.resolve()
+      .then(() => fn(controller.signal))
+      .then(
+        (v) => done(() => resolve(v)),
+        (e: unknown) =>
+          done(() => {
+            if (e && typeof e === 'object' && 'name' in e && (e as { name: unknown }).name === 'AbortError') {
+              reject(new LaneFailure('timeout'));
+            } else {
+              reject(e);
+            }
+          }),
+      );
+  });
+}
 
 /** Injectable dependencies for {@link executeUntrusted} (transport + auth resolver). */
 export interface UntrustedExecDeps {
@@ -410,23 +456,42 @@ export function makeCliExecutor(spawnImpl?: SpawnLike): TrustedExecFn {
   };
 }
 
-type OllamaFetch = (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<FetchLikeResponse>;
+type OllamaFetch = (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<FetchLikeResponse>;
 
-/** Local Ollama executor: POST /api/generate; uses reported eval counts when present. */
-export function makeOllamaExecutor(fetchImpl?: OllamaFetch): TrustedExecFn {
+/** Default per-fetch timeout for API/Ollama executors (avoids an indefinite hang on a stalled socket). */
+const DEFAULT_FETCH_TIMEOUT_MS = 90_000;
+
+/**
+ * Local Ollama executor: POST /api/generate; uses reported eval counts when present.
+ * A hard `fetchTimeoutMs` (default 90 s) bounds a stalled Ollama socket — the real
+ * risk is a hung keep-alive or a model loading indefinitely. The AbortSignal is also
+ * passed to the fetch so a well-behaved implementation cancels early.
+ */
+export function makeOllamaExecutor(fetchImpl?: OllamaFetch, opts?: { fetchTimeoutMs?: number }): TrustedExecFn {
   const doFetch = fetchImpl ?? (globalThis.fetch as unknown as OllamaFetch);
+  const fetchTimeoutMs = opts?.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   return async (lane, instruction, attachments) => {
     const base = lane.endpoint ?? 'http://localhost:11434';
-    const res = await doFetch(`${base}/api/generate`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false }),
-    });
-    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `ollama lane "${lane.id}" returned status ${res.status}`);
-    const data = (await res.json()) as { response?: unknown; prompt_eval_count?: unknown; eval_count?: unknown };
+    const body = JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false });
+    // Wrap fetch + json() together: a stalled response BODY (not just the initial
+    // connection) can also hang indefinitely, so the AbortController stays active
+    // through body parsing. res.ok is checked before res.json() so a non-OK
+    // response with invalid JSON produces the right classifyHttpStatus failure.
+    const { ok, status, data } = await wrapWithFetchTimeout(async (signal) => {
+      const res = await doFetch(`${base}/api/generate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body,
+        signal,
+      });
+      if (!res.ok) return { ok: false as const, status: res.status, data: undefined };
+      const data = (await res.json()) as { response?: unknown; prompt_eval_count?: unknown; eval_count?: unknown };
+      return { ok: true as const, status: res.status, data };
+    }, fetchTimeoutMs);
+    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `ollama lane "${lane.id}" returned status ${status}`);
     return {
-      resultText: typeof data.response === 'string' ? data.response : '',
-      reported: { tokens_in: numOrUndef(data.prompt_eval_count), tokens_out: numOrUndef(data.eval_count) },
+      resultText: typeof data!.response === 'string' ? data!.response : '',
+      reported: { tokens_in: numOrUndef(data!.prompt_eval_count), tokens_out: numOrUndef(data!.eval_count) },
     };
   };
 }
@@ -436,11 +501,17 @@ export function makeOllamaExecutor(fetchImpl?: OllamaFetch): TrustedExecFn {
  * attachments (no minimization — a `full`/trusted lane the user approved). Auth
  * is resolved from the lane's authHandle; a lane that needs auth without a
  * resolver fails closed (throws ⇒ runTask degrades).
+ *
+ * A hard `fetchTimeoutMs` (default 90 s) bounds a stalled API socket. A stalled
+ * HTTP keep-alive or DNS hang produces a Promise that never rejects, which no
+ * upstream `Promise.race` can preempt — the AbortController + timer in
+ * `wrapWithFetchTimeout` is the only real backstop.
  */
 export function makeTrustedApiExecutor(
-  deps: { fetchImpl?: FetchLike; resolveAuth?: (authHandle: string) => string } = {},
+  deps: { fetchImpl?: FetchLike; resolveAuth?: (authHandle: string) => string; fetchTimeoutMs?: number } = {},
 ): TrustedExecFn {
   const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as FetchLike | undefined);
+  const fetchTimeoutMs = deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   return async (lane, instruction, attachments) => {
     if (!lane.endpoint) throw new LaneFailure('bad_request', `api lane "${lane.id}" has no endpoint configured`);
     if (!doFetch) throw new LaneFailure('provider_error', 'no fetch implementation available');
@@ -459,13 +530,21 @@ export function makeTrustedApiExecutor(
       model: lane.model,
       messages: [{ role: 'user', content: combinedPrompt(instruction, attachments) }],
     });
-    const res = await doFetch(lane.endpoint, { method: 'POST', headers, body });
-    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `api lane "${lane.id}" returned status ${res.status}`);
-    const data = (await res.json()) as { choices?: { message?: { content?: unknown } }[]; usage?: Record<string, unknown> };
-    const content = data.choices?.[0]?.message?.content;
+    // Wrap fetch + json() together so the AbortController stays active through body
+    // parsing. A stalled response body (not just the initial connection) can also
+    // hang indefinitely. res.ok is checked before res.json() so a non-OK response
+    // with invalid JSON produces the right classifyHttpStatus failure.
+    const { ok, status, data } = await wrapWithFetchTimeout(async (signal) => {
+      const res = await doFetch(lane.endpoint!, { method: 'POST', headers, body, signal });
+      if (!res.ok) return { ok: false as const, status: res.status, data: undefined };
+      const data = (await res.json()) as { choices?: { message?: { content?: unknown } }[]; usage?: Record<string, unknown> };
+      return { ok: true as const, status: res.status, data };
+    }, fetchTimeoutMs);
+    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `api lane "${lane.id}" returned status ${status}`);
+    const content = data!.choices?.[0]?.message?.content;
     return {
       resultText: typeof content === 'string' ? content : '',
-      reported: { tokens_in: numOrUndef(data.usage?.prompt_tokens), tokens_out: numOrUndef(data.usage?.completion_tokens) },
+      reported: { tokens_in: numOrUndef(data!.usage?.prompt_tokens), tokens_out: numOrUndef(data!.usage?.completion_tokens) },
     };
   };
 }

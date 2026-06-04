@@ -8102,6 +8102,32 @@ function loadPolicyConfig(path) {
   }
   return parsePolicyConfig(text);
 }
+function wrapWithFetchTimeout(fn, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    let settled = false;
+    const done = (cb) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cb();
+    };
+    const timer = setTimeout(() => {
+      controller.abort();
+      done(() => reject(new LaneFailure("timeout")));
+    }, timeoutMs);
+    Promise.resolve().then(() => fn(controller.signal)).then(
+      (v) => done(() => resolve(v)),
+      (e) => done(() => {
+        if (e && typeof e === "object" && "name" in e && e.name === "AbortError") {
+          reject(new LaneFailure("timeout"));
+        } else {
+          reject(e);
+        }
+      })
+    );
+  });
+}
 function defaultLedgerPath() {
   return join(homedir(), ".tokenmaxed", "ledger.jsonl");
 }
@@ -8196,17 +8222,25 @@ function makeCliExecutor(spawnImpl) {
     return { resultText: res.stdout ?? "" };
   };
 }
-function makeOllamaExecutor(fetchImpl) {
+var DEFAULT_FETCH_TIMEOUT_MS = 9e4;
+function makeOllamaExecutor(fetchImpl, opts) {
   const doFetch = fetchImpl ?? globalThis.fetch;
+  const fetchTimeoutMs = opts?.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   return async (lane, instruction, attachments) => {
     const base = lane.endpoint ?? "http://localhost:11434";
-    const res = await doFetch(`${base}/api/generate`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false })
-    });
-    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `ollama lane "${lane.id}" returned status ${res.status}`);
-    const data = await res.json();
+    const body = JSON.stringify({ model: lane.model, prompt: combinedPrompt(instruction, attachments), stream: false });
+    const { ok, status, data } = await wrapWithFetchTimeout(async (signal) => {
+      const res = await doFetch(`${base}/api/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal
+      });
+      if (!res.ok) return { ok: false, status: res.status, data: void 0 };
+      const data2 = await res.json();
+      return { ok: true, status: res.status, data: data2 };
+    }, fetchTimeoutMs);
+    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `ollama lane "${lane.id}" returned status ${status}`);
     return {
       resultText: typeof data.response === "string" ? data.response : "",
       reported: { tokens_in: numOrUndef(data.prompt_eval_count), tokens_out: numOrUndef(data.eval_count) }
@@ -8215,6 +8249,7 @@ function makeOllamaExecutor(fetchImpl) {
 }
 function makeTrustedApiExecutor(deps = {}) {
   const doFetch = deps.fetchImpl ?? globalThis.fetch;
+  const fetchTimeoutMs = deps.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
   return async (lane, instruction, attachments) => {
     if (!lane.endpoint) throw new LaneFailure("bad_request", `api lane "${lane.id}" has no endpoint configured`);
     if (!doFetch) throw new LaneFailure("provider_error", "no fetch implementation available");
@@ -8233,9 +8268,13 @@ function makeTrustedApiExecutor(deps = {}) {
       model: lane.model,
       messages: [{ role: "user", content: combinedPrompt(instruction, attachments) }]
     });
-    const res = await doFetch(lane.endpoint, { method: "POST", headers, body });
-    if (!res.ok) throw new LaneFailure(classifyHttpStatus(res.status), `api lane "${lane.id}" returned status ${res.status}`);
-    const data = await res.json();
+    const { ok, status, data } = await wrapWithFetchTimeout(async (signal) => {
+      const res = await doFetch(lane.endpoint, { method: "POST", headers, body, signal });
+      if (!res.ok) return { ok: false, status: res.status, data: void 0 };
+      const data2 = await res.json();
+      return { ok: true, status: res.status, data: data2 };
+    }, fetchTimeoutMs);
+    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `api lane "${lane.id}" returned status ${status}`);
     const content = data.choices?.[0]?.message?.content;
     return {
       resultText: typeof content === "string" ? content : "",
@@ -8417,6 +8456,9 @@ async function runHostTurnReview(turnId, deps) {
   if (result.notes) out.notes = result.notes;
   return out;
 }
+function makeReviewRunner(deps) {
+  return (turnId) => runHostTurnReview(turnId, deps);
+}
 var MAX_DIFF_BYTES = 256 * 1024;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var GIT_TIMEOUT_MS = 15e3;
@@ -8451,19 +8493,45 @@ function makeHostReviewDeps(env) {
   };
 }
 
+// ../mcp/src/review-budget.ts
+async function runReviewWithBudget(runner, newId, opts) {
+  const totalBudgetMs = opts?.totalBudgetMs ?? 12e4;
+  const maxRetries = opts?.maxRetries ?? 1;
+  const nAttempts = maxRetries + 1;
+  const perAttemptMs = Math.floor(totalBudgetMs / nAttempts);
+  if (perAttemptMs <= 0) {
+    return { reviewed: false, reason: "review budget too small" };
+  }
+  const turnId = newId();
+  const deadlineAt = Date.now() + totalBudgetMs;
+  let lastReason = "review timed out";
+  const TIMEOUT = /* @__PURE__ */ Symbol("timeout");
+  const SLOT_JITTER_MS = 50;
+  for (let i = 0; i < nAttempts; i++) {
+    const remaining = deadlineAt - Date.now();
+    const slotMs = Math.min(perAttemptMs, remaining);
+    if (slotMs < perAttemptMs - SLOT_JITTER_MS) break;
+    const result = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(TIMEOUT), slotMs);
+      Promise.resolve().then(() => runner(turnId)).then(
+        (r) => {
+          clearTimeout(timer);
+          resolve(r);
+        },
+        (e) => {
+          clearTimeout(timer);
+          lastReason = e instanceof Error ? `review failed: ${e.message}` : "review failed";
+          resolve(TIMEOUT);
+        }
+      );
+    });
+    if (result !== TIMEOUT) return result;
+  }
+  return { reviewed: false, reason: lastReason };
+}
+
 // ../mcp/src/hook-stop.ts
 var MAX_BLOCKS = 2;
-var REVIEW_DEADLINE_MS = 12e4;
-function reviewWithDeadline(deps) {
-  let timer;
-  const deadline = new Promise((resolve) => {
-    timer = setTimeout(() => resolve({ reviewed: false, reason: "review timed out" }), REVIEW_DEADLINE_MS);
-    timer.unref?.();
-  });
-  return Promise.race([runHostTurnReview(randomUUID3(), deps), deadline]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
 function readCounter(file) {
   try {
     const n = Number.parseInt(readFileSync2(file, "utf8"), 10);
@@ -8492,7 +8560,11 @@ async function main() {
   }
   const sessionId = (typeof input.session_id === "string" ? input.session_id : "default").replace(/[^A-Za-z0-9_.-]/g, "_");
   const counterFile = join4(tmpdir2(), "tokenmaxed-stop", sessionId);
-  const result = await reviewWithDeadline(makeHostReviewDeps(env));
+  const deps = makeHostReviewDeps(env);
+  const result = await runReviewWithBudget(makeReviewRunner(deps), randomUUID3, {
+    totalBudgetMs: 12e4,
+    maxRetries: 1
+  });
   if (!result.reviewed || !result.verdict) {
     writeCounter(counterFile, 0);
     return;

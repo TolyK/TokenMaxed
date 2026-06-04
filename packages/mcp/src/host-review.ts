@@ -96,6 +96,17 @@ export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): P
   return out;
 }
 
+/**
+ * Build a runner function compatible with {@link runReviewWithBudget} from a set
+ * of real host-review deps. The runner passes the supplied `turnId` directly to
+ * {@link runHostTurnReview} so the budget helper can share one ID across retries.
+ */
+export function makeReviewRunner(
+  deps: HostReviewDeps,
+): (turnId: string) => Promise<HostReviewResult> {
+  return (turnId) => runHostTurnReview(turnId, deps);
+}
+
 const MAX_DIFF_BYTES = 256 * 1024; // truncate what we hand the manager
 const GIT_MAX_BUFFER = 64 * 1024 * 1024; // read big diffs without ENOBUFS, then truncate
 const GIT_TIMEOUT_MS = 15_000; // git diff is fast; bound it so a wedged git can't hang us

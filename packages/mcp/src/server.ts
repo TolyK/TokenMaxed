@@ -57,7 +57,8 @@ import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
 import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
-import { makeHostReviewDeps, runHostTurnReview } from './host-review.ts';
+import { makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
+import { runReviewWithBudget } from './review-budget.ts';
 import { runSetup } from './setup.ts';
 import { createTools, dispatch } from './tools.ts';
 import { readEnabled, writeEnabled } from './toggle.ts';
@@ -393,13 +394,14 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       );
     },
     delegate,
-    // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
-    // same runHostTurnReview path independently. Honor the global kill-switch so a
-    // recursion-guarded child (TOKENMAXED_DISABLE=1) can't review + spawn again.
+    // Manual manager review of the turn's diff (A-7); the Stop gate reuses the same
+    // path independently. Honor the global kill-switch so a recursion-guarded child
+    // (TOKENMAXED_DISABLE=1) can't review + spawn again. runReviewWithBudget bounds
+    // the call (total deadline + retry) so a hung manager never stalls the turn.
     review: (): Promise<ReviewOutcome> =>
       globallyDisabled
         ? Promise.resolve({ reviewed: false, reason: 'routing is disabled (TOKENMAXED_DISABLE)' })
-        : runHostTurnReview(randomUUID(), makeHostReviewDeps(env)),
+        : runReviewWithBudget(makeReviewRunner(makeHostReviewDeps(env)), randomUUID),
     // Create/validate user config + report status (A-8).
     setup: () => runSetup(env),
     now: () => Date.now(),

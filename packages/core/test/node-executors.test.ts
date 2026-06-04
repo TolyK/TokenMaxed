@@ -13,6 +13,7 @@ import {
   makeTrustedExecutor,
   runAndRecord,
 } from '../src/node.ts';
+import { LaneFailure } from '../src/failure.ts';
 import type { PriceTable } from '../src/price.ts';
 import type { Lane, RouteContext } from '../src/types.ts';
 
@@ -158,4 +159,100 @@ test('runAndRecord degrades to native and records nothing extra when the host la
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Fetch timeout tests — ensure a stalled fetch is hard-bounded by wrapWithFetchTimeout
+// ---------------------------------------------------------------------------
+
+const apiLaneForTimeout: Lane = {
+  id: 'api-timeout', kind: 'api', model: 'gpt-x', trust_mode: 'full',
+  costBasis: 'metered', provenance: 'openai', jurisdiction: 'US',
+  endpoint: 'https://api.example.com/v1/chat', capability: { feature: 0.9 },
+};
+
+test('makeTrustedApiExecutor: a hanging fetch resolves to LaneFailure(timeout) within fetchTimeoutMs', async () => {
+  let capturedSignal: AbortSignal | undefined;
+  // fetchImpl that never resolves — simulates a stalled connection.
+  const hangingFetch = (_url: string, init: { signal?: AbortSignal }): Promise<never> => {
+    capturedSignal = init.signal;
+    return new Promise<never>(() => { /* never resolves */ });
+  };
+  const exec = makeTrustedApiExecutor({ fetchImpl: hangingFetch as typeof hangingFetch & Parameters<typeof makeTrustedApiExecutor>[0], fetchTimeoutMs: 100 });
+  const start = Date.now();
+  await assert.rejects(
+    () => exec(apiLaneForTimeout, 'test'),
+    (err: unknown) => {
+      assert.ok(err instanceof LaneFailure, 'should be a LaneFailure');
+      assert.equal((err as LaneFailure).failureKind, 'timeout');
+      return true;
+    },
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 500, `should reject quickly (elapsed: ${elapsed}ms)`);
+  // AbortSignal should have been aborted after the timeout.
+  assert.ok(capturedSignal?.aborted === true, 'AbortSignal should be aborted after timeout');
+});
+
+const ollamaLaneForTimeout: Lane = {
+  id: 'ollama-timeout', kind: 'local', model: 'llama3.1:8b', trust_mode: 'full',
+  costBasis: 'local', provenance: 'meta', jurisdiction: 'US', capability: { docs: 0.7 },
+};
+
+test('makeOllamaExecutor: a hanging fetch resolves to LaneFailure(timeout) within fetchTimeoutMs', async () => {
+  let capturedSignal: AbortSignal | undefined;
+  const hangingFetch = (_url: string, init: { signal?: AbortSignal }): Promise<never> => {
+    capturedSignal = init.signal;
+    return new Promise<never>(() => { /* never resolves */ });
+  };
+  const exec = makeOllamaExecutor(hangingFetch as Parameters<typeof makeOllamaExecutor>[0], { fetchTimeoutMs: 100 });
+  const start = Date.now();
+  await assert.rejects(
+    () => exec(ollamaLaneForTimeout, 'test'),
+    (err: unknown) => {
+      assert.ok(err instanceof LaneFailure, 'should be a LaneFailure');
+      assert.equal((err as LaneFailure).failureKind, 'timeout');
+      return true;
+    },
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 500, `should reject quickly (elapsed: ${elapsed}ms)`);
+  assert.ok(capturedSignal?.aborted === true, 'AbortSignal should be aborted after timeout');
+});
+
+test('makeTrustedApiExecutor: a fetch that hangs on res.json() is also bounded', async () => {
+  // The fetch returns headers quickly but the body never arrives.
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: (): Promise<never> => new Promise(() => { /* never resolves */ }),
+    }),
+    fetchTimeoutMs: 100,
+  });
+  const start = Date.now();
+  await assert.rejects(
+    () => exec(apiLaneForTimeout, 'test'),
+    (err: unknown) => {
+      assert.ok(err instanceof LaneFailure);
+      assert.equal((err as LaneFailure).failureKind, 'timeout');
+      return true;
+    },
+  );
+  assert.ok(Date.now() - start < 500);
+});
+
+test('makeTrustedApiExecutor: HTTP non-ok still maps to typed LaneFailure (not swallowed by timeout wrapper)', async () => {
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async () => ({ ok: false, status: 429, json: async () => ({}) }),
+    fetchTimeoutMs: 5_000,
+  });
+  await assert.rejects(
+    () => exec(apiLaneForTimeout, 'test'),
+    (err: unknown) => {
+      assert.ok(err instanceof LaneFailure);
+      assert.equal((err as LaneFailure).failureKind, 'rate_limited');
+      return true;
+    },
+  );
 });
