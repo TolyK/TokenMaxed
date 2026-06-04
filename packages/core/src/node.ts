@@ -528,6 +528,8 @@ export async function runAndRecord(
       makeTrustedExecutor(resolveAuth ? { api: makeTrustedApiExecutor({ resolveAuth }) } : {}),
     executeUntrusted: (env) => executeUntrusted(env, resolveAuth ? { resolveAuth } : {}),
     untrustedLaneDTO: laneToUntrustedDTO,
+    executeReader: (env) => executeReader(env, resolveAuth ? { resolveAuth } : {}),
+    readerLaneDTO: laneToReaderDTO,
     scanSecrets: opts.scanSecrets ?? makeGitleaksScanner(),
     priceTable: opts.priceTable,
     newId: () => randomUUID(),

@@ -13,12 +13,13 @@
 
 import { computeCostPrimitives } from './price.ts';
 import type { PriceTable } from './price.ts';
-import { minimize } from './minimize.ts';
+import { minimize, minimizeForReader } from './minimize.ts';
 import type { MinimizedAttachment, SecretScanner } from './minimize.ts';
 import { routeDecide } from './route.ts';
 import { resolveUsage, usageFromReported } from './usage.ts';
 import type { RawUsage, ResolvedUsage } from './usage.ts';
-import type { SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
+import { READER_SYSTEM_FRAMING } from './boundary.ts';
+import type { SafeReaderEnvelope, SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
 import { isTransient, LaneFailure, shouldCooldown } from './failure.ts';
 import type { FailureKind } from './failure.ts';
 import { escalationDecision, selectEscalationTarget, TRUST_RANK } from './reassign.ts';
@@ -62,6 +63,10 @@ export interface RunDeps {
   executeUntrusted: (env: SafeUntrustedEnvelope) => Promise<UntrustedExecResultLite>;
   /** Resolve a worker lane to its narrow egress DTO (endpoint/authHandle from config). */
   untrustedLaneDTO: (lane: Lane) => UntrustedLaneDTO;
+  /** F-2: execute a reader lane over the reader egress boundary. Optional — absent ⇒ reader lanes degrade to native. */
+  executeReader?: (env: SafeReaderEnvelope) => Promise<UntrustedExecResultLite>;
+  /** F-2: resolve a reader lane to its narrow egress DTO. Optional (pairs with executeReader). */
+  readerLaneDTO?: (lane: Lane) => UntrustedLaneDTO;
   scanSecrets: SecretScanner;
   priceTable: PriceTable;
   newId: () => string;
@@ -79,6 +84,12 @@ export interface RunResult {
   native?: boolean;
   /** Normalized failure category when status is failed/blocked (drives fallback). */
   failureKind?: FailureKind;
+  /**
+   * F-2 taint: true ⇒ this result text came from a `reader` lane and may echo
+   * private repo code. It must never be fed to a `worker` lane or placed in a
+   * contentful log, and should be scanned before any further non-full egress.
+   */
+  readerDerived?: boolean;
   /** Content-free task events to append to the ledger (attempt records). */
   events: TaskEventInput[];
 }
@@ -157,6 +168,55 @@ export async function runTask(
       // or stop; otherwise treat an unknown throw as a transient provider error.
       const failureKind: FailureKind = err instanceof LaneFailure ? err.failureKind : 'provider_error';
       return { decision, laneId: lane.id, status: 'failed', native: true, failureKind, events: [event('failed', ZERO_USAGE)] };
+    }
+  }
+
+  // --- reader (F-2) lane: minimizeForReader (repo-read allowed, secret-gated),
+  // then execute over the reader egress boundary. Output is tainted reader-derived. ---
+  if (lane.trust_mode === 'reader') {
+    // Missing executor wiring ⇒ degrade to native rather than mis-route (defensive;
+    // selectability already requires the egress opt-in to reach here).
+    if (!deps.executeReader || !deps.readerLaneDTO) {
+      return { decision, laneId: lane.id, status: 'blocked', native: true, failureKind: 'policy_blocked', events: [event('blocked', ZERO_USAGE)] };
+    }
+    const rmin = await minimizeForReader(
+      {
+        instruction: request.instruction,
+        category: request.category,
+        ...(request.attachments ? { attachments: request.attachments } : {}),
+        ...(policyContext.repo_class ? { repo_class: policyContext.repo_class } : {}),
+        ...(policyContext.sensitivity ? { sensitivity: policyContext.sensitivity } : {}),
+      },
+      deps.scanSecrets,
+    );
+    if (!rmin.ok) {
+      return { decision, laneId: lane.id, status: 'blocked', native: true, failureKind: 'policy_blocked', events: [event('blocked', ZERO_USAGE)] };
+    }
+    try {
+      const env: SafeReaderEnvelope = { payload: rmin.payload, lane: deps.readerLaneDTO(lane) };
+      // Estimate from the SAME text the reader actually receives — including the
+      // answer-only system framing buildReaderRequestBody prepends — so a
+      // non-reporting endpoint's input tokens aren't undercounted.
+      const promptText = combinedText(
+        [READER_SYSTEM_FRAMING, rmin.payload.instruction].join('\n\n'),
+        rmin.payload.attachments,
+      );
+      const r = await deps.executeReader(env);
+      if (!r.ok) {
+        const usage = r.reported ? usageFromReported(r.reported) : ZERO_USAGE;
+        return {
+          decision,
+          laneId: lane.id,
+          status: 'failed',
+          native: true,
+          failureKind: r.failureKind ?? 'provider_error',
+          events: [event('failed', usage)],
+        };
+      }
+      const usage = resolveUsage({ reported: r.reported, promptText, resultText: r.resultText });
+      return { decision, laneId: lane.id, status: 'ok', resultText: r.resultText, readerDerived: true, events: [event('ok', usage)] };
+    } catch {
+      return { decision, laneId: lane.id, status: 'failed', native: true, failureKind: 'provider_error', events: [event('failed', ZERO_USAGE)] };
     }
   }
 

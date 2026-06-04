@@ -46,8 +46,9 @@ export function canReassign(from: Lane, to: Lane, task: Task, ctx: RouteContext,
   const toRank = TRUST_RANK[to.trust_mode] as number | undefined;
   if (fromRank === undefined || toRank === undefined) return false;
   if (toRank < fromRank) return false; // never move down
-  // Same structural gate as routing (also excludes blocked/reader, ungated workers, pre-gate API).
-  if (!isSelectablePreGate(to, ctx.gateReady ?? false)) return false;
+  // Same structural gate as routing (worker needs gate+cert; reader needs the
+  // egress opt-in + cert + attestation; blocked never; pre-gate API excluded).
+  if (!isSelectablePreGate(to, ctx.gateReady ?? false, ctx.readerEgress ?? false)) return false;
   const { verdict } = evaluate(task, to, ctx.policyContext ?? {}, policy);
   return laneAllowedByVerdict(to, verdict);
 }

@@ -12,7 +12,7 @@
  * before scoring once untrusted lanes exist. The shape returned here is stable.
  */
 
-import { isExecutorCertified } from './boundary.ts';
+import { isExecutorCertified, isReaderExecutorCertified } from './boundary.ts';
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
 import { TRUSTED_PROVENANCES } from './types.ts';
 import type {
@@ -88,8 +88,8 @@ function capPenaltyFor(headroom: number | undefined): number {
  *   restriction for full (trusted) lanes; worker admission lands with the policy
  *   engine + egress certification.
  */
-export function isSelectablePreGate(lane: Lane, gateReady = false): boolean {
-  // ALLOWLIST + fail-closed: only `full` and `worker` have selectable logic.
+export function isSelectablePreGate(lane: Lane, gateReady = false, readerEgress = false): boolean {
+  // ALLOWLIST + fail-closed: only `full`/`worker`/`reader` have selectable logic.
   // Full (trusted, user-approved) lanes: CLI/local always selectable; an API lane
   // only once the gate is ready (the blanket pre-gate "no API lane" guard relaxes).
   if (lane.trust_mode === 'full') return gateReady || lane.kind !== 'api';
@@ -97,11 +97,22 @@ export function isSelectablePreGate(lane: Lane, gateReady = false): boolean {
   // core-owned, egress-CI-certified executor exists for the lane. The policy gate
   // and the minimizer then apply on top (defense in depth) before anything sends.
   if (lane.trust_mode === 'worker') return gateReady && isExecutorCertified(lane);
-  // Everything else fails CLOSED: `blocked` (never), `reader` (F-2 middle tier —
-  // inert until its repo-read boundary + egress-certified executor + opt-in gate
-  // land; selectability is decided in its own dedicated path, never here), and any
-  // unknown/legacy value (e.g. a deprecated `monitored` reaching a direct JS caller
-  // without going through config normalization).
+  // `reader` (F-2 middle tier) is HIGH-FRICTION: selectable only with ALL of —
+  // the gate ready, the global reader-egress opt-in, an egress-certified reader
+  // executor (API-only in v1), AND the per-lane repo_read_attestation (the user's
+  // "private code may go to this vendor" sign-off). The policy hard cap + the
+  // minimizeForReader boundary then apply on top before anything sends.
+  if (lane.trust_mode === 'reader') {
+    return (
+      readerEgress &&
+      gateReady &&
+      isReaderExecutorCertified(lane) &&
+      lane.repo_read_attestation === true
+    );
+  }
+  // Everything else fails CLOSED: `blocked` (never) and any unknown/legacy value
+  // (e.g. a deprecated `monitored` reaching a direct JS caller without config
+  // normalization).
   return false;
 }
 
@@ -267,12 +278,13 @@ export function routeDecide(
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
   const gateReady = ctx.gateReady ?? false;
+  const readerEgress = ctx.readerEgress ?? false;
 
   // Filter candidates by the structural pre-gate guard AND the policy verdict,
   // before scoring. Remember each survivor's verdict for the decision.
   const verdicts = new Map<string, PolicyVerdict>();
   const candidates = ctx.lanes.filter((lane) => {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady)) return false;
+    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) return false;
     const { verdict } = evaluate(task, lane, policyContext, policy);
     if (!laneAllowedByVerdict(lane, verdict)) return false;
     verdicts.set(lane.id, verdict);

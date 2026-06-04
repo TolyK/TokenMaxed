@@ -328,19 +328,19 @@ lanes:
   assert.equal(parseLaneConfig(cfg).byId('legacy')?.trust_mode, 'reader');
 });
 
-test('a reader lane may omit executor config (not yet selectable until F-2 executor lands)', () => {
-  const cfg = `
+test('a reader lane must declare executor config (it can execute — F2-S4)', () => {
+  const noEndpoint = `
 lanes:
   - id: stub-reader
-    kind: cli
+    kind: api
     model: m
     trust_mode: reader
     costBasis: subscription
     provenance: p
     jurisdiction: US
 `;
-  // No command/endpoint required for a reader (like blocked) — must not throw.
-  assert.equal(parseLaneConfig(cfg).byId('stub-reader')?.trust_mode, 'reader');
+  // An api reader without an endpoint would win routing then fail in the DTO — reject at load.
+  assert.throws(() => parseLaneConfig(noEndpoint), { message: /an api lane requires an endpoint/ });
 });
 
 test('repo_read_attestation is rejected on a non-reader lane', () => {

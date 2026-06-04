@@ -199,6 +199,13 @@ export interface RouteContext {
    * lanes are rejected regardless of config).
    */
   gateReady?: boolean;
+  /**
+   * F-2: whether the global reader-egress opt-in (`TOKENMAXED_READER_EGRESS`) is
+   * on. Required (with the gate, an API reader executor, and a per-lane
+   * `repo_read_attestation`) before a `reader` lane is selectable. Default false ⇒
+   * reader lanes are never selected.
+   */
+  readerEgress?: boolean;
   /** Task-level context the policy gate evaluates against (defaults to unknown/sensitive). */
   policyContext?: PolicyContext;
 }

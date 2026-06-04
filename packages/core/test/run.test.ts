@@ -378,3 +378,56 @@ test('escalation: a native/host offload is not reviewed (accept as-is)', async (
   assert.equal(r.result.native, true);
   assert.deepEqual(r.events.map((e) => e.kind), []); // native records nothing
 });
+
+// --- F2-S4c: the reader execution path ---------------------------------------
+
+const readerLane: Lane = {
+  id: 'gemini-reader', kind: 'api', model: 'gpt-5.5', trust_mode: 'reader',
+  costBasis: 'subscription', provenance: 'google', jurisdiction: 'US',
+  repo_read_attestation: true, capability: { bugfix: 0.99 },
+};
+const allowReader: Policy = { rules: [{ trust_mode: 'reader', verdict: 'allow' }] };
+const readerCtx: RouteContext = {
+  lanes: [readerLane], gateReady: true, readerEgress: true,
+  policyContext: { repo_class: 'private', sensitivity: 'normal' },
+};
+
+test('reader lane: routes through minimizeForReader + executeReader, output tainted reader-derived', async () => {
+  let sent: unknown;
+  const d = deps({
+    executeReader: async (env) => { sent = env; return { ok: true, resultText: 'reader answer', reported: { tokens_in: 20, tokens_out: 10 } }; },
+    readerLaneDTO: (lane) => ({ id: lane.id, model: lane.model, endpoint: 'https://reader', authHandle: 'h' }),
+  });
+  const r = await runTask({ category: 'bugfix', instruction: 'explain X' }, readerCtx, allowReader, d);
+  assert.equal(r.laneId, 'gemini-reader');
+  assert.equal(r.status, 'ok');
+  assert.equal(r.resultText, 'reader answer');
+  assert.equal(r.readerDerived, true);
+  assert.ok(sent); // the reader executor was actually used
+});
+
+test('reader lane without an executeReader dep degrades to native (defensive)', async () => {
+  const r = await runTask({ category: 'bugfix', instruction: 'x' }, readerCtx, allowReader, deps());
+  assert.equal(r.native, true);
+  assert.equal(r.status, 'blocked');
+});
+
+test('reader lane blocks (native) when the secret scanner is unavailable', async () => {
+  const d = deps({
+    scanSecrets: unavailableScan,
+    executeReader: async () => ({ ok: true, resultText: 'x' }),
+    readerLaneDTO: (lane) => ({ id: lane.id, model: lane.model, endpoint: 'https://r', authHandle: 'h' }),
+  });
+  const r = await runTask({ category: 'bugfix', instruction: 'x' }, readerCtx, allowReader, d);
+  assert.equal(r.status, 'blocked');
+  assert.equal(r.native, true);
+});
+
+test('reader lane is not selected when reader egress is off (degrades to native)', async () => {
+  const d = deps({
+    executeReader: async () => ({ ok: true, resultText: 'x' }),
+    readerLaneDTO: (lane) => ({ id: lane.id, model: lane.model, endpoint: 'https://r', authHandle: 'h' }),
+  });
+  const r = await runTask({ category: 'bugfix', instruction: 'x' }, { ...readerCtx, readerEgress: false }, allowReader, d);
+  assert.equal(r.native, true); // no selectable lane ⇒ native
+});

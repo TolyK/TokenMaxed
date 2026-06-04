@@ -66,5 +66,8 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     // F-1 learned capability; also disabled by the global kill-switch.
     learnCapability:
       env.TOKENMAXED_LEARN_CAPABILITY === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
+    // F-2 reader egress; also disabled by the global kill-switch.
+    readerEgress:
+      env.TOKENMAXED_READER_EGRESS === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
   };
 }

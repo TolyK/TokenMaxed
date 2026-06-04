@@ -85,6 +85,12 @@ export interface ToolDeps {
    * caller can still override per-call with `gate_ready`.
    */
   gateReady: boolean;
+  /**
+   * F-2: whether the global reader-egress opt-in (`TOKENMAXED_READER_EGRESS`) is on,
+   * so router_preview reflects the same reader selectability router_delegate routes
+   * with. Default surface is off ⇒ reader lanes never appear.
+   */
+  readerEgress: boolean;
   /** Whether routing/offloading is enabled for the current project (A-4 toggle). */
   getEnabled: () => boolean;
   /** Persist the project's enabled state (A-4 toggle). */
@@ -118,6 +124,8 @@ export interface SetupReport {
   escalate: boolean;
   /** F-1: whether learned capability feedback is enabled (TOKENMAXED_LEARN_CAPABILITY). */
   learnCapability: boolean;
+  /** F-2: whether reader-egress is enabled (TOKENMAXED_READER_EGRESS). */
+  readerEgress: boolean;
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -155,6 +163,12 @@ export interface DelegateOutcome {
   recordingFailed?: boolean;
   /** C-13: the offload ran but the manager review couldn't (result is UNREVIEWED). */
   reviewUnavailable?: boolean;
+  /**
+   * F-2 taint: true ⇒ a `reader` lane produced this text, which may echo private
+   * repo code. Surfaced to the caller so it is not re-delegated to a worker or
+   * pasted into untrusted contexts.
+   */
+  readerDerived?: boolean;
 }
 
 /** A declarative tool: advertised by the server, invoked via its handler. */
@@ -398,6 +412,7 @@ export function createTools(core: CorePort): ToolDef[] {
         const ctx: RouteContext = {
           lanes,
           gateReady,
+          readerEgress: deps.readerEgress,
           policyContext,
           ...(observedCapability ? { observedCapability } : {}),
         };
@@ -551,6 +566,7 @@ export function createTools(core: CorePort): ToolDef[] {
           `  review-on-stop: ${r.reviewOnStop ? 'on' : 'off'} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
           `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
           `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
+          `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
         ];
@@ -574,32 +590,46 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     // A failed metered attempt that also couldn't be recorded must be flagged, so
     // the user isn't unaware that spend happened off-ledger.
     const note = o.recordingFailed ? ' (note: this attempt could not be recorded to the ledger)' : '';
-    return ok(`Handle this task yourself (native): ${why}.${note}`, {
+    // F-2: a reader give-back can carry manager notes quoting the reader output —
+    // keep the taint warning/flag on this native path too.
+    const taint = o.readerDerived
+      ? '\n\n⚠️ reader-derived: any quoted reader output above may include private repo code — do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts.'
+      : '';
+    return ok(`Handle this task yourself (native): ${why}.${note}${taint}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
       ...(o.failureKind ? { failureKind: o.failureKind } : {}),
+      ...(o.readerDerived ? { readerDerived: true } : {}),
       ...(o.recordingFailed ? { recordingFailed: true } : {}),
     });
   }
   const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
   const note = o.recordingFailed ? '\n\n(note: this offload could not be recorded to the ledger.)' : '';
+  // F-2: warn when the result came from a reader lane — it may echo private repo
+  // code, so it must not be re-delegated to a worker or pasted into untrusted contexts.
+  // Applies to BOTH the reviewed and the unreviewed branches below.
+  const taint = o.readerDerived
+    ? '\n\n⚠️ reader-derived: this text may include private repo code — do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts.'
+    : '';
+  const taintFlag = o.readerDerived ? { readerDerived: true } : {};
   // C-13: the offload produced output but the manager review couldn't run — the
   // result is UNREVIEWED, so do NOT tell the host to "use it"; flag it for review.
   if (o.reviewUnavailable) {
     return ok(
-      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${note}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.recordingFailed ? { recordingFailed: true } : {}) },
+      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}) },
     );
   }
   // C-13: `reason` may carry "escalated to X" / "reworked on X" (accept_after_*).
   const how = o.reason ? ` (${o.reason})` : '';
-  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${note}`, {
+  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${taint}${note}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
     status: o.status,
     ...(o.reason ? { reason: o.reason } : {}),
+    ...taintFlag,
     ...(o.recordingFailed ? { recordingFailed: true } : {}),
   });
 }

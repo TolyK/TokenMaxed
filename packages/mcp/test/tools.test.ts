@@ -74,6 +74,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     readLedger: () => [],
     candidateLanes: () => [lane({ id: 'claude-native', native: true })],
     observedCapability: () => undefined,
+    readerEgress: false,
     loadPolicy: (): Policy => ({}),
     gateReady: true,
     getEnabled: () => true,
@@ -91,6 +92,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       reviewOnStop: false,
       escalate: false,
       learnCapability: false,
+      readerEgress: false,
     }),
     now: () => FIXED_NOW,
     ...over,
@@ -257,6 +259,40 @@ test('delegate offloads and returns the lane result to use', async () => {
   assert.match(r.content[0]!.text, /done\(\)/);
 });
 
+test('delegate surfaces the reader-derived taint warning (F-2)', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'gemini-reader', model: 'gemini-x', status: 'ok', resultText: 'analysis', readerDerived: true }) }),
+    { category: 'explain', instruction: 'explain module' },
+  );
+  assert.equal(r.structuredContent!.readerDerived as boolean, true);
+  assert.match(r.content[0]!.text, /reader-derived/);
+  assert.match(r.content[0]!.text, /do not re-delegate/i);
+});
+
+test('delegate keeps the reader taint even when the result is UNREVIEWED', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'gemini-reader', model: 'gemini-x', status: 'ok', resultText: 'analysis', readerDerived: true, reviewUnavailable: true }) }),
+    { category: 'explain', instruction: 'explain module' },
+  );
+  assert.equal(r.structuredContent!.reviewUnavailable as boolean, true);
+  assert.equal(r.structuredContent!.readerDerived as boolean, true);
+  assert.match(r.content[0]!.text, /UNREVIEWED/);
+  assert.match(r.content[0]!.text, /reader-derived/);
+});
+
+test('delegate keeps the reader taint on a native give-back (escalation reject)', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'gemini-reader', status: 'ok', native: true, readerDerived: true, reason: 'manager review (fail) — notes quoting output' }) }),
+    { category: 'explain', instruction: 'explain module' },
+  );
+  assert.equal(r.structuredContent!.native as boolean, true);
+  assert.equal(r.structuredContent!.readerDerived as boolean, true);
+  assert.match(r.content[0]!.text, /reader-derived/);
+});
+
 test('delegate still returns the result when recording failed (no lost work)', async () => {
   const r = await call(
     'router_delegate',
@@ -401,9 +437,11 @@ test('setup reports the manager + open gate when present', async () => {
         reviewOnStop: true,
         escalate: true,
         learnCapability: true,
+        readerEgress: true,
       }),
     }),
   );
+  assert.match(r.content[0]!.text, /reader egress: on/);
   assert.match(r.content[0]!.text, /manager: claude-haiku/);
   assert.match(r.content[0]!.text, /worker gate: open/);
   assert.match(r.content[0]!.text, /quality escalation: on/);

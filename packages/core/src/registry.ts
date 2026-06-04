@@ -207,12 +207,14 @@ function parseLane(entry: unknown, index: number): Lane {
   const capability = parseCapability(entry.capability, at('capability'));
   if (capability) lane.capability = capability;
 
-  // A SELECTABLE (full/worker), non-native lane must be executable: cli needs a
-  // command, api needs an endpoint (local defaults to localhost). Reject at load
-  // so an unexecutable lane can never be selected and silently degrade. Blocked
-  // and (not-yet-selectable) reader lanes are excluded here, so a stub may omit
-  // executor config until reader's executor lands (F-2).
-  const selectable = lane.trust_mode === 'full' || lane.trust_mode === 'worker';
+  // A SELECTABLE (full/worker/reader), non-native lane must be executable: cli
+  // needs a command, api needs an endpoint (local defaults to localhost). Reject
+  // at load so an unexecutable lane can never be selected and silently degrade —
+  // including `reader` now that it can execute (an endpointless api reader would
+  // otherwise win routing then throw in laneToReaderDTO). Only `blocked` may omit
+  // executor config.
+  const selectable =
+    lane.trust_mode === 'full' || lane.trust_mode === 'worker' || lane.trust_mode === 'reader';
   if (selectable && !lane.native) {
     if (lane.kind === 'cli' && lane.command === undefined) {
       throw new LaneConfigError(`${at('command')}: a non-native cli lane requires a command (or set native: true).`);

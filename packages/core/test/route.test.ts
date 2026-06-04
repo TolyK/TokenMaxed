@@ -145,8 +145,13 @@ test('isSelectablePreGate admits only full, non-API lanes while the gate is not 
   assert.equal(isSelectablePreGate(apiWorker, true), true); // gate ready + certified
   const blocked: Lane = { ...ollama, id: 'b', trust_mode: 'blocked' };
   assert.equal(isSelectablePreGate(blocked, true), false); // blocked never runs
-  const reader: Lane = { ...ollama, id: 'm', trust_mode: 'reader' };
-  assert.equal(isSelectablePreGate(reader, true), false); // reader not yet selectable until its executor lands (F-2)
+  // reader (F-2) is HIGH-FRICTION: needs gate + readerEgress + API cert + attestation.
+  const readerApi: Lane = { ...ollama, id: 'rd', kind: 'api', trust_mode: 'reader', repo_read_attestation: true };
+  assert.equal(isSelectablePreGate(readerApi, true), false); // readerEgress off ⇒ no
+  assert.equal(isSelectablePreGate(readerApi, false, true), false); // gate off ⇒ no
+  assert.equal(isSelectablePreGate({ ...readerApi, repo_read_attestation: false }, true, true), false); // no attestation ⇒ no
+  assert.equal(isSelectablePreGate({ ...readerApi, kind: 'cli', command: 'x' }, true, true), false); // CLI not certified (API-only v1)
+  assert.equal(isSelectablePreGate(readerApi, true, true), true); // all four ⇒ selectable
   // Fail-closed: a legacy/unknown trust_mode reaching a direct JS caller (not via
   // config normalization) must NOT fall through to the full-lane branch.
   const legacyCli = { ...ollama, id: 'legacy-cli', trust_mode: 'monitored' as unknown as Lane['trust_mode'] };

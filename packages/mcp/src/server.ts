@@ -39,7 +39,9 @@ import { TASK_CATEGORIES, evaluate, filterEventsSince, isManagerEligible, outcom
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
+  executeReader,
   executeUntrusted,
+  laneToReaderDTO,
   laneToUntrustedDTO,
   loadLaneConfig,
   loadPriceTable,
@@ -94,6 +96,7 @@ function escToOutcome(esc: EscalationResult, registry: LaneRegistry, recordingFa
     ...(r.resultText !== undefined ? { resultText: r.resultText } : {}),
     ...(model ? { model } : {}),
     ...(r.failureKind ? { failureKind: r.failureKind } : {}),
+    ...(r.readerDerived ? { readerDerived: true } : {}),
     ...(recordingFailed ? { recordingFailed: true } : {}),
   };
   switch (esc.final_action) {
@@ -156,6 +159,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // review outcomes adjust the EFFECTIVE capability routing scores by. Never active
   // under the kill-switch. Off ⇒ overlay is undefined ⇒ declared scores, unchanged.
   const learnEnabled = env.TOKENMAXED_LEARN_CAPABILITY === 'true' && !globallyDisabled;
+  // F-2 reader egress — OPT-IN, off by default. The GLOBAL half of the reader
+  // gate; a lane is selectable only if this is on AND it has repo_read_attestation
+  // AND an API reader executor AND the safety gate is ready. Never under the
+  // kill-switch. This is what authorizes sending repo-read code to a reader vendor.
+  const readerEgress = env.TOKENMAXED_READER_EGRESS === 'true' && !globallyDisabled;
   // Shared overlay builder so router_delegate and router_preview apply the SAME
   // learned adjustment (no /why-vs-run divergence). Built from the ledger + clock
   // the adapter owns; undefined when learning is off. Lazy per call (cheap: local
@@ -231,6 +239,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const ctx = {
       lanes,
       gateReady,
+      readerEgress,
       policyContext: request.policyContext ?? {},
       ...(observedCapability ? { observedCapability } : {}),
     };
@@ -249,6 +258,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       }),
       executeUntrusted: (envelope) => executeUntrusted(envelope, { resolveAuth }),
       untrustedLaneDTO: laneToUntrustedDTO,
+      executeReader: (envelope) => executeReader(envelope, { resolveAuth }),
+      readerLaneDTO: laneToReaderDTO,
       scanSecrets: makeGitleaksScanner(),
       priceTable,
       newId: () => randomUUID(),
@@ -303,6 +314,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       ...(registry.byId(result.laneId)?.model ? { model: registry.byId(result.laneId)!.model } : {}),
       ...(result.failureKind ? { failureKind: result.failureKind } : {}),
       ...(result.decision?.reason ? { reason: result.decision.reason } : {}),
+      ...(result.readerDerived ? { readerDerived: true } : {}),
       ...(recordingFailed ? { recordingFailed: true } : {}),
     };
   };
@@ -324,6 +336,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
     gateReady,
+    // F-2: same reader-egress posture delegate routes with (so /why shows reader
+    // lanes only when they'd actually be selectable).
+    readerEgress,
     // TOKENMAXED_DISABLE forces routing off (kill-switch + recursion guard),
     // overriding the per-project toggle.
     getEnabled: () => (globallyDisabled ? false : readEnabled(store, projectKey)),

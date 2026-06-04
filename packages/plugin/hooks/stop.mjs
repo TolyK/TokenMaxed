@@ -7395,6 +7395,9 @@ var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 function isExecutorCertified(lane) {
   return lane.kind === "api";
 }
+function isReaderExecutorCertified(lane) {
+  return lane.kind === "api";
+}
 
 // ../core/src/policy.ts
 var import_yaml = __toESM(require_dist(), 1);
@@ -7544,9 +7547,12 @@ function parsePolicyConfig(text) {
 
 // ../core/src/route.ts
 var DEFAULT_CAPABILITY = 0.5;
-function isSelectablePreGate(lane, gateReady = false) {
+function isSelectablePreGate(lane, gateReady = false, readerEgress = false) {
   if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
   if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
+  if (lane.trust_mode === "reader") {
+    return readerEgress && gateReady && isReaderExecutorCertified(lane) && lane.repo_read_attestation === true;
+  }
   return false;
 }
 function isManagerEligible(lane) {
@@ -7718,7 +7724,7 @@ function parseLane(entry, index) {
   }
   const capability = parseCapability(entry.capability, at("capability"));
   if (capability) lane.capability = capability;
-  const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker";
+  const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
       throw new LaneConfigError(`${at("command")}: a non-native cli lane requires a command (or set native: true).`);
