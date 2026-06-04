@@ -30,3 +30,6 @@ npm-debug.log*
 .env
 .env.*
 !.env.example
+
+# Agent worktrees (created by Claude Code subagent isolation)
+.claude/worktrees/
