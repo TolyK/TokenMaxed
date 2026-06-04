@@ -7574,6 +7574,7 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
   "model",
+  "model_family",
   "trust_mode",
   "costBasis",
   "provenance",
@@ -7705,6 +7706,7 @@ function parseLane(entry, index) {
     }
     lane.native = entry.native;
   }
+  if (entry.model_family !== void 0) lane.model_family = requireString(entry.model_family, at("model_family"));
   if (entry.command !== void 0) lane.command = requireString(entry.command, at("command"));
   if (entry.endpoint !== void 0) lane.endpoint = requireString(entry.endpoint, at("endpoint"));
   if (entry.authHandle !== void 0) lane.authHandle = requireString(entry.authHandle, at("authHandle"));
