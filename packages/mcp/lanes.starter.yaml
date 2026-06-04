@@ -60,6 +60,27 @@ lanes:
     execution_mode: answer-only
     command: codex          # the provider CLI to spawn (exact flags verified per tool)
     args: [exec]
+    # Default reviewer for all code: the host-turn review (/tokenmaxed:review and
+    # the opt-in Stop gate) sends the working-tree diff to the FIRST eligible
+    # manager in file order, and codex-cli is listed before claude-haiku — so
+    # Codex reviews by default. (A full CLI manager needs no safety gate; only
+    # TOKENMAXED_REVIEW_ON_STOP=true to auto-review at turn end.) The host-turn
+    # path has no capability gate, so this works for any diff.
+    # NOTE on the SEPARATE escalation path (C-13, reviewing an offloaded output):
+    # selectReviewManager requires an INDEPENDENT manager that is at-least-as-
+    # capable as the subject for that category. claude-haiku can only fill that
+    # role for categories where it isn't weaker than Codex (boilerplate/docs/
+    # explain — Codex is at the 0.5 default there); for Codex's strong categories
+    # (bugfix/codegen/feature/refactor) Haiku is NOT eligible, so a Codex-authored
+    # output has no independent reviewer: runWithEscalation returns
+    # `review_unavailable` and DELIVERS Codex's result UNREVIEWED (it is not given
+    # back). Add a stronger independent manager if you want Codex's own offloads
+    # independently reviewed — e.g. point claude-haiku at Sonnet/Opus AND raise its
+    # per-category `capability` scores to >= Codex's (selectReviewManager compares
+    # the declared `capability` numbers, not the model id), or trust another
+    # already-capable lane as manager.
+    roles: [manager]
+    manager_allowed: true
     capability:
       bugfix: 0.92
       codegen: 0.90
@@ -93,10 +114,16 @@ lanes:
     execution_mode: answer-only
     command: claude
     args: ["-p", "--model", "claude-haiku-4-5-20251001"]
-    # In-family manager: /tokenmaxed:review (and the opt-in Stop gate) send the
-    # working-tree diff here for a verdict. Trusted + Anthropic, so the review
-    # stays in-family. Point this at a stronger model (e.g. Sonnet/Opus or Codex)
-    # via /tokenmaxed:setup if you want deeper reviews.
+    # Secondary / in-family manager. Codex above is the default host-turn reviewer
+    # (first eligible in file order). On the escalation path this lane can only
+    # independently review an offloaded output in categories where it isn't weaker
+    # than the subject (e.g. boilerplate/docs/explain) — it is NOT capable enough
+    # to review Codex's bugfix/codegen/feature/refactor outputs (see codex-cli's
+    # note). To make it qualify, point it at Sonnet/Opus AND raise its per-category
+    # `capability` scores below to >= Codex's (selection reads the declared
+    # `capability` numbers, not the model id).
+    # To make Claude the default reviewer instead, move this lane above codex-cli
+    # (or drop codex-cli's manager fields).
     roles: [manager]
     manager_allowed: true
     capability:

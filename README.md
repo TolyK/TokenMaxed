@@ -104,8 +104,12 @@ prints what's enabled and what to do next. **That's the whole required setup.**
 
 ### 3. Use it
 
-Just code as usual: with routing on, Claude offloads bounded, well-specified
-subtasks to the cheapest capable lane automatically. Or drive it by hand:
+**Just code as usual — there's no separate command to "run" TokenMaxed.** When a
+step is a bounded, self-contained subtask (boilerplate, codegen, docs, a
+mechanical refactor, an isolated bugfix), Claude offloads it to the cheapest
+capable lane on its own, guided by the bundled `route` skill — it's Claude's
+judgment call, not a background daemon, so you can also nudge it ("offload this
+to a cheaper lane") or drive everything by hand:
 
 | Command | What it does |
 |---|---|
@@ -115,6 +119,95 @@ subtasks to the cheapest capable lane automatically. Or drive it by hand:
 | `/tokenmaxed:why <category>` | preview which lane would handle a category — nothing runs |
 | `/tokenmaxed:review` | manager review of your current working-tree changes |
 | `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
+
+### Launch it (and turn on optional features)
+
+Once the plugin is loaded and `/tokenmaxed:setup` has run, **you're done — just
+code.** The three steps above are the whole required path. Offload is
+*agent-driven*: Claude invokes the bundled `route` skill to hand a suitable
+subtask to the cheapest capable lane via the `router_delegate` tool — trusted
+CLI/local lanes (Codex, a local Ollama, the cheaper-Claude lane) work with **no
+flags**. The plugin's hooks don't route on their own; they only gate delegation
+when routing is off (a deterministic backstop) and run the optional turn-end
+review. The env flags below switch on the *optional* features.
+
+The optional features are opt-in **environment flags you set when you launch
+Claude Code**. In the shell they go *before* `claude` (they're environment
+variables, not CLI arguments):
+
+```bash
+# Plain — trusted CLI/local offload works out of the box:
+claude --plugin-dir packages/plugin
+
+# Common "turn the safe extras on" launch: open the safety gate (needs gitleaks)
+# so API/BYOK worker lanes and full API lanes can run, plus review your changes
+# at turn end. (Reader lanes need MORE than the gate — TOKENMAXED_READER_EGRESS,
+# per-lane attestation, and a policy allow rule; see Reader lanes below.)
+TOKENMAXED_GATE_READY=true TOKENMAXED_REVIEW_ON_STOP=true \
+  claude --plugin-dir packages/plugin
+
+# Same, but also skip Claude Code's per-tool permission prompts (you trust the
+# offloads to run unattended):
+TOKENMAXED_GATE_READY=true TOKENMAXED_REVIEW_ON_STOP=true \
+  claude --dangerously-skip-permissions --plugin-dir packages/plugin
+```
+
+> ⚠️ `claude --dangerously-skip-permissions TOKENMAXED_GATE_READY=true` does **not**
+> work: anything after `claude` is passed *to* Claude Code (here it'd be read as
+> an opening prompt), not exported to the environment. Env assignments must
+> **precede** the command, as shown above. (To persist them instead, `export` the
+> vars in your shell profile or set them in your Claude Code env settings.)
+
+Each flag is described under [Configure & extend](#configure--extend) below;
+combine whichever you want on one launch line. Note: a **full CLI** reviewer
+(e.g. Codex) needs no safety gate — only `TOKENMAXED_REVIEW_ON_STOP=true` to run
+the turn-end review; the gate is needed only for API/BYOK egress.
+
+#### Optional: a `tmax` shortcut (so you don't retype the flags)
+
+Typing the env flags and `--plugin-dir` every launch gets old. Two pieces make
+it a one-word command:
+
+**1. Persist the env flags in your Claude Code settings** (`~/.claude/settings.json`)
+so they're always on and never typed. This file is **strict JSON** — no comments —
+so add just the `env` keys:
+
+```json
+{
+  "env": {
+    "TOKENMAXED_GATE_READY": "true",
+    "TOKENMAXED_REVIEW_ON_STOP": "true",
+    "TOKENMAXED_ESCALATE": "true"
+  }
+}
+```
+
+(`TOKENMAXED_GATE_READY` opens the safety gate so API/BYOK egress is allowed — for
+both worker/reader lanes and `full` API lanes; `TOKENMAXED_REVIEW_ON_STOP` reviews
+your changes at turn end; `TOKENMAXED_ESCALATE` reworks/escalates offloads that fail
+review instead of shipping them unreviewed.)
+
+**2. Alias the launch.** Pick **one** of these — the same word can't be both a
+standalone command and an appended argument (in zsh the later definition wins):
+
+```zsh
+# (a) STANDALONE — type `tmax` alone, from any folder (recommended):
+alias tmax='claude --dangerously-skip-permissions --plugin-dir /ABS/PATH/TO/packages/plugin'
+#   →  tmax
+
+# (b) APPENDED — a zsh GLOBAL alias you tack onto `claude` (`alias -g`, zsh-only):
+alias -g tmax='--plugin-dir /ABS/PATH/TO/packages/plugin'
+#   →  claude tmax
+#   →  claude --dangerously-skip-permissions tmax
+```
+
+Use an **absolute** `--plugin-dir` path so it works from any directory. With the
+flags in settings (step 1), every form above launches fully configured — gate
+open, turn-end review on, and offloads escalated rather than shipped unreviewed.
+(`TOKENMAXED_GATE_READY` in global settings is inert until the plugin is loaded;
+once loaded it affects `/tokenmaxed:why`/`setup` and gates **all** API/BYOK egress
+— worker, reader, and `full` API lanes. Drop it from settings and prepend it
+per-launch if you'd rather opt into the gate explicitly each time.)
 
 ### Configure & extend
 
@@ -136,9 +229,10 @@ subtasks to the cheapest capable lane automatically. Or drive it by hand:
     retry it on a more capable lane (and ultimately give the task back to Claude
     rather than ship something that failed review); enable with
     `TOKENMAXED_ESCALATE=true`. The `router_delegate` outcome reports what
-    happened ("accepted after rework", "after escalation", or an unreviewed
-    give-back), and the per-offload escalation rate shows up in
-    `/tokenmaxed:savings`.
+    happened ("accepted after rework", "accepted after escalation", a give-back
+    when a reviewed result still failed, or — when no eligible manager is available
+    — the result delivered **unreviewed**), and the per-offload escalation rate
+    shows up in `/tokenmaxed:savings`.
   - **Learned capability** — let observed manager-review outcomes adjust routing
     over time; enable with `TOKENMAXED_LEARN_CAPABILITY=true`. Each lane's
     hand-assigned per-category `capability` score is treated as a **prior**; the
