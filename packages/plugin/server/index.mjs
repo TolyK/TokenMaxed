@@ -24758,6 +24758,15 @@ import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync3 } from "node:fs";
 
+// ../mcp/src/manager-select.ts
+function selectManagerLane(lanes, policy, gateReady, available = null) {
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
+  return lanes.find(
+    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+  );
+}
+
 // ../mcp/src/reviewer.ts
 var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
 function buildReviewPrompt(diff) {
@@ -24789,13 +24798,6 @@ function parseManagerVerdict(text) {
 }
 
 // ../mcp/src/host-review.ts
-function selectManagerLane(lanes, policy, gateReady, available = null) {
-  const disabled = new Set(policy.disabledLaneIds ?? []);
-  const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
-  return lanes.find(
-    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
-  );
-}
 async function runHostTurnReview(turnId, deps) {
   const diff = deps.readDiff();
   if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };

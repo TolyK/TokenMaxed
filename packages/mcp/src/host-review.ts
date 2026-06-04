@@ -14,7 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 
-import { evaluate, isManagerEligible, isSelectablePreGate, laneAllowedByVerdict, review } from '@tokenmaxed/core';
+import { review } from '@tokenmaxed/core';
 import type { Lane, OutcomeEventInput, Policy, ReviewVerdict } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -26,6 +26,7 @@ import {
 
 import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
+import { selectManagerLane } from './manager-select.ts';
 import { buildReviewPrompt, parseManagerVerdict } from './reviewer.ts';
 
 /** Outcome of a host-turn review. */
@@ -55,34 +56,6 @@ export interface HostReviewDeps {
   /** The safety-gate posture — gates API managers (egress) just like routing. */
   gateReady: boolean;
   newId: () => string;
-}
-
-/**
- * The manager lane the review path will actually use, applying ALL the same
- * filters as routing so /tokenmaxed:setup and the review never disagree:
- *  - manager-eligible (full trust + manager_allowed + trusted origin/attestation)
- *  - EXECUTABLE (not the native host — we can't run the host from here)
- *  - gate-selectable (an API manager only once the safety gate is open — egress)
- *  - not policy-disabled / blocked. The diff IS the user's real code, so egress is
- *    evaluated as the most sensitive context (private + sensitive).
- */
-export function selectManagerLane(
-  lanes: readonly Lane[],
-  policy: Policy,
-  gateReady: boolean,
-  available: ReadonlySet<string> | null = null,
-): Lane | undefined {
-  const disabled = new Set(policy.disabledLaneIds ?? []);
-  const reviewContext = { repo_class: 'private' as const, sensitivity: 'sensitive' as const };
-  return lanes.find(
-    (l) =>
-      isManagerEligible(l) &&
-      !l.native &&
-      isSelectablePreGate(l, gateReady) &&
-      !disabled.has(l.id) &&
-      (!available || available.has(l.id)) &&
-      laneAllowedByVerdict(l, evaluate({ category: 'refactor' }, l, reviewContext, policy).verdict),
-  );
 }
 
 /** Review the turn's diff with a configured manager. Pure over its injected deps. */

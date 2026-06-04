@@ -15,7 +15,7 @@ import { loadLaneConfig, loadPolicyConfig, makeGitleaksScanner } from '@tokenmax
 
 import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile } from './config.ts';
-import { selectManagerLane } from './host-review.ts';
+import { selectManagerLane } from './manager-select.ts';
 import type { SetupReport } from './tools.ts';
 
 const LANES_STARTER = fileURLToPath(new URL('../lanes.starter.yaml', import.meta.url));

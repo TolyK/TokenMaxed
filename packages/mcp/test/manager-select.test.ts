@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { selectManagerLane } from '../src/host-review.ts';
+import { selectManagerLane } from '../src/manager-select.ts';
 import type { Lane, Policy } from '@tokenmaxed/core';
 
 const mgr = (over: Partial<Lane> & { id: string }): Lane => ({
