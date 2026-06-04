@@ -52,6 +52,8 @@ import {
 } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
+import { selectManagerLane } from './manager-select.ts';
+import { buildSummaryData } from './summary.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { makeHostReviewDeps, runHostTurnReview } from './host-review.ts';
 import { runSetup } from './setup.ts';
@@ -361,6 +363,24 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // overriding the per-project toggle.
     getEnabled: () => (globallyDisabled ? false : readEnabled(store, projectKey)),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
+    // Session summary (router_summary / /tokenmaxed:summary). Reuses the SAME core
+    // aggregates, full registry lanes, availability probe, and manager selector the
+    // rest of the server uses — composed by the pure buildSummaryData. Read-only.
+    summary: async () => {
+      const lanes = existsSync(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+      const available = await probeAvailable(lanes);
+      return buildSummaryData({
+        events: new JsonlLedger(ledgerPath).readAll(),
+        lanes,
+        policy: loadPolicySafe(),
+        availableLaneIds: available,
+        gateReady,
+        enabled: globallyDisabled ? false : readEnabled(store, projectKey),
+        now: Date.now(),
+        core: { summarize, tokenStats, filterEventsSince },
+        selectManager: selectManagerLane,
+      });
+    },
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
     // same runHostTurnReview path independently. Honor the global kill-switch so a

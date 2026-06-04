@@ -81,6 +81,15 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     getEnabled: () => true,
     setEnabled: () => {},
     delegate: async (): Promise<DelegateOutcome> => ({ laneId: 'native', status: 'ok', native: true }),
+    summary: async () => ({
+      enabled: true,
+      meteredAvoidedLifetime: 0,
+      meteredAvoided7d: 0,
+      zeroMeteredShare: 1,
+      windows: [],
+      lanes: [],
+      empty: true,
+    }),
     review: async (): Promise<ReviewOutcome> => ({ reviewed: false, reason: 'no manager' }),
     setup: async (): Promise<SetupReport> => ({
       lanesPath: '/home/.tokenmaxed/lanes.yaml',
@@ -118,6 +127,7 @@ test('builds the expected tool set with object input schemas', () => {
       'router_set_enabled',
       'router_setup',
       'router_status',
+      'router_summary',
       'router_tokens',
     ],
   );
@@ -125,6 +135,29 @@ test('builds the expected tool set with object input schemas', () => {
     assert.equal((t.inputSchema as { type: string }).type, 'object');
     assert.ok(t.description.length > 0);
   }
+});
+
+test('router_summary renders the injected summary data verbatim', async () => {
+  const r = await call('router_summary', deps({
+    summary: async () => ({
+      enabled: true,
+      meteredAvoidedLifetime: 4.1,
+      meteredAvoided7d: 0.71,
+      zeroMeteredShare: 0.8,
+      windows: [
+        { label: '24h', tokens: 1240000, meteredAvoided: 0.04, offloads: 3 },
+        { label: '7d', tokens: 18900000, meteredAvoided: 0.71, offloads: 41 },
+        { label: 'lifetime', tokens: 102400000, meteredAvoided: 4.1, offloads: 233 },
+      ],
+      lanes: [{ id: 'codex-cli', kind: 'cli', model: 'm', trustMode: 'full', isActiveReviewer: true, available: true }],
+      activeReviewerId: 'codex-cli',
+      empty: false,
+    }),
+  }));
+  assert.notEqual(r.isError, true);
+  assert.match(r.content[0]!.text, /Saved \$4\.10 in metered API spend/);
+  assert.match(r.content[0]!.text, /codex-cli \(reviewer\)/);
+  assert.ok((r.structuredContent!.summary as { enabled: boolean }).enabled);
 });
 
 test('dispatch returns an isError result for an unknown tool', async () => {

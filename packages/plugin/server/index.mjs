@@ -12327,8 +12327,8 @@ var require_cst_scalar = __commonJS({
           let oa = source.length;
           if (token.props[0].type === "block-scalar-header")
             oa -= token.props[0].source.length;
-          for (const tok of end)
-            tok.offset += oa;
+          for (const tok2 of end)
+            tok2.offset += oa;
           delete token.props;
           Object.assign(token, { type, source, end });
           break;
@@ -12366,8 +12366,8 @@ var require_cst_stringify = __commonJS({
       switch (token.type) {
         case "block-scalar": {
           let res = "";
-          for (const tok of token.props)
-            res += stringifyToken(tok);
+          for (const tok2 of token.props)
+            res += stringifyToken(tok2);
           return res + token.source;
         }
         case "block-map":
@@ -12436,9 +12436,9 @@ var require_cst_visit = __commonJS({
     visit.itemAtPath = (cst, path) => {
       let item = cst;
       for (const [field, index] of path) {
-        const tok = item?.[field];
-        if (tok && "items" in tok) {
-          item = tok.items[index];
+        const tok2 = item?.[field];
+        if (tok2 && "items" in tok2) {
+          item = tok2.items[index];
         } else
           return void 0;
       }
@@ -23837,14 +23837,14 @@ function summarize(events) {
   }
   const frontier_avoided = frontier_cost - actual_cost;
   const metered_avoided = frontier_cost - metered_spent_total;
-  const pct2 = (n) => frontier_cost === 0 ? 0 : 100 * n / frontier_cost;
+  const pct3 = (n) => frontier_cost === 0 ? 0 : 100 * n / frontier_cost;
   const savings = {
     frontier_cost,
     frontier_avoided,
     metered_spent: metered_spent_total,
     metered_avoided,
-    frontier_avoided_pct: pct2(frontier_avoided),
-    metered_avoided_pct: pct2(metered_avoided)
+    frontier_avoided_pct: pct3(frontier_avoided),
+    metered_avoided_pct: pct3(metered_avoided)
   };
   return { events: tasks.length, savings, actual_cost, metered_spent_total, laneMix, blockCount };
 }
@@ -24753,11 +24753,6 @@ function makeAvailabilityProbe(env) {
   return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
-// ../mcp/src/host-review.ts
-import { spawnSync as spawnSync3 } from "node:child_process";
-import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync3 } from "node:fs";
-
 // ../mcp/src/manager-select.ts
 function selectManagerLane(lanes, policy, gateReady, available = null) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
@@ -24766,6 +24761,99 @@ function selectManagerLane(lanes, policy, gateReady, available = null) {
     (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
   );
 }
+
+// ../mcp/src/summary.ts
+var DAY_MS = 24 * 60 * 60 * 1e3;
+function buildSummaryData(input) {
+  const { events, lanes, policy, availableLaneIds: availableLaneIds2, gateReady, enabled, now, core, selectManager } = input;
+  const availableSet = new Set(availableLaneIds2);
+  const windowFor = (label, sinceIso) => {
+    const evs = core.filterEventsSince(events, sinceIso);
+    const summary = core.summarize(evs);
+    return {
+      label,
+      tokens: core.tokenStats(evs).total.total,
+      meteredAvoided: summary.savings.metered_avoided,
+      offloads: summary.events
+    };
+  };
+  const iso = (ms) => new Date(ms).toISOString();
+  const windows = [
+    windowFor("24h", iso(now - DAY_MS)),
+    windowFor("7d", iso(now - 7 * DAY_MS)),
+    windowFor("lifetime")
+  ];
+  const lifetime = windows[2];
+  const week = windows[1];
+  let zeroTok = 0;
+  let allTok = 0;
+  for (const e of events) {
+    if (e.event_type !== "task") continue;
+    const tok2 = e.tokens_in + e.tokens_out;
+    allTok += tok2;
+    if (e.metered_spent === 0) zeroTok += tok2;
+  }
+  const zeroMeteredShare = allTok > 0 ? zeroTok / allTok : 1;
+  const reviewer = selectManager(lanes, policy, gateReady, availableSet);
+  const laneSummaries = lanes.map((l) => ({
+    id: l.id,
+    kind: l.kind,
+    model: l.model,
+    trustMode: l.trust_mode,
+    isActiveReviewer: !!reviewer && l.id === reviewer.id,
+    available: !!l.native || availableSet.has(l.id)
+  }));
+  return {
+    enabled,
+    meteredAvoidedLifetime: lifetime.meteredAvoided,
+    meteredAvoided7d: week.meteredAvoided,
+    zeroMeteredShare,
+    windows,
+    lanes: laneSummaries,
+    ...reviewer ? { activeReviewerId: reviewer.id } : {},
+    empty: lifetime.offloads === 0
+  };
+}
+var usd = (n) => `$${n.toFixed(2)}`;
+var pct = (share) => `${Math.round(share * 100)}%`;
+function tok(n) {
+  const k = Math.round(n / 1e3);
+  return `${k.toLocaleString("en-US")}k`;
+}
+function formatSummaryBanner(data) {
+  if (!data.enabled) {
+    return "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+  }
+  const lines = [];
+  if (data.empty) {
+    lines.push("\u{1F7E2} TokenMaxed \u2014 ready. No routed work yet; your savings will show here.");
+  } else {
+    lines.push("\u{1F7E2} TokenMaxed \u2014 maximizing your flat-rate capacity");
+    lines.push(
+      `   Saved ${usd(data.meteredAvoidedLifetime)} in metered API spend (lifetime) \xB7 ${usd(data.meteredAvoided7d)} last 7d`
+    );
+    lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
+    lines.push("");
+    for (const w of data.windows) {
+      lines.push(
+        `   ${w.label.padEnd(9)}${tok(w.tokens).padStart(9)} tok routed \xB7 ${usd(w.meteredAvoided)} metered avoided \xB7 ${w.offloads} offloads`
+      );
+    }
+  }
+  lines.push("");
+  const laneStr = data.lanes.map((l) => {
+    const role = l.isActiveReviewer ? "reviewer" : l.trustMode;
+    return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}`;
+  }).join(" \xB7 ");
+  lines.push(`   Lanes: ${laneStr}`);
+  lines.push("   /tokenmaxed:summary anytime \xB7 /tokenmaxed:why <category> to preview \xB7 /tokenmaxed:savings for detail");
+  return lines.join("\n");
+}
+
+// ../mcp/src/host-review.ts
+import { spawnSync as spawnSync3 } from "node:child_process";
+import { randomUUID as randomUUID2 } from "node:crypto";
+import { existsSync as existsSync3 } from "node:fs";
 
 // ../mcp/src/reviewer.ts
 var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
@@ -24914,7 +25002,7 @@ var ToolInputError = class extends Error {
   }
 };
 var PERIOD_RE = /^(\d+)([dh])$/;
-var DAY_MS = 864e5;
+var DAY_MS2 = 864e5;
 var HOUR_MS = 36e5;
 function resolveSinceIso(period, nowMs) {
   if (period === void 0 || period === "all") return void 0;
@@ -24922,7 +25010,7 @@ function resolveSinceIso(period, nowMs) {
   if (!m) {
     throw new ToolInputError(`Invalid period "${period}". Use "all" or N followed by d/h, e.g. "7d".`);
   }
-  const ms = (m[2] === "d" ? DAY_MS : HOUR_MS) * Number(m[1]);
+  const ms = (m[2] === "d" ? DAY_MS2 : HOUR_MS) * Number(m[1]);
   return new Date(nowMs - ms).toISOString();
 }
 function optString(args, key) {
@@ -24967,7 +25055,7 @@ async function guardedAsync(body) {
     throw err;
   }
 }
-function pct(alreadyPercent) {
+function pct2(alreadyPercent) {
   return `${alreadyPercent.toFixed(1)}%`;
 }
 var REPO_CLASSES2 = ["public", "private", "unknown"];
@@ -24979,9 +25067,9 @@ function renderSavings(summary, tokens, period) {
   const lines = [
     `Savings${scope} \u2014 ${summary.events} event(s)`,
     `  actual API spend:            $${summary.metered_spent_total.toFixed(4)}`,
-    `  metered spend avoided:       $${s.metered_avoided.toFixed(4)} (${pct(s.metered_avoided_pct)}) \u2014 finance-grade`,
+    `  metered spend avoided:       $${s.metered_avoided.toFixed(4)} (${pct2(s.metered_avoided_pct)}) \u2014 finance-grade`,
     `  \u2014 baseline context (hypothetical: every task on the frontier model) \u2014`,
-    `  vs all-frontier baseline:    $${s.frontier_avoided.toFixed(4)} (${pct(s.frontier_avoided_pct)})`,
+    `  vs all-frontier baseline:    $${s.frontier_avoided.toFixed(4)} (${pct2(s.frontier_avoided_pct)})`,
     `  tokens: ${tokens.total.in} in / ${tokens.total.out} out`
   ];
   if (summary.blockCount > 0) lines.push(`  blocked tasks: ${summary.blockCount}`);
@@ -25039,6 +25127,15 @@ function createTools(core) {
       const by = optEnum(args, "by", ["model", "lane"]) ?? "model";
       const tokens = core.tokenStats(eventsInPeriod(deps, period));
       return ok(renderTokens(tokens, by, period), { tokens, by });
+    })
+  };
+  const summaryTool = {
+    name: "router_summary",
+    description: "Session summary from the local content-free ledger: token usage + metered $ avoided over 24h/7d/lifetime, the configured lanes with their trust/role and live availability, and the active reviewer. Powers /tokenmaxed:summary and the session-start banner. Read-only; nothing is sent anywhere.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    handler: (deps) => guardedAsync(async () => {
+      const data = await deps.summary();
+      return ok(formatSummaryBanner(data), { summary: data });
     })
   };
   const previewTool = {
@@ -25233,7 +25330,7 @@ ${r.notes}` : "";
       return ok(lines.join("\n"), { ...r });
     })
   };
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
 }
 function renderDelegate(o) {
   if (o.native || o.status !== "ok") {
@@ -25512,6 +25609,24 @@ function makeServerDeps(env = process.env) {
     // overriding the per-project toggle.
     getEnabled: () => globallyDisabled ? false : readEnabled(store, projectKey),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
+    // Session summary (router_summary / /tokenmaxed:summary). Reuses the SAME core
+    // aggregates, full registry lanes, availability probe, and manager selector the
+    // rest of the server uses — composed by the pure buildSummaryData. Read-only.
+    summary: async () => {
+      const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+      const available = await probeAvailable(lanes);
+      return buildSummaryData({
+        events: new JsonlLedger(ledgerPath).readAll(),
+        lanes,
+        policy: loadPolicySafe(),
+        availableLaneIds: available,
+        gateReady,
+        enabled: globallyDisabled ? false : readEnabled(store, projectKey),
+        now: Date.now(),
+        core: { summarize, tokenStats, filterEventsSince },
+        selectManager: selectManagerLane
+      });
+    },
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
     // same runHostTurnReview path independently. Honor the global kill-switch so a

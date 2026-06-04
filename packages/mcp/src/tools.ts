@@ -30,6 +30,9 @@ import type {
   TokenStats,
 } from '@tokenmaxed/core';
 
+import { formatSummaryBanner } from './summary.ts';
+import type { SummaryData } from './summary.ts';
+
 // --- ports + result + dependency shapes ----------------------------------------
 
 /** The pure core operations the tools call, injected so this stays no-build. */
@@ -111,6 +114,13 @@ export interface ToolDeps {
    * a lane that isn't runnable. Absent ⇒ availability is not checked.
    */
   availableLaneIds?: (lanes: readonly Lane[]) => Promise<string[]>;
+  /**
+   * Build the session summary (windows + lane/role/availability + savings) for
+   * router_summary / the /tokenmaxed:summary skill. The server wires the real
+   * ledger + registry + availability + core fns + selectManagerLane behind this,
+   * keeping tools.ts free of host I/O and runtime core imports.
+   */
+  summary: () => Promise<SummaryData>;
   /** Have the configured manager review the turn's working-tree diff (A-7). */
   review: () => Promise<ReviewOutcome>;
   /** Create/validate user config and report setup status (A-8). */
@@ -368,6 +378,18 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
+  const summaryTool: ToolDef = {
+    name: 'router_summary',
+    description:
+      'Session summary from the local content-free ledger: token usage + metered $ avoided over 24h/7d/lifetime, the configured lanes with their trust/role and live availability, and the active reviewer. Powers /tokenmaxed:summary and the session-start banner. Read-only; nothing is sent anywhere.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} },
+    handler: (deps) =>
+      guardedAsync(async () => {
+        const data = await deps.summary();
+        return ok(formatSummaryBanner(data), { summary: data as unknown as Record<string, unknown> });
+      }),
+  };
+
   const previewTool: ToolDef = {
     name: 'router_preview',
     description:
@@ -601,7 +623,7 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */
