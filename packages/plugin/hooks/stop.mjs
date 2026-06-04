@@ -7573,6 +7573,15 @@ function declaredCapabilityFor(lane, category) {
 
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist(), 1);
+
+// ../core/src/model-freshness.ts
+function parseModelAlias(model) {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
+  return { latest: false, id: model };
+}
+
+// ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
@@ -7733,6 +7742,14 @@ function parseLane(entry, index) {
     }
     if (lane.kind === "api" && lane.endpoint === void 0) {
       throw new LaneConfigError(`${at("endpoint")}: an api lane requires an endpoint.`);
+    }
+  }
+  if (lane.model.trim().endsWith("@latest")) {
+    if (lane.kind !== "api") {
+      throw new LaneConfigError(`${at("model")}: a "<family>@latest" alias is only supported on api lanes.`);
+    }
+    if (!parseModelAlias(lane.model).latest) {
+      throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "minimax@latest".`);
     }
   }
   return lane;
