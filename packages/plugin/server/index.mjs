@@ -22836,7 +22836,7 @@ function validateAttachment(a, i) {
   }
   return { content: rec.content, provenance: rec.provenance, repo_derived: rec.repo_derived };
 }
-async function minimize(request, scanSecrets) {
+function validateInstruction(request) {
   if (typeof request.instruction !== "string" || request.instruction.trim() === "") {
     return blocked("instruction must be a non-empty string");
   }
@@ -22846,13 +22846,9 @@ async function minimize(request, scanSecrets) {
   if (request.instruction.length > LIMITS.maxInstructionChars) {
     return blocked(`instruction exceeds ${LIMITS.maxInstructionChars} chars`);
   }
-  const repoClass = request.repo_class ?? "unknown";
-  const sensitivity = request.sensitivity ?? "unknown";
-  if (!(repoClass === "public" && sensitivity === "normal")) {
-    return blocked(
-      `context not safe for an untrusted lane (repo_class=${repoClass}, sensitivity=${sensitivity}); minimization to a worker requires public + normal`
-    );
-  }
+  return request.instruction;
+}
+function collectAttachments(request) {
   const rawAttachments = request.attachments ?? [];
   if (!Array.isArray(rawAttachments)) return blocked("attachments must be an array");
   if (rawAttachments.length > LIMITS.maxAttachments) {
@@ -22867,24 +22863,46 @@ async function minimize(request, scanSecrets) {
     }
     attachments.push(v);
   }
-  const instruction = scrubText(request.instruction);
-  const scrubbedAttachments = attachments.map((a) => ({ ...a, content: scrubText(a.content) }));
-  const total = instruction.length + scrubbedAttachments.reduce((n, a) => n + a.content.length, 0);
-  if (total > LIMITS.maxTotalChars) {
-    return blocked(`total payload exceeds ${LIMITS.maxTotalChars} chars`);
-  }
+  return attachments;
+}
+function enforceTotal(instruction, attachments) {
+  const total = instruction.length + attachments.reduce((n, a) => n + a.content.length, 0);
+  if (total > LIMITS.maxTotalChars) return blocked(`total payload exceeds ${LIMITS.maxTotalChars} chars`);
+  return null;
+}
+async function secretGate(texts, scanSecrets, lane) {
   let scan;
   try {
-    scan = await scanSecrets([instruction, ...scrubbedAttachments.map((a) => a.content)]);
+    scan = await scanSecrets(texts);
   } catch {
-    return blocked("secret scan failed \u2014 blocked from untrusted lane");
+    return blocked(`secret scan failed \u2014 blocked from ${lane} lane`);
   }
-  if (!scan.available) {
-    return blocked("secret scanner (gitleaks) unavailable \u2014 untrusted lane disabled");
+  if (!scan.available) return blocked(`secret scanner (gitleaks) unavailable \u2014 ${lane} lane disabled`);
+  if (scan.hasSecret) return blocked(`secret detected in payload \u2014 blocked from ${lane} lane`);
+  return null;
+}
+async function minimize(request, scanSecrets) {
+  const ins = validateInstruction(request);
+  if (typeof ins !== "string") return ins;
+  const repoClass = request.repo_class ?? "unknown";
+  const sensitivity = request.sensitivity ?? "unknown";
+  if (!(repoClass === "public" && sensitivity === "normal")) {
+    return blocked(
+      `context not safe for an untrusted lane (repo_class=${repoClass}, sensitivity=${sensitivity}); minimization to a worker requires public + normal`
+    );
   }
-  if (scan.hasSecret) {
-    return blocked("secret detected in payload \u2014 blocked from untrusted lane");
-  }
+  const collected = collectAttachments(request);
+  if ("ok" in collected) return collected;
+  const instruction = scrubText(request.instruction);
+  const scrubbedAttachments = collected.map((a) => ({ ...a, content: scrubText(a.content) }));
+  const overLimit = enforceTotal(instruction, scrubbedAttachments);
+  if (overLimit) return overLimit;
+  const secret = await secretGate(
+    [instruction, ...scrubbedAttachments.map((a) => a.content)],
+    scanSecrets,
+    "untrusted"
+  );
+  if (secret) return secret;
   const payload = Object.freeze({
     instruction,
     attachments: Object.freeze(scrubbedAttachments.map((a) => Object.freeze(a))),

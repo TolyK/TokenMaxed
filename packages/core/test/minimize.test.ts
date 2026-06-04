@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
-import { isMinimizedPayload, LIMITS, minimize, scrubText } from '../src/minimize.ts';
+import { isMinimizedPayload, isReaderPayload, LIMITS, minimize, minimizeForReader, scrubText } from '../src/minimize.ts';
 import type { MinimizedRequest, SecretScanner } from '../src/minimize.ts';
 import { makeGitleaksScanner } from '../src/node.ts';
 
@@ -161,7 +161,7 @@ test('isMinimizedPayload recognizes only genuine payloads (spread/clone is rejec
   assert.equal(isMinimizedPayload(null), false);
 });
 
-test('guard: no `as MinimizedPayload` casts anywhere in source (nominal boundary)', () => {
+test('guard: no `as MinimizedPayload`/`as ReaderPayload` casts anywhere in source (nominal boundary)', () => {
   const roots = [
     fileURLToPath(new URL('../src', import.meta.url)),
     fileURLToPath(new URL('../../cli/src', import.meta.url)),
@@ -171,17 +171,82 @@ test('guard: no `as MinimizedPayload` casts anywhere in source (nominal boundary
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const p = join(dir, entry.name);
       if (entry.isDirectory()) walk(p);
-      // minimize.ts is the brand's home (it documents the rule); the ban is for
+      // minimize.ts is the brands' home (it documents the rule); the ban is for
       // every OTHER module — none may forge a payload via cast.
-      else if (
-        entry.name.endsWith('.ts') &&
-        entry.name !== 'minimize.ts' &&
-        readFileSync(p, 'utf8').includes('as MinimizedPayload')
-      ) {
-        offenders.push(p);
+      else if (entry.name.endsWith('.ts') && entry.name !== 'minimize.ts') {
+        const src = readFileSync(p, 'utf8');
+        if (src.includes('as MinimizedPayload') || src.includes('as ReaderPayload')) offenders.push(p);
       }
     }
   };
   for (const root of roots) walk(root);
   assert.deepEqual(offenders, []);
+});
+
+// --- F2-S2: the reader boundary (minimizeForReader) --------------------------
+
+test('minimizeForReader allows private-repo + normal context and brands a ReaderPayload', async () => {
+  const r = await minimizeForReader({ ...base, repo_class: 'private' }, clean);
+  assert.ok(r.ok);
+  assert.equal(isReaderPayload(r.payload), true);
+  assert.equal(r.payload.origin, 'reader-derived');
+});
+
+test('minimizeForReader also allows public + normal', async () => {
+  const r = await minimizeForReader({ ...base, repo_class: 'public' }, clean);
+  assert.ok(r.ok);
+});
+
+test('minimizeForReader blocks unknown repo_class (fail-closed hard floor)', async () => {
+  const r = await minimizeForReader({ instruction: 'x', category: 'codegen', sensitivity: 'normal' }, clean);
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.reason, /reader requires a known/);
+});
+
+test('minimizeForReader blocks non-normal sensitivity (sensitive or unknown)', async () => {
+  for (const sensitivity of ['sensitive', 'unknown'] as const) {
+    const r = await minimizeForReader({ ...base, repo_class: 'private', sensitivity }, clean);
+    assert.equal(r.ok, false);
+  }
+});
+
+test('minimizeForReader keeps the secret scan as a hard gate (hit / unavailable / throw ⇒ block)', async () => {
+  for (const scanner of [hasSecret, unavailable, throwingScanner]) {
+    const r = await minimizeForReader({ ...base, repo_class: 'private' }, scanner);
+    assert.equal(r.ok, false);
+  }
+});
+
+test('minimizeForReader scans the RAW text too (scrub cannot mask a secret)', async () => {
+  // A scanner that only flags the pre-scrub form: scrubText turns the URL into
+  // "[url]", so a scrubbed-only scan would miss "evil.example"; the raw scan catches it.
+  const flagsRaw: SecretScanner = async (texts) => ({
+    available: true,
+    hasSecret: texts.some((t) => t.includes('evil.example')),
+  });
+  const req: MinimizedRequest = {
+    instruction: 'see https://evil.example/leak for context',
+    category: 'codegen',
+    repo_class: 'private',
+    sensitivity: 'normal',
+  };
+  const reader = await minimizeForReader(req, flagsRaw);
+  assert.equal(reader.ok, false); // raw scan catches it
+});
+
+test('reader and worker payloads are NOT interchangeable (distinct brands)', async () => {
+  const reader = await minimizeForReader({ ...base, repo_class: 'private' }, clean);
+  const worker = await minimize(base, clean);
+  assert.ok(reader.ok && worker.ok);
+  assert.equal(isMinimizedPayload(reader.payload), false); // a reader payload is not a worker payload
+  assert.equal(isReaderPayload(worker.payload), false); // and vice versa
+});
+
+test('a spread/clone of a reader payload is rejected by isReaderPayload', async () => {
+  const r = await minimizeForReader({ ...base, repo_class: 'private' }, clean);
+  assert.ok(r.ok);
+  const forged = { ...r.payload, instruction: 'raw repo text' };
+  assert.equal(isReaderPayload(forged), false);
+  assert.equal(isReaderPayload({}), false);
+  assert.equal(isReaderPayload(null), false);
 });

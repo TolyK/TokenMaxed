@@ -60,7 +60,7 @@ export type {
 } from './ledger.ts';
 export { evaluate, laneAllowedByVerdict, parsePolicyConfig, PolicyConfigError } from './policy.ts';
 export type { PolicyDecision } from './policy.ts';
-export { minimize, isMinimizedPayload, scrubText, LIMITS } from './minimize.ts';
+export { minimize, minimizeForReader, isMinimizedPayload, isReaderPayload, scrubText, LIMITS } from './minimize.ts';
 export { buildUntrustedRequestBody, isExecutorCertified } from './boundary.ts';
 export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody } from './boundary.ts';
 export { canReassign, reassignmentTarget, shouldReassign, TRUST_RANK } from './reassign.ts';
@@ -102,6 +102,8 @@ export type {
   MinimizedRequest,
   MinimizedPayload,
   MinimizeResult,
+  ReaderPayload,
+  ReaderMinimizeResult,
   SecretScanner,
   SecretScanResult,
 } from './minimize.ts';
