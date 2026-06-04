@@ -30,6 +30,8 @@ import type {
   TokenStats,
 } from '@tokenmaxed/core';
 
+import { renderStalenessWarnings } from './freshness-report.ts';
+import type { StalenessWarning } from './freshness-report.ts';
 import { formatSummaryBanner } from './summary.ts';
 import type { SummaryData } from './summary.ts';
 
@@ -98,6 +100,12 @@ export interface ToolDeps {
   readerEgress: boolean;
   /** Whether routing/offloading is enabled for the current project (A-4 toggle). */
   getEnabled: () => boolean;
+  /**
+   * Check enabled API lanes for a stale pinned model (MODEL-FRESHNESS). Makes a
+   * gated provider /models call + updates the freshness cache; returns one warning
+   * per stale lane. Optional so non-networked callers/tests can omit it.
+   */
+  freshness?: () => Promise<StalenessWarning[]>;
   /** Persist the project's enabled state (A-4 toggle). */
   setEnabled: (enabled: boolean) => void;
   /**
@@ -493,15 +501,22 @@ export function createTools(core: CorePort): ToolDef[] {
   const statusTool: ToolDef = {
     name: 'router_status',
     description:
-      'Report whether TokenMaxed routing/offloading is currently enabled for this project. Read-only.',
+      'Report whether TokenMaxed routing is enabled for this project, and check each enabled API lane for a stale pinned model. This makes a provider /models call (sends only the API key — no repo/task content) and updates the local freshness cache. Routing is never changed.',
     inputSchema: { type: 'object', additionalProperties: false, properties: {} },
-    handler: (deps) => {
-      const enabled = deps.getEnabled();
-      return ok(
-        `TokenMaxed routing is ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`,
-        { enabled },
-      );
-    },
+    handler: (deps) =>
+      guardedAsync(async () => {
+        const enabled = deps.getEnabled();
+        const warnings = enabled && deps.freshness ? await deps.freshness() : [];
+        const lines = [`TokenMaxed routing is ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`];
+        if (warnings.length > 0) {
+          lines.push('', 'Stale pinned models (you can keep them, or move to the latest):', ...renderStalenessWarnings(warnings));
+        } else if (enabled && deps.freshness) {
+          // Honest: empty ⇒ nothing FLAGGED, which also covers lanes we couldn't check
+          // (no key, unreachable provider, unknown family) — not a positive freshness claim.
+          lines.push('No stale models flagged (only enabled, keyed API lanes with a known family are checked).');
+        }
+        return ok(lines.join('\n'), { enabled, staleness: warnings as unknown as Record<string, unknown>[] });
+      }),
   };
 
   const setEnabledTool: ToolDef = {

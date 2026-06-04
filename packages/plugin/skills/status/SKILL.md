@@ -1,5 +1,5 @@
 ---
-description: Show whether TokenMaxed routing/offloading is currently enabled for this project.
+description: Show whether TokenMaxed routing is enabled for this project, and check enabled API lanes for a stale pinned model (makes a provider /models call — key only, no repo/task content — and updates the local freshness cache; routing is never changed).
 disable-model-invocation: true
 ---
 
@@ -7,4 +7,5 @@ disable-model-invocation: true
 
 1. Call the MCP tool `mcp__plugin_tokenmaxed_tokenmaxed__router_status` (no
    arguments).
-2. Present its text result to the user verbatim.
+2. Present its text result to the user verbatim — it shows the enabled/disabled
+   state and any stale pinned models (with the newer version available).

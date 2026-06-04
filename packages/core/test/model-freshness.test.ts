@@ -12,6 +12,8 @@ import {
   compareNewestFirst,
   pricedIdsInFamily,
   newestPricedInFamily,
+  sameFamily,
+  assessStaleness,
 } from '../src/model-freshness.ts';
 import type { PriceTable } from '../src/price.ts';
 
@@ -58,6 +60,48 @@ test('newestPricedInFamily returns the newest priced same-family id, else undefi
   assert.equal(newestPricedInFamily(table, 'minimax'), 'minimax-m3');
   assert.equal(newestPricedInFamily(table, 'glm'), 'glm-5.1');
   assert.equal(newestPricedInFamily(table, 'unpriced-family'), undefined);
+});
+
+test('sameFamily matches on an exact id or a boundary, never a partial prefix', () => {
+  assert.equal(sameFamily('minimax-m3', 'minimax'), true);
+  assert.equal(sameFamily('minimax', 'minimax'), true);
+  assert.equal(sameFamily('minimax.5', 'minimax'), true);
+  assert.equal(sameFamily('minimaxx', 'minimax'), false); // 'x' is alnum ⇒ not a boundary
+  assert.equal(sameFamily('glm-5.1', 'minimax'), false);
+});
+
+test('assessStaleness: fresh when pinned is the newest same-family model', () => {
+  const remote = [{ id: 'minimax-m2', created: 100 }, { id: 'minimax-m3', created: 200 }];
+  assert.deepEqual(assessStaleness('minimax-m3', 'minimax', remote, table), { status: 'fresh' });
+});
+
+test('assessStaleness: stale when a newer same-family model exists (priced flag set)', () => {
+  const remote = [{ id: 'minimax-m2', created: 100 }, { id: 'minimax-m3', created: 200 }];
+  assert.deepEqual(assessStaleness('minimax-m2', 'minimax', remote, table), {
+    status: 'stale',
+    newest: 'minimax-m3',
+    newestPriced: true, // m3 is in the table
+  });
+});
+
+test('assessStaleness: stale + newestPriced=false when the newer model is unpriced', () => {
+  const remote = [{ id: 'minimax-m2', created: 100 }, { id: 'minimax-m9', created: 300 }];
+  assert.deepEqual(assessStaleness('minimax-m2', 'minimax', remote, table), {
+    status: 'stale',
+    newest: 'minimax-m9', // not in the table ⇒ pricing gap
+    newestPriced: false,
+  });
+});
+
+test('assessStaleness: unknown when the remote list has no same-family model', () => {
+  assert.deepEqual(assessStaleness('minimax-m2', 'minimax', [{ id: 'glm-5.1' }], table), { status: 'unknown' });
+});
+
+test('assessStaleness falls back to version order when created is absent', () => {
+  const remote = [{ id: 'minimax-m2' }, { id: 'minimax-m10' }];
+  const r = assessStaleness('minimax-m2', 'minimax', remote, table);
+  assert.equal(r.status, 'stale');
+  assert.equal(r.status === 'stale' && r.newest, 'minimax-m10'); // 10 > 2 numerically
 });
 
 test('newestPricedInFamily falls back to version order when releases are absent', () => {

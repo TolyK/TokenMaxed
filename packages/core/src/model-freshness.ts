@@ -85,3 +85,57 @@ export function newestPricedInFamily(table: PriceTable, family: string): string 
   if (ids.length === 0) return undefined;
   return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
 }
+
+/** A model id (optionally with a vendor `created` epoch) for family matching. */
+export interface FamilyModel {
+  id: string;
+  created?: number;
+}
+
+/**
+ * Whether `id` belongs to the EXPLICIT `family`: an exact match, or `family` followed
+ * by a non-alphanumeric boundary (so "minimax" matches "minimax-m3" but NOT "minimaxx").
+ * The family is always provided by the caller (from `model_family` or a `@latest`
+ * alias stem) — we never infer it from an id.
+ */
+export function sameFamily(id: string, family: string): boolean {
+  if (id === family) return true;
+  if (!id.startsWith(family)) return false;
+  const next = id.charAt(family.length);
+  return next !== '' && !/[a-z0-9]/i.test(next);
+}
+
+/** Staleness of a pinned model vs the vendor's live same-family list. */
+export type StalenessReport =
+  | { status: 'fresh' }
+  | { status: 'unknown' } // no same-family model in the remote list ⇒ can't judge
+  | { status: 'stale'; newest: string; newestPriced: boolean };
+
+/**
+ * Compare a pinned `model` against the newest same-family model the vendor reports.
+ * `stale` ⇒ a newer same-family model exists (with whether TokenMaxed can price it —
+ * an unpriced newer model is a pricing-gap to surface, not auto-adopt). Ordering uses
+ * `created` when both have it, else the natural version comparator. Never throws.
+ */
+export function assessStaleness(
+  pinnedId: string,
+  family: string,
+  remote: readonly FamilyModel[],
+  table: PriceTable,
+): StalenessReport {
+  const fam = remote.filter((m) => sameFamily(m.id, family));
+  if (fam.length === 0) return { status: 'unknown' };
+  const newest = [...fam].sort((a, b) =>
+    a.created !== undefined && b.created !== undefined && a.created !== b.created
+      ? b.created - a.created
+      : compareModelVersion(b.id, a.id),
+  )[0]!;
+  if (newest.id === pinnedId) return { status: 'fresh' };
+  const pinned = fam.find((m) => m.id === pinnedId);
+  const newer =
+    pinned?.created !== undefined && newest.created !== undefined
+      ? newest.created > pinned.created
+      : compareModelVersion(newest.id, pinnedId) > 0;
+  if (!newer) return { status: 'fresh' };
+  return { status: 'stale', newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
+}

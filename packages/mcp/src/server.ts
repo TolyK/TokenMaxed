@@ -27,7 +27,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -52,6 +52,9 @@ import {
 } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
+import { reportFreshness } from './freshness-report.ts';
+import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
+import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { makeHostReviewDeps, runHostTurnReview } from './host-review.ts';
@@ -366,6 +369,29 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
     // one source of truth. Read-only.
     summary: makeSummaryFromEnv(env),
+    // MODEL-FRESHNESS: check enabled API lanes for a stale pinned model (router_status).
+    // Gated egress — only non-blocked, gate-open, keyed api lanes get a /models call
+    // (key only, no content); never when routing is globally disabled. Caches results.
+    freshness: async () => {
+      if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
+      const registry = loadLaneConfig(lanesPath);
+      // Keyed lanes only — never send an UNauthenticated /models request.
+      const eligible = registry.lanes.filter(
+        (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
+      );
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
+      return reportFreshness(
+        eligible,
+        {
+          fetchList: (lane) => fetchModelList(lane, { resolveAuth }),
+          table: loadPriceTable(pricesPath),
+          now: Date.now(),
+          readCache: () => readFreshnessCache(cachePath),
+          writeCache: (c) => writeFreshnessCache(cachePath, c),
+        },
+        { refresh: true },
+      );
+    },
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
     // same runHostTurnReview path independently. Honor the global kill-switch so a

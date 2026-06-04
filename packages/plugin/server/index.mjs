@@ -14227,8 +14227,8 @@ var require_dist2 = __commonJS({
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname3 } from "node:path";
+import { existsSync as existsSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname4, join as join4 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
@@ -23614,6 +23614,52 @@ function computeCostPrimitives(table, lane, usage) {
   };
 }
 
+// ../core/src/model-freshness.ts
+function parseModelAlias(model) {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
+  return { latest: false, id: model };
+}
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function sameFamily(id, family) {
+  if (id === family) return true;
+  if (!id.startsWith(family)) return false;
+  const next = id.charAt(family.length);
+  return next !== "" && !/[a-z0-9]/i.test(next);
+}
+function assessStaleness(pinnedId, family, remote, table) {
+  const fam = remote.filter((m) => sameFamily(m.id, family));
+  if (fam.length === 0) return { status: "unknown" };
+  const newest = [...fam].sort(
+    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
+  )[0];
+  if (newest.id === pinnedId) return { status: "fresh" };
+  const pinned = fam.find((m) => m.id === pinnedId);
+  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
+  if (!newer) return { status: "fresh" };
+  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
+}
+
 // ../core/src/ledger.ts
 var SCHEMA_VERSION = 1;
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback"];
@@ -24768,8 +24814,171 @@ function makeAvailabilityProbe(env) {
   return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
+// ../mcp/src/model-cache.ts
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname as dirname2 } from "node:path";
+var CACHE_VERSION = 1;
+function emptyCache() {
+  return { version: CACHE_VERSION, endpoints: /* @__PURE__ */ Object.create(null) };
+}
+function coerceCache(raw) {
+  if (!raw || typeof raw !== "object" || raw.version !== CACHE_VERSION) return emptyCache();
+  const eps = raw.endpoints;
+  if (!eps || typeof eps !== "object" || Array.isArray(eps)) return emptyCache();
+  const out = emptyCache();
+  for (const [endpoint, v] of Object.entries(eps)) {
+    if (!v || typeof v !== "object") continue;
+    const checkedAt = v.checkedAt;
+    const models = v.models;
+    if (typeof checkedAt !== "number" || !Number.isFinite(checkedAt) || !Array.isArray(models)) continue;
+    const clean = [];
+    for (const m of models) {
+      const id = m?.id;
+      if (typeof id !== "string" || id === "") continue;
+      const created = m.created;
+      clean.push(typeof created === "number" && Number.isFinite(created) ? { id, created } : { id });
+    }
+    out.endpoints[endpoint] = { models: clean, checkedAt };
+  }
+  return out;
+}
+function getEntry(cache, endpoint) {
+  return Object.hasOwn(cache.endpoints, endpoint) ? cache.endpoints[endpoint] : void 0;
+}
+function putEntry(cache, endpoint, models, now) {
+  const next = emptyCache();
+  Object.assign(next.endpoints, cache.endpoints);
+  next.endpoints[endpoint] = { models, checkedAt: now };
+  return next;
+}
+function readFreshnessCache(path) {
+  try {
+    return existsSync3(path) ? coerceCache(JSON.parse(readFileSync2(path, "utf8"))) : emptyCache();
+  } catch {
+    return emptyCache();
+  }
+}
+function writeFreshnessCache(path, cache) {
+  try {
+    mkdirSync2(dirname2(path), { recursive: true });
+    writeFileSync2(path, JSON.stringify(cache, null, 2) + "\n", "utf8");
+  } catch {
+  }
+}
+
+// ../mcp/src/freshness-report.ts
+async function reportFreshness(lanes, deps, opts) {
+  let cache = deps.readCache();
+  const warnings = [];
+  for (const lane of lanes) {
+    if (lane.kind !== "api" || !lane.endpoint) continue;
+    const spec = parseModelAlias(lane.model);
+    if (spec.latest) continue;
+    const family = lane.model_family;
+    if (!family) continue;
+    let models = getEntry(cache, lane.endpoint)?.models ?? [];
+    if (opts.refresh) {
+      const result = await deps.fetchList(lane);
+      if (result.status === "ok" || result.status === "ok-empty") {
+        models = result.status === "ok" ? result.models : [];
+        cache = putEntry(cache, lane.endpoint, models, deps.now);
+        deps.writeCache(cache);
+      }
+    }
+    const report = assessStaleness(spec.id, family, models, deps.table);
+    if (report.status === "stale") {
+      warnings.push({ laneId: lane.id, family, pinned: spec.id, newest: report.newest, newestPriced: report.newestPriced });
+    }
+  }
+  return warnings;
+}
+function renderStalenessWarnings(warnings) {
+  return warnings.map(
+    (w) => w.newestPriced ? `  \u26A0 ${w.laneId}: using ${w.pinned}; newer available: ${w.newest} (set model: ${w.family}@latest, or pin ${w.newest})` : `  \u26A0 ${w.laneId}: using ${w.pinned}; newer ${w.newest} exists but isn't priced yet \u2014 add it to the price table to route it`
+  );
+}
+
+// ../mcp/src/model-list.ts
+var DEFAULT_TIMEOUT_MS = 2e3;
+var MAX_MODELS = 500;
+var LOOPBACK = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+function modelsUrlFromEndpoint(endpoint) {
+  let url;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return null;
+  }
+  if (url.username || url.password) return null;
+  const isLoopback = LOOPBACK.has(url.hostname);
+  if (url.protocol !== "https:" && !(isLoopback && url.protocol === "http:")) return null;
+  if (url.pathname.endsWith("/chat/completions")) {
+    url.pathname = url.pathname.slice(0, -"/chat/completions".length) + "/models";
+  } else if (url.pathname.endsWith("/models")) {
+  } else {
+    return null;
+  }
+  url.search = "";
+  url.hash = "";
+  return url;
+}
+function parseModels(body) {
+  const arr = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray(body.data) ? body.data : null;
+  if (!arr) return null;
+  const out = [];
+  for (const entry of arr.slice(0, MAX_MODELS)) {
+    if (!entry || typeof entry !== "object") continue;
+    const id = entry.id;
+    if (typeof id !== "string" || id === "") continue;
+    const created = entry.created;
+    out.push(typeof created === "number" && Number.isFinite(created) ? { id, created } : { id });
+  }
+  return out;
+}
+async function fetchModelList(lane, deps) {
+  if (lane.kind !== "api" || !lane.endpoint) return { status: "unsupported" };
+  const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+  if (!fetchImpl) return { status: "offline" };
+  let token = "";
+  if (lane.authHandle) {
+    try {
+      token = deps.resolveAuth(lane.authHandle);
+    } catch {
+      token = "";
+    }
+    if (!token) return { status: "auth-missing" };
+  }
+  const url = modelsUrlFromEndpoint(lane.endpoint);
+  if (!url) return { status: "unsupported" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  try {
+    const headers = { accept: "application/json" };
+    if (token) headers.authorization = `Bearer ${token}`;
+    let res;
+    try {
+      res = await fetchImpl(url.toString(), { method: "GET", headers, signal: controller.signal, redirect: "manual" });
+    } catch (err) {
+      return controller.signal.aborted || err?.name === "AbortError" ? { status: "timeout" } : { status: "offline" };
+    }
+    if (res.status >= 300 && res.status < 400) return { status: "unsupported" };
+    if (!res.ok) return { status: "unsupported" };
+    let body;
+    try {
+      body = await res.json();
+    } catch (err) {
+      return controller.signal.aborted || err?.name === "AbortError" ? { status: "timeout" } : { status: "malformed" };
+    }
+    const models = parseModels(body);
+    if (!models) return { status: "malformed" };
+    return models.length === 0 ? { status: "ok-empty" } : { status: "ok", models };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ../mcp/src/summary-deps.ts
-import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
+import { existsSync as existsSync4, readFileSync as readFileSync3 } from "node:fs";
 
 // ../mcp/src/manager-select.ts
 function selectManagerLane(lanes, policy, gateReady, available = null) {
@@ -24897,7 +25106,7 @@ function readOnlyToggleStore(statePath) {
   return {
     read: () => {
       try {
-        return existsSync3(statePath) ? JSON.parse(readFileSync2(statePath, "utf8")) : {};
+        return existsSync4(statePath) ? JSON.parse(readFileSync3(statePath, "utf8")) : {};
       } catch {
         return {};
       }
@@ -24918,7 +25127,7 @@ function makeSummaryFromEnv(env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
   return async () => {
-    const lanes = existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+    const lanes = existsSync4(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
@@ -24937,7 +25146,7 @@ function makeSummaryFromEnv(env) {
 // ../mcp/src/host-review.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync4 } from "node:fs";
+import { existsSync as existsSync5 } from "node:fs";
 
 // ../mcp/src/reviewer.ts
 var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
@@ -25021,7 +25230,7 @@ function makeHostReviewDeps(env) {
 
 [diff truncated for review]` : diff;
     },
-    loadLanes: () => existsSync4(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    loadLanes: () => existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
     availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
@@ -25034,22 +25243,22 @@ function makeHostReviewDeps(env) {
 }
 
 // ../mcp/src/setup.ts
-import { copyFileSync, existsSync as existsSync5, mkdirSync as mkdirSync2 } from "node:fs";
-import { dirname as dirname2 } from "node:path";
+import { copyFileSync, existsSync as existsSync6, mkdirSync as mkdirSync3 } from "node:fs";
+import { dirname as dirname3 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 var LANES_STARTER = fileURLToPath2(new URL("../lanes.starter.yaml", import.meta.url));
 var POLICY_STARTER = fileURLToPath2(new URL("../policy.starter.yaml", import.meta.url));
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
-  const lanesExisted = existsSync5(lanesPath);
+  const lanesExisted = existsSync6(lanesPath);
   if (!lanesExisted) {
-    mkdirSync2(dirname2(lanesPath), { recursive: true });
+    mkdirSync3(dirname3(lanesPath), { recursive: true });
     copyFileSync(LANES_STARTER, lanesPath);
   }
-  const policyExisted = existsSync5(policyPath);
+  const policyExisted = existsSync6(policyPath);
   if (!policyExisted) {
-    mkdirSync2(dirname2(policyPath), { recursive: true });
+    mkdirSync3(dirname3(policyPath), { recursive: true });
     copyFileSync(POLICY_STARTER, policyPath);
   }
   const registry2 = loadLaneConfig(lanesPath);
@@ -25300,15 +25509,19 @@ function createTools(core) {
   };
   const statusTool = {
     name: "router_status",
-    description: "Report whether TokenMaxed routing/offloading is currently enabled for this project. Read-only.",
+    description: "Report whether TokenMaxed routing is enabled for this project, and check each enabled API lane for a stale pinned model. This makes a provider /models call (sends only the API key \u2014 no repo/task content) and updates the local freshness cache. Routing is never changed.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
-    handler: (deps) => {
+    handler: (deps) => guardedAsync(async () => {
       const enabled = deps.getEnabled();
-      return ok(
-        `TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`,
-        { enabled }
-      );
-    }
+      const warnings = enabled && deps.freshness ? await deps.freshness() : [];
+      const lines = [`TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`];
+      if (warnings.length > 0) {
+        lines.push("", "Stale pinned models (you can keep them, or move to the latest):", ...renderStalenessWarnings(warnings));
+      } else if (enabled && deps.freshness) {
+        lines.push("No stale models flagged (only enabled, keyed API lanes with a known family are checked).");
+      }
+      return ok(lines.join("\n"), { enabled, staleness: warnings });
+    })
   };
   const setEnabledTool = {
     name: "router_set_enabled",
@@ -25518,16 +25731,16 @@ function escToOutcome(esc2, registry2, recordingFailed) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync6(statePath)) return {};
+      if (!existsSync7(statePath)) return {};
       try {
-        return JSON.parse(readFileSync3(statePath, "utf8"));
+        return JSON.parse(readFileSync4(statePath, "utf8"));
       } catch {
         return {};
       }
     },
     write: (state) => {
-      mkdirSync3(dirname3(statePath), { recursive: true });
-      writeFileSync2(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+      mkdirSync4(dirname4(statePath), { recursive: true });
+      writeFileSync3(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
 }
@@ -25558,7 +25771,7 @@ function makeServerDeps(env = process.env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync6(lanesPath)) {
+    if (!existsSync7(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
@@ -25566,7 +25779,7 @@ function makeServerDeps(env = process.env) {
     return loadLaneConfig(lanesPath).candidateLanes(category).filter((lane) => recordableLane(lane, priceTable));
   };
   const delegate = async (request) => {
-    if (!existsSync6(lanesPath)) {
+    if (!existsSync7(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -25677,6 +25890,28 @@ function makeServerDeps(env = process.env) {
     // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
     // one source of truth. Read-only.
     summary: makeSummaryFromEnv(env),
+    // MODEL-FRESHNESS: check enabled API lanes for a stale pinned model (router_status).
+    // Gated egress — only non-blocked, gate-open, keyed api lanes get a /models call
+    // (key only, no content); never when routing is globally disabled. Caches results.
+    freshness: async () => {
+      if (globallyDisabled || !gateReady || !existsSync7(lanesPath)) return [];
+      const registry2 = loadLaneConfig(lanesPath);
+      const eligible = registry2.lanes.filter(
+        (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
+      );
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname4(statePath), "model-freshness.json");
+      return reportFreshness(
+        eligible,
+        {
+          fetchList: (lane) => fetchModelList(lane, { resolveAuth }),
+          table: loadPriceTable(pricesPath),
+          now: Date.now(),
+          readCache: () => readFreshnessCache(cachePath),
+          writeCache: (c) => writeFreshnessCache(cachePath, c)
+        },
+        { refresh: true }
+      );
+    },
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
     // same runHostTurnReview path independently. Honor the global kill-switch so a

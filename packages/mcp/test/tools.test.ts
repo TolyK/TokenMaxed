@@ -260,6 +260,19 @@ test('status reports the current enabled state', async () => {
   assert.match(off.content[0]!.text, /DISABLED/);
 });
 
+test('status surfaces stale-model warnings from the freshness check', async () => {
+  const warned = await call('router_status', deps({
+    getEnabled: () => true,
+    freshness: async () => [{ laneId: 'minimax-api', family: 'minimax', pinned: 'minimax-m2', newest: 'minimax-m3', newestPriced: true }],
+  }));
+  assert.match(warned.content[0]!.text, /Stale pinned models/);
+  assert.match(warned.content[0]!.text, /minimax-api: using minimax-m2; newer available: minimax-m3/);
+
+  // No freshness dep (e.g. tests / non-networked) ⇒ just the enabled line, no error.
+  const plain = await call('router_status', deps({ getEnabled: () => true }));
+  assert.doesNotMatch(plain.content[0]!.text, /Stale/);
+});
+
 test('set_enabled persists the requested state', async () => {
   const calls: boolean[] = [];
   const r = await call('router_set_enabled', deps({ setEnabled: (e) => calls.push(e) }), { enabled: false });
