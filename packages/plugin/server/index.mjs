@@ -22792,7 +22792,8 @@ var StdioServerTransport = class {
 };
 
 // ../core/src/types.ts
-var TRUST_MODES = ["full", "worker", "monitored", "blocked"];
+var TRUST_MODES = ["full", "worker", "reader", "blocked"];
+var TRUST_MODE_ALIASES = { monitored: "reader" };
 var TASK_CATEGORIES = [
   "boilerplate",
   "bugfix",
@@ -22997,7 +22998,9 @@ function parseRule(entry, index) {
   const rule = { verdict: entry.verdict };
   const repo_class = validateCondition(entry.repo_class, REPO_CLASSES, `${where}.repo_class`);
   const sensitivity = validateCondition(entry.sensitivity, SENSITIVITIES, `${where}.sensitivity`);
-  const trust_mode = validateCondition(entry.trust_mode, TRUST_MODES, `${where}.trust_mode`);
+  const aliasTrust = (v) => typeof v === "string" && v in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[v] : v;
+  const rawTrust = Array.isArray(entry.trust_mode) ? entry.trust_mode.map(aliasTrust) : aliasTrust(entry.trust_mode);
+  const trust_mode = validateCondition(rawTrust, TRUST_MODES, `${where}.trust_mode`);
   const provenance = validateCondition(entry.provenance, null, `${where}.provenance`);
   const jurisdiction = validateCondition(entry.jurisdiction, null, `${where}.jurisdiction`);
   const category = validateCondition(entry.category, TASK_CATEGORIES, `${where}.category`);
@@ -23068,10 +23071,9 @@ function capPenaltyFor(headroom) {
   return CAP_WARN_PENALTY;
 }
 function isSelectablePreGate(lane, gateReady = false) {
-  if (lane.trust_mode === "blocked") return false;
-  if (lane.trust_mode === "monitored") return false;
+  if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
   if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
-  return gateReady || lane.kind !== "api";
+  return false;
 }
 function isManagerEligible(lane) {
   if (lane.trust_mode !== "full" || lane.manager_allowed !== true) return false;
@@ -23227,6 +23229,7 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "manager_allowed",
   "execution_mode",
   "attestation",
+  "repo_read_attestation",
   "command",
   "args",
   "endpoint",
@@ -23292,7 +23295,9 @@ function parseLane(entry, index) {
   }
   const id = requireString(entry.id, `${where}.id`);
   const at = (field) => `lanes[${index}] (${id}).${field}`;
-  const trust_mode = requireEnum(entry.trust_mode, TRUST_MODES, at("trust_mode"));
+  const rawTrust = entry.trust_mode;
+  const aliasedTrust = typeof rawTrust === "string" && rawTrust in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[rawTrust] : rawTrust;
+  const trust_mode = requireEnum(aliasedTrust, TRUST_MODES, at("trust_mode"));
   const lane = {
     id,
     kind: requireEnum(entry.kind, LANE_KINDS, at("kind")),
@@ -23319,6 +23324,17 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at("attestation")} must be a boolean.`);
     }
     lane.attestation = entry.attestation;
+  }
+  if (entry.repo_read_attestation !== void 0) {
+    if (typeof entry.repo_read_attestation !== "boolean") {
+      throw new LaneConfigError(`${at("repo_read_attestation")} must be a boolean.`);
+    }
+    if (trust_mode !== "reader") {
+      throw new LaneConfigError(
+        `${at("repo_read_attestation")}: only valid on a 'reader' lane (got trust_mode '${trust_mode}').`
+      );
+    }
+    lane.repo_read_attestation = entry.repo_read_attestation;
   }
   if (entry.execution_mode !== void 0) {
     const mode = requireEnum(entry.execution_mode, EXECUTION_MODES, at("execution_mode"));
@@ -23779,13 +23795,16 @@ function tokenStats(events) {
 var TRUST_RANK = {
   blocked: 0,
   worker: 1,
-  monitored: 2,
+  reader: 2,
   full: 3
 };
 function canReassign(from, to, task, ctx, policy) {
   if (to.id === from.id) return false;
   if ((policy.disabledLaneIds ?? []).includes(to.id)) return false;
-  if (TRUST_RANK[to.trust_mode] < TRUST_RANK[from.trust_mode]) return false;
+  const fromRank = TRUST_RANK[from.trust_mode];
+  const toRank = TRUST_RANK[to.trust_mode];
+  if (fromRank === void 0 || toRank === void 0) return false;
+  if (toRank < fromRank) return false;
   if (!isSelectablePreGate(to, ctx.gateReady ?? false)) return false;
   const { verdict } = evaluate(task, to, ctx.policyContext ?? {}, policy);
   return laneAllowedByVerdict(to, verdict);

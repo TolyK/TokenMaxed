@@ -123,7 +123,7 @@ lanes:
     jurisdiction: US
 `;
   assert.throws(() => parseLaneConfig(cfg), {
-    message: /trust_mode must be one of: full, worker, monitored, blocked/,
+    message: /trust_mode must be one of: full, worker, reader, blocked/,
   });
 });
 
@@ -289,4 +289,88 @@ test('loadLaneConfig gives a clear error for a missing file', () => {
     name: 'LaneConfigError',
     message: /Could not read lane config/,
   });
+});
+
+// --- F2-S1: the reader trust tier + monitored alias --------------------------
+
+const READER_LANE = `
+lanes:
+  - id: gemini-reader
+    kind: api
+    model: gemini-3.5-flash
+    trust_mode: reader
+    costBasis: subscription
+    provenance: google
+    jurisdiction: US
+    endpoint: https://example.invalid
+    repo_read_attestation: true
+`;
+
+test('parses a reader lane and its repo_read_attestation', () => {
+  const reg = parseLaneConfig(READER_LANE);
+  const lane = reg.byId('gemini-reader');
+  assert.equal(lane?.trust_mode, 'reader');
+  assert.equal(lane?.repo_read_attestation, true);
+});
+
+test("the deprecated 'monitored' trust_mode is normalized to 'reader'", () => {
+  const cfg = `
+lanes:
+  - id: legacy
+    kind: api
+    model: m
+    trust_mode: monitored
+    costBasis: subscription
+    provenance: p
+    jurisdiction: US
+    endpoint: https://example.invalid
+`;
+  assert.equal(parseLaneConfig(cfg).byId('legacy')?.trust_mode, 'reader');
+});
+
+test('a reader lane may omit executor config (not yet selectable until F-2 executor lands)', () => {
+  const cfg = `
+lanes:
+  - id: stub-reader
+    kind: cli
+    model: m
+    trust_mode: reader
+    costBasis: subscription
+    provenance: p
+    jurisdiction: US
+`;
+  // No command/endpoint required for a reader (like blocked) — must not throw.
+  assert.equal(parseLaneConfig(cfg).byId('stub-reader')?.trust_mode, 'reader');
+});
+
+test('repo_read_attestation is rejected on a non-reader lane', () => {
+  const cfg = `
+lanes:
+  - id: full-lane
+    kind: cli
+    model: m
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    command: claude
+    repo_read_attestation: true
+`;
+  assert.throws(() => parseLaneConfig(cfg), { message: /repo_read_attestation.*only valid on a 'reader' lane/ });
+});
+
+test('repo_read_attestation: false is also rejected on a non-reader lane (no misleading opt-out)', () => {
+  const cfg = `
+lanes:
+  - id: worker-lane
+    kind: api
+    model: m
+    trust_mode: worker
+    costBasis: metered
+    provenance: deepseek
+    jurisdiction: CN
+    endpoint: https://example.invalid
+    repo_read_attestation: false
+`;
+  assert.throws(() => parseLaneConfig(cfg), { message: /repo_read_attestation.*only valid on a 'reader' lane/ });
 });

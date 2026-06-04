@@ -248,10 +248,10 @@ test('a trusted lane throwing an auth LaneFailure is permanent (no fallback)', a
 });
 
 test('fallback preserves the real failure when remaining lanes are not routable', async () => {
-  // Worker hits quota; the only other lane is monitored (passes the trust floor
-  // but is never selectable) ⇒ keep the worker failure, do not overwrite with native.
+  // Worker hits quota; the only other lane is a reader (passes the trust floor
+  // but is not yet selectable) ⇒ keep the worker failure, do not overwrite with native.
   const w: Lane = { ...worker, id: 'w', capability: { bugfix: 0.9 } };
-  const mon: Lane = { ...worker, id: 'mon', trust_mode: 'monitored', capability: { bugfix: 1 } };
+  const mon: Lane = { ...worker, id: 'mon', trust_mode: 'reader', capability: { bugfix: 1 } };
   const d = deps({ executeUntrusted: async () => ({ ok: false, failureKind: 'quota_exhausted', error: 'out' }) });
   const ctx: RouteContext = { lanes: [w, mon], gateReady: true, policyContext: { repo_class: 'public', sensitivity: 'normal' } };
   const r = await runWithFallback({ category: 'bugfix', instruction: 'x' }, ctx, noPolicy, d);

@@ -14,7 +14,7 @@
 import { parse as parseYaml } from 'yaml';
 
 import { declaredCapabilityFor } from './route.ts';
-import { TASK_CATEGORIES, TRUST_MODES } from './types.ts';
+import { TASK_CATEGORIES, TRUST_MODE_ALIASES, TRUST_MODES } from './types.ts';
 import type {
   CostBasis,
   ExecutionMode,
@@ -43,6 +43,7 @@ const ALLOWED_LANE_KEYS = new Set([
   'manager_allowed',
   'execution_mode',
   'attestation',
+  'repo_read_attestation',
   'command',
   'args',
   'endpoint',
@@ -122,7 +123,12 @@ function parseLane(entry: unknown, index: number): Lane {
   }
   const id = requireString(entry.id, `${where}.id`);
   const at = (field: string): string => `lanes[${index}] (${id}).${field}`;
-  const trust_mode = requireEnum(entry.trust_mode, TRUST_MODES, at('trust_mode'));
+  // Normalize deprecated trust-mode aliases (e.g. `monitored` → `reader`) BEFORE
+  // enum validation, so old configs keep loading; the canonical value is stored.
+  const rawTrust = entry.trust_mode;
+  const aliasedTrust =
+    typeof rawTrust === 'string' && rawTrust in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[rawTrust] : rawTrust;
+  const trust_mode = requireEnum(aliasedTrust, TRUST_MODES, at('trust_mode'));
   const lane: Lane = {
     id,
     kind: requireEnum(entry.kind, LANE_KINDS, at('kind')),
@@ -150,6 +156,21 @@ function parseLane(entry: unknown, index: number): Lane {
       throw new LaneConfigError(`${at('attestation')} must be a boolean.`);
     }
     lane.attestation = entry.attestation;
+  }
+  if (entry.repo_read_attestation !== undefined) {
+    if (typeof entry.repo_read_attestation !== 'boolean') {
+      throw new LaneConfigError(`${at('repo_read_attestation')} must be a boolean.`);
+    }
+    // This attestation only has meaning for a reader lane (it authorizes private
+    // repo-read egress to that vendor). Reject it on any other tier REGARDLESS of
+    // value — even `false` is misleading on a full/worker lane (it has no effect;
+    // trust_mode alone controls context), so the field must not appear there.
+    if (trust_mode !== 'reader') {
+      throw new LaneConfigError(
+        `${at('repo_read_attestation')}: only valid on a 'reader' lane (got trust_mode '${trust_mode}').`,
+      );
+    }
+    lane.repo_read_attestation = entry.repo_read_attestation;
   }
   if (entry.execution_mode !== undefined) {
     const mode = requireEnum(entry.execution_mode, EXECUTION_MODES, at('execution_mode'));
@@ -189,8 +210,8 @@ function parseLane(entry: unknown, index: number): Lane {
   // A SELECTABLE (full/worker), non-native lane must be executable: cli needs a
   // command, api needs an endpoint (local defaults to localhost). Reject at load
   // so an unexecutable lane can never be selected and silently degrade. Blocked
-  // and (deferred) monitored lanes are never selectable, so a disabled stub may
-  // omit executor config.
+  // and (not-yet-selectable) reader lanes are excluded here, so a stub may omit
+  // executor config until reader's executor lands (F-2).
   const selectable = lane.trust_mode === 'full' || lane.trust_mode === 'worker';
   if (selectable && !lane.native) {
     if (lane.kind === 'cli' && lane.command === undefined) {

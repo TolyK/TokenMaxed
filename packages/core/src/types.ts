@@ -11,20 +11,33 @@ export type LaneKind = 'cli' | 'api' | 'local';
 
 /**
  * Trust mode — what *context* a lane may receive (a user choice, kept separate
- * from `provenance`):
- * - `full`: may see repo + tools + broad context (trusted, user-approved lanes).
+ * from `provenance`). Trust ladder (low→high): `blocked < worker < reader < full`.
+ * - `full`: may see repo + tools + broad context (trusted, user-approved lanes);
+ *   the only tier that may be `agentic`.
+ * - `reader` (F-2): may receive bounded, scanned, scrubbed **repo-read** context
+ *   (so repo-aware work can offload) but NEVER secrets, shell, write, or tools —
+ *   answer-only. This DELIBERATELY sends (possibly private) repo code to the
+ *   vendor: secret egress is fail-closed + scanner-gated, *not proven impossible*,
+ *   so it is opt-in (global egress flag + per-lane `repo_read_attestation`) and the
+ *   lane only ever gets a bounded payload, never a repo handle. NOT the old
+ *   "no-leak" guarantee — a clearer, safer alternative to marking a vendor `full`.
  * - `worker`: receives only a minimized, scrubbed, bounded, no-tool task — never
  *   the repo/secrets/tools.
- * - `monitored`: deferred (later phase); reserved here so config validates.
  * - `blocked`: never selected.
  *
  * No non-`full` lane may run until the minimization/policy gate is ready
  * (`gate.ready`) and the lane's executor is egress-certified.
+ *
+ * `monitored` is a DEPRECATED alias for `reader`, accepted by the config parser
+ * (normalized to `reader`) for back-compat; it is never the canonical value.
  */
-export type TrustMode = 'full' | 'worker' | 'monitored' | 'blocked';
+export type TrustMode = 'full' | 'worker' | 'reader' | 'blocked';
 
 /** All trust modes, canonical order. */
-export const TRUST_MODES: readonly TrustMode[] = ['full', 'worker', 'monitored', 'blocked'];
+export const TRUST_MODES: readonly TrustMode[] = ['full', 'worker', 'reader', 'blocked'];
+
+/** Deprecated config alias → canonical trust mode (only `monitored` → `reader` today). */
+export const TRUST_MODE_ALIASES: Readonly<Record<string, TrustMode>> = { monitored: 'reader' };
 
 /** Roles a lane may be assigned. `manager` reviews work and (re)assigns tasks. */
 export type LaneRole = 'manager' | 'worker';
@@ -106,6 +119,14 @@ export interface Lane {
    * provenance lane is trusted enough to be manager-eligible. Default false.
    */
   attestation?: boolean;
+  /**
+   * F-2: explicit, high-friction user attestation authorizing **private repo-read
+   * egress** to this `reader` lane's vendor ("private source code may be sent to
+   * this provider"). Distinct from {@link attestation} (manager eligibility) and
+   * required, alongside the global egress flag, before a `reader` lane is
+   * selectable. Only valid on a `reader` lane. Default false.
+   */
+  repo_read_attestation?: boolean;
   /**
    * Per-category capability in [0, 1]. A missing category falls back to
    * {@link DEFAULT_CAPABILITY}. This is the lane's competence at a category,

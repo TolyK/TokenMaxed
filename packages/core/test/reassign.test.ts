@@ -20,16 +20,16 @@ const worker = lane({ id: 'worker', kind: 'api', trust_mode: 'worker', costBasis
 const fullA = lane({ id: 'full-a', provenance: 'anthropic', capability: { bugfix: 0.9 } });
 const fullB = lane({ id: 'full-b', provenance: 'openai', capability: { bugfix: 0.95 } });
 const blocked = lane({ id: 'blk', trust_mode: 'blocked' });
-const monitored = lane({ id: 'mon', trust_mode: 'monitored' });
+const reader = lane({ id: 'rdr', trust_mode: 'reader' });
 
 const task: Task = { category: 'bugfix' };
 const safeCtx: RouteContext = { lanes: [], policyContext: { repo_class: 'public', sensitivity: 'normal' } };
 const noPolicy: Policy = {};
 
-test('TRUST_RANK orders blocked < worker < monitored < full', () => {
+test('TRUST_RANK orders blocked < worker < reader < full', () => {
   assert.ok(TRUST_RANK.blocked < TRUST_RANK.worker);
-  assert.ok(TRUST_RANK.worker < TRUST_RANK.monitored);
-  assert.ok(TRUST_RANK.monitored < TRUST_RANK.full);
+  assert.ok(TRUST_RANK.worker < TRUST_RANK.reader);
+  assert.ok(TRUST_RANK.reader < TRUST_RANK.full);
 });
 
 test('shouldReassign triggers on needs-rework/fail only', () => {
@@ -43,7 +43,15 @@ test('canReassign: up the ladder + policy-allowed only', () => {
   assert.equal(canReassign(fullA, worker, task, safeCtx, noPolicy), false); // never move down
   assert.equal(canReassign(worker, worker, task, safeCtx, noPolicy), false); // same lane
   assert.equal(canReassign(worker, blocked, task, safeCtx, noPolicy), false); // blocked never a target
-  assert.equal(canReassign(worker, monitored, task, safeCtx, noPolicy), false); // monitored deferred
+  assert.equal(canReassign(worker, reader, task, safeCtx, noPolicy), false); // reader not yet selectable (F-2)
+});
+
+test('canReassign fails closed on an unrankable (legacy/unknown) trust mode', () => {
+  // A direct JS caller bypassing config normalization passes a legacy `monitored`
+  // source: undefined rank must NOT silently allow a down-ladder reassignment.
+  const legacy = lane({ id: 'legacy', trust_mode: 'monitored' as unknown as Lane['trust_mode'] });
+  assert.equal(canReassign(legacy, worker, task, safeCtx, noPolicy), false);
+  assert.equal(canReassign(worker, legacy, task, safeCtx, noPolicy), false);
 });
 
 test('canReassign refuses an administratively disabled lane', () => {

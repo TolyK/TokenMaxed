@@ -76,7 +76,7 @@ function capPenaltyFor(headroom: number | undefined): number {
 }
 
 /**
- * Enforcement order is law. A non-`full` lane (worker/monitored/blocked) may run
+ * Enforcement order is law. A non-`full` lane (worker/reader/blocked) may run
  * ONLY once the minimization/policy gate is ready AND its executor is
  * egress-certified. Until then, only `full`, non-`api` lanes are selectable —
  * a hard structural guard independent of policy config. When the gate ships, the
@@ -89,16 +89,20 @@ function capPenaltyFor(headroom: number | undefined): number {
  *   engine + egress certification.
  */
 export function isSelectablePreGate(lane: Lane, gateReady = false): boolean {
-  if (lane.trust_mode === 'blocked') return false; // never selectable, period
-  // `monitored` is deferred (later phase) — no monitoring implementation yet.
-  if (lane.trust_mode === 'monitored') return false;
+  // ALLOWLIST + fail-closed: only `full` and `worker` have selectable logic.
+  // Full (trusted, user-approved) lanes: CLI/local always selectable; an API lane
+  // only once the gate is ready (the blanket pre-gate "no API lane" guard relaxes).
+  if (lane.trust_mode === 'full') return gateReady || lane.kind !== 'api';
   // Untrusted `worker` lanes are admitted only when the gate is ready AND a
   // core-owned, egress-CI-certified executor exists for the lane. The policy gate
   // and the minimizer then apply on top (defense in depth) before anything sends.
   if (lane.trust_mode === 'worker') return gateReady && isExecutorCertified(lane);
-  // Full (trusted, user-approved) lanes: CLI/local always selectable; an API lane
-  // only once the gate is ready (the blanket pre-gate "no API lane" guard relaxes).
-  return gateReady || lane.kind !== 'api';
+  // Everything else fails CLOSED: `blocked` (never), `reader` (F-2 middle tier —
+  // inert until its repo-read boundary + egress-certified executor + opt-in gate
+  // land; selectability is decided in its own dedicated path, never here), and any
+  // unknown/legacy value (e.g. a deprecated `monitored` reaching a direct JS caller
+  // without going through config normalization).
+  return false;
 }
 
 /**

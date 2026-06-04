@@ -16,7 +16,7 @@
 
 import { parse as parseYaml } from 'yaml';
 
-import { POLICY_VERDICTS, TASK_CATEGORIES, TRUST_MODES } from './types.ts';
+import { POLICY_VERDICTS, TASK_CATEGORIES, TRUST_MODE_ALIASES, TRUST_MODES } from './types.ts';
 import type {
   Lane,
   Policy,
@@ -165,7 +165,12 @@ function parseRule(entry: unknown, index: number): PolicyRule {
   const rule: PolicyRule = { verdict: entry.verdict as PolicyVerdict };
   const repo_class = validateCondition(entry.repo_class, REPO_CLASSES, `${where}.repo_class`);
   const sensitivity = validateCondition(entry.sensitivity, SENSITIVITIES, `${where}.sensitivity`);
-  const trust_mode = validateCondition(entry.trust_mode, TRUST_MODES, `${where}.trust_mode`);
+  // Normalize deprecated trust-mode aliases (e.g. `monitored` → `reader`) so old
+  // policies keep loading; matches the lane-config parser.
+  const aliasTrust = (v: unknown): unknown =>
+    typeof v === 'string' && v in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[v] : v;
+  const rawTrust = Array.isArray(entry.trust_mode) ? entry.trust_mode.map(aliasTrust) : aliasTrust(entry.trust_mode);
+  const trust_mode = validateCondition(rawTrust, TRUST_MODES, `${where}.trust_mode`);
   const provenance = validateCondition(entry.provenance, null, `${where}.provenance`);
   const jurisdiction = validateCondition(entry.jurisdiction, null, `${where}.jurisdiction`);
   const category = validateCondition(entry.category, TASK_CATEGORIES, `${where}.category`);

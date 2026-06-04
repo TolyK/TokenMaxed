@@ -2,12 +2,12 @@
  * Assignment / reassignment (C-8). Pure decision logic the manager uses to
  * escalate a routed task whose output was rated `needs-rework`/`fail`.
  *
- * Trust-ladder rule (up-only): `blocked < worker < monitored < full`. A
+ * Trust-ladder rule (up-only): `blocked < worker < reader < full`. A
  * reassignment may only move UP the ladder (never hand more context, or fewer
  * controls, to a less-trusted lane) and must re-pass the policy gate for the new
- * lane. `monitored`/`blocked` are never reassignment targets in v0 (monitored is
- * deferred). A loop-guard caps the number of reassignments. Authority applies
- * only within router-managed tasks.
+ * lane. `blocked` is never a target; `reader` becomes a target once its boundary +
+ * executor land (F-2). A loop-guard caps the number of reassignments. Authority
+ * applies only within router-managed tasks.
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
@@ -15,11 +15,11 @@ import { effectiveCapabilityFor, isSelectablePreGate } from './route.ts';
 import type { ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, Task, TrustMode } from './types.ts';
 
-/** Strict trust ordering for the ladder. */
+/** Strict trust ordering for the ladder: blocked < worker < reader < full. */
 export const TRUST_RANK: Record<TrustMode, number> = {
   blocked: 0,
   worker: 1,
-  monitored: 2,
+  reader: 2,
   full: 3,
 };
 
@@ -39,8 +39,14 @@ export function shouldReassign(verdict: ReviewVerdict): boolean {
 export function canReassign(from: Lane, to: Lane, task: Task, ctx: RouteContext, policy: Policy): boolean {
   if (to.id === from.id) return false;
   if ((policy.disabledLaneIds ?? []).includes(to.id)) return false; // admin-disabled never selectable
-  if (TRUST_RANK[to.trust_mode] < TRUST_RANK[from.trust_mode]) return false; // never move down
-  // Same structural gate as routing (also excludes blocked/monitored, ungated workers, pre-gate API).
+  // Fail CLOSED on an unrankable trust mode (e.g. a deprecated `monitored` reaching
+  // a direct JS caller without config normalization): `undefined` comparisons are
+  // always false, which would silently bypass the down-ladder guard.
+  const fromRank = TRUST_RANK[from.trust_mode] as number | undefined;
+  const toRank = TRUST_RANK[to.trust_mode] as number | undefined;
+  if (fromRank === undefined || toRank === undefined) return false;
+  if (toRank < fromRank) return false; // never move down
+  // Same structural gate as routing (also excludes blocked/reader, ungated workers, pre-gate API).
   if (!isSelectablePreGate(to, ctx.gateReady ?? false)) return false;
   const { verdict } = evaluate(task, to, ctx.policyContext ?? {}, policy);
   return laneAllowedByVerdict(to, verdict);

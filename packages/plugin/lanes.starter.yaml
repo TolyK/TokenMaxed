@@ -9,10 +9,12 @@
 #   id              unique local identifier for the lane
 #   kind            cli | api | local
 #   model           model id used for pricing / registry lookups
-#   trust_mode      full | worker | monitored | blocked
+#   trust_mode      full | worker | reader | blocked
 #                     full     = may see repo + tools + broad context (trusted)
+#                     reader   = bounded repo-READ context, no secrets/shell/tools,
+#                                answer-only (opt-in: TOKENMAXED_READER_EGRESS +
+#                                repo_read_attestation). Sends repo code to the vendor.
 #                     worker   = minimized, scrubbed, bounded task only (no repo/tools)
-#                     monitored= (deferred — later phase)
 #                     blocked  = never selected
 #                   Non-`full` lanes only run once the minimization/policy gate is ready.
 #   costBasis       subscription | metered | local

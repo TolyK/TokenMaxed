@@ -252,7 +252,7 @@ export async function runWithFallback(
     const result = await runTask({ ...request, task_id, attempt: i }, { ...ctx, lanes }, policy, deps);
 
     // A FALLBACK iteration that found no routable candidate (decision undefined —
-    // remaining lanes are gated/monitored/empty) didn't really run; keep the real
+    // remaining lanes are gated/reader/empty) didn't really run; keep the real
     // prior failure rather than overwriting it with a native degrade.
     if (i > 0 && result.decision === undefined) break;
 

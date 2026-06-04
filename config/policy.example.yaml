@@ -5,7 +5,7 @@
 # condition given as a list matches if the value is in the list.
 #
 # Conditions: repo_class (public|private|unknown), sensitivity (normal|sensitive|unknown),
-#             trust_mode (full|worker|monitored|blocked), provenance, jurisdiction, category
+#             trust_mode (full|worker|reader|blocked), provenance, jurisdiction, category
 # Verdict:    allow | block | force-trusted
 #               allow         = lane may handle the task
 #               block         = lane excluded entirely
@@ -16,9 +16,18 @@
 # force-trusted — an unknown/sensitive context never silently uses a worker lane.
 
 rules:
-  # Private or unknown repos never go to an untrusted worker lane.
+  # Private or unknown repos never go to an untrusted worker lane. A `reader` lane
+  # MAY take private repo work — that's its purpose — but enabling it takes two
+  # steps, because removing `reader` here is NOT enough: with no matching rule the
+  # deny-by-default baseline returns force-trusted, which still excludes `reader`.
+  # To allow it: (1) drop `reader` from this block, AND (2) add an explicit allow
+  # rule ABOVE the defaults, e.g.
+  #     - repo_class: private
+  #       trust_mode: reader
+  #       verdict: allow
+  #       reason: "reader lane approved for private repo-read"
   - repo_class: [private, unknown]
-    trust_mode: [worker, monitored]
+    trust_mode: [worker, reader]
     verdict: block
     reason: "private/unknown repo: untrusted lanes blocked"
 
