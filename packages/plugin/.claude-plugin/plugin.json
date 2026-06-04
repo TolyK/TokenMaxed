@@ -20,6 +20,17 @@
     }
   },
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart.mjs\""
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "mcp__plugin_tokenmaxed_tokenmaxed__router_delegate",

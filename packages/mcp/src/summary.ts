@@ -167,13 +167,17 @@ export function formatSummaryBanner(data: SummaryData): string {
     }
   }
   lines.push('');
-  const laneStr = data.lanes
-    .map((l) => {
-      const role = l.isActiveReviewer ? 'reviewer' : l.trustMode;
-      return `${l.id} (${role})${l.available ? '' : ' ⚠ offline'}`;
-    })
-    .join(' · ');
-  lines.push(`   Lanes: ${laneStr}`);
+  if (data.lanes.length > 0) {
+    const laneStr = data.lanes
+      .map((l) => {
+        const role = l.isActiveReviewer ? 'reviewer' : l.trustMode;
+        return `${l.id} (${role})${l.available ? '' : ' ⚠ offline'}`;
+      })
+      .join(' · ');
+    lines.push(`   Lanes: ${laneStr}`);
+  } else {
+    lines.push('   No lanes configured yet — run /tokenmaxed:setup');
+  }
   lines.push('   /tokenmaxed:summary anytime · /tokenmaxed:why <category> to preview · /tokenmaxed:savings for detail');
   return lines.join('\n');
 }

@@ -14227,7 +14227,7 @@ var require_dist2 = __commonJS({
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname3 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 
@@ -24753,6 +24753,9 @@ function makeAvailabilityProbe(env) {
   return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
+// ../mcp/src/summary-deps.ts
+import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
+
 // ../mcp/src/manager-select.ts
 function selectManagerLane(lanes, policy, gateReady, available = null) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
@@ -24841,19 +24844,85 @@ function formatSummaryBanner(data) {
     }
   }
   lines.push("");
-  const laneStr = data.lanes.map((l) => {
-    const role = l.isActiveReviewer ? "reviewer" : l.trustMode;
-    return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}`;
-  }).join(" \xB7 ");
-  lines.push(`   Lanes: ${laneStr}`);
+  if (data.lanes.length > 0) {
+    const laneStr = data.lanes.map((l) => {
+      const role = l.isActiveReviewer ? "reviewer" : l.trustMode;
+      return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}`;
+    }).join(" \xB7 ");
+    lines.push(`   Lanes: ${laneStr}`);
+  } else {
+    lines.push("   No lanes configured yet \u2014 run /tokenmaxed:setup");
+  }
   lines.push("   /tokenmaxed:summary anytime \xB7 /tokenmaxed:why <category> to preview \xB7 /tokenmaxed:savings for detail");
   return lines.join("\n");
+}
+
+// ../mcp/src/toggle.ts
+var ENABLED_BY_DEFAULT = true;
+function asMap(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "boolean") out[k] = v;
+  }
+  return out;
+}
+function readEnabled(store, projectKey) {
+  const map = asMap(store.read());
+  return Object.hasOwn(map, projectKey) ? map[projectKey] : ENABLED_BY_DEFAULT;
+}
+function writeEnabled(store, projectKey, enabled) {
+  const map = asMap(store.read());
+  map[projectKey] = enabled;
+  store.write(map);
+}
+
+// ../mcp/src/summary-deps.ts
+function readOnlyToggleStore(statePath) {
+  return {
+    read: () => {
+      try {
+        return existsSync3(statePath) ? JSON.parse(readFileSync2(statePath, "utf8")) : {};
+      } catch {
+        return {};
+      }
+    },
+    write: () => {
+    }
+    // summary never mutates the toggle
+  };
+}
+function makeSummaryFromEnv(env) {
+  const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
+  const ledgerPath = env.TOKENMAXED_LEDGER;
+  const statePath = env.TOKENMAXED_STATE ?? homeFile("state.json");
+  const projectKey = env.TOKENMAXED_PROJECT ?? "default";
+  const gateReady = env.TOKENMAXED_GATE_READY === "true";
+  const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
+  const loadPolicy = makeLoadPolicy(env);
+  const probeAvailable = makeAvailabilityProbe(env);
+  const store = readOnlyToggleStore(statePath);
+  return async () => {
+    const lanes = existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+    const available = await probeAvailable(lanes);
+    return buildSummaryData({
+      events: new JsonlLedger(ledgerPath).readAll(),
+      lanes,
+      policy: loadPolicy(),
+      availableLaneIds: available,
+      gateReady,
+      enabled: globallyDisabled ? false : readEnabled(store, projectKey),
+      now: Date.now(),
+      core: { summarize, tokenStats, filterEventsSince },
+      selectManager: selectManagerLane
+    });
+  };
 }
 
 // ../mcp/src/host-review.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync3 } from "node:fs";
+import { existsSync as existsSync4 } from "node:fs";
 
 // ../mcp/src/reviewer.ts
 var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
@@ -24937,7 +25006,7 @@ function makeHostReviewDeps(env) {
 
 [diff truncated for review]` : diff;
     },
-    loadLanes: () => existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    loadLanes: () => existsSync4(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
     availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
@@ -24950,7 +25019,7 @@ function makeHostReviewDeps(env) {
 }
 
 // ../mcp/src/setup.ts
-import { copyFileSync, existsSync as existsSync4, mkdirSync as mkdirSync2 } from "node:fs";
+import { copyFileSync, existsSync as existsSync5, mkdirSync as mkdirSync2 } from "node:fs";
 import { dirname as dirname2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 var LANES_STARTER = fileURLToPath2(new URL("../lanes.starter.yaml", import.meta.url));
@@ -24958,12 +25027,12 @@ var POLICY_STARTER = fileURLToPath2(new URL("../policy.starter.yaml", import.met
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
-  const lanesExisted = existsSync4(lanesPath);
+  const lanesExisted = existsSync5(lanesPath);
   if (!lanesExisted) {
     mkdirSync2(dirname2(lanesPath), { recursive: true });
     copyFileSync(LANES_STARTER, lanesPath);
   }
-  const policyExisted = existsSync4(policyPath);
+  const policyExisted = existsSync5(policyPath);
   if (!policyExisted) {
     mkdirSync2(dirname2(policyPath), { recursive: true });
     copyFileSync(POLICY_STARTER, policyPath);
@@ -25393,26 +25462,6 @@ function unknownKeys(inputSchema, args) {
   return `Unknown argument(s): ${extras.join(", ")}. Allowed: ${allowed.length ? allowed.join(", ") : "(none)"}.`;
 }
 
-// ../mcp/src/toggle.ts
-var ENABLED_BY_DEFAULT = true;
-function asMap(raw) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const out = /* @__PURE__ */ Object.create(null);
-  for (const [k, v] of Object.entries(raw)) {
-    if (typeof v === "boolean") out[k] = v;
-  }
-  return out;
-}
-function readEnabled(store, projectKey) {
-  const map = asMap(store.read());
-  return Object.hasOwn(map, projectKey) ? map[projectKey] : ENABLED_BY_DEFAULT;
-}
-function writeEnabled(store, projectKey, enabled) {
-  const map = asMap(store.read());
-  map[projectKey] = enabled;
-  store.write(map);
-}
-
 // ../mcp/src/server.ts
 var DEFAULT_LANES = homeFile("lanes.yaml");
 var DEFAULT_PRICES = fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
@@ -25454,9 +25503,9 @@ function escToOutcome(esc2, registry2, recordingFailed) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync5(statePath)) return {};
+      if (!existsSync6(statePath)) return {};
       try {
-        return JSON.parse(readFileSync2(statePath, "utf8"));
+        return JSON.parse(readFileSync3(statePath, "utf8"));
       } catch {
         return {};
       }
@@ -25494,7 +25543,7 @@ function makeServerDeps(env = process.env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync5(lanesPath)) {
+    if (!existsSync6(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
@@ -25502,7 +25551,7 @@ function makeServerDeps(env = process.env) {
     return loadLaneConfig(lanesPath).candidateLanes(category).filter((lane) => recordableLane(lane, priceTable));
   };
   const delegate = async (request) => {
-    if (!existsSync5(lanesPath)) {
+    if (!existsSync6(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -25609,24 +25658,10 @@ function makeServerDeps(env = process.env) {
     // overriding the per-project toggle.
     getEnabled: () => globallyDisabled ? false : readEnabled(store, projectKey),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
-    // Session summary (router_summary / /tokenmaxed:summary). Reuses the SAME core
-    // aggregates, full registry lanes, availability probe, and manager selector the
-    // rest of the server uses — composed by the pure buildSummaryData. Read-only.
-    summary: async () => {
-      const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
-      const available = await probeAvailable(lanes);
-      return buildSummaryData({
-        events: new JsonlLedger(ledgerPath).readAll(),
-        lanes,
-        policy: loadPolicySafe(),
-        availableLaneIds: available,
-        gateReady,
-        enabled: globallyDisabled ? false : readEnabled(store, projectKey),
-        now: Date.now(),
-        core: { summarize, tokenStats, filterEventsSince },
-        selectManager: selectManagerLane
-      });
-    },
+    // Session summary (router_summary / /tokenmaxed:summary), composed from the same
+    // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
+    // one source of truth. Read-only.
+    summary: makeSummaryFromEnv(env),
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the
     // same runHostTurnReview path independently. Honor the global kill-switch so a
