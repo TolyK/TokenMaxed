@@ -14,6 +14,7 @@ import { test } from 'node:test';
 
 import {
   TASK_CATEGORIES,
+  eligibleLanes,
   evaluate,
   filterEventsSince,
   routeDecide,
@@ -27,7 +28,7 @@ import type { CorePort, DelegateOutcome, ReviewOutcome, SetupReport, ToolDeps } 
 
 // --- harness -------------------------------------------------------------------
 
-const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, evaluate, taskCategories: TASK_CATEGORIES };
+const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
 const TOOLS = createTools(CORE);
 
 const FIXED_NOW = Date.parse('2026-06-02T12:00:00.000Z');
@@ -473,6 +474,35 @@ test('preview applies the learned overlay (F-1); flag-off is identical to declar
   const on = await call('router_preview', deps({ candidateLanes: () => lanes, observedCapability: () => overlay }), { category: 'bugfix' });
   assert.equal((on.structuredContent!.decision as { laneId: string }).laneId, 'cheap');
   assert.match(on.content[0]!.text, /learned/);
+});
+
+test('preview applies the availability filter (skips a lane that cannot run)', async () => {
+  // A free local lane ties on capability and would win on cost — but it's not
+  // available, so preview must pick the available subscription lane instead.
+  const localCheap = lane({ id: 'ollama', kind: 'local', costBasis: 'local', capability: { docs: 0.8 } });
+  const sub = lane({ id: 'sub', costBasis: 'subscription', capability: { docs: 0.8 } });
+  const lanes = [sub, localCheap];
+
+  // No availability dep ⇒ unchecked ⇒ the local lane wins on cost (back-compat).
+  const noProbe = await call('router_preview', deps({ candidateLanes: () => lanes }), { category: 'docs' });
+  assert.equal((noProbe.structuredContent!.decision as { laneId: string }).laneId, 'ollama');
+
+  // With availability listing only the subscription lane, it wins — and the probe
+  // is handed exactly the gate+policy-eligible lanes (never a blocked/gated lane).
+  let probed: readonly Lane[] | undefined;
+  const withProbe = await call(
+    'router_preview',
+    deps({
+      candidateLanes: () => lanes,
+      availableLaneIds: async (ls) => {
+        probed = ls;
+        return ['sub'];
+      },
+    }),
+    { category: 'docs' },
+  );
+  assert.equal((withProbe.structuredContent!.decision as { laneId: string }).laneId, 'sub');
+  assert.deepEqual([...(probed ?? [])].map((l) => l.id).sort(), ['ollama', 'sub']);
 });
 
 test('preview defaults gate_ready to the server posture (matches what delegate would do)', async () => {

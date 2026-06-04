@@ -222,6 +222,9 @@ export function selectReviewManager(
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const gateReady = ctx.gateReady ?? false;
   const policyContext = ctx.policyContext ?? {};
+  // Don't pick a manager that can't run now (CLI not installed, server down, key
+  // missing) — it would just fail the review. Absent set ⇒ availability unchecked.
+  const available = ctx.availableLaneIds ? new Set(ctx.availableLaneIds) : null;
   const eligible = lanes.filter(
     (m) =>
       m.id !== subject.id &&
@@ -231,6 +234,7 @@ export function selectReviewManager(
       declaredCapabilityFor(m, category) >= subjectCap &&
       !disabled.has(m.id) &&
       isSelectablePreGate(m, gateReady) &&
+      (!available || available.has(m.id)) &&
       laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict),
   );
   if (eligible.length === 0) return null;

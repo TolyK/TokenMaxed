@@ -38,6 +38,8 @@ export interface CorePort {
   summarize: (events: readonly LedgerEvent[]) => LedgerSummary;
   tokenStats: (events: readonly LedgerEvent[]) => TokenStats;
   routeDecide: (task: Task, ctx: RouteContext, policy: Policy) => RouteDecision;
+  /** The gate+policy-eligible lanes for a task (no availability/scoring) — the set worth probing. */
+  eligibleLanes: (task: Task, ctx: RouteContext, policy: Policy) => { lane: Lane }[];
   evaluate: (task: Task, lane: Lane, ctx: PolicyContext, policy: Policy) => PolicyDecision;
   /** Canonical task categories (core's TASK_CATEGORIES). */
   taskCategories: readonly TaskCategory[];
@@ -101,6 +103,14 @@ export interface ToolDeps {
    * free of core/node runtime imports; the server wires it to `runAndRecord`.
    */
   delegate: (request: DelegateRequest) => Promise<DelegateOutcome>;
+  /**
+   * Ids of the candidate lanes that can actually RUN now (provider CLI installed,
+   * local server reachable, BYOK key present). Injected so the pure tools layer
+   * stays free of host I/O. When present, router_preview routes with the same
+   * availability filter router_delegate uses, so /tokenmaxed:why never advertises
+   * a lane that isn't runnable. Absent ⇒ availability is not checked.
+   */
+  availableLaneIds?: (lanes: readonly Lane[]) => Promise<string[]>;
   /** Have the configured manager review the turn's working-tree diff (A-7). */
   review: () => Promise<ReviewOutcome>;
   /** Create/validate user config and report setup status (A-8). */
@@ -378,7 +388,7 @@ export function createTools(core: CorePort): ToolDef[] {
       },
     },
     handler: (deps, args) =>
-      guarded(() => {
+      guardedAsync(async () => {
         const category = optEnum(args, 'category', core.taskCategories);
         if (category === undefined) throw new ToolInputError('"category" is required.');
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
@@ -409,19 +419,36 @@ export function createTools(core: CorePort): ToolDef[] {
         // Apply the learned overlay (F-1) so /tokenmaxed:why reflects the same
         // effective capability router_delegate routes with. Undefined ⇒ declared.
         const observedCapability = deps.observedCapability();
+        // Same availability filter delegate routes with (when the host provides it),
+        // so /tokenmaxed:why never advertises a lane that can't actually run. Probe
+        // ONLY the gate+policy-eligible lanes — never a disabled/blocked/gated lane
+        // (no wasted I/O, and no network probe to a lane policy would reject).
+        let availableIds: string[] | undefined;
+        if (deps.availableLaneIds) {
+          const baseCtx: RouteContext = {
+            lanes,
+            gateReady,
+            readerEgress: deps.readerEgress,
+            policyContext,
+            ...(observedCapability ? { observedCapability } : {}),
+          };
+          const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
+          availableIds = await deps.availableLaneIds(eligible);
+        }
         const ctx: RouteContext = {
           lanes,
           gateReady,
           readerEgress: deps.readerEgress,
           policyContext,
           ...(observedCapability ? { observedCapability } : {}),
+          ...(availableIds ? { availableLaneIds: availableIds } : {}),
         };
 
         let decision: RouteDecision;
         try {
           decision = core.routeDecide({ category }, ctx, policy);
         } catch {
-          // No selectable lane (all gated/blocked) ⇒ the host would do it itself.
+          // No selectable lane (all gated/blocked/unavailable) ⇒ the host does it.
           return ok(
             `category "${category}": no eligible lane (gate_ready=${gateReady}) — would run on the host (native).`,
             { category, gateReady, policyContext, decision: null, native: true },

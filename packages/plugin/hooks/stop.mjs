@@ -7369,7 +7369,7 @@ var require_dist = __commonJS({
 import { randomUUID as randomUUID3 } from "node:crypto";
 import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { tmpdir as tmpdir2 } from "node:os";
-import { join as join3 } from "node:path";
+import { join as join4 } from "node:path";
 
 // ../mcp/src/host-review.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
@@ -8254,6 +8254,10 @@ function makeTrustedExecutor(deps = {}) {
   };
 }
 
+// ../mcp/src/availability.ts
+import { accessSync, constants, statSync } from "node:fs";
+import { join as join3 } from "node:path";
+
 // ../mcp/src/config.ts
 import { spawnSync as spawnSync2 } from "node:child_process";
 import { existsSync as existsSync2 } from "node:fs";
@@ -8285,6 +8289,54 @@ function makeCliSpawn(timeoutMs = DEFAULT_CLI_TIMEOUT_MS) {
     env: { ...process.env, TOKENMAXED_DISABLE: "1" },
     timeout: timeoutMs
   });
+}
+
+// ../mcp/src/availability.ts
+var DEFAULT_OLLAMA_BASE = "http://localhost:11434";
+var LOCAL_PROBE_TIMEOUT_MS = 700;
+function isExecutableFile(candidate) {
+  try {
+    if (!statSync(candidate).isFile()) return false;
+    accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function commandOnPath(command, path) {
+  if (!command) return false;
+  if (command.includes("/")) return isExecutableFile(command);
+  const dirs = (path ?? "").split(":").filter(Boolean);
+  return dirs.some((dir) => isExecutableFile(join3(dir, command)));
+}
+async function localReachable(base, fetchImpl) {
+  if (!fetchImpl) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LOCAL_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${base}/api/tags`, { method: "GET", signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function isLaneAvailable(lane, deps) {
+  if (lane.native) return true;
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
+  if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
+  return false;
+}
+async function availableLaneIds(lanes, deps) {
+  const results = await Promise.all(lanes.map(async (lane) => await isLaneAvailable(lane, deps) ? lane.id : null));
+  return results.filter((id) => id !== null);
+}
+function makeAvailabilityProbe(env) {
+  const resolveAuth = makeResolveAuth(env);
+  const fetchImpl = globalThis.fetch;
+  return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
 // ../mcp/src/reviewer.ts
@@ -8325,11 +8377,11 @@ function stopGateDecision(verdict, priorBlocks, maxAttempts) {
 }
 
 // ../mcp/src/host-review.ts
-function selectManagerLane(lanes, policy, gateReady) {
+function selectManagerLane(lanes, policy, gateReady, available = null) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
   return lanes.find(
-    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
   );
 }
 async function runHostTurnReview(turnId, deps) {
@@ -8337,7 +8389,8 @@ async function runHostTurnReview(turnId, deps) {
   if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
-  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady);
+  const available = new Set(await deps.availableLaneIds(lanes));
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady, available);
   if (!manager) {
     return {
       reviewed: false,
@@ -8383,6 +8436,7 @@ function makeHostReviewDeps(env) {
 [diff truncated for review]` : diff;
     },
     loadLanes: () => existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
     appendOutcome: (event) => {
@@ -8416,7 +8470,7 @@ function readCounter(file) {
 }
 function writeCounter(file, n) {
   try {
-    mkdirSync2(join3(file, ".."), { recursive: true });
+    mkdirSync2(join4(file, ".."), { recursive: true });
     writeFileSync2(file, String(n), "utf8");
     return true;
   } catch {
@@ -8433,7 +8487,7 @@ async function main() {
   } catch {
   }
   const sessionId = (typeof input.session_id === "string" ? input.session_id : "default").replace(/[^A-Za-z0-9_.-]/g, "_");
-  const counterFile = join3(tmpdir2(), "tokenmaxed-stop", sessionId);
+  const counterFile = join4(tmpdir2(), "tokenmaxed-stop", sessionId);
   const result = await reviewWithDeadline(makeHostReviewDeps(env));
   if (!result.reviewed || !result.verdict) {
     writeCounter(counterFile, 0);

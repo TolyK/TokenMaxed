@@ -70,6 +70,40 @@ test('prefers the cheaper cost basis when capability is tied', () => {
   assert.equal(d.laneId, 'a-local');
 });
 
+test('availability: excludes a configured-but-unavailable lane (the cost winner)', () => {
+  // Reproduces the reported bug: a free local lane wins on cost for a tied
+  // category — but with availability supplied and the local lane absent from it,
+  // the next capable available lane (the subscription CLI) wins instead.
+  const localDocs: Lane = { ...ollama, id: 'a-local', capability: { docs: 0.8 } };
+  const subDocs: Lane = { ...claude, id: 'z-sub', capability: { docs: 0.8 } };
+  const lanes = [subDocs, localDocs];
+  // Sanity: without availability, the local lane wins on cost.
+  assert.equal(routeDecide({ category: 'docs' }, { lanes }, noPolicy).laneId, 'a-local');
+  // With availability listing only the subscription lane, it wins.
+  const d = routeDecide({ category: 'docs' }, { lanes, availableLaneIds: ['z-sub'] }, noPolicy);
+  assert.equal(d.laneId, 'z-sub');
+});
+
+test('availability: an empty available set with no native lane leaves no candidate', () => {
+  assert.throws(
+    () => routeDecide({ category: 'docs' }, { lanes: [claude, ollama], availableLaneIds: [] }, noPolicy),
+    /no candidate lanes available/,
+  );
+});
+
+test('availability: the native lane is exempt (always runnable) even if not listed', () => {
+  const host: Lane = { ...claude, id: 'host', native: true, capability: { docs: 0.5 } };
+  // host is NOT in availableLaneIds, yet remains selectable as the only candidate.
+  const d = routeDecide({ category: 'docs' }, { lanes: [host, ollama], availableLaneIds: [] }, noPolicy);
+  assert.equal(d.laneId, 'host');
+});
+
+test('availability: absent set is a no-op (back-compat) — local cost winner still wins', () => {
+  const localDocs: Lane = { ...ollama, id: 'a-local', capability: { docs: 0.8 } };
+  const subDocs: Lane = { ...claude, id: 'z-sub', capability: { docs: 0.8 } };
+  assert.equal(routeDecide({ category: 'docs' }, { lanes: [subDocs, localDocs] }, noPolicy).laneId, 'a-local');
+});
+
 test('breaks an exact tie deterministically by lane id (ascending)', () => {
   const l1: Lane = { ...ollama, id: 'zzz', capability: { explain: 0.6 } };
   const l2: Lane = { ...ollama, id: 'aaa', capability: { explain: 0.6 } };

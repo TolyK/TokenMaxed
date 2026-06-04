@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 import { loadLaneConfig, loadPolicyConfig, makeGitleaksScanner } from '@tokenmaxed/core/node';
 
+import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile } from './config.ts';
 import { selectManagerLane } from './host-review.ts';
 import type { SetupReport } from './tools.ts';
@@ -41,9 +42,11 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
   const registry = loadLaneConfig(lanesPath);
   const policy = loadPolicyConfig(policyPath);
   // Report the manager EXACTLY as the review path would select it (gate + policy
-  // filtered), so setup never claims a usable manager that review then rejects.
+  // + availability filtered), so setup never claims a manager that isn't installed
+  // and would fail the moment review runs.
   const gateReady = env.TOKENMAXED_GATE_READY === 'true';
-  const manager = selectManagerLane(registry.lanes, policy, gateReady);
+  const available = new Set(await makeAvailabilityProbe(env)([...registry.lanes]));
+  const manager = selectManagerLane(registry.lanes, policy, gateReady, available);
   // Probe scanner health with a benign input (never sends anything). makeGitleaksScanner
   // fails CLOSED (available:true, hasSecret:true) when the probe itself errors, so a
   // benign input flagged as a "secret" means the scanner is broken — report unusable.

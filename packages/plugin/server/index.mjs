@@ -419,11 +419,11 @@ var require_codegen = __commonJS({
         const rhs = this.rhs === void 0 ? "" : ` = ${this.rhs}`;
         return `${varKind} ${this.name}${rhs};` + _n;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         if (!names[this.name.str])
           return;
         if (this.rhs)
-          this.rhs = optimizeExpr(this.rhs, names, constants);
+          this.rhs = optimizeExpr(this.rhs, names, constants2);
         return this;
       }
       get names() {
@@ -440,10 +440,10 @@ var require_codegen = __commonJS({
       render({ _n }) {
         return `${this.lhs} = ${this.rhs};` + _n;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         if (this.lhs instanceof code_1.Name && !names[this.lhs.str] && !this.sideEffects)
           return;
-        this.rhs = optimizeExpr(this.rhs, names, constants);
+        this.rhs = optimizeExpr(this.rhs, names, constants2);
         return this;
       }
       get names() {
@@ -504,8 +504,8 @@ var require_codegen = __commonJS({
       optimizeNodes() {
         return `${this.code}` ? this : void 0;
       }
-      optimizeNames(names, constants) {
-        this.code = optimizeExpr(this.code, names, constants);
+      optimizeNames(names, constants2) {
+        this.code = optimizeExpr(this.code, names, constants2);
         return this;
       }
       get names() {
@@ -534,12 +534,12 @@ var require_codegen = __commonJS({
         }
         return nodes.length > 0 ? this : void 0;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         const { nodes } = this;
         let i = nodes.length;
         while (i--) {
           const n = nodes[i];
-          if (n.optimizeNames(names, constants))
+          if (n.optimizeNames(names, constants2))
             continue;
           subtractNames(names, n.names);
           nodes.splice(i, 1);
@@ -592,12 +592,12 @@ var require_codegen = __commonJS({
           return void 0;
         return this;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         var _a3;
-        this.else = (_a3 = this.else) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants);
-        if (!(super.optimizeNames(names, constants) || this.else))
+        this.else = (_a3 = this.else) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants2);
+        if (!(super.optimizeNames(names, constants2) || this.else))
           return;
-        this.condition = optimizeExpr(this.condition, names, constants);
+        this.condition = optimizeExpr(this.condition, names, constants2);
         return this;
       }
       get names() {
@@ -620,10 +620,10 @@ var require_codegen = __commonJS({
       render(opts) {
         return `for(${this.iteration})` + super.render(opts);
       }
-      optimizeNames(names, constants) {
-        if (!super.optimizeNames(names, constants))
+      optimizeNames(names, constants2) {
+        if (!super.optimizeNames(names, constants2))
           return;
-        this.iteration = optimizeExpr(this.iteration, names, constants);
+        this.iteration = optimizeExpr(this.iteration, names, constants2);
         return this;
       }
       get names() {
@@ -659,10 +659,10 @@ var require_codegen = __commonJS({
       render(opts) {
         return `for(${this.varKind} ${this.name} ${this.loop} ${this.iterable})` + super.render(opts);
       }
-      optimizeNames(names, constants) {
-        if (!super.optimizeNames(names, constants))
+      optimizeNames(names, constants2) {
+        if (!super.optimizeNames(names, constants2))
           return;
-        this.iterable = optimizeExpr(this.iterable, names, constants);
+        this.iterable = optimizeExpr(this.iterable, names, constants2);
         return this;
       }
       get names() {
@@ -704,11 +704,11 @@ var require_codegen = __commonJS({
         (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNodes();
         return this;
       }
-      optimizeNames(names, constants) {
+      optimizeNames(names, constants2) {
         var _a3, _b;
-        super.optimizeNames(names, constants);
-        (_a3 = this.catch) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants);
-        (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNames(names, constants);
+        super.optimizeNames(names, constants2);
+        (_a3 = this.catch) === null || _a3 === void 0 ? void 0 : _a3.optimizeNames(names, constants2);
+        (_b = this.finally) === null || _b === void 0 ? void 0 : _b.optimizeNames(names, constants2);
         return this;
       }
       get names() {
@@ -1009,7 +1009,7 @@ var require_codegen = __commonJS({
     function addExprNames(names, from) {
       return from instanceof code_1._CodeOrName ? addNames(names, from.names) : names;
     }
-    function optimizeExpr(expr, names, constants) {
+    function optimizeExpr(expr, names, constants2) {
       if (expr instanceof code_1.Name)
         return replaceName(expr);
       if (!canOptimize(expr))
@@ -1024,14 +1024,14 @@ var require_codegen = __commonJS({
         return items;
       }, []));
       function replaceName(n) {
-        const c = constants[n.str];
+        const c = constants2[n.str];
         if (c === void 0 || names[n.str] !== 1)
           return n;
         delete names[n.str];
         return c;
       }
       function canOptimize(e) {
-        return e instanceof code_1._Code && e._items.some((c) => c instanceof code_1.Name && names[c.str] === 1 && constants[c.str] !== void 0);
+        return e instanceof code_1._Code && e._items.some((c) => c instanceof code_1.Name && names[c.str] === 1 && constants2[c.str] !== void 0);
       }
     }
     function subtractNames(names, from) {
@@ -23217,22 +23217,30 @@ function describe2(lane, best, task) {
   }
   return reason;
 }
-function routeDecide(task, ctx, policy) {
+function eligibleLanes(task, ctx, policy) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
   const gateReady = ctx.gateReady ?? false;
   const readerEgress = ctx.readerEgress ?? false;
-  const verdicts = /* @__PURE__ */ new Map();
-  const candidates = ctx.lanes.filter((lane) => {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) return false;
+  const out = [];
+  for (const lane of ctx.lanes) {
+    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) continue;
     const { verdict } = evaluate(task, lane, policyContext, policy);
-    if (!laneAllowedByVerdict(lane, verdict)) return false;
+    if (!laneAllowedByVerdict(lane, verdict)) continue;
+    out.push({ lane, verdict });
+  }
+  return out;
+}
+function routeDecide(task, ctx, policy) {
+  const available = ctx.availableLaneIds ? new Set(ctx.availableLaneIds) : null;
+  const verdicts = /* @__PURE__ */ new Map();
+  const candidates = eligibleLanes(task, ctx, policy).filter(({ lane }) => !(available && !lane.native && !available.has(lane.id))).map(({ lane, verdict }) => {
     verdicts.set(lane.id, verdict);
-    return true;
+    return lane;
   });
   if (candidates.length === 0) {
     throw new Error(
-      "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, or blocked/forced-trusted away by policy)."
+      "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, unavailable to run, or blocked/forced-trusted away by policy)."
     );
   }
   const scores = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability)).sort(compareScores);
@@ -23889,6 +23897,7 @@ var TRUST_RANK = {
 function canReassign(from, to, task, ctx, policy) {
   if (to.id === from.id) return false;
   if ((policy.disabledLaneIds ?? []).includes(to.id)) return false;
+  if (ctx.availableLaneIds && !to.native && !new Set(ctx.availableLaneIds).has(to.id)) return false;
   const fromRank = TRUST_RANK[from.trust_mode];
   const toRank = TRUST_RANK[to.trust_mode];
   if (fromRank === void 0 || toRank === void 0) return false;
@@ -24048,8 +24057,9 @@ function selectReviewManager(lanes, subject, category, ctx, policy) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const gateReady = ctx.gateReady ?? false;
   const policyContext = ctx.policyContext ?? {};
+  const available = ctx.availableLaneIds ? new Set(ctx.availableLaneIds) : null;
   const eligible = lanes.filter(
-    (m) => m.id !== subject.id && !m.native && isManagerEligible(m) && (m.costBasis === "subscription" || m.costBasis === "local") && declaredCapabilityFor(m, category) >= subjectCap && !disabled.has(m.id) && isSelectablePreGate(m, gateReady) && laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict)
+    (m) => m.id !== subject.id && !m.native && isManagerEligible(m) && (m.costBasis === "subscription" || m.costBasis === "local") && declaredCapabilityFor(m, category) >= subjectCap && !disabled.has(m.id) && isSelectablePreGate(m, gateReady) && (!available || available.has(m.id)) && laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict)
   );
   if (eligible.length === 0) return null;
   eligible.sort((a, b) => {
@@ -24658,6 +24668,10 @@ function laneToReaderDTO(lane) {
   return { id: lane.id, model: lane.model, endpoint: lane.endpoint, authHandle: lane.authHandle ?? "" };
 }
 
+// ../mcp/src/availability.ts
+import { accessSync, constants, statSync } from "node:fs";
+import { join as join3 } from "node:path";
+
 // ../mcp/src/config.ts
 import { spawnSync as spawnSync2 } from "node:child_process";
 import { existsSync as existsSync2 } from "node:fs";
@@ -24689,6 +24703,54 @@ function makeCliSpawn(timeoutMs = DEFAULT_CLI_TIMEOUT_MS) {
     env: { ...process.env, TOKENMAXED_DISABLE: "1" },
     timeout: timeoutMs
   });
+}
+
+// ../mcp/src/availability.ts
+var DEFAULT_OLLAMA_BASE = "http://localhost:11434";
+var LOCAL_PROBE_TIMEOUT_MS = 700;
+function isExecutableFile(candidate) {
+  try {
+    if (!statSync(candidate).isFile()) return false;
+    accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function commandOnPath(command, path) {
+  if (!command) return false;
+  if (command.includes("/")) return isExecutableFile(command);
+  const dirs = (path ?? "").split(":").filter(Boolean);
+  return dirs.some((dir) => isExecutableFile(join3(dir, command)));
+}
+async function localReachable(base, fetchImpl) {
+  if (!fetchImpl) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LOCAL_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${base}/api/tags`, { method: "GET", signal: controller.signal });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function isLaneAvailable(lane, deps) {
+  if (lane.native) return true;
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
+  if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
+  return false;
+}
+async function availableLaneIds(lanes, deps) {
+  const results = await Promise.all(lanes.map(async (lane) => await isLaneAvailable(lane, deps) ? lane.id : null));
+  return results.filter((id) => id !== null);
+}
+function makeAvailabilityProbe(env) {
+  const resolveAuth = makeResolveAuth(env);
+  const fetchImpl = globalThis.fetch;
+  return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
 // ../mcp/src/host-review.ts
@@ -24727,11 +24789,11 @@ function parseManagerVerdict(text) {
 }
 
 // ../mcp/src/host-review.ts
-function selectManagerLane(lanes, policy, gateReady) {
+function selectManagerLane(lanes, policy, gateReady, available = null) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
   return lanes.find(
-    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
   );
 }
 async function runHostTurnReview(turnId, deps) {
@@ -24739,7 +24801,8 @@ async function runHostTurnReview(turnId, deps) {
   if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
-  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady);
+  const available = new Set(await deps.availableLaneIds(lanes));
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady, available);
   if (!manager) {
     return {
       reviewed: false,
@@ -24785,6 +24848,7 @@ function makeHostReviewDeps(env) {
 [diff truncated for review]` : diff;
     },
     loadLanes: () => existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
     appendOutcome: (event) => {
@@ -24817,7 +24881,8 @@ async function runSetup(env) {
   const registry2 = loadLaneConfig(lanesPath);
   const policy = loadPolicyConfig(policyPath);
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
-  const manager = selectManagerLane(registry2.lanes, policy, gateReady);
+  const available = new Set(await makeAvailabilityProbe(env)([...registry2.lanes]));
+  const manager = selectManagerLane(registry2.lanes, policy, gateReady, available);
   const scan = await makeGitleaksScanner()([""]);
   const gitleaksAvailable = scan.available && !scan.hasSecret;
   return {
@@ -24991,7 +25056,7 @@ function createTools(core) {
         }
       }
     },
-    handler: (deps, args) => guarded(() => {
+    handler: (deps, args) => guardedAsync(async () => {
       const category = optEnum(args, "category", core.taskCategories);
       if (category === void 0) throw new ToolInputError('"category" is required.');
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
@@ -25010,12 +25075,25 @@ function createTools(core) {
       const lanes = deps.candidateLanes(category);
       const policy = deps.loadPolicy();
       const observedCapability = deps.observedCapability();
+      let availableIds;
+      if (deps.availableLaneIds) {
+        const baseCtx = {
+          lanes,
+          gateReady,
+          readerEgress: deps.readerEgress,
+          policyContext,
+          ...observedCapability ? { observedCapability } : {}
+        };
+        const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
+        availableIds = await deps.availableLaneIds(eligible);
+      }
       const ctx = {
         lanes,
         gateReady,
         readerEgress: deps.readerEgress,
         policyContext,
-        ...observedCapability ? { observedCapability } : {}
+        ...observedCapability ? { observedCapability } : {},
+        ...availableIds ? { availableLaneIds: availableIds } : {}
       };
       let decision;
       try {
@@ -25290,7 +25368,7 @@ function fileToggleStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, evaluate, taskCategories: TASK_CATEGORIES };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
   const lanesPathExplicit = env.TOKENMAXED_LANES !== void 0;
@@ -25314,6 +25392,7 @@ function makeServerDeps(env = process.env) {
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
   const resolveAuth = makeResolveAuth(env);
+  const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
     if (!existsSync5(lanesPath)) {
@@ -25339,13 +25418,16 @@ function makeServerDeps(env = process.env) {
     const ledger = new JsonlLedger(ledgerPath);
     const lanes = registry2.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
     const observedCapability = buildObserved();
-    const ctx = {
+    const baseCtx = {
       lanes,
       gateReady,
       readerEgress,
       policyContext: request.policyContext ?? {},
       ...observedCapability ? { observedCapability } : {}
     };
+    const eligible = eligibleLanes({ category: request.category }, baseCtx, policy).map((e) => e.lane);
+    const available = await probeAvailable(eligible);
+    const ctx = { ...baseCtx, availableLaneIds: available };
     const runDeps = {
       executeTrusted: makeTrustedExecutor({
         cli: makeCliExecutor(makeCliSpawn()),
@@ -25411,6 +25493,9 @@ function makeServerDeps(env = process.env) {
       const c = usableCandidates(category);
       return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
     },
+    // Same availability probe delegate routes with, so /tokenmaxed:why never
+    // advertises a lane that can't run (e.g. a free local lane whose server is down).
+    availableLaneIds: probeAvailable,
     // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
     // /tokenmaxed:why reflects the effective capability, not the stale prior.
     observedCapability: buildObserved,

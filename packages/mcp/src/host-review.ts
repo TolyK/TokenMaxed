@@ -24,6 +24,7 @@ import {
   makeTrustedExecutor,
 } from '@tokenmaxed/core/node';
 
+import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { buildReviewPrompt, parseManagerVerdict } from './reviewer.ts';
 
@@ -43,6 +44,8 @@ export interface HostReviewDeps {
   readDiff: () => string;
   /** Configured lanes, or null when no config file exists yet. */
   loadLanes: () => Lane[] | null;
+  /** Ids of lanes that can actually run now, so an unavailable manager isn't picked. */
+  availableLaneIds: (lanes: readonly Lane[]) => Promise<string[]>;
   /** The active policy (fail-closed loader); gates which manager lanes are allowed. */
   loadPolicy: () => Policy;
   /** Run the manager lane over a prompt, returning its raw text. */
@@ -63,7 +66,12 @@ export interface HostReviewDeps {
  *  - not policy-disabled / blocked. The diff IS the user's real code, so egress is
  *    evaluated as the most sensitive context (private + sensitive).
  */
-export function selectManagerLane(lanes: readonly Lane[], policy: Policy, gateReady: boolean): Lane | undefined {
+export function selectManagerLane(
+  lanes: readonly Lane[],
+  policy: Policy,
+  gateReady: boolean,
+  available: ReadonlySet<string> | null = null,
+): Lane | undefined {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const reviewContext = { repo_class: 'private' as const, sensitivity: 'sensitive' as const };
   return lanes.find(
@@ -72,6 +80,7 @@ export function selectManagerLane(lanes: readonly Lane[], policy: Policy, gateRe
       !l.native &&
       isSelectablePreGate(l, gateReady) &&
       !disabled.has(l.id) &&
+      (!available || available.has(l.id)) &&
       laneAllowedByVerdict(l, evaluate({ category: 'refactor' }, l, reviewContext, policy).verdict),
   );
 }
@@ -84,7 +93,10 @@ export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): P
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: 'no lanes configured yet — run /tokenmaxed:setup' };
 
-  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady);
+  // Skip a manager that can't run now (e.g. Codex not installed) so review falls
+  // through to an available manager instead of failing to spawn.
+  const available = new Set(await deps.availableLaneIds(lanes));
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady, available);
   if (!manager) {
     return {
       reviewed: false,
@@ -141,6 +153,7 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
       return diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}\n\n[diff truncated for review]` : diff;
     },
     loadLanes: () => (existsSync(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null),
+    availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
     appendOutcome: (event) => {

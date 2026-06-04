@@ -265,6 +265,35 @@ function describe(lane: Lane, best: LaneScore, task: Task): string {
   return reason;
 }
 
+/** A lane that passed the structural + policy eligibility filter, with its verdict. */
+export interface EligibleLane {
+  lane: Lane;
+  verdict: PolicyVerdict;
+}
+
+/**
+ * The lanes that pass the structural pre-gate guard AND the policy verdict for
+ * this task — the set routeDecide scores over, WITHOUT the availability filter or
+ * scoring. Exposed so a host can probe availability for exactly these lanes (and
+ * not waste an I/O probe on a lane that's disabled / gated / policy-blocked and
+ * would never be routed to anyway). routeDecide layers availability + scoring on
+ * top of this, so the two can never disagree on what's eligible.
+ */
+export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): EligibleLane[] {
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const policyContext = ctx.policyContext ?? {};
+  const gateReady = ctx.gateReady ?? false;
+  const readerEgress = ctx.readerEgress ?? false;
+  const out: EligibleLane[] = [];
+  for (const lane of ctx.lanes) {
+    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) continue;
+    const { verdict } = evaluate(task, lane, policyContext, policy);
+    if (!laneAllowedByVerdict(lane, verdict)) continue;
+    out.push({ lane, verdict });
+  }
+  return out;
+}
+
 /**
  * Decide which lane should handle a task. Pure: depends only on its arguments.
  *
@@ -275,26 +304,25 @@ export function routeDecide(
   ctx: RouteContext,
   policy: Policy,
 ): RouteDecision {
-  const disabled = new Set(policy.disabledLaneIds ?? []);
-  const policyContext = ctx.policyContext ?? {};
-  const gateReady = ctx.gateReady ?? false;
-  const readerEgress = ctx.readerEgress ?? false;
+  // Availability filter (optional): when the host supplies the runnable-lane set,
+  // a non-native lane that isn't in it (CLI not installed, local server down, key
+  // missing) is excluded so it can never win on cost. Absent ⇒ not checked.
+  const available = ctx.availableLaneIds ? new Set(ctx.availableLaneIds) : null;
 
-  // Filter candidates by the structural pre-gate guard AND the policy verdict,
-  // before scoring. Remember each survivor's verdict for the decision.
+  // Start from the gate+policy-eligible lanes, then drop unavailable ones (native
+  // is always runnable and exempt). Remember each survivor's verdict.
   const verdicts = new Map<string, PolicyVerdict>();
-  const candidates = ctx.lanes.filter((lane) => {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) return false;
-    const { verdict } = evaluate(task, lane, policyContext, policy);
-    if (!laneAllowedByVerdict(lane, verdict)) return false;
-    verdicts.set(lane.id, verdict);
-    return true;
-  });
+  const candidates = eligibleLanes(task, ctx, policy)
+    .filter(({ lane }) => !(available && !lane.native && !available.has(lane.id)))
+    .map(({ lane, verdict }) => {
+      verdicts.set(lane.id, verdict);
+      return lane;
+    });
 
   if (candidates.length === 0) {
     throw new Error(
       'routeDecide: no candidate lanes available (lanes empty, disabled, excluded ' +
-        'before the gate, or blocked/forced-trusted away by policy).',
+        'before the gate, unavailable to run, or blocked/forced-trusted away by policy).',
     );
   }
 

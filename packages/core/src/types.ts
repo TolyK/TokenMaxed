@@ -208,6 +208,18 @@ export interface RouteContext {
   readerEgress?: boolean;
   /** Task-level context the policy gate evaluates against (defaults to unknown/sensitive). */
   policyContext?: PolicyContext;
+  /**
+   * Optional ids of lanes that can actually RUN right now — e.g. the provider CLI
+   * is installed, the local model server is reachable, the BYOK key is present.
+   * When provided, a non-native lane is a routing candidate ONLY if its id is
+   * listed, so a configured-but-unavailable lane (Ollama down, CLI not installed,
+   * key missing) is never selected. The native host lane is always available and
+   * is exempt from this filter. Absent ⇒ availability is not checked (every
+   * configured lane is treated as available), identical to before this feature.
+   * Availability is determined by the host adapter (it does the I/O); the core
+   * stays pure and only reads the resulting id list.
+   */
+  availableLaneIds?: readonly string[];
 }
 
 /**

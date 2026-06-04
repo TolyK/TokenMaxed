@@ -61,6 +61,17 @@ test('canReassign refuses an administratively disabled lane', () => {
   assert.equal(reassignmentTarget(worker, [fullA, fullB], task, safeCtx, policy)?.id, 'full-b');
 });
 
+test('canReassign refuses a lane that is not currently available', () => {
+  // availableLaneIds present and full-a absent ⇒ never a reassignment/escalation target.
+  const ctx: RouteContext = { ...safeCtx, availableLaneIds: ['full-b'] };
+  assert.equal(canReassign(worker, fullA, task, ctx, noPolicy), false); // unavailable ⇒ excluded
+  assert.equal(canReassign(worker, fullB, task, ctx, noPolicy), true); // available ⇒ allowed
+  // reassignmentTarget then skips the unavailable lane and picks the available one.
+  assert.equal(reassignmentTarget(worker, [fullA, fullB], task, ctx, noPolicy)?.id, 'full-b');
+  // Absent availableLaneIds ⇒ availability not checked (back-compat).
+  assert.equal(canReassign(worker, fullA, task, safeCtx, noPolicy), true);
+});
+
 test('same-tier reassignment is allowed (escalate to a stronger trusted model)', () => {
   // full → full is trust-safe and the primary use case; never blocked.
   assert.equal(canReassign(fullA, fullB, task, safeCtx, noPolicy), true);

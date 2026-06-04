@@ -39,6 +39,9 @@ export function shouldReassign(verdict: ReviewVerdict): boolean {
 export function canReassign(from: Lane, to: Lane, task: Task, ctx: RouteContext, policy: Policy): boolean {
   if (to.id === from.id) return false;
   if ((policy.disabledLaneIds ?? []).includes(to.id)) return false; // admin-disabled never selectable
+  // Never escalate/reassign to a lane that can't run now (same availability filter
+  // as routing; native is always runnable). Absent set ⇒ availability not checked.
+  if (ctx.availableLaneIds && !to.native && !new Set(ctx.availableLaneIds).has(to.id)) return false;
   // Fail CLOSED on an unrankable trust mode (e.g. a deprecated `monitored` reaching
   // a direct JS caller without config normalization): `undefined` comparisons are
   // always false, which would silently bypass the down-ladder guard.

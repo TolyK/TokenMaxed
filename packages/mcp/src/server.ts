@@ -35,7 +35,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, evaluate, filterEventsSince, isManagerEligible, outcomeCapability, priceForModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, isManagerEligible, outcomeCapability, priceForModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -51,6 +51,7 @@ import {
   makeTrustedExecutor,
 } from '@tokenmaxed/core/node';
 
+import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { makeHostReviewDeps, runHostTurnReview } from './host-review.ts';
 import { runSetup } from './setup.ts';
@@ -132,7 +133,7 @@ function fileToggleStore(statePath: string): ToggleStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, evaluate, taskCategories: TASK_CATEGORIES };
+const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
 
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
@@ -190,6 +191,12 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // arbitrary secret env var; unknown ⇒ '' ⇒ the executor fails closed.
   const resolveAuth = makeResolveAuth(env);
 
+  // Availability probe: which candidate lanes can actually run now (CLI installed,
+  // local server reachable, BYOK key present). Shared by preview and delegate (and
+  // host-review/setup via the same helper) so they all agree and never pick an
+  // unavailable lane.
+  const probeAvailable = makeAvailabilityProbe(env);
+
   // Fail-closed policy loader (shared with the review path via config.ts): an
   // explicitly configured but missing policy throws; the default path missing
   // (pre-setup) falls back to {} (core deny-by-default + closed gate still apply).
@@ -236,13 +243,21 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // core selectors read ctx.observedCapability; runWithEscalation preserves it
     // through its effective-context spread, so escalation/reassign also benefit.
     const observedCapability = buildObserved();
-    const ctx = {
+    // Exclude lanes that can't run now (e.g. Ollama down) so routing never picks an
+    // unavailable lane on cost; threads through runTask/runWithEscalation to
+    // routeDecide + canReassign. Empty ⇒ no candidate ⇒ runTask degrades to native.
+    // Probe ONLY the gate+policy-eligible lanes (same set routeDecide scores), so a
+    // disabled/blocked/gated lane is never probed (no wasted or sensitive I/O).
+    const baseCtx = {
       lanes,
       gateReady,
       readerEgress,
       policyContext: request.policyContext ?? {},
       ...(observedCapability ? { observedCapability } : {}),
     };
+    const eligible = eligibleLanes({ category: request.category }, baseCtx, policy).map((e) => e.lane);
+    const available = await probeAvailable(eligible);
+    const ctx = { ...baseCtx, availableLaneIds: available };
 
     // Execute, THEN record as a separate step: a recording failure (corrupt /
     // unwritable / unappendable ledger) must NEVER discard an already-paid-for
@@ -329,6 +344,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       const c = usableCandidates(category);
       return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
     },
+    // Same availability probe delegate routes with, so /tokenmaxed:why never
+    // advertises a lane that can't run (e.g. a free local lane whose server is down).
+    availableLaneIds: probeAvailable,
     // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
     // /tokenmaxed:why reflects the effective capability, not the stale prior.
     observedCapability: buildObserved,
