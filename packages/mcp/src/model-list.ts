@@ -6,8 +6,10 @@
  *   - URL built with the URL API (never string concat),
  *   - short abort timeout, redirects rejected, response strictly parsed + capped,
  *   - sends only the API key (Authorization) — NO prompt/repo/task content.
- * The caller decides WHEN to run it (explicit setup/status, or @latest routing) and
- * gates it to enabled, gate-open, keyed api lanes. Pure over an injected fetch.
+ * The caller decides WHEN to run it — only the explicit, networked /tokenmaxed:status
+ * (NOT the routing path: @latest resolves purely from the price table, no egress, and
+ * NOT the session-start summary, which is cache-only). It gates to enabled, keyed api
+ * lanes. Pure over an injected fetch.
  */
 
 import type { Lane } from '@tokenmaxed/core';

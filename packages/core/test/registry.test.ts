@@ -338,6 +338,10 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   for (const id of ['ollama-llama3', 'gemini-cli', 'kimi-cli', 'glm-api', 'minimax-api']) {
     assert.equal(reg.byId(id)?.trust_mode, 'blocked', `${id} must ship blocked`);
   }
+  // MODEL-FRESHNESS: api vendor templates default to <family>@latest so enabling one
+  // tracks the newest priced model rather than silently pinning a stale id.
+  assert.equal(reg.byId('minimax-api')?.model, 'minimax@latest');
+  assert.equal(reg.byId('glm-api')?.model, 'glm@latest');
 });
 
 test('loadLaneConfig gives a clear error for a missing file', () => {

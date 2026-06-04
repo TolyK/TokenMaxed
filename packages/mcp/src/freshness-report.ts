@@ -35,9 +35,10 @@ export interface FreshnessDeps {
 }
 
 /**
- * Assess staleness for each lane with a concrete, family-tagged pinned model. A
- * `<family>@latest` alias is skipped here (it tracks latest by definition — the
- * resolver handles it). Returns one warning per stale lane.
+ * Assess staleness for each eligible api lane. A concrete pin is compared at its id;
+ * a `<family>@latest` alias is compared at the model it RESOLVES to (newest priced),
+ * so a newer-but-unpriced vendor model still raises a pricing-gap warning. Returns one
+ * warning per stale lane.
  *   - `refresh:true`  ⇒ a live `/models` query (and cache write) per lane.
  *   - `refresh:false` ⇒ STRICTLY cache-only — never makes a network call (this is
  *     the session-start/summary path; passive egress is not allowed there).
@@ -53,7 +54,8 @@ export async function reportFreshness(
   for (const lane of lanes) {
     if (lane.kind !== 'api' || !lane.endpoint) continue;
     const spec = parseModelAlias(lane.model);
-    // For a concrete pin, compare its id against the family (needs model_family).
+    // For a concrete pin, compare its id against the family (from model_family OR the
+    // price table's metadata for a priced id — no prefix guessing).
     // For a `<family>@latest` alias, compare the model it RESOLVES to (newest priced)
     // so we still surface a newer-but-unpriced model (the pricing-gap that closes the
     // loop) — @latest is "latest TokenMaxed can PRICE", not necessarily the vendor's.
@@ -65,9 +67,14 @@ export async function reportFreshness(
       pinned = resolved;
       family = spec.family;
     } else {
-      if (!lane.model_family) continue; // no explicit family ⇒ we don't guess
+      // Concrete pin: prefer the lane's explicit model_family; otherwise derive the
+      // family from the price table's metadata for this id (still explicit — never
+      // guessed from the string). So a PRICED pin (e.g. minimax-m2) is checked with
+      // no extra config; an unpriced/unknown-family pin is skipped (can't judge).
+      const fam = lane.model_family ?? deps.table.models[spec.id]?.family;
+      if (!fam) continue;
       pinned = spec.id;
-      family = lane.model_family;
+      family = fam;
     }
 
     let models = getEntry(cache, lane.endpoint)?.models ?? [];

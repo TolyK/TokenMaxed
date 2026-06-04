@@ -97,9 +97,10 @@ export interface Lane {
   model: string;
   /**
    * Optional EXPLICIT model family for staleness checks on a pinned `model` (e.g.
-   * "minimax"). Required to flag staleness on a concrete id (family is never guessed
-   * from the id by prefix). For a `<family>@latest` alias the family is the alias
-   * stem, so this is not needed.
+   * "minimax"). The family is never guessed from the id by prefix: it comes from this
+   * field, or — for a model that's PRICED — from the price table's `family` metadata,
+   * so a priced pin is checked without this field. Set it to enable staleness on an
+   * UNPRICED concrete pin. For a `<family>@latest` alias the family is the alias stem.
    */
   model_family?: string;
   /** What context the lane may receive (see {@link TrustMode}). */

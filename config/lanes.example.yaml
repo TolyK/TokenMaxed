@@ -181,7 +181,7 @@ lanes:
 
   - id: glm-api                 # Zhipu GLM via BYOK API. Can be worker / reader / full.
     kind: api
-    model: glm-5.1
+    model: glm@latest           # tracks the newest PRICED glm model (vs a stale pin)
     trust_mode: blocked         # → worker (no repo) or reader (repo-read; see above) or full
     # repo_read_attestation: true   # uncomment + set trust_mode: reader to allow repo-read egress
     costBasis: metered
@@ -193,7 +193,11 @@ lanes:
 
   - id: minimax-api             # MiniMax via BYOK API. Can be worker / reader / full.
     kind: api
-    model: minimax-m2
+    model: minimax@latest       # tracks the newest PRICED minimax model (vs a stale pin
+                                #   like minimax-m2). To stay on a specific version, pin a
+                                #   concrete id: a PRICED pin is still staleness-checked
+                                #   automatically (family from the price table); for an
+                                #   unpriced pin add `model_family: minimax`.
     trust_mode: blocked         # → worker (no repo) or reader (repo-read; see above) or full
     costBasis: metered
     provenance: minimax

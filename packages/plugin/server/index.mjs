@@ -24954,9 +24954,10 @@ async function reportFreshness(lanes, deps, opts) {
       pinned = resolved;
       family = spec.family;
     } else {
-      if (!lane.model_family) continue;
+      const fam = lane.model_family ?? deps.table.models[spec.id]?.family;
+      if (!fam) continue;
       pinned = spec.id;
-      family = lane.model_family;
+      family = fam;
     }
     let models = getEntry(cache, lane.endpoint)?.models ?? [];
     if (opts.refresh) {

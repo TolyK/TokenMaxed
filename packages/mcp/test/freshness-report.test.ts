@@ -48,6 +48,20 @@ test('warns on a stale pinned model and writes the live list to the cache', asyn
   assert.ok(getEntry((d as { _peek: () => FreshnessCache })._peek(), lane().endpoint!)); // cached
 });
 
+test('a concrete pin with NO model_family is still checked via the price-table family', async () => {
+  // minimax-m2 is priced with family "minimax" in the table ⇒ staleness works even
+  // though the lane omits model_family (no guessing — the family comes from the table).
+  const warnings = await reportFreshness([lane({ model: 'minimax-m2', model_family: undefined })], deps(), { refresh: true });
+  assert.deepEqual(warnings, [{ laneId: 'minimax-api', family: 'minimax', pinned: 'minimax-m2', newest: 'minimax-m3', newestPriced: true }]);
+});
+
+test('a concrete pin that is unpriced AND has no model_family is skipped (cannot judge)', async () => {
+  let fetched = 0;
+  const warnings = await reportFreshness([lane({ model: 'mystery-1', model_family: undefined })], deps({ fetchList: async () => { fetched++; return { status: 'ok', models: [] }; } }), { refresh: true });
+  assert.deepEqual(warnings, []);
+  assert.equal(fetched, 0); // no family known ⇒ skipped before any egress
+});
+
 test('no warning when the pinned model is already newest', async () => {
   const warnings = await reportFreshness([lane({ model: 'minimax-m3' })], deps(), { refresh: true });
   assert.deepEqual(warnings, []);
@@ -56,7 +70,7 @@ test('no warning when the pinned model is already newest', async () => {
 test('skips non-api lanes and lanes with no model_family (no egress)', async () => {
   const lanes = [
     lane({ id: 'l2', kind: 'cli', endpoint: undefined, command: 'x' }), // not api
-    lane({ id: 'l3', model_family: undefined }), // concrete pin, no explicit family
+    lane({ id: 'l3', model: 'mystery-x', model_family: undefined }), // unpriced pin, no family ⇒ unknown
   ];
   let fetched = 0;
   const warnings = await reportFreshness(lanes, deps({ fetchList: async () => { fetched++; return { status: 'ok-empty' }; } }), { refresh: true });

@@ -269,6 +269,31 @@ per-launch if you'd rather opt into the gate explicitly each time.)
   - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
     regardless of the flags above.
 
+### Model freshness (never silently run a stale model)
+
+A lane's `model` is a pinned string, so it can drift stale as a vendor's family
+advances (e.g. `minimax-m2` while the family reaches `minimax-m3`). TokenMaxed makes
+that visible and gives you the choice:
+
+- **Track the latest** — set `model: <family>@latest` on an **api** lane (e.g.
+  `minimax@latest`). It resolves to the **newest model TokenMaxed can price** in that
+  family, from the price table. Resolution is pure and adds **no network call** on the
+  routing path; the shipped api vendor templates default to `@latest`.
+- **Pin deliberately** — keep a concrete id (e.g. `minimax-m2`) to stay on a specific
+  version; your choice is respected, never overridden. A pinned model that's **priced**
+  in the table is still checked for staleness automatically (its family comes from the
+  table metadata); for an unpriced or unknown-family pin, add `model_family: <family>`
+  to the lane to enable the check.
+- **Staleness is shown** — `/tokenmaxed:status` makes a one-time provider `/models`
+  call (sends only the API key — no repo/task content), caches the result, and **warns**
+  when a newer same-family model exists. The session-start summary then shows that
+  warning from **cache only** (no per-launch egress). If the newer model isn't in your
+  price table yet, the warning says so (a "pricing gap" — add its price to route it).
+- **Price-table metadata** — `config/prices.seed.json` (schema_version 2) carries an
+  optional `family` + `released` per model so `@latest` and staleness can order a
+  family newest-first. CLI lanes (Codex/Gemini/Kimi) pin a concrete model the provider
+  runtime selects — there's no model endpoint to auto-verify, so `@latest` is api-only.
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
