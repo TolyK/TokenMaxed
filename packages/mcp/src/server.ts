@@ -170,6 +170,21 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // AND an API reader executor AND the safety gate is ready. Never under the
   // kill-switch. This is what authorizes sending repo-read code to a reader vendor.
   const readerEgress = env.TOKENMAXED_READER_EGRESS === 'true' && !globallyDisabled;
+  // MODEL-TIERS: opt-in tiered routing (start cheap, step up). Off ⇒ default maximize.
+  const tieredStrategy: 'maximize' | 'tiered' =
+    env.TOKENMAXED_TIERED === 'true' && !globallyDisabled ? 'tiered' : 'maximize';
+  const parsedFloor = Number.parseFloat(env.TOKENMAXED_TIER_FLOOR ?? '');
+  const tierFloor = Number.isFinite(parsedFloor) ? parsedFloor : undefined; // undefined ⇒ core default
+  // Per-lane cost signal for tiered ranking, from the price table (input+output $/1M of
+  // the lane's RESOLVED model); a lane with no price falls back to its costBasis penalty.
+  const laneCostMap = (lanes: readonly Lane[], table: PriceTable): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const l of lanes) {
+      const p = table.models[l.model];
+      if (p) out[l.id] = p.inputPer1M + p.outputPer1M;
+    }
+    return out;
+  };
   // Shared overlay builder so router_delegate and router_preview apply the SAME
   // learned adjustment (no /why-vs-run divergence). Built from the ledger + clock
   // the adapter owns; undefined when learning is off. Lazy per call (cheap: local
@@ -272,6 +287,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       readerEgress,
       policyContext: request.policyContext ?? {},
       ...(observedCapability ? { observedCapability } : {}),
+      // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
+      ...(tieredStrategy === 'tiered'
+        ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(lanes, priceTable) }
+        : {}),
     };
     const eligible = eligibleLanes({ category: request.category }, baseCtx, policy).map((e) => e.lane);
     const available = await probeAvailable(eligible);
@@ -376,6 +395,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // F-2: same reader-egress posture delegate routes with (so /why shows reader
     // lanes only when they'd actually be selectable).
     readerEgress,
+    // MODEL-TIERS: same tiered posture + cost signal delegate routes with, so
+    // /tokenmaxed:why reflects the tiered pick (cheapest clearing the floor).
+    tieredStrategy,
+    ...(tierFloor !== undefined ? { tierFloor } : {}),
+    laneCost: (lanes: readonly Lane[]) => laneCostMap(lanes, loadPriceTable(pricesPath)),
     // TOKENMAXED_DISABLE forces routing off (kill-switch + recursion guard),
     // overriding the per-project toggle.
     getEnabled: () => (globallyDisabled ? false : readEnabled(store, projectKey)),

@@ -25478,7 +25478,9 @@ async function runSetup(env) {
     // F-1 learned capability; also disabled by the global kill-switch.
     learnCapability: env.TOKENMAXED_LEARN_CAPABILITY === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // F-2 reader egress; also disabled by the global kill-switch.
-    readerEgress: env.TOKENMAXED_READER_EGRESS === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true")
+    readerEgress: env.TOKENMAXED_READER_EGRESS === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
+    // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
+    tiered: env.TOKENMAXED_TIERED === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true")
   };
 }
 
@@ -25674,13 +25676,19 @@ function createTools(core) {
         const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
       }
+      const tieredCtx = deps.tieredStrategy === "tiered" ? {
+        strategy: "tiered",
+        ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {},
+        ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}
+      } : {};
       const ctx = {
         lanes,
         gateReady,
         readerEgress: deps.readerEgress,
         policyContext,
         ...observedCapability ? { observedCapability } : {},
-        ...availableIds ? { availableLaneIds: availableIds } : {}
+        ...availableIds ? { availableLaneIds: availableIds } : {},
+        ...tieredCtx
       };
       let decision;
       try {
@@ -25816,6 +25824,7 @@ ${r.notes}` : "";
         `  quality escalation: ${r.escalate ? "on" : "off"} (enable with TOKENMAXED_ESCALATE=true \u2014 offloads a failed cheap result up to a stronger lane)`,
         `  learned capability: ${r.learnCapability ? "on" : "off"} (enable with TOKENMAXED_LEARN_CAPABILITY=true \u2014 review outcomes adjust routing over time)`,
         `  reader egress: ${r.readerEgress ? "on" : "off"} (enable with TOKENMAXED_READER_EGRESS=true \u2014 lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
+        `  tiered routing: ${r.tiered ? "on" : "off"} (enable with TOKENMAXED_TIERED=true \u2014 start on the cheapest lane clearing the capability floor, step up on review failure)`,
         "",
         `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
       ];
@@ -25952,6 +25961,17 @@ function makeServerDeps(env = process.env) {
   const escalateEnabled = env.TOKENMAXED_ESCALATE === "true" && !globallyDisabled;
   const learnEnabled = env.TOKENMAXED_LEARN_CAPABILITY === "true" && !globallyDisabled;
   const readerEgress = env.TOKENMAXED_READER_EGRESS === "true" && !globallyDisabled;
+  const tieredStrategy = env.TOKENMAXED_TIERED === "true" && !globallyDisabled ? "tiered" : "maximize";
+  const parsedFloor = Number.parseFloat(env.TOKENMAXED_TIER_FLOOR ?? "");
+  const tierFloor = Number.isFinite(parsedFloor) ? parsedFloor : void 0;
+  const laneCostMap = (lanes, table) => {
+    const out = {};
+    for (const l of lanes) {
+      const p = table.models[l.model];
+      if (p) out[l.id] = p.inputPer1M + p.outputPer1M;
+    }
+    return out;
+  };
   const buildObserved = () => {
     if (!learnEnabled) return void 0;
     try {
@@ -25995,7 +26015,9 @@ function makeServerDeps(env = process.env) {
       gateReady,
       readerEgress,
       policyContext: request.policyContext ?? {},
-      ...observedCapability ? { observedCapability } : {}
+      ...observedCapability ? { observedCapability } : {},
+      // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
+      ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(lanes, priceTable) } : {}
     };
     const eligible = eligibleLanes({ category: request.category }, baseCtx, policy).map((e) => e.lane);
     const available = await probeAvailable(eligible);
@@ -26079,6 +26101,11 @@ function makeServerDeps(env = process.env) {
     // F-2: same reader-egress posture delegate routes with (so /why shows reader
     // lanes only when they'd actually be selectable).
     readerEgress,
+    // MODEL-TIERS: same tiered posture + cost signal delegate routes with, so
+    // /tokenmaxed:why reflects the tiered pick (cheapest clearing the floor).
+    tieredStrategy,
+    ...tierFloor !== void 0 ? { tierFloor } : {},
+    laneCost: (lanes) => laneCostMap(lanes, loadPriceTable(pricesPath)),
     // TOKENMAXED_DISABLE forces routing off (kill-switch + recursion guard),
     // overriding the per-project toggle.
     getEnabled: () => globallyDisabled ? false : readEnabled(store, projectKey),

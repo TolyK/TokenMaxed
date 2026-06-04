@@ -266,6 +266,17 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     constraint: **CLI** lanes can only be `full` (or `blocked`); `worker`/`reader`
     are **API/BYOK-only** (the certified executors are HTTP). So a CLI vendor is
     full-or-nothing, while an API vendor can be `worker`/`reader`/`full`.
+  - **Tiered routing (start cheap, step up)** — enable with `TOKENMAXED_TIERED=true`.
+    Instead of maximizing capability, routing picks the **cheapest lane whose
+    *effective* capability clears a floor** (`TOKENMAXED_TIER_FLOOR`, default 0.6;
+    per-category overridable), so within a family (Haiku → Sonnet → Opus; minimax
+    small → large) it **starts on the smallest model that's good enough** and **steps
+    up** to a stronger same-family lane on a review failure (the escalation gate). Ties
+    among floor-clearers break by cap-health, then real price (from the price table,
+    so two subscription tiers are still distinguishable), then the lowest-capable lane
+    that clears. A `capability: 0` lane is never selected; if nothing clears the floor,
+    routing falls back to maximize so it never fails. `/tokenmaxed:why` shows the
+    tiered pick. Family grouping uses each lane's `model_family`.
   - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
     regardless of the flags above.
 

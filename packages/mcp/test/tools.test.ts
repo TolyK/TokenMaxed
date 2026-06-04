@@ -103,6 +103,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       escalate: false,
       learnCapability: false,
       readerEgress: false,
+      tiered: false,
     }),
     now: () => FIXED_NOW,
     ...over,
@@ -485,6 +486,7 @@ test('setup reports the manager + open gate when present', async () => {
         escalate: true,
         learnCapability: true,
         readerEgress: true,
+        tiered: true,
       }),
     }),
   );
@@ -549,6 +551,19 @@ test('preview applies the availability filter (skips a lane that cannot run)', a
   );
   assert.equal((withProbe.structuredContent!.decision as { laneId: string }).laneId, 'sub');
   assert.deepEqual([...(probed ?? [])].map((l) => l.id).sort(), ['ollama', 'sub']);
+});
+
+test('preview reflects tiered routing (cheapest floor-clearer) when the server is tiered', async () => {
+  const cheap = lane({ id: 'cheap', costBasis: 'subscription', capability: { docs: 0.7 } });
+  const exp = lane({ id: 'exp', costBasis: 'subscription', capability: { docs: 0.95 } });
+  const lanes = [cheap, exp];
+  // Default (maximize): most capable wins.
+  const max = await call('router_preview', deps({ candidateLanes: () => lanes }), { category: 'docs' });
+  assert.equal((max.structuredContent!.decision as { laneId: string }).laneId, 'exp');
+  // Tiered: cheapest lane clearing the floor wins, and /why says tiered.
+  const tier = await call('router_preview', deps({ candidateLanes: () => lanes, tieredStrategy: 'tiered', tierFloor: 0.6 }), { category: 'docs' });
+  assert.equal((tier.structuredContent!.decision as { laneId: string }).laneId, 'cheap');
+  assert.match(tier.content[0]!.text, /tiered/);
 });
 
 test('preview defaults gate_ready to the server posture (matches what delegate would do)', async () => {

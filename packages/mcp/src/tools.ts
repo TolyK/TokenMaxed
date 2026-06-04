@@ -98,6 +98,15 @@ export interface ToolDeps {
    * with. Default surface is off ⇒ reader lanes never appear.
    */
   readerEgress: boolean;
+  /**
+   * MODEL-TIERS: routing strategy router_delegate uses, so router_preview shows the
+   * same pick. `tiered` ⇒ cheapest lane clearing the floor; default `maximize`.
+   */
+  tieredStrategy?: 'maximize' | 'tiered';
+  /** Tiered capability floor (undefined ⇒ core default). */
+  tierFloor?: number;
+  /** Per-lane cost signal (price-derived) for tiered ranking; optional. */
+  laneCost?: (lanes: readonly Lane[]) => Record<string, number>;
   /** Whether routing/offloading is enabled for the current project (A-4 toggle). */
   getEnabled: () => boolean;
   /**
@@ -154,6 +163,8 @@ export interface SetupReport {
   learnCapability: boolean;
   /** F-2: whether reader-egress is enabled (TOKENMAXED_READER_EGRESS). */
   readerEgress: boolean;
+  /** MODEL-TIERS: whether tiered routing is enabled (TOKENMAXED_TIERED). */
+  tiered: boolean;
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -465,6 +476,15 @@ export function createTools(core: CorePort): ToolDef[] {
           const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
           availableIds = await deps.availableLaneIds(eligible);
         }
+        // MODEL-TIERS: mirror delegate's tiered posture + cost signal so /why agrees.
+        const tieredCtx =
+          deps.tieredStrategy === 'tiered'
+            ? {
+                strategy: 'tiered' as const,
+                ...(deps.tierFloor !== undefined ? { tierFloor: deps.tierFloor } : {}),
+                ...(deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}),
+              }
+            : {};
         const ctx: RouteContext = {
           lanes,
           gateReady,
@@ -472,6 +492,7 @@ export function createTools(core: CorePort): ToolDef[] {
           policyContext,
           ...(observedCapability ? { observedCapability } : {}),
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
+          ...tieredCtx,
         };
 
         let decision: RouteDecision;
@@ -631,6 +652,7 @@ export function createTools(core: CorePort): ToolDef[] {
           `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
           `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
           `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
+          `  tiered routing: ${r.tiered ? 'on' : 'off'} (enable with TOKENMAXED_TIERED=true — start on the cheapest lane clearing the capability floor, step up on review failure)`,
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
         ];

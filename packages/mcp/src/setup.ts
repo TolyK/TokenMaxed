@@ -72,5 +72,8 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     // F-2 reader egress; also disabled by the global kill-switch.
     readerEgress:
       env.TOKENMAXED_READER_EGRESS === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
+    // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
+    tiered:
+      env.TOKENMAXED_TIERED === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
   };
 }
