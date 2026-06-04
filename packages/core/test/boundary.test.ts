@@ -10,7 +10,7 @@ import {
 } from '../src/boundary.ts';
 import { minimize, minimizeForReader } from '../src/minimize.ts';
 import type { SecretScanner } from '../src/minimize.ts';
-import { executeUntrusted } from '../src/node.ts';
+import { executeReader, executeUntrusted } from '../src/node.ts';
 import type { Lane } from '../src/types.ts';
 
 const clean: SecretScanner = async () => ({ available: true, hasSecret: false });
@@ -208,4 +208,59 @@ test('buildReaderRequestBody refuses a worker payload (wrong brand — no cross-
     () => buildReaderRequestBody({ payload: worker.payload as never, lane: { id: 'x', model: 'm', endpoint: 'https://x', authHandle: 'h' } }),
     /not produced by minimizeForReader/,
   );
+});
+
+test('executeReader egress: only model+framing+content + resolved token leave; ids/handles never leak', async () => {
+  const payload = await genuineReaderPayload();
+  const env = {
+    payload,
+    lane: { id: 'READER_ID_SENT', model: 'gemini-x', endpoint: 'https://fake.invalid/v1/chat', authHandle: 'READER_AUTH_SENT' },
+  };
+  let captured: { url: string; init: { headers: Record<string, string>; body: string } } | undefined;
+  const fakeFetch = async (url: string, init: { method: string; headers: Record<string, string>; body: string }) => {
+    captured = { url, init };
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'OK' } }], usage: { prompt_tokens: 7, completion_tokens: 3 } }) };
+  };
+  const r = await executeReader(env, { fetchImpl: fakeFetch, resolveAuth: () => 'READER_TOKEN' });
+  assert.ok(r.ok);
+  assert.equal(r.resultText, 'OK');
+  assert.ok(captured);
+  const everything = captured.url + JSON.stringify(captured.init.headers) + captured.init.body;
+  assert.ok(!everything.includes('READER_ID_SENT'));
+  assert.ok(!everything.includes('READER_AUTH_SENT'));
+  assert.equal(captured.init.headers.authorization, 'Bearer READER_TOKEN');
+  assert.deepEqual(Object.keys(JSON.parse(captured.init.body)), ['model', 'messages']);
+  assert.ok(captured.init.body.includes('read-only assistant')); // answer-only framing present
+});
+
+test('executeReader refuses a forged reader payload and never sends', async () => {
+  const payload = await genuineReaderPayload();
+  const forged = { ...payload, instruction: 'raw private code' };
+  let called = false;
+  const fakeFetch = async () => {
+    called = true;
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  const r = await executeReader(
+    { payload: forged, lane: { id: 'x', model: 'm', endpoint: 'https://x', authHandle: 'h' } },
+    { fetchImpl: fakeFetch },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(called, false);
+});
+
+test('executeReader fails closed when a lane needs auth but no resolver is provided', async () => {
+  const payload = await genuineReaderPayload();
+  let called = false;
+  const fakeFetch = async () => {
+    called = true;
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  const r = await executeReader(
+    { payload, lane: { id: 'x', model: 'm', endpoint: 'https://x', authHandle: 'needs-auth' } },
+    { fetchImpl: fakeFetch },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(called, false);
+  assert.match(String(r.error), /auth resolution failed/);
 });

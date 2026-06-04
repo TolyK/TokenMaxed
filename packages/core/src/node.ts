@@ -17,10 +17,10 @@ import { LaneConfigError, LaneRegistry, parseLaneConfig } from './registry.ts';
 import { PriceError, validatePriceTable } from './price.ts';
 import type { PriceTable } from './price.ts';
 import { PolicyConfigError, parsePolicyConfig } from './policy.ts';
-import { isMinimizedPayload } from './minimize.ts';
+import { isMinimizedPayload, isReaderPayload } from './minimize.ts';
 import type { SecretScanner } from './minimize.ts';
-import { buildUntrustedRequestBody } from './boundary.ts';
-import type { SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
+import { buildReaderRequestBody, buildUntrustedRequestBody } from './boundary.ts';
+import type { SafeReaderEnvelope, SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
 import type { RawUsage } from './usage.ts';
 import { runTask } from './run.ts';
 import type { RunDeps, RunRequest, RunResult, TrustedExecResult } from './run.ts';
@@ -221,6 +221,52 @@ export async function executeUntrusted(
   } catch {
     // Content-free: never surface payload/repo text (or a resolver's raw error).
     return { ok: false, error: 'untrusted lane request failed', failureKind: 'provider_error' };
+  }
+}
+
+/**
+ * Execute a task on a READER lane over HTTP (F-2). Mirrors {@link executeUntrusted}
+ * but accepts a {@link SafeReaderEnvelope} and verifies at runtime that the payload
+ * is a genuine reader payload (produced by `minimizeForReader`) — a spread/clone or
+ * a worker payload is refused, never sent. The request carries the answer-only
+ * framing built by {@link buildReaderRequestBody}. On any failure it returns a
+ * content-free error (never throws raw content).
+ */
+export async function executeReader(
+  env: SafeReaderEnvelope,
+  deps: UntrustedExecDeps = {},
+): Promise<UntrustedExecResult> {
+  // Runtime boundary check — the real guarantee (the type brand is copyable).
+  if (!isReaderPayload(env.payload)) {
+    return { ok: false, error: 'refused: payload was not produced by minimizeForReader()' };
+  }
+  const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as FetchLike | undefined);
+  if (!doFetch) return { ok: false, error: 'no fetch implementation available' };
+
+  // Resolve auth FIRST and classify its failure as auth_failed (permanent).
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (env.lane.authHandle) {
+    let token = '';
+    try {
+      token = deps.resolveAuth ? deps.resolveAuth(env.lane.authHandle) : '';
+    } catch {
+      return { ok: false, error: 'auth resolution failed for reader lane', failureKind: 'auth_failed' };
+    }
+    if (!token) return { ok: false, error: 'auth resolution failed for reader lane', failureKind: 'auth_failed' };
+    headers.authorization = `Bearer ${token}`;
+  }
+
+  try {
+    const body = JSON.stringify(buildReaderRequestBody(env));
+    const res = await doFetch(env.lane.endpoint, { method: 'POST', headers, body });
+    if (!res.ok) {
+      return { ok: false, error: `reader lane returned status ${res.status}`, failureKind: classifyHttpStatus(res.status) };
+    }
+    const data = await res.json();
+    return { ok: true, resultText: extractText(data), reported: extractUsage(data) };
+  } catch {
+    // Content-free: never surface payload/repo text (or a resolver's raw error).
+    return { ok: false, error: 'reader lane request failed', failureKind: 'provider_error' };
   }
 }
 
@@ -447,6 +493,12 @@ export function makeTrustedExecutor(deps: { cli?: TrustedExecFn; ollama?: Truste
 /** Build the narrow untrusted DTO for a worker lane (requires a configured endpoint). */
 export function laneToUntrustedDTO(lane: Lane): UntrustedLaneDTO {
   if (!lane.endpoint) throw new Error(`worker lane "${lane.id}" has no endpoint configured`);
+  return { id: lane.id, model: lane.model, endpoint: lane.endpoint, authHandle: lane.authHandle ?? '' };
+}
+
+/** Build the narrow DTO for a reader lane (requires a configured endpoint; API-only in v1). */
+export function laneToReaderDTO(lane: Lane): UntrustedLaneDTO {
+  if (!lane.endpoint) throw new Error(`reader lane "${lane.id}" has no endpoint configured`);
   return { id: lane.id, model: lane.model, endpoint: lane.endpoint, authHandle: lane.authHandle ?? '' };
 }
 
