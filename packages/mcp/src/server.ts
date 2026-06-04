@@ -35,7 +35,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, isManagerEligible, outcomeCapability, priceForModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -92,9 +92,9 @@ function recordableLane(lane: Lane, priceTable: PriceTable): boolean {
 }
 
 /** Map a C-13 EscalationResult onto the adapter's DelegateOutcome for rendering. */
-function escToOutcome(esc: EscalationResult, registry: LaneRegistry, recordingFailed: boolean): DelegateOutcome {
+function escToOutcome(esc: EscalationResult, modelOf: (laneId: string) => string | undefined, recordingFailed: boolean): DelegateOutcome {
   const r = esc.result;
-  const model = registry.byId(r.laneId)?.model;
+  const model = modelOf(r.laneId);
   const base: DelegateOutcome = {
     laneId: r.laneId,
     status: r.status,
@@ -221,7 +221,12 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const priceTable = loadPriceTable(pricesPath);
     return loadLaneConfig(lanesPath)
       .candidateLanes(category)
-      .filter((lane) => recordableLane(lane, priceTable));
+      // Resolve `<family>@latest` to a concrete priced id BEFORE the priceability
+      // filter, so an aliased lane routes/prices/displays on its concrete model.
+      .map((lane) => resolveLaneModel(lane, priceTable))
+      // Drop any STILL-unresolved alias (no priced family member) regardless of cost
+      // basis, so a literal "@latest" can never reach execution; then priceability.
+      .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
   };
 
   const delegate = async (request: DelegateRequest): Promise<DelegateOutcome> => {
@@ -243,7 +248,15 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const ledger = new JsonlLedger(ledgerPath);
     // Same usable set preview sees: unpriceable metered lanes are already excluded,
     // so runTask never picks one and can't throw on cost after paying for it.
-    const lanes = registry.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
+    const lanes = registry
+      .candidateLanes(request.category)
+      .map((lane) => resolveLaneModel(lane, priceTable)) // <family>@latest ⇒ concrete priced id
+      // Drop a still-unresolved alias (any cost basis) so literal "@latest" never runs.
+      .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
+    // Display/outcome must show the RESOLVED model (e.g. minimax-m3), not the alias —
+    // the resolved lane set wins; fall back to the registry for ids not in it (native).
+    const modelOf = (laneId: string): string | undefined =>
+      lanes.find((l) => l.id === laneId)?.model ?? registry.byId(laneId)?.model;
     // F-1: apply the learned overlay (undefined when off ⇒ declared scores). The
     // core selectors read ctx.observedCapability; runWithEscalation preserves it
     // through its effective-context spread, so escalation/reassign also benefit.
@@ -316,7 +329,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       } catch {
         escRecordingFailed = true;
       }
-      return escToOutcome(esc, registry, escRecordingFailed);
+      return escToOutcome(esc, modelOf, escRecordingFailed);
     }
 
     const result = await runTask(taskInput, ctx, policy, runDeps);
@@ -326,12 +339,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     } catch {
       recordingFailed = true; // keep the result; recording is best-effort
     }
+    const resultModel = modelOf(result.laneId);
     return {
       laneId: result.laneId,
       status: result.status,
       ...(result.native ? { native: true } : {}),
       ...(result.resultText !== undefined ? { resultText: result.resultText } : {}),
-      ...(registry.byId(result.laneId)?.model ? { model: registry.byId(result.laneId)!.model } : {}),
+      ...(resultModel ? { model: resultModel } : {}),
       ...(result.failureKind ? { failureKind: result.failureKind } : {}),
       ...(result.decision?.reason ? { reason: result.decision.reason } : {}),
       ...(result.readerDerived ? { readerDerived: true } : {}),

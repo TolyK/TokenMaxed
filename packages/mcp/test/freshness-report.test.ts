@@ -53,16 +53,31 @@ test('no warning when the pinned model is already newest', async () => {
   assert.deepEqual(warnings, []);
 });
 
-test('skips @latest aliases, non-api lanes, and lanes with no model_family', async () => {
+test('skips non-api lanes and lanes with no model_family (no egress)', async () => {
   const lanes = [
-    lane({ id: 'l1', model: 'minimax@latest' }), // alias ⇒ skipped
     lane({ id: 'l2', kind: 'cli', endpoint: undefined, command: 'x' }), // not api
-    lane({ id: 'l3', model_family: undefined }), // no explicit family
+    lane({ id: 'l3', model_family: undefined }), // concrete pin, no explicit family
   ];
   let fetched = 0;
   const warnings = await reportFreshness(lanes, deps({ fetchList: async () => { fetched++; return { status: 'ok-empty' }; } }), { refresh: true });
   assert.deepEqual(warnings, []);
   assert.equal(fetched, 0); // none eligible ⇒ no egress
+});
+
+test('a @latest lane is assessed at its RESOLVED model — flags a newer unpriced vendor model (pricing gap)', async () => {
+  // minimax@latest resolves (price table) to minimax-m3; the vendor now reports an
+  // unpriced minimax-m4 ⇒ status must surface the pricing-gap warning to close the loop.
+  const warnings = await reportFreshness([lane({ model: 'minimax@latest', model_family: undefined })], deps({
+    fetchList: async () => ({ status: 'ok', models: [{ id: 'minimax-m3', created: 200 }, { id: 'minimax-m4', created: 300 }] }),
+  }), { refresh: true });
+  assert.deepEqual(warnings, [{ laneId: 'minimax-api', family: 'minimax', pinned: 'minimax-m3', newest: 'minimax-m4', newestPriced: false }]);
+});
+
+test('a @latest lane is NOT flagged when its resolved model is the newest the vendor reports', async () => {
+  const warnings = await reportFreshness([lane({ model: 'minimax@latest', model_family: undefined })], deps({
+    fetchList: async () => ({ status: 'ok', models: [{ id: 'minimax-m2', created: 100 }, { id: 'minimax-m3', created: 200 }] }),
+  }), { refresh: true });
+  assert.deepEqual(warnings, []); // resolves to m3, which is newest ⇒ fresh
 });
 
 test('refresh:false is STRICTLY cache-only — never fetches, even when cache is fresh', async () => {

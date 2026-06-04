@@ -32,6 +32,7 @@ export {
   compareNewestFirst,
   pricedIdsInFamily,
   newestPricedInFamily,
+  resolveLaneModel,
   sameFamily,
   assessStaleness,
 } from './model-freshness.ts';

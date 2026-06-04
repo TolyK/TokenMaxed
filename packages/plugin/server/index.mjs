@@ -23308,6 +23308,78 @@ function outcomeCapability(events, now, opts = {}) {
 
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist2(), 1);
+
+// ../core/src/model-freshness.ts
+function parseModelAlias(model) {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
+  return { latest: false, id: model };
+}
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function releasedMs(table, id) {
+  const r = table.models[id]?.released;
+  return r === void 0 ? void 0 : Date.parse(r);
+}
+function compareNewestFirst(table, a, b) {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
+  return compareModelVersion(b, a);
+}
+function pricedIdsInFamily(table, family) {
+  return Object.keys(table.models).filter((id) => table.models[id].family === family);
+}
+function newestPricedInFamily(table, family) {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return void 0;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}
+function resolveLaneModel(lane, table) {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
+function sameFamily(id, family) {
+  if (id === family) return true;
+  if (!id.startsWith(family)) return false;
+  const next = id.charAt(family.length);
+  return next !== "" && !/[a-z0-9]/i.test(next);
+}
+function assessStaleness(pinnedId, family, remote, table) {
+  const fam = remote.filter((m) => sameFamily(m.id, family));
+  if (fam.length === 0) return { status: "unknown" };
+  const newest = [...fam].sort(
+    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
+  )[0];
+  if (newest.id === pinnedId) return { status: "fresh" };
+  const pinned = fam.find((m) => m.id === pinnedId);
+  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
+  if (!newer) return { status: "fresh" };
+  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
+}
+
+// ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
@@ -23470,6 +23542,14 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at("endpoint")}: an api lane requires an endpoint.`);
     }
   }
+  if (lane.model.trim().endsWith("@latest")) {
+    if (lane.kind !== "api") {
+      throw new LaneConfigError(`${at("model")}: a "<family>@latest" alias is only supported on api lanes.`);
+    }
+    if (!parseModelAlias(lane.model).latest) {
+      throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "minimax@latest".`);
+    }
+  }
   return lane;
 }
 function freezeLane(lane) {
@@ -23612,52 +23692,6 @@ function computeCostPrimitives(table, lane, usage) {
     frontier_avoided: frontier_cost - actual_cost,
     metered_avoided: frontier_cost - metered_spent
   };
-}
-
-// ../core/src/model-freshness.ts
-function parseModelAlias(model) {
-  const m = /^(.+)@latest$/.exec(model.trim());
-  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
-  return { latest: false, id: model };
-}
-function compareModelVersion(a, b) {
-  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
-  const ra = runs(a);
-  const rb = runs(b);
-  const n = Math.max(ra.length, rb.length);
-  for (let i = 0; i < n; i++) {
-    const xa = ra[i];
-    const xb = rb[i];
-    if (xa === void 0) return -1;
-    if (xb === void 0) return 1;
-    const na = /^\d+$/.test(xa);
-    const nb = /^\d+$/.test(xb);
-    if (na && nb) {
-      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
-      if (d !== 0) return d < 0 ? -1 : 1;
-    } else if (xa !== xb) {
-      return xa < xb ? -1 : 1;
-    }
-  }
-  return 0;
-}
-function sameFamily(id, family) {
-  if (id === family) return true;
-  if (!id.startsWith(family)) return false;
-  const next = id.charAt(family.length);
-  return next !== "" && !/[a-z0-9]/i.test(next);
-}
-function assessStaleness(pinnedId, family, remote, table) {
-  const fam = remote.filter((m) => sameFamily(m.id, family));
-  if (fam.length === 0) return { status: "unknown" };
-  const newest = [...fam].sort(
-    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
-  )[0];
-  if (newest.id === pinnedId) return { status: "fresh" };
-  const pinned = fam.find((m) => m.id === pinnedId);
-  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
-  if (!newer) return { status: "fresh" };
-  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
 }
 
 // ../core/src/ledger.ts
@@ -24912,9 +24946,18 @@ async function reportFreshness(lanes, deps, opts) {
   for (const lane of lanes) {
     if (lane.kind !== "api" || !lane.endpoint) continue;
     const spec = parseModelAlias(lane.model);
-    if (spec.latest) continue;
-    const family = lane.model_family;
-    if (!family) continue;
+    let pinned;
+    let family;
+    if (spec.latest) {
+      const resolved = newestPricedInFamily(deps.table, spec.family);
+      if (!resolved) continue;
+      pinned = resolved;
+      family = spec.family;
+    } else {
+      if (!lane.model_family) continue;
+      pinned = spec.id;
+      family = lane.model_family;
+    }
     let models = getEntry(cache, lane.endpoint)?.models ?? [];
     if (opts.refresh) {
       const result = await deps.fetchList(lane);
@@ -24924,9 +24967,9 @@ async function reportFreshness(lanes, deps, opts) {
         deps.writeCache(cache);
       }
     }
-    const report = assessStaleness(spec.id, family, models, deps.table);
+    const report = assessStaleness(pinned, family, models, deps.table);
     if (report.status === "stale") {
-      warnings.push({ laneId: lane.id, family, pinned: spec.id, newest: report.newest, newestPriced: report.newestPriced });
+      warnings.push({ laneId: lane.id, family, pinned, newest: report.newest, newestPriced: report.newestPriced });
     }
   }
   return warnings;
@@ -25781,9 +25824,9 @@ function recordableLane(lane, priceTable) {
     return false;
   }
 }
-function escToOutcome(esc2, registry2, recordingFailed) {
+function escToOutcome(esc2, modelOf, recordingFailed) {
   const r = esc2.result;
-  const model = registry2.byId(r.laneId)?.model;
+  const model = modelOf(r.laneId);
   const base = {
     laneId: r.laneId,
     status: r.status,
@@ -25855,7 +25898,7 @@ function makeServerDeps(env = process.env) {
       return [];
     }
     const priceTable = loadPriceTable(pricesPath);
-    return loadLaneConfig(lanesPath).candidateLanes(category).filter((lane) => recordableLane(lane, priceTable));
+    return loadLaneConfig(lanesPath).candidateLanes(category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
   };
   const delegate = async (request) => {
     if (!existsSync7(lanesPath)) {
@@ -25871,7 +25914,8 @@ function makeServerDeps(env = process.env) {
     const policy = loadPolicySafe();
     const priceTable = loadPriceTable(pricesPath);
     const ledger = new JsonlLedger(ledgerPath);
-    const lanes = registry2.candidateLanes(request.category).filter((lane) => recordableLane(lane, priceTable));
+    const lanes = registry2.candidateLanes(request.category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
+    const modelOf = (laneId) => lanes.find((l) => l.id === laneId)?.model ?? registry2.byId(laneId)?.model;
     const observedCapability = buildObserved();
     const baseCtx = {
       lanes,
@@ -25917,7 +25961,7 @@ function makeServerDeps(env = process.env) {
       } catch {
         escRecordingFailed = true;
       }
-      return escToOutcome(esc2, registry2, escRecordingFailed);
+      return escToOutcome(esc2, modelOf, escRecordingFailed);
     }
     const result = await runTask(taskInput, ctx, policy, runDeps);
     let recordingFailed = false;
@@ -25926,12 +25970,13 @@ function makeServerDeps(env = process.env) {
     } catch {
       recordingFailed = true;
     }
+    const resultModel = modelOf(result.laneId);
     return {
       laneId: result.laneId,
       status: result.status,
       ...result.native ? { native: true } : {},
       ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
-      ...registry2.byId(result.laneId)?.model ? { model: registry2.byId(result.laneId).model } : {},
+      ...resultModel ? { model: resultModel } : {},
       ...result.failureKind ? { failureKind: result.failureKind } : {},
       ...result.decision?.reason ? { reason: result.decision.reason } : {},
       ...result.readerDerived ? { readerDerived: true } : {},

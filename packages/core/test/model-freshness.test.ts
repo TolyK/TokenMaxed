@@ -12,6 +12,7 @@ import {
   compareNewestFirst,
   pricedIdsInFamily,
   newestPricedInFamily,
+  resolveLaneModel,
   sameFamily,
   assessStaleness,
 } from '../src/model-freshness.ts';
@@ -60,6 +61,16 @@ test('newestPricedInFamily returns the newest priced same-family id, else undefi
   assert.equal(newestPricedInFamily(table, 'minimax'), 'minimax-m3');
   assert.equal(newestPricedInFamily(table, 'glm'), 'glm-5.1');
   assert.equal(newestPricedInFamily(table, 'unpriced-family'), undefined);
+});
+
+test('resolveLaneModel resolves <family>@latest to the newest priced id', () => {
+  assert.equal(resolveLaneModel({ model: 'minimax@latest' }, table).model, 'minimax-m3');
+  // Concrete (non-alias) lanes are returned unchanged.
+  assert.equal(resolveLaneModel({ model: 'minimax-m2' }, table).model, 'minimax-m2');
+  // An alias with no priced family member stays @latest (caller's filter drops it).
+  assert.equal(resolveLaneModel({ model: 'unpriced@latest' }, table).model, 'unpriced@latest');
+  // Preserves other lane fields on the clone.
+  assert.deepEqual(resolveLaneModel({ id: 'x', model: 'minimax@latest' }, table), { id: 'x', model: 'minimax-m3' });
 });
 
 test('sameFamily matches on an exact id or a boundary, never a partial prefix', () => {

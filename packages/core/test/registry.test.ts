@@ -268,6 +268,53 @@ test('rejects native on a non-full lane (contradictory)', () => {
   assert.throws(() => parseLaneConfig(cfg), { message: /native is only valid on a full-trust lane/ });
 });
 
+test('rejects a <family>@latest alias on a non-api lane (api-only)', () => {
+  const cli = `
+lanes:
+  - id: x
+    kind: cli
+    model: claude@latest
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    command: claude
+`;
+  assert.throws(() => parseLaneConfig(cli), { message: /@latest" alias is only supported on api lanes/ });
+});
+
+test('rejects a bare "@latest" with no family stem (would otherwise execute literally)', () => {
+  const bare = `
+lanes:
+  - id: x
+    kind: api
+    model: "@latest"
+    trust_mode: worker
+    costBasis: subscription
+    provenance: minimax
+    jurisdiction: CN
+    endpoint: https://api.minimax.io/v1/chat/completions
+    authHandle: MINIMAX
+`;
+  assert.throws(() => parseLaneConfig(bare), { message: /needs a family stem/ });
+});
+
+test('accepts a <family>@latest alias on an api lane (stored as alias; resolved at routing)', () => {
+  const api = `
+lanes:
+  - id: x
+    kind: api
+    model: minimax@latest
+    trust_mode: worker
+    costBasis: metered
+    provenance: minimax
+    jurisdiction: CN
+    endpoint: https://api.minimax.io/v1/chat/completions
+    authHandle: MINIMAX
+`;
+  assert.equal(parseLaneConfig(api).byId('x')?.model, 'minimax@latest');
+});
+
 test('loadLaneConfig reads and validates the shipped example file', () => {
   // Pass the file: URL directly; loadLaneConfig handles URL→path (and spaces).
   const examplePath = new URL('../../../config/lanes.example.yaml', import.meta.url);

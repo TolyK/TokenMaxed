@@ -9,7 +9,7 @@
  * check. Here we just resolve each lane's model list and compare.
  */
 
-import { assessStaleness, parseModelAlias } from '@tokenmaxed/core';
+import { assessStaleness, newestPricedInFamily, parseModelAlias } from '@tokenmaxed/core';
 import type { Lane, PriceTable } from '@tokenmaxed/core';
 
 import { getEntry, putEntry } from './model-cache.ts';
@@ -53,9 +53,22 @@ export async function reportFreshness(
   for (const lane of lanes) {
     if (lane.kind !== 'api' || !lane.endpoint) continue;
     const spec = parseModelAlias(lane.model);
-    if (spec.latest) continue; // @latest tracks the newest by definition — not "stale"
-    const family = lane.model_family;
-    if (!family) continue; // no explicit family ⇒ we don't guess; nothing to compare
+    // For a concrete pin, compare its id against the family (needs model_family).
+    // For a `<family>@latest` alias, compare the model it RESOLVES to (newest priced)
+    // so we still surface a newer-but-unpriced model (the pricing-gap that closes the
+    // loop) — @latest is "latest TokenMaxed can PRICE", not necessarily the vendor's.
+    let pinned: string;
+    let family: string;
+    if (spec.latest) {
+      const resolved = newestPricedInFamily(deps.table, spec.family);
+      if (!resolved) continue; // no priced family member ⇒ lane can't route anyway
+      pinned = resolved;
+      family = spec.family;
+    } else {
+      if (!lane.model_family) continue; // no explicit family ⇒ we don't guess
+      pinned = spec.id;
+      family = lane.model_family;
+    }
 
     let models = getEntry(cache, lane.endpoint)?.models ?? [];
     if (opts.refresh) {
@@ -68,9 +81,9 @@ export async function reportFreshness(
       // offline/timeout/auth-missing/etc ⇒ keep whatever the cache had (models above).
     }
 
-    const report = assessStaleness(spec.id, family, models, deps.table);
+    const report = assessStaleness(pinned, family, models, deps.table);
     if (report.status === 'stale') {
-      warnings.push({ laneId: lane.id, family, pinned: spec.id, newest: report.newest, newestPriced: report.newestPriced });
+      warnings.push({ laneId: lane.id, family, pinned, newest: report.newest, newestPriced: report.newestPriced });
     }
   }
   return warnings;

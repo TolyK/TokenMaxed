@@ -13,6 +13,7 @@
 
 import { parse as parseYaml } from 'yaml';
 
+import { parseModelAlias } from './model-freshness.ts';
 import { declaredCapabilityFor } from './route.ts';
 import { TASK_CATEGORIES, TRUST_MODE_ALIASES, TRUST_MODES } from './types.ts';
 import type {
@@ -223,6 +224,18 @@ function parseLane(entry: unknown, index: number): Lane {
     }
     if (lane.kind === 'api' && lane.endpoint === undefined) {
       throw new LaneConfigError(`${at('endpoint')}: an api lane requires an endpoint.`);
+    }
+  }
+  // A `<family>@latest` alias is resolved against the price table at routing time.
+  // Reject anything ending in "@latest" that isn't a well-formed alias on an api
+  // lane: bare "@latest" (empty family stem) would otherwise parse as a concrete id
+  // and could reach execution literally; CLI/local lanes pin a concrete model.
+  if (lane.model.trim().endsWith('@latest')) {
+    if (lane.kind !== 'api') {
+      throw new LaneConfigError(`${at('model')}: a "<family>@latest" alias is only supported on api lanes.`);
+    }
+    if (!parseModelAlias(lane.model).latest) {
+      throw new LaneConfigError(`${at('model')}: "@latest" needs a family stem, e.g. "minimax@latest".`);
     }
   }
   return lane;

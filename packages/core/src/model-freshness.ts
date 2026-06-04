@@ -86,6 +86,22 @@ export function newestPricedInFamily(table: PriceTable, family: string): string 
   return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
 }
 
+/**
+ * Resolve a lane whose `model` is a `<family>@latest` alias to a concrete, PRICED
+ * model id (the newest priced model in that family). Pure + egress-free: an unpriced
+ * model can't route anyway (it has no price for the savings math), so the price table
+ * IS the set of resolvable models — the live `/models` list only drives the staleness
+ * warning that prompts adding a newer model's price. A concrete (non-alias) lane is
+ * returned unchanged; an alias with no priced family member is returned UNCHANGED
+ * (still `@latest`), so the normal unpriceable-lane filter excludes it (caller warns).
+ */
+export function resolveLaneModel<L extends { model: string }>(lane: L, table: PriceTable): L {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
+
 /** A model id (optionally with a vendor `created` epoch) for family matching. */
 export interface FamilyModel {
   id: string;
