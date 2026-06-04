@@ -7366,7 +7366,9 @@ var require_dist = __commonJS({
 });
 
 // ../mcp/src/summary-deps.ts
-import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
+import { existsSync as existsSync4, readFileSync as readFileSync3 } from "node:fs";
+import { dirname as dirname2, join as join4 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../core/src/types.ts
 var TRUST_MODES = ["full", "worker", "reader", "blocked"];
@@ -7571,6 +7573,63 @@ function parseModelAlias(model) {
   const m = /^(.+)@latest$/.exec(model.trim());
   if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
   return { latest: false, id: model };
+}
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function releasedMs(table, id) {
+  const r = table.models[id]?.released;
+  return r === void 0 ? void 0 : Date.parse(r);
+}
+function compareNewestFirst(table, a, b) {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
+  return compareModelVersion(b, a);
+}
+function pricedIdsInFamily(table, family) {
+  return Object.keys(table.models).filter((id) => table.models[id].family === family);
+}
+function newestPricedInFamily(table, family) {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return void 0;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}
+function sameFamily(id, family) {
+  if (id === family) return true;
+  if (!id.startsWith(family)) return false;
+  const next = id.charAt(family.length);
+  return next !== "" && !/[a-z0-9]/i.test(next);
+}
+function assessStaleness(pinnedId, family, remote, table) {
+  const fam = remote.filter((m) => sameFamily(m.id, family));
+  if (fam.length === 0) return { status: "unknown" };
+  const newest = [...fam].sort(
+    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
+  )[0];
+  if (newest.id === pinnedId) return { status: "fresh" };
+  const pinned = fam.find((m) => m.id === pinnedId);
+  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
+  if (!newer) return { status: "fresh" };
+  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
 }
 
 // ../core/src/registry.ts
@@ -7800,6 +7859,66 @@ function parseLaneConfig(text) {
   return new LaneRegistry(lanes);
 }
 
+// ../core/src/price.ts
+var PriceError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PriceError";
+  }
+};
+function isPlainObject3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function requireNonNegativeNumber(value, where) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new PriceError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function validatePriceTable(data) {
+  if (!isPlainObject3(data)) {
+    throw new PriceError("Price table must be a JSON object.");
+  }
+  if (typeof data.schema_version !== "number") {
+    throw new PriceError('Price table "schema_version" must be a number.');
+  }
+  if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
+    throw new PriceError('Price table "frontier_model" must be a non-empty string.');
+  }
+  if (!isPlainObject3(data.models)) {
+    throw new PriceError('Price table "models" must be a mapping of model id to prices.');
+  }
+  const models = /* @__PURE__ */ Object.create(null);
+  for (const [model, raw] of Object.entries(data.models)) {
+    if (!isPlainObject3(raw)) {
+      throw new PriceError(`Price table models["${model}"] must be a mapping.`);
+    }
+    const entry = {
+      inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
+      outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`)
+    };
+    if (raw.family !== void 0) {
+      if (typeof raw.family !== "string" || raw.family.trim() === "") {
+        throw new PriceError(`models["${model}"].family must be a non-empty string when present.`);
+      }
+      entry.family = raw.family;
+    }
+    if (raw.released !== void 0) {
+      if (typeof raw.released !== "string" || Number.isNaN(Date.parse(raw.released))) {
+        throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
+      }
+      entry.released = raw.released;
+    }
+    models[model] = entry;
+  }
+  if (!Object.hasOwn(models, data.frontier_model)) {
+    throw new PriceError(
+      `Price table frontier_model "${data.frontier_model}" has no entry in models.`
+    );
+  }
+  return { schema_version: data.schema_version, frontier_model: data.frontier_model, models };
+}
+
 // ../core/src/ledger.ts
 var SCHEMA_VERSION = 1;
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback"];
@@ -7864,7 +7983,7 @@ var LedgerError = class extends Error {
     this.name = "LedgerError";
   }
 };
-function isPlainObject3(value) {
+function isPlainObject4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireString2(value, where) {
@@ -7884,7 +8003,7 @@ function requireIsoTimestamp(value, where) {
   }
   return s;
 }
-function requireNonNegativeNumber(value, where) {
+function requireNonNegativeNumber2(value, where) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     throw new LedgerError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
   }
@@ -7909,9 +8028,9 @@ function requireEnum2(value, allowed, where) {
   return value;
 }
 function validateEventInput(input) {
-  const actual_cost = requireNonNegativeNumber(input.actual_cost, "task.actual_cost");
-  const frontier_cost = requireNonNegativeNumber(input.frontier_cost, "task.frontier_cost");
-  const metered_spent = requireNonNegativeNumber(input.metered_spent, "task.metered_spent");
+  const actual_cost = requireNonNegativeNumber2(input.actual_cost, "task.actual_cost");
+  const frontier_cost = requireNonNegativeNumber2(input.frontier_cost, "task.frontier_cost");
+  const metered_spent = requireNonNegativeNumber2(input.metered_spent, "task.metered_spent");
   const out = {
     task_id: requireString2(input.task_id, "task.task_id"),
     attempt: requireNonNegativeInt(input.attempt, "task.attempt"),
@@ -8001,7 +8120,7 @@ function backfillLegacyTask(obj) {
   };
 }
 function parseEvent(obj) {
-  if (!isPlainObject3(obj)) {
+  if (!isPlainObject4(obj)) {
     throw new LedgerError("Ledger record must be a JSON object.");
   }
   const meta = parseMeta(obj);
@@ -8104,6 +8223,24 @@ function loadLaneConfig(path) {
     throw new LaneConfigError(`Could not read lane config at "${filePath}": ${detail}`);
   }
   return parseLaneConfig(text);
+}
+function loadPriceTable(path) {
+  const filePath = typeof path === "string" ? path : fileURLToPath(path);
+  let text;
+  try {
+    text = readFileSync(filePath, "utf8");
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PriceError(`Could not read price table at "${filePath}": ${detail}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PriceError(`Could not parse price table at "${filePath}" as JSON: ${detail}`);
+  }
+  return validatePriceTable(parsed);
 }
 function loadPolicyConfig(path) {
   const filePath = typeof path === "string" ? path : fileURLToPath(path);
@@ -8272,6 +8409,86 @@ function makeAvailabilityProbe(env) {
   return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
+// ../mcp/src/model-cache.ts
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+var CACHE_VERSION = 1;
+function emptyCache() {
+  return { version: CACHE_VERSION, endpoints: /* @__PURE__ */ Object.create(null) };
+}
+function coerceCache(raw) {
+  if (!raw || typeof raw !== "object" || raw.version !== CACHE_VERSION) return emptyCache();
+  const eps = raw.endpoints;
+  if (!eps || typeof eps !== "object" || Array.isArray(eps)) return emptyCache();
+  const out = emptyCache();
+  for (const [endpoint, v] of Object.entries(eps)) {
+    if (!v || typeof v !== "object") continue;
+    const checkedAt = v.checkedAt;
+    const models = v.models;
+    if (typeof checkedAt !== "number" || !Number.isFinite(checkedAt) || !Array.isArray(models)) continue;
+    const clean = [];
+    for (const m of models) {
+      const id = m?.id;
+      if (typeof id !== "string" || id === "") continue;
+      const created = m.created;
+      clean.push(typeof created === "number" && Number.isFinite(created) ? { id, created } : { id });
+    }
+    out.endpoints[endpoint] = { models: clean, checkedAt };
+  }
+  return out;
+}
+function getEntry(cache, endpoint) {
+  return Object.hasOwn(cache.endpoints, endpoint) ? cache.endpoints[endpoint] : void 0;
+}
+function putEntry(cache, endpoint, models, now) {
+  const next = emptyCache();
+  Object.assign(next.endpoints, cache.endpoints);
+  next.endpoints[endpoint] = { models, checkedAt: now };
+  return next;
+}
+function readFreshnessCache(path) {
+  try {
+    return existsSync3(path) ? coerceCache(JSON.parse(readFileSync2(path, "utf8"))) : emptyCache();
+  } catch {
+    return emptyCache();
+  }
+}
+
+// ../mcp/src/freshness-report.ts
+async function reportFreshness(lanes, deps, opts) {
+  let cache = deps.readCache();
+  const warnings = [];
+  for (const lane of lanes) {
+    if (lane.kind !== "api" || !lane.endpoint) continue;
+    const spec = parseModelAlias(lane.model);
+    let pinned;
+    let family;
+    if (spec.latest) {
+      const resolved = newestPricedInFamily(deps.table, spec.family);
+      if (!resolved) continue;
+      pinned = resolved;
+      family = spec.family;
+    } else {
+      if (!lane.model_family) continue;
+      pinned = spec.id;
+      family = lane.model_family;
+    }
+    let models = getEntry(cache, lane.endpoint)?.models ?? [];
+    if (opts.refresh) {
+      const result = await deps.fetchList(lane);
+      if (result.status === "ok" || result.status === "ok-empty") {
+        models = result.status === "ok" ? result.models : [];
+        cache = putEntry(cache, lane.endpoint, models, deps.now);
+        deps.writeCache(cache);
+      }
+    }
+    const report = assessStaleness(pinned, family, models, deps.table);
+    if (report.status === "stale") {
+      warnings.push({ laneId: lane.id, family, pinned, newest: report.newest, newestPriced: report.newestPriced });
+    }
+  }
+  return warnings;
+}
+
 // ../mcp/src/manager-select.ts
 function selectManagerLane(lanes, policy, gateReady, available = null) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
@@ -8314,14 +8531,19 @@ function buildSummaryData(input) {
   }
   const zeroMeteredShare = allTok > 0 ? zeroTok / allTok : 1;
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
-  const laneSummaries = lanes.map((l) => ({
-    id: l.id,
-    kind: l.kind,
-    model: l.model,
-    trustMode: l.trust_mode,
-    isActiveReviewer: !!reviewer && l.id === reviewer.id,
-    available: !!l.native || availableSet.has(l.id)
-  }));
+  const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
+  const laneSummaries = lanes.map((l) => {
+    const s = staleByLane.get(l.id);
+    return {
+      id: l.id,
+      kind: l.kind,
+      model: l.model,
+      trustMode: l.trust_mode,
+      isActiveReviewer: !!reviewer && l.id === reviewer.id,
+      available: !!l.native || availableSet.has(l.id),
+      ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
+    };
+  });
   return {
     enabled,
     meteredAvoidedLifetime: lifetime.meteredAvoided,
@@ -8363,11 +8585,17 @@ function formatSummaryBanner(data) {
   if (data.lanes.length > 0) {
     const laneStr = data.lanes.map((l) => {
       const role = l.isActiveReviewer ? "reviewer" : l.trustMode;
-      return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}`;
+      return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}${l.stale ? " \u26A0 stale" : ""}`;
     }).join(" \xB7 ");
     lines.push(`   Lanes: ${laneStr}`);
   } else {
     lines.push("   No lanes configured yet \u2014 run /tokenmaxed:setup");
+  }
+  const stale = data.lanes.filter((l) => l.stale);
+  for (const l of stale) {
+    lines.push(
+      l.stale.newestPriced ? `   \u26A0 ${l.id} on ${l.model} \u2014 newer available: ${l.stale.newest} (set model: <family>@latest, or pin it)` : `   \u26A0 ${l.id} on ${l.model} \u2014 newer ${l.stale.newest} exists but isn't priced yet`
+    );
   }
   lines.push("   /tokenmaxed:summary anytime \xB7 /tokenmaxed:why <category> to preview \xB7 /tokenmaxed:savings for detail");
   return lines.join("\n");
@@ -8393,7 +8621,7 @@ function readOnlyToggleStore(statePath) {
   return {
     read: () => {
       try {
-        return existsSync3(statePath) ? JSON.parse(readFileSync2(statePath, "utf8")) : {};
+        return existsSync4(statePath) ? JSON.parse(readFileSync3(statePath, "utf8")) : {};
       } catch {
         return {};
       }
@@ -8406,16 +8634,40 @@ function readOnlyToggleStore(statePath) {
 function makeSummaryFromEnv(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
-  const statePath = env.TOKENMAXED_STATE ?? homeFile("state.json");
+  const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join4(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
   const loadPolicy = makeLoadPolicy(env);
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
+  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname2(statePath), "model-freshness.json");
   return async () => {
-    const lanes = existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+    const lanes = existsSync4(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
+    const now = Date.now();
+    let staleness = [];
+    if (!globallyDisabled && existsSync4(pricesPath)) {
+      try {
+        staleness = await reportFreshness(
+          lanes,
+          {
+            fetchList: () => {
+              throw new Error("summary path must not fetch");
+            },
+            table: loadPriceTable(pricesPath),
+            now,
+            readCache: () => readFreshnessCache(cachePath),
+            writeCache: () => {
+            }
+          },
+          { refresh: false }
+        );
+      } catch {
+        staleness = [];
+      }
+    }
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
       lanes,
@@ -8423,9 +8675,10 @@ function makeSummaryFromEnv(env) {
       availableLaneIds: available,
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
-      now: Date.now(),
+      now,
       core: { summarize, tokenStats, filterEventsSince },
-      selectManager: selectManagerLane
+      selectManager: selectManagerLane,
+      staleness
     });
   };
 }

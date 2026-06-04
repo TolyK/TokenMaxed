@@ -56,7 +56,7 @@ const lane = (over: Partial<Lane> & { id: string }): Lane => ({
 const lanes: Lane[] = [
   lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', manager_allowed: true, roles: ['manager'] }),
   lane({ id: 'claude-haiku', command: 'claude', manager_allowed: true, roles: ['manager'] }),
-  lane({ id: 'minimax-api', kind: 'api', trust_mode: 'worker', provenance: 'minimax', endpoint: 'https://x', authHandle: 'MINIMAX' }),
+  lane({ id: 'minimax-api', kind: 'api', model: 'minimax-m2', trust_mode: 'worker', provenance: 'minimax', endpoint: 'https://x', authHandle: 'MINIMAX' }),
   lane({ id: 'ollama-llama3', kind: 'local', costBasis: 'local', provenance: 'meta' }),
 ];
 
@@ -71,6 +71,7 @@ function build(over: Partial<Parameters<typeof buildSummaryData>[0]> = {}) {
     now: NOW,
     core,
     selectManager: selectManagerLane,
+    staleness: [],
     ...over,
   });
 }
@@ -123,6 +124,21 @@ test('banner headline is finance-grade (metered $), never the frontier hypotheti
   // HONESTY GUARD: the all-frontier figure must never surface in the banner.
   assert.doesNotMatch(banner, /frontier/i);
   assert.doesNotMatch(banner, /trees|coffee/i); // no unlabeled relatable units
+});
+
+test('banner flags a stale lane from the (cache-derived) staleness input', () => {
+  const banner = formatSummaryBanner(build({
+    staleness: [{ laneId: 'minimax-api', newest: 'minimax-m3', newestPriced: true }],
+  }));
+  assert.match(banner, /minimax-api \(worker\).*⚠ stale/); // marked in the Lanes line (after any offline flag)
+  assert.match(banner, /minimax-api on minimax-m2 — newer available: minimax-m3/); // spelled out
+});
+
+test('banner spells out a pricing-gap (newer model not priced)', () => {
+  const banner = formatSummaryBanner(build({
+    staleness: [{ laneId: 'minimax-api', newest: 'minimax-m9', newestPriced: false }],
+  }));
+  assert.match(banner, /newer minimax-m9 exists but isn't priced yet/);
 });
 
 test('banner shows a routing-OFF variant when disabled', () => {

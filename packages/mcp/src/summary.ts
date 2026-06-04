@@ -40,6 +40,19 @@ export interface SummaryInput {
   core: SummaryCorePort;
   /** The real selectManagerLane, injected (keeps this module runtime-pure). */
   selectManager: ManagerSelectPort;
+  /**
+   * Stale-model findings (MODEL-FRESHNESS), computed by the caller CACHE-ONLY (no
+   * egress on the summary path). Each names a lane on a stale pinned/resolved model
+   * and the newer one available. Empty when nothing is cached or nothing is stale.
+   */
+  staleness: readonly LaneStaleness[];
+}
+
+/** A stale-model finding for one lane (structural subset of a freshness warning). */
+export interface LaneStaleness {
+  laneId: string;
+  newest: string;
+  newestPriced: boolean;
 }
 
 export interface SummaryWindow {
@@ -59,6 +72,8 @@ export interface LaneSummary {
   /** True for the lane the review path would actually use right now. */
   isActiveReviewer: boolean;
   available: boolean;
+  /** Set when a newer model is available for this lane's family (cache-derived). */
+  stale?: { newest: string; newestPriced: boolean };
 }
 
 export interface SummaryData {
@@ -112,14 +127,19 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
   const zeroMeteredShare = allTok > 0 ? zeroTok / allTok : 1;
 
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
-  const laneSummaries: LaneSummary[] = lanes.map((l) => ({
-    id: l.id,
-    kind: l.kind,
-    model: l.model,
-    trustMode: l.trust_mode,
-    isActiveReviewer: !!reviewer && l.id === reviewer.id,
-    available: !!l.native || availableSet.has(l.id),
-  }));
+  const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
+  const laneSummaries: LaneSummary[] = lanes.map((l) => {
+    const s = staleByLane.get(l.id);
+    return {
+      id: l.id,
+      kind: l.kind,
+      model: l.model,
+      trustMode: l.trust_mode,
+      isActiveReviewer: !!reviewer && l.id === reviewer.id,
+      available: !!l.native || availableSet.has(l.id),
+      ...(s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}),
+    };
+  });
 
   return {
     enabled,
@@ -171,12 +191,21 @@ export function formatSummaryBanner(data: SummaryData): string {
     const laneStr = data.lanes
       .map((l) => {
         const role = l.isActiveReviewer ? 'reviewer' : l.trustMode;
-        return `${l.id} (${role})${l.available ? '' : ' ⚠ offline'}`;
+        return `${l.id} (${role})${l.available ? '' : ' ⚠ offline'}${l.stale ? ' ⚠ stale' : ''}`;
       })
       .join(' · ');
     lines.push(`   Lanes: ${laneStr}`);
   } else {
     lines.push('   No lanes configured yet — run /tokenmaxed:setup');
+  }
+  // Spell out each stale lane (cache-derived; refreshed by /tokenmaxed:status).
+  const stale = data.lanes.filter((l) => l.stale);
+  for (const l of stale) {
+    lines.push(
+      l.stale!.newestPriced
+        ? `   ⚠ ${l.id} on ${l.model} — newer available: ${l.stale!.newest} (set model: <family>@latest, or pin it)`
+        : `   ⚠ ${l.id} on ${l.model} — newer ${l.stale!.newest} exists but isn't priced yet`,
+    );
   }
   lines.push('   /tokenmaxed:summary anytime · /tokenmaxed:why <category> to preview · /tokenmaxed:savings for detail');
   return lines.join('\n');

@@ -14228,8 +14228,8 @@ var require_dist2 = __commonJS({
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
 import { existsSync as existsSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname4, join as join4 } from "node:path";
-import { fileURLToPath as fileURLToPath3 } from "node:url";
+import { dirname as dirname5, join as join5 } from "node:path";
+import { fileURLToPath as fileURLToPath4 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
 var _a;
@@ -25061,6 +25061,8 @@ async function fetchModelList(lane, deps) {
 
 // ../mcp/src/summary-deps.ts
 import { existsSync as existsSync4, readFileSync as readFileSync3 } from "node:fs";
+import { dirname as dirname3, join as join4 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../mcp/src/manager-select.ts
 function selectManagerLane(lanes, policy, gateReady, available = null) {
@@ -25104,14 +25106,19 @@ function buildSummaryData(input) {
   }
   const zeroMeteredShare = allTok > 0 ? zeroTok / allTok : 1;
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
-  const laneSummaries = lanes.map((l) => ({
-    id: l.id,
-    kind: l.kind,
-    model: l.model,
-    trustMode: l.trust_mode,
-    isActiveReviewer: !!reviewer && l.id === reviewer.id,
-    available: !!l.native || availableSet.has(l.id)
-  }));
+  const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
+  const laneSummaries = lanes.map((l) => {
+    const s = staleByLane.get(l.id);
+    return {
+      id: l.id,
+      kind: l.kind,
+      model: l.model,
+      trustMode: l.trust_mode,
+      isActiveReviewer: !!reviewer && l.id === reviewer.id,
+      available: !!l.native || availableSet.has(l.id),
+      ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
+    };
+  });
   return {
     enabled,
     meteredAvoidedLifetime: lifetime.meteredAvoided,
@@ -25153,11 +25160,17 @@ function formatSummaryBanner(data) {
   if (data.lanes.length > 0) {
     const laneStr = data.lanes.map((l) => {
       const role = l.isActiveReviewer ? "reviewer" : l.trustMode;
-      return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}`;
+      return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}${l.stale ? " \u26A0 stale" : ""}`;
     }).join(" \xB7 ");
     lines.push(`   Lanes: ${laneStr}`);
   } else {
     lines.push("   No lanes configured yet \u2014 run /tokenmaxed:setup");
+  }
+  const stale = data.lanes.filter((l) => l.stale);
+  for (const l of stale) {
+    lines.push(
+      l.stale.newestPriced ? `   \u26A0 ${l.id} on ${l.model} \u2014 newer available: ${l.stale.newest} (set model: <family>@latest, or pin it)` : `   \u26A0 ${l.id} on ${l.model} \u2014 newer ${l.stale.newest} exists but isn't priced yet`
+    );
   }
   lines.push("   /tokenmaxed:summary anytime \xB7 /tokenmaxed:why <category> to preview \xB7 /tokenmaxed:savings for detail");
   return lines.join("\n");
@@ -25201,16 +25214,40 @@ function readOnlyToggleStore(statePath) {
 function makeSummaryFromEnv(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
-  const statePath = env.TOKENMAXED_STATE ?? homeFile("state.json");
+  const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join4(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
   const loadPolicy = makeLoadPolicy(env);
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
+  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname3(statePath), "model-freshness.json");
   return async () => {
     const lanes = existsSync4(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
+    const now = Date.now();
+    let staleness = [];
+    if (!globallyDisabled && existsSync4(pricesPath)) {
+      try {
+        staleness = await reportFreshness(
+          lanes,
+          {
+            fetchList: () => {
+              throw new Error("summary path must not fetch");
+            },
+            table: loadPriceTable(pricesPath),
+            now,
+            readCache: () => readFreshnessCache(cachePath),
+            writeCache: () => {
+            }
+          },
+          { refresh: false }
+        );
+      } catch {
+        staleness = [];
+      }
+    }
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
       lanes,
@@ -25218,9 +25255,10 @@ function makeSummaryFromEnv(env) {
       availableLaneIds: available,
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
-      now: Date.now(),
+      now,
       core: { summarize, tokenStats, filterEventsSince },
-      selectManager: selectManagerLane
+      selectManager: selectManagerLane,
+      staleness
     });
   };
 }
@@ -25366,21 +25404,21 @@ async function runReviewWithBudget(runner, newId, opts) {
 
 // ../mcp/src/setup.ts
 import { copyFileSync, existsSync as existsSync6, mkdirSync as mkdirSync3 } from "node:fs";
-import { dirname as dirname3 } from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
-var LANES_STARTER = fileURLToPath2(new URL("../lanes.starter.yaml", import.meta.url));
-var POLICY_STARTER = fileURLToPath2(new URL("../policy.starter.yaml", import.meta.url));
+import { dirname as dirname4 } from "node:path";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
+var LANES_STARTER = fileURLToPath3(new URL("../lanes.starter.yaml", import.meta.url));
+var POLICY_STARTER = fileURLToPath3(new URL("../policy.starter.yaml", import.meta.url));
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
   const lanesExisted = existsSync6(lanesPath);
   if (!lanesExisted) {
-    mkdirSync3(dirname3(lanesPath), { recursive: true });
+    mkdirSync3(dirname4(lanesPath), { recursive: true });
     copyFileSync(LANES_STARTER, lanesPath);
   }
   const policyExisted = existsSync6(policyPath);
   if (!policyExisted) {
-    mkdirSync3(dirname3(policyPath), { recursive: true });
+    mkdirSync3(dirname4(policyPath), { recursive: true });
     copyFileSync(POLICY_STARTER, policyPath);
   }
   const registry2 = loadLaneConfig(lanesPath);
@@ -25814,7 +25852,7 @@ function unknownKeys(inputSchema, args) {
 
 // ../mcp/src/server.ts
 var DEFAULT_LANES = homeFile("lanes.yaml");
-var DEFAULT_PRICES = fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
+var DEFAULT_PRICES = fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
 function recordableLane(lane, priceTable) {
   if (lane.native || lane.costBasis !== "metered") return true;
   try {
@@ -25861,7 +25899,7 @@ function fileToggleStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync4(dirname4(statePath), { recursive: true });
+      mkdirSync4(dirname5(statePath), { recursive: true });
       writeFileSync3(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -26023,7 +26061,7 @@ function makeServerDeps(env = process.env) {
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname4(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname5(statePath), "model-freshness.json");
       return reportFreshness(
         eligible,
         {
