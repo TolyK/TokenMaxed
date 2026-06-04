@@ -23205,13 +23205,16 @@ function scoreLane(lane, task, capHeadroom2, observedCapability) {
   };
 }
 function compareScores(a, b) {
+  const az = a.factors.capability === 0;
+  const bz = b.factors.capability === 0;
+  if (az !== bz) return az ? 1 : -1;
   if (b.score !== a.score) return b.score - a.score;
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
-function describe2(lane, best, task) {
+function describe2(lane, best, task, tiered = false) {
   const f = best.factors;
   const cap = f.capability.toFixed(2);
-  let reason = `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
+  let reason = tiered ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.` : `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
   if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
     reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
   }
@@ -23243,15 +23246,41 @@ function routeDecide(task, ctx, policy) {
       "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, unavailable to run, or blocked/forced-trusted away by policy)."
     );
   }
-  const scores = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability)).sort(compareScores);
+  const scored = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability));
+  const strategy = ctx.strategy ?? "maximize";
+  const tiered = strategy === "tiered";
+  const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
   const winner = scores[0];
   const winningLane = candidates.find((lane) => lane.id === winner.laneId);
+  const wonByTier = tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
   return {
     laneId: winner.laneId,
-    reason: describe2(winningLane, winner, task),
+    reason: describe2(winningLane, winner, task, wonByTier),
     scores,
     policyVerdict: verdicts.get(winner.laneId)
   };
+}
+function tierFloorFor(task, ctx) {
+  return ctx.tierFloorByCategory?.[task.category] ?? ctx.tierFloor ?? DEFAULT_TIER_FLOOR;
+}
+var DEFAULT_TIER_FLOOR = 0.6;
+function orderTiered(scored, candidates, task, ctx) {
+  const floor = tierFloorFor(task, ctx);
+  const laneById = new Map(candidates.map((l) => [l.id, l]));
+  const costOf = (id) => ctx.laneCost?.[id] ?? COST_PENALTY[laneById.get(id).costBasis];
+  const isClear = (s) => s.factors.capability > 0 && s.factors.capability >= floor;
+  const clears = scored.filter(isClear);
+  if (clears.length === 0) return [...scored].sort(compareScores);
+  const byTier = (a, b) => {
+    if (a.factors.capPenalty !== b.factors.capPenalty) return a.factors.capPenalty - b.factors.capPenalty;
+    const ca = costOf(a.laneId);
+    const cb = costOf(b.laneId);
+    if (ca !== cb) return ca - cb;
+    if (a.factors.capability !== b.factors.capability) return a.factors.capability - b.factors.capability;
+    return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
+  };
+  const rest = scored.filter((s) => !isClear(s)).sort(compareScores);
+  return [...clears.sort(byTier), ...rest];
 }
 
 // ../core/src/feedback.ts
@@ -24023,6 +24052,11 @@ function selectEscalationTarget(subject, candidates, task, ctx, policy, opts = {
   eligible.sort((a, b) => {
     const byCap = cap(b) - cap(a);
     if (byCap !== 0) return byCap;
+    if (subject.model_family !== void 0) {
+      const aSame = a.model_family === subject.model_family ? 0 : 1;
+      const bSame = b.model_family === subject.model_family ? 0 : 1;
+      if (aSame !== bSame) return aSame - bSame;
+    }
     const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
     if (byRank !== 0) return byRank;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;

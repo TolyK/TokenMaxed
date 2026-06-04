@@ -168,3 +168,14 @@ test('selectEscalationTarget: minDelta is clamped non-negative', () => {
   // A negative delta clamps to 0 ⇒ equal-capability becomes eligible (still trust/policy-gated).
   assert.equal(selectEscalationTarget(cheap, [equal], task, safeCtx, noPolicy, { minDelta: -5 })?.id, 'equal');
 });
+
+test('selectEscalationTarget: same-family is a TIE-BREAK after capability (never overrides a stronger lane)', () => {
+  const subj = lane({ id: 'subj', provenance: 'anthropic', model_family: 'claude', capability: { bugfix: 0.70 } });
+  // Two equally-capable escalation targets; one shares the subject's family.
+  const sameFam = lane({ id: 'same', provenance: 'anthropic', model_family: 'claude', capability: { bugfix: 0.90 } });
+  const otherFam = lane({ id: 'other', provenance: 'openai', model_family: 'gpt', capability: { bugfix: 0.90 } });
+  assert.equal(selectEscalationTarget(subj, [otherFam, sameFam], task, safeCtx, noPolicy)?.id, 'same');
+  // But a clearly STRONGER other-family lane still wins (tie-break never overrides capability).
+  const strongerOther = lane({ id: 'strong', provenance: 'openai', model_family: 'gpt', capability: { bugfix: 0.99 } });
+  assert.equal(selectEscalationTarget(subj, [strongerOther, sameFam], task, safeCtx, noPolicy)?.id, 'strong');
+});

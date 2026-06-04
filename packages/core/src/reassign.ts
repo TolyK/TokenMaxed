@@ -200,6 +200,13 @@ export function selectEscalationTarget(
   eligible.sort((a, b) => {
     const byCap = cap(b) - cap(a);
     if (byCap !== 0) return byCap;
+    // MODEL-TIERS: prefer stepping UP the SAME family — a TIE-BREAK only (after
+    // capability), so we never pass over a clearly stronger lane for a same-family one.
+    if (subject.model_family !== undefined) {
+      const aSame = a.model_family === subject.model_family ? 0 : 1;
+      const bSame = b.model_family === subject.model_family ? 0 : 1;
+      if (aSame !== bSame) return aSame - bSame;
+    }
     const byRank = TRUST_RANK[b.trust_mode] - TRUST_RANK[a.trust_mode];
     if (byRank !== 0) return byRank;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;

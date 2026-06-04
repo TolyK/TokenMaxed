@@ -247,16 +247,23 @@ function scoreLane(
  * higher score wins; on equal score, the lower lane id (ascending) wins.
  */
 function compareScores(a: LaneScore, b: LaneScore): number {
+  // A declared `capability: 0` (⇒ effective 0) is a HARD opt-out: it must rank below
+  // ANY positive-capability lane, even when a cost penalty would otherwise lift its
+  // raw score above a weak metered lane. It stays visible in `scores` but never wins.
+  const az = a.factors.capability === 0;
+  const bz = b.factors.capability === 0;
+  if (az !== bz) return az ? 1 : -1;
   if (b.score !== a.score) return b.score - a.score;
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
 
-function describe(lane: Lane, best: LaneScore, task: Task): string {
+function describe(lane: Lane, best: LaneScore, task: Task, tiered = false): string {
   const f = best.factors;
   const cap = f.capability.toFixed(2);
-  let reason =
-    `Selected ${lane.id} (${lane.model}) for ${task.category}: ` +
-    `capability ${cap} at ${lane.costBasis} cost.`;
+  let reason = tiered
+    ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the ` +
+      `capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.`
+    : `Selected ${lane.id} (${lane.model}) for ${task.category}: ` + `capability ${cap} at ${lane.costBasis} cost.`;
   // Annotate only when evidence actually moved the score (avoid overstating tiny
   // samples): at least one weighted review AND a different rounded value.
   if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
@@ -326,16 +333,59 @@ export function routeDecide(
     );
   }
 
-  const scores = candidates
-    .map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability))
-    .sort(compareScores);
+  const scored = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability));
+  const strategy = ctx.strategy ?? 'maximize';
+  const tiered = strategy === 'tiered';
+  // `maximize` (default): most capable wins. `tiered`: cheapest lane clearing the
+  // capability floor wins ("start cheap"); falls back to maximize if none clear it.
+  const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
   const winner = scores[0]!;
   const winningLane = candidates.find((lane) => lane.id === winner.laneId)!;
+  // Only claim "tiered" in the reason when the winner ACTUALLY cleared the floor — a
+  // no-clear fallback used the maximize ranking, so it must not say "clearing the floor".
+  const wonByTier = tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
 
   return {
     laneId: winner.laneId,
-    reason: describe(winningLane, winner, task),
+    reason: describe(winningLane, winner, task, wonByTier),
     scores,
     policyVerdict: verdicts.get(winner.laneId)!,
   };
+}
+
+/** The effective-capability floor for `task` under the tiered strategy. */
+function tierFloorFor(task: Task, ctx: RouteContext): number {
+  return ctx.tierFloorByCategory?.[task.category] ?? ctx.tierFloor ?? DEFAULT_TIER_FLOOR;
+}
+
+/** Default minimum effective capability a lane must clear to be a tiered candidate. */
+export const DEFAULT_TIER_FLOOR = 0.6;
+
+/**
+ * Tiered ordering ("start cheap, step up"): among lanes clearing the per-category
+ * capability floor, rank by cap-health (least cap-constrained first), then cost
+ * (laneCost, else costBasis penalty), then LOWEST effective capability (the smallest
+ * model that clears the floor), then id. If NO lane clears the floor, fall back to the
+ * maximize ordering so routing never fails. Floor-clearers always precede the rest.
+ */
+function orderTiered(scored: LaneScore[], candidates: readonly Lane[], task: Task, ctx: RouteContext): LaneScore[] {
+  const floor = tierFloorFor(task, ctx);
+  const laneById = new Map(candidates.map((l) => [l.id, l]));
+  const costOf = (id: string): number => ctx.laneCost?.[id] ?? COST_PENALTY[laneById.get(id)!.costBasis];
+  // A capability-0 lane is a hard opt-out — never a floor-clearer, even if a
+  // misconfigured floor is ≤ 0. It falls into `rest` (and stays in `scores`), demoted
+  // by compareScores. `rest` is the exact complement of `clears` so nothing is dropped.
+  const isClear = (s: LaneScore): boolean => s.factors.capability > 0 && s.factors.capability >= floor;
+  const clears = scored.filter(isClear);
+  if (clears.length === 0) return [...scored].sort(compareScores); // none clear ⇒ maximize
+  const byTier = (a: LaneScore, b: LaneScore): number => {
+    if (a.factors.capPenalty !== b.factors.capPenalty) return a.factors.capPenalty - b.factors.capPenalty; // cap-health
+    const ca = costOf(a.laneId);
+    const cb = costOf(b.laneId);
+    if (ca !== cb) return ca - cb; // cheaper first
+    if (a.factors.capability !== b.factors.capability) return a.factors.capability - b.factors.capability; // smallest over floor
+    return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
+  };
+  const rest = scored.filter((s) => !isClear(s)).sort(compareScores);
+  return [...clears.sort(byTier), ...rest];
 }

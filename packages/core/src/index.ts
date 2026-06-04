@@ -13,6 +13,7 @@ export {
   effectiveCapabilityFor,
   DEFAULT_CAPABILITY,
   DEFAULT_PRIOR_STRENGTH,
+  DEFAULT_TIER_FLOOR,
 } from './route.ts';
 export type { EffectiveCapabilityOptions, EligibleLane } from './route.ts';
 export { outcomeCapability, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';

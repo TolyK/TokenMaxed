@@ -221,6 +221,24 @@ export interface RouteContext {
   /** Task-level context the policy gate evaluates against (defaults to unknown/sensitive). */
   policyContext?: PolicyContext;
   /**
+   * Routing strategy (MODEL-TIERS). `maximize` (default) picks the highest
+   * capability-vs-cost score — today's behavior. `tiered` picks the CHEAPEST lane
+   * whose EFFECTIVE capability clears `tierFloor` ("start cheap"); if none clear it,
+   * it falls back to `maximize` so routing never fails. Opt-in via the adapter.
+   */
+  strategy?: 'maximize' | 'tiered';
+  /** Tiered floor: minimum effective capability a lane must clear (default ~0.6). */
+  tierFloor?: number;
+  /** Per-category overrides for {@link tierFloor}. */
+  tierFloorByCategory?: Partial<Record<TaskCategory, number>>;
+  /**
+   * Optional per-lane cost signal (e.g. resolved-model input+output $/1M from the
+   * price table) used by `tiered` selection to rank "cheapest" — coarse `costBasis`
+   * can't separate same-basis tiers (Haiku vs Opus). Absent for a lane ⇒ fall back
+   * to its `costBasis` penalty. Supplied by the host adapter (core stays pure).
+   */
+  laneCost?: Record<string, number>;
+  /**
    * Optional ids of lanes that can actually RUN right now — e.g. the provider CLI
    * is installed, the local model server is reachable, the BYOK key is present.
    * When provided, a non-native lane is a routing candidate ONLY if its id is

@@ -351,3 +351,91 @@ test('worker (api) is selectable once gate ready + certified + policy allows; la
     'claude-native',
   );
 });
+
+// --- MODEL-TIERS: tiered routing (start cheap, step up) ------------------------
+
+const tlane = (over: Partial<Lane> & { id: string }): Lane => ({
+  kind: 'cli', model: 'm', trust_mode: 'full', costBasis: 'subscription',
+  provenance: 'anthropic', jurisdiction: 'US', ...over,
+});
+const cheap = tlane({ id: 'cheap', capability: { docs: 0.7 } });
+const mid = tlane({ id: 'mid', capability: { docs: 0.85 } });
+const exp = tlane({ id: 'exp', capability: { docs: 0.95 } });
+const tierLanes = [cheap, mid, exp];
+
+test('tiered: among floor-clearers picks the LOWEST effective capability (cheapest tier)', () => {
+  const d = routeDecide({ category: 'docs' }, { lanes: tierLanes, strategy: 'tiered', tierFloor: 0.6 }, noPolicy);
+  assert.equal(d.laneId, 'cheap'); // all clear 0.6; same cost ⇒ smallest-over-floor wins
+  assert.match(d.reason, /tiered/);
+});
+
+test('tiered: laneCost decides "cheapest" when cost basis is equal', () => {
+  const d = routeDecide(
+    { category: 'docs' },
+    { lanes: tierLanes, strategy: 'tiered', tierFloor: 0.6, laneCost: { cheap: 5, mid: 1, exp: 10 } },
+    noPolicy,
+  );
+  assert.equal(d.laneId, 'mid'); // mid is cheapest by laneCost despite higher capability
+});
+
+test('tiered: falls back to maximize when NO lane clears the floor', () => {
+  const d = routeDecide({ category: 'docs' }, { lanes: tierLanes, strategy: 'tiered', tierFloor: 0.99 }, noPolicy);
+  assert.equal(d.laneId, 'exp'); // none clear ⇒ most capable wins (maximize)
+});
+
+test('tiered: cap-health takes precedence — a critical-cap cheap lane is deprioritized', () => {
+  const d = routeDecide(
+    { category: 'docs' },
+    { lanes: tierLanes, strategy: 'tiered', tierFloor: 0.6, capHeadroom: { cheap: 0 } },
+    noPolicy,
+  );
+  assert.equal(d.laneId, 'mid'); // cheap is critical-cap ⇒ deprioritized; mid is next cheapest healthy
+});
+
+test('tiered: floor is on EFFECTIVE capability (F-1 learning can lift a lane over it)', () => {
+  const lanes = [tlane({ id: 'low', capability: { docs: 0.5 } }), exp];
+  const ctx: RouteContext = { lanes, strategy: 'tiered', tierFloor: 0.6 };
+  // declared 0.5 < floor ⇒ only exp clears ⇒ exp wins.
+  assert.equal(routeDecide({ category: 'docs' }, ctx, noPolicy).laneId, 'exp');
+  // observed evidence lifts low's effective docs to ~0.78 (over the 0.6 floor, under
+  // exp's 0.95) ⇒ it now clears and wins as the cheapest/lowest-over-floor lane.
+  const lifted = { ...ctx, observedCapability: { low: { docs: { rate: 1, n: 10 } } } };
+  assert.equal(routeDecide({ category: 'docs' }, lifted, noPolicy).laneId, 'low');
+});
+
+test('tiered: a capability:0 opt-out never clears the floor (and loses the maximize fallback)', () => {
+  const optout = tlane({ id: 'optout', capability: { docs: 0 } });
+  assert.equal(routeDecide({ category: 'docs' }, { lanes: [optout, exp], strategy: 'tiered', tierFloor: 0.6 }, noPolicy).laneId, 'exp');
+});
+
+test('tiered: capability:0 opt-out is excluded even in the no-floor fallback (a weak metered lane wins)', () => {
+  // None clear the 0.6 floor ⇒ maximize fallback. A local capability:0 lane (score 0)
+  // must NOT beat a weak metered lane: the hard opt-out is enforced before scoring.
+  const optoutLocal = tlane({ id: 'optoutLocal', costBasis: 'local', capability: { docs: 0 } });
+  const weakMetered = tlane({ id: 'weakMetered', kind: 'api', costBasis: 'metered', endpoint: 'https://x', capability: { docs: 0.1 } });
+  const d = routeDecide({ category: 'docs' }, { lanes: [optoutLocal, weakMetered], strategy: 'tiered', tierFloor: 0.6, gateReady: true }, noPolicy);
+  assert.equal(d.laneId, 'weakMetered');
+});
+
+test('tiered: a capability:0 lane never clears the floor even if tierFloor is 0 (opt-out)', () => {
+  const optoutLocal = tlane({ id: 'optoutLocal', costBasis: 'local', capability: { docs: 0 } });
+  const weakMetered = tlane({ id: 'weakMetered', kind: 'api', costBasis: 'metered', endpoint: 'https://x', capability: { docs: 0.1 } });
+  const d = routeDecide({ category: 'docs' }, { lanes: [optoutLocal, weakMetered], strategy: 'tiered', tierFloor: 0, gateReady: true }, noPolicy);
+  assert.equal(d.laneId, 'weakMetered'); // optout excluded from clears AND demoted in fallback
+  assert.ok(d.scores.some((s) => s.laneId === 'optoutLocal')); // still visible in scores
+});
+
+test('tiered: the no-clear fallback reason does NOT claim it cleared the floor', () => {
+  const d = routeDecide({ category: 'docs' }, { lanes: tierLanes, strategy: 'tiered', tierFloor: 0.99 }, noPolicy);
+  assert.equal(d.laneId, 'exp');
+  assert.doesNotMatch(d.reason, /clearing the/); // fell back to maximize ⇒ honest reason
+});
+
+test('tiered: a true floor-clear winner DOES say tiered', () => {
+  const d = routeDecide({ category: 'docs' }, { lanes: tierLanes, strategy: 'tiered', tierFloor: 0.6 }, noPolicy);
+  assert.match(d.reason, /tiered/);
+});
+
+test('tiered: default strategy (maximize) is unchanged', () => {
+  assert.equal(routeDecide({ category: 'docs' }, { lanes: tierLanes }, noPolicy).laneId, 'exp'); // most capable
+});
