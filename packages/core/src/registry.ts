@@ -35,6 +35,7 @@ const ALLOWED_LANE_KEYS = new Set([
   'id',
   'kind',
   'model',
+  'model_family',
   'trust_mode',
   'costBasis',
   'provenance',
@@ -194,6 +195,7 @@ function parseLane(entry: unknown, index: number): Lane {
     }
     lane.native = entry.native;
   }
+  if (entry.model_family !== undefined) lane.model_family = requireString(entry.model_family, at('model_family'));
   if (entry.command !== undefined) lane.command = requireString(entry.command, at('command'));
   if (entry.endpoint !== undefined) lane.endpoint = requireString(entry.endpoint, at('endpoint'));
   if (entry.authHandle !== undefined) lane.authHandle = requireString(entry.authHandle, at('authHandle'));

@@ -89,8 +89,19 @@ export interface Lane {
   /** Stable local identifier, e.g. "claude-native", "codex-cli", "ollama-llama3". */
   id: string;
   kind: LaneKind;
-  /** Model id used for pricing/registry lookups, e.g. "claude-opus-4-7". */
+  /**
+   * Model id used for pricing/registry lookups, e.g. "claude-opus-4-7". May be a
+   * `<family>@latest` alias (resolved to a concrete id by the host adapter before
+   * pricing/execution).
+   */
   model: string;
+  /**
+   * Optional EXPLICIT model family for staleness checks on a pinned `model` (e.g.
+   * "minimax"). Required to flag staleness on a concrete id (family is never guessed
+   * from the id by prefix). For a `<family>@latest` alias the family is the alias
+   * stem, so this is not needed.
+   */
+  model_family?: string;
   /** What context the lane may receive (see {@link TrustMode}). */
   trust_mode: TrustMode;
   costBasis: CostBasis;

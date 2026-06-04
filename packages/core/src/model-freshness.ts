@@ -1,0 +1,87 @@
+/**
+ * Model-freshness primitives (pure, no I/O). The bug these address: a lane's
+ * `model` is a static string set once and never reconciled against the vendor's
+ * family, so it silently goes stale (e.g. `minimax-m2` while the family advanced to
+ * `minimax-m3`). These helpers support a `<family>@latest` alias and staleness
+ * detection, with EXPLICIT family metadata (never inferred from an id by prefix —
+ * `gpt-4` vs `gpt-4o` etc. make that unsafe).
+ *
+ * The host adapter does the network `/models` query and feeds concrete data in;
+ * this module only decides things from values, so it stays unit-testable.
+ */
+
+import type { PriceTable } from './price.ts';
+
+/** A parsed `model` field: either a concrete id, or a `<family>@latest` alias. */
+export type ModelSpec =
+  | { latest: false; id: string }
+  | { latest: true; family: string };
+
+/**
+ * Parse a lane's `model` string. `"<family>@latest"` ⇒ a latest-in-family alias;
+ * anything else ⇒ a concrete id. The family is the literal stem before `@latest`
+ * (explicit — we never guess a family from a concrete id here).
+ */
+export function parseModelAlias(model: string): ModelSpec {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1]!.trim() !== '') return { latest: true, family: m[1]!.trim() };
+  return { latest: false, id: model };
+}
+
+/**
+ * Natural version comparison of two model ids: split into numeric and non-numeric
+ * runs and compare run-by-run so `m2 < m2.5 < m3 < m10`. Purely lexical fallback
+ * ordering used ONLY when no release date is available; returns <0, 0, or >0.
+ */
+export function compareModelVersion(a: string, b: string): number {
+  const runs = (s: string) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === undefined) return -1; // a is a prefix of b ⇒ a is "older/smaller"
+    if (xb === undefined) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+/** Release-time of a priced model (epoch ms), or undefined when no `released` is set. */
+function releasedMs(table: PriceTable, id: string): number | undefined {
+  const r = table.models[id]?.released;
+  return r === undefined ? undefined : Date.parse(r);
+}
+
+/** Order two same-family model ids newest-first: by `released` when both have it, else version. */
+export function compareNewestFirst(table: PriceTable, a: string, b: string): number {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== undefined && tb !== undefined && ta !== tb) return tb - ta; // newer first
+  return compareModelVersion(b, a); // higher version first
+}
+
+/** The priced model ids in `family` (exact `family` metadata match — no guessing). */
+export function pricedIdsInFamily(table: PriceTable, family: string): string[] {
+  return Object.keys(table.models).filter((id) => table.models[id]!.family === family);
+}
+
+/**
+ * The newest priced model in `family` (by `released`, else version), or undefined if
+ * the table has no priced model tagged with that family. This is the deterministic,
+ * pricing-safe fallback for `<family>@latest` when the live `/models` list is
+ * unavailable — and the floor a resolved `@latest` must stay at least as new as.
+ */
+export function newestPricedInFamily(table: PriceTable, family: string): string | undefined {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return undefined;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}

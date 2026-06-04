@@ -172,12 +172,19 @@ test('loadPriceTable reads and validates the shipped seed file', () => {
   const seedPath = new URL('../../../config/prices.seed.json', import.meta.url);
   const t = loadPriceTable(seedPath);
   assert.equal(t.frontier_model, 'claude-opus-4-7');
-  assert.equal(Object.keys(t.models).length, 8);
+  assert.equal(t.schema_version, 2); // MODEL-FRESHNESS: metadata-carrying seed
+  assert.equal(Object.keys(t.models).length, 9);
   assert.equal(t.models['claude-opus-4-7']?.inputPer1M, 15);
   assert.equal(t.models['claude-haiku-4-5-20251001']?.outputPer1M, 5);
   // F2-S5: metered vendor models priced so opted-up reader/worker lanes are routable.
   assert.ok(t.models['glm-5.1']);
   assert.ok(t.models['minimax-m2']);
+  // MODEL-FRESHNESS: the family advanced to m3, now priced + tagged so @latest can
+  // resolve to it and staleness can be detected against the explicit family.
+  assert.ok(t.models['minimax-m3']);
+  assert.equal(t.models['minimax-m2']?.family, 'minimax');
+  assert.equal(t.models['minimax-m3']?.family, 'minimax');
+  assert.ok(t.models['minimax-m3']?.released);
 });
 
 test('loadPriceTable gives a clear error for a missing file', () => {

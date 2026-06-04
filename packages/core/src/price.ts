@@ -17,6 +17,15 @@ import type { CostBasis, Usage } from './types.ts';
 export interface ModelPrice {
   inputPer1M: number;
   outputPer1M: number;
+  /**
+   * Optional model-freshness metadata (price table schema_version >= 2). `family`
+   * is the EXPLICIT family group used by `@latest` resolution and staleness checks
+   * (never inferred from the id by prefix); `released` is an ISO date used to order
+   * same-family models newest-first. Both optional so schema_version 1 tables (and
+   * user tables without metadata) still load.
+   */
+  family?: string;
+  released?: string;
 }
 
 /** A validated price table: per-model list prices plus the frontier baseline. */
@@ -91,10 +100,25 @@ export function validatePriceTable(data: unknown): PriceTable {
     if (!isPlainObject(raw)) {
       throw new PriceError(`Price table models["${model}"] must be a mapping.`);
     }
-    models[model] = {
+    const entry: ModelPrice = {
       inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
       outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`),
     };
+    // Optional freshness metadata (schema_version >= 2); validated if present so a
+    // malformed field is caught, but absent ⇒ the model simply has no family/order.
+    if (raw.family !== undefined) {
+      if (typeof raw.family !== 'string' || raw.family.trim() === '') {
+        throw new PriceError(`models["${model}"].family must be a non-empty string when present.`);
+      }
+      entry.family = raw.family;
+    }
+    if (raw.released !== undefined) {
+      if (typeof raw.released !== 'string' || Number.isNaN(Date.parse(raw.released))) {
+        throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
+      }
+      entry.released = raw.released;
+    }
+    models[model] = entry;
   }
   if (!Object.hasOwn(models, data.frontier_model)) {
     throw new PriceError(

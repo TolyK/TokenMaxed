@@ -27,6 +27,14 @@ export {
 } from './price.ts';
 export type { ModelPrice, PriceTable, CostPrimitives, SavingsSummary } from './price.ts';
 export {
+  parseModelAlias,
+  compareModelVersion,
+  compareNewestFirst,
+  pricedIdsInFamily,
+  newestPricedInFamily,
+} from './model-freshness.ts';
+export type { ModelSpec } from './model-freshness.ts';
+export {
   LedgerError,
   EVENT_FIELDS,
   OUTCOME_EVENT_FIELDS,
