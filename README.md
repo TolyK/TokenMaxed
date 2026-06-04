@@ -126,9 +126,10 @@ to a cheaper lane") or drive everything by hand:
 Once the plugin is loaded and `/tokenmaxed:setup` has run, **you're done — just
 code.** The three steps above are the whole required path. Offload is
 *agent-driven*: Claude invokes the bundled `route` skill to hand a suitable
-subtask to the cheapest capable lane via the `router_delegate` tool — trusted
-CLI/local lanes (Codex, a local Ollama, the cheaper-Claude lane) work with **no
-flags**. The plugin's hooks don't route on their own; they only gate delegation
+subtask to the cheapest capable lane via the `router_delegate` tool — the trusted
+subscription CLI lanes enabled by default (Codex, the cheaper-Claude lane) work
+with **no flags** (a local Ollama is an opt-in template — flip `blocked`→`full`
+once a server is running). The plugin's hooks don't route on their own; they only gate delegation
 when routing is off (a deterministic backstop) and run the optional turn-end
 review. The env flags below switch on the *optional* features.
 
@@ -137,7 +138,7 @@ Claude Code**. In the shell they go *before* `claude` (they're environment
 variables, not CLI arguments):
 
 ```bash
-# Plain — trusted CLI/local offload works out of the box:
+# Plain — trusted subscription CLI offload (Codex, cheaper-Claude) works out of the box:
 claude --plugin-dir packages/plugin
 
 # Common "turn the safe extras on" launch: open the safety gate (needs gitleaks)
@@ -297,9 +298,11 @@ cp config/lanes.example.yaml config/lanes.yaml
 Each lane declares its `kind`, `model`, `trust_mode`, `costBasis`, provenance,
 and optional per-category `capability` scores in `[0, 1]`. See
 [`config/lanes.example.yaml`](./config/lanes.example.yaml) for the full,
-commented schema. **Trusted CLI/local lanes are selectable out of the box;
-untrusted worker (BYOK API) lanes stay disabled until you open the safety gate**
-(`TOKENMAXED_GATE_READY=true` with a secret scanner installed) — that ordering is
+commented schema. **Trusted subscription CLI lanes (Codex, the cheaper-Claude lane)
+are enabled by default; a local Ollama and untrusted worker (BYOK API) lanes ship as
+opt-in `blocked` templates** — Ollama needs only a flip to `full` (plus a running
+local server), while worker lanes also require opening the safety gate
+(`TOKENMAXED_GATE_READY=true` with a secret scanner installed). That ordering is
 enforced in code by the minimization/policy gate.
 
 ### 3. Route a task

@@ -16,6 +16,14 @@ test('lanes.starter.yaml matches config/lanes.example.yaml', () => {
   assert.equal(shipped, canonical, 'run: cp config/lanes.example.yaml packages/mcp/lanes.starter.yaml');
 });
 
+test('the PLUGIN lanes.starter.yaml also matches config/lanes.example.yaml', () => {
+  // build.mjs copies this from the mcp starter; guard it so a stale plugin starter
+  // can't ship an out-of-date default (e.g. an enabled Ollama after CONFIG-1).
+  const shipped = read(new URL('../../plugin/lanes.starter.yaml', import.meta.url));
+  const canonical = read(new URL('../../../config/lanes.example.yaml', import.meta.url));
+  assert.equal(shipped, canonical, 'run: npm run build:plugin (copies lanes.starter.yaml into packages/plugin)');
+});
+
 test('policy.starter.yaml matches config/policy.example.yaml', () => {
   const shipped = read(new URL('../policy.starter.yaml', import.meta.url));
   const canonical = read(new URL('../../../config/policy.example.yaml', import.meta.url));

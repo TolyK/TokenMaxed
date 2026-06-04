@@ -274,17 +274,21 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   const reg = loadLaneConfig(examplePath);
   assert.equal(reg.lanes.length, 8);
   assert.ok(reg.byId('claude-native'));
-  assert.ok(reg.byId('codex-cli'));
-  assert.ok(reg.byId('ollama-llama3'));
+  // CONFIG-1: enabled defaults are the host + the default reviewer (codex) + the
+  // in-family cheaper-Claude lane — all first-party or availability-gated.
+  assert.equal(reg.byId('codex-cli')?.trust_mode, 'full', 'codex-cli is the default reviewer (full)');
   // Cheaper-Claude in-family lane (A-5b): a trusted `claude -p` CLI lane.
   const haiku = reg.byId('claude-haiku');
   assert.ok(haiku);
   assert.equal(haiku!.command, 'claude');
   assert.equal(haiku!.provenance, 'anthropic');
+  assert.equal(haiku!.trust_mode, 'full', 'claude-haiku stays an enabled in-family lane');
   assert.ok(reg instanceof LaneRegistry);
-  // F2-S5: the named vendor lanes ship as SAFE inert templates (blocked) — only
-  // the native host + manager are trusted out of the box; vendors are user's choice.
-  for (const id of ['gemini-cli', 'kimi-cli', 'glm-api', 'minimax-api']) {
+  // CONFIG-1: a local Ollama is NOT an enabled default (a local server isn't
+  // assumed) — it ships blocked alongside the named vendor templates. Only the host,
+  // the reviewer, and the in-family lane are trusted out of the box; the rest are the
+  // user's deliberate choice.
+  for (const id of ['ollama-llama3', 'gemini-cli', 'kimi-cli', 'glm-api', 'minimax-api']) {
     assert.equal(reg.byId(id)?.trust_mode, 'blocked', `${id} must ship blocked`);
   }
 });

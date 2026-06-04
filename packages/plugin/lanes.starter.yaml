@@ -87,13 +87,13 @@ lanes:
       feature: 0.85
       refactor: 0.82
 
-  - id: ollama-llama3
-    kind: local
-    model: llama3.1:8b
-    trust_mode: full
-    costBasis: local
-    provenance: meta
-    jurisdiction: US
+  - id: ollama-llama3            # Local Ollama model. OPT-IN: a local server is the
+    kind: local                  # least likely thing to be present, so it is NOT an
+    model: llama3.1:8b           # enabled default — you choose it deliberately.
+    trust_mode: blocked          # → full to enable (requires a running local Ollama
+    costBasis: local             #   server reachable at the endpoint; default
+    provenance: meta             #   http://localhost:11434). Routing skips it anyway
+    jurisdiction: US             #   if the server isn't reachable (availability gate).
     capability:
       boilerplate: 0.70
       docs: 0.60
@@ -134,10 +134,12 @@ lanes:
 
   # --- Other provider lanes (SUPPORTED) ---------------------------------------
   # Popular vendors, shipped as SAFE inert TEMPLATES: each is `blocked` (never
-  # selected) until YOU pick a trust_mode. (The lanes ABOVE — codex-cli, ollama —
-  # are illustrative `full` examples; in your own config, set every lane's trust
-  # deliberately. The vendor lanes here add nothing to your trust surface until
-  # you change `blocked`.) Trust ladder: blocked < worker < reader < full.
+  # selected) until YOU pick a trust_mode. (The only enabled defaults ABOVE are the
+  # host `claude-native`, `codex-cli` (the default reviewer), and the in-family
+  # `claude-haiku` — all first-party or availability-gated. `ollama-llama3` ships
+  # `blocked` too: a local server isn't assumed. In your own config, set every
+  # lane's trust deliberately.) The vendor lanes here add nothing to your trust
+  # surface until you change `blocked`. Trust ladder: blocked < worker < reader < full.
   #   • worker — cheapest safe offload: a minimized, scrubbed, no-repo task. API/BYOK only.
   #   • reader — repo-READ context (no secrets/shell/tools, answer-only) for a vendor you
   #              trust with CODE but not secrets. Sends repo code to the vendor. API/BYOK
