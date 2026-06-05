@@ -105,6 +105,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       readerEgress: false,
       tiered: false,
       lanes: [],
+      laneReview: 'current',
     }),
     now: () => FIXED_NOW,
     ...over,
@@ -492,11 +493,13 @@ test('setup reports the manager + open gate when present', async () => {
           { id: 'codex-cli', kind: 'cli', model: 'gpt-5.5', trustMode: 'full', executionMode: 'answer-only', role: 'active-reviewer', available: true },
           { id: 'minimax-api', kind: 'api', model: 'minimax-m3', rawModel: 'minimax@latest', trustMode: 'worker', executionMode: 'answer-only', role: 'none', available: false },
         ],
+        laneReview: 'changed',
       }),
     }),
   );
   assert.match(r.content[0]!.text, /reader egress: on/);
   assert.match(r.content[0]!.text, /tiered routing: on/);
+  assert.match(r.content[0]!.text, /lanes changed since you last reviewed them/); // SETUP-1 B reminder
   assert.match(r.content[0]!.text, /manager: claude-haiku/);
   assert.match(r.content[0]!.text, /worker gate: open/);
   // SETUP-1: the per-lane confirmation is rendered (model resolved, trust→permission, role).

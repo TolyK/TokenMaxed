@@ -8,7 +8,7 @@
  */
 
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isManagerEligible, resolveLaneModel } from '@tokenmaxed/core';
@@ -17,6 +17,7 @@ import { loadLaneConfig, loadPolicyConfig, loadPriceTable, makeGitleaksScanner }
 import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile } from './config.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
+import { laneSetFingerprint, markLanesSeen, readLaneReviewState, writeLaneReviewState } from './lane-state.ts';
 import { selectManagerLane } from './manager-select.ts';
 import type { SetupReport } from './tools.ts';
 
@@ -76,6 +77,20 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
       ...(l.capability ? { capability: l.capability } : {}),
     };
   });
+
+  // SETUP-1 B: detect whether the lane set changed since this project last reviewed it,
+  // then MARK SEEN (setup is the explicit, visible surface — the only one that writes).
+  // Fingerprint the RAW lanes (config), per Codex — not the resolved @latest models.
+  const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? 'default';
+  const statePath =
+    env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join(env.CLAUDE_PLUGIN_DATA, 'state.json') : homeFile('state.json'));
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join(dirname(statePath), 'lane-review.json');
+  const fingerprint = laneSetFingerprint(registry.lanes);
+  const reviewState = readLaneReviewState(laneStatePath);
+  const prior = Object.hasOwn(reviewState.byProject, projectKey) ? reviewState.byProject[projectKey]!.fingerprint : undefined;
+  const laneReview: SetupReport['laneReview'] = prior === undefined ? 'first-review' : prior !== fingerprint ? 'changed' : 'current';
+  writeLaneReviewState(laneStatePath, markLanesSeen(reviewState, projectKey, fingerprint));
+
   // Probe scanner health with a benign input (never sends anything). makeGitleaksScanner
   // fails CLOSED (available:true, hasSecret:true) when the probe itself errors, so a
   // benign input flagged as a "secret" means the scanner is broken — report unusable.
@@ -105,5 +120,6 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     tiered:
       env.TOKENMAXED_TIERED === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
     lanes: laneRows,
+    laneReview,
   };
 }

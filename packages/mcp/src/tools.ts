@@ -169,6 +169,12 @@ export interface SetupReport {
   tiered: boolean;
   /** SETUP-1: per-lane confirmation rows (model/trust/permissions/role/availability). */
   lanes: LaneSetupRow[];
+  /**
+   * SETUP-1 B: lane-review state for this project vs the configured lane set —
+   * 'first-review' (never reviewed here), 'changed' (config changed since last review),
+   * or 'current'. Setup marks the set as reviewed when it runs.
+   */
+  laneReview: 'first-review' | 'changed' | 'current';
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -658,6 +664,11 @@ export function createTools(core: CorePort): ToolDef[] {
           `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
           `  tiered routing: ${r.tiered ? 'on' : 'off'} (enable with TOKENMAXED_TIERED=true — start on the cheapest lane clearing the capability floor, step up on review failure)`,
           '',
+          ...(r.laneReview === 'changed'
+            ? ['⚠ Your lanes changed since you last reviewed them — confirm the summary below.']
+            : r.laneReview === 'first-review'
+              ? ['ℹ Lane review: confirm what each lane may see/do below (recorded so you\'re reminded if it changes).']
+              : []),
           ...formatLaneSetup(r.lanes),
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,

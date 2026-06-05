@@ -14227,8 +14227,8 @@ var require_dist2 = __commonJS({
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync7, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname5, join as join5 } from "node:path";
+import { existsSync as existsSync8, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync4 } from "node:fs";
+import { dirname as dirname6, join as join6 } from "node:path";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
@@ -25438,23 +25438,101 @@ async function runReviewWithBudget(runner, newId, opts) {
 }
 
 // ../mcp/src/setup.ts
-import { copyFileSync, existsSync as existsSync6, mkdirSync as mkdirSync3 } from "node:fs";
-import { dirname as dirname4 } from "node:path";
+import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
+import { dirname as dirname5, join as join5 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
+
+// ../mcp/src/lane-state.ts
+import { createHash } from "node:crypto";
+import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname4 } from "node:path";
+var STATE_VERSION = 1;
+function canonicalLane(l) {
+  return {
+    id: l.id,
+    kind: l.kind,
+    model: l.model,
+    // RAW (an @latest alias is config; price-table resolution is not)
+    model_family: l.model_family ?? null,
+    trust_mode: l.trust_mode,
+    costBasis: l.costBasis,
+    provenance: l.provenance,
+    jurisdiction: l.jurisdiction,
+    native: l.native ?? false,
+    manager_allowed: l.manager_allowed ?? false,
+    attestation: l.attestation ?? false,
+    repo_read_attestation: l.repo_read_attestation ?? false,
+    execution_mode: l.execution_mode ?? "answer-only",
+    roles: [...l.roles ?? []].sort(),
+    // a role SET — order-insensitive, sort for stability
+    command: l.command ?? null,
+    args: l.args ?? null,
+    // CLI arg ORDER is significant — preserve it
+    endpoint: l.endpoint ?? null,
+    authHandle: l.authHandle ?? null,
+    capability: sortedCapability(l.capability)
+  };
+}
+function sortedCapability(cap) {
+  if (!cap) return null;
+  const out = {};
+  for (const k of Object.keys(cap).sort()) out[k] = cap[k];
+  return out;
+}
+function laneSetFingerprint(lanes) {
+  const canonical = lanes.map(canonicalLane);
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+function emptyLaneReviewState() {
+  return { version: STATE_VERSION, byProject: /* @__PURE__ */ Object.create(null) };
+}
+function coerceLaneReviewState(raw) {
+  if (!raw || typeof raw !== "object" || raw.version !== STATE_VERSION) return emptyLaneReviewState();
+  const by = raw.byProject;
+  if (!by || typeof by !== "object" || Array.isArray(by)) return emptyLaneReviewState();
+  const out = emptyLaneReviewState();
+  for (const [key, v] of Object.entries(by)) {
+    const fp = v?.fingerprint;
+    if (typeof fp === "string" && fp !== "") out.byProject[key] = { fingerprint: fp };
+  }
+  return out;
+}
+function readLaneReviewState(path) {
+  try {
+    return existsSync6(path) ? coerceLaneReviewState(JSON.parse(readFileSync4(path, "utf8"))) : emptyLaneReviewState();
+  } catch {
+    return emptyLaneReviewState();
+  }
+}
+function writeLaneReviewState(path, state) {
+  try {
+    mkdirSync3(dirname4(path), { recursive: true });
+    writeFileSync3(path, JSON.stringify(state, null, 2) + "\n", "utf8");
+  } catch {
+  }
+}
+function markLanesSeen(state, projectKey, fingerprint) {
+  const next = emptyLaneReviewState();
+  Object.assign(next.byProject, state.byProject);
+  next.byProject[projectKey] = { fingerprint };
+  return next;
+}
+
+// ../mcp/src/setup.ts
 var LANES_STARTER = fileURLToPath3(new URL("../lanes.starter.yaml", import.meta.url));
 var POLICY_STARTER = fileURLToPath3(new URL("../policy.starter.yaml", import.meta.url));
 var DEFAULT_PRICES = fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
-  const lanesExisted = existsSync6(lanesPath);
+  const lanesExisted = existsSync7(lanesPath);
   if (!lanesExisted) {
-    mkdirSync3(dirname4(lanesPath), { recursive: true });
+    mkdirSync4(dirname5(lanesPath), { recursive: true });
     copyFileSync(LANES_STARTER, lanesPath);
   }
-  const policyExisted = existsSync6(policyPath);
+  const policyExisted = existsSync7(policyPath);
   if (!policyExisted) {
-    mkdirSync3(dirname4(policyPath), { recursive: true });
+    mkdirSync4(dirname5(policyPath), { recursive: true });
     copyFileSync(POLICY_STARTER, policyPath);
   }
   const registry2 = loadLaneConfig(lanesPath);
@@ -25483,6 +25561,14 @@ async function runSetup(env) {
       ...l.capability ? { capability: l.capability } : {}
     };
   });
+  const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
+  const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join5(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname5(statePath), "lane-review.json");
+  const fingerprint = laneSetFingerprint(registry2.lanes);
+  const reviewState = readLaneReviewState(laneStatePath);
+  const prior = Object.hasOwn(reviewState.byProject, projectKey) ? reviewState.byProject[projectKey].fingerprint : void 0;
+  const laneReview = prior === void 0 ? "first-review" : prior !== fingerprint ? "changed" : "current";
+  writeLaneReviewState(laneStatePath, markLanesSeen(reviewState, projectKey, fingerprint));
   const scan = await makeGitleaksScanner()([""]);
   const gitleaksAvailable = scan.available && !scan.hasSecret;
   return {
@@ -25503,7 +25589,8 @@ async function runSetup(env) {
     readerEgress: env.TOKENMAXED_READER_EGRESS === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
     tiered: env.TOKENMAXED_TIERED === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
-    lanes: laneRows
+    lanes: laneRows,
+    laneReview
   };
 }
 
@@ -25882,6 +25969,7 @@ ${r.notes}` : "";
         `  reader egress: ${r.readerEgress ? "on" : "off"} (enable with TOKENMAXED_READER_EGRESS=true \u2014 lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
         `  tiered routing: ${r.tiered ? "on" : "off"} (enable with TOKENMAXED_TIERED=true \u2014 start on the cheapest lane clearing the capability floor, step up on review failure)`,
         "",
+        ...r.laneReview === "changed" ? ["\u26A0 Your lanes changed since you last reviewed them \u2014 confirm the summary below."] : r.laneReview === "first-review" ? ["\u2139 Lane review: confirm what each lane may see/do below (recorded so you're reminded if it changes)."] : [],
         ...formatLaneSetup(r.lanes),
         "",
         `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
@@ -25993,16 +26081,16 @@ function escToOutcome(esc2, modelOf, recordingFailed) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync7(statePath)) return {};
+      if (!existsSync8(statePath)) return {};
       try {
-        return JSON.parse(readFileSync4(statePath, "utf8"));
+        return JSON.parse(readFileSync5(statePath, "utf8"));
       } catch {
         return {};
       }
     },
     write: (state) => {
-      mkdirSync4(dirname5(statePath), { recursive: true });
-      writeFileSync3(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+      mkdirSync5(dirname6(statePath), { recursive: true });
+      writeFileSync4(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
 }
@@ -26044,7 +26132,7 @@ function makeServerDeps(env = process.env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync7(lanesPath)) {
+    if (!existsSync8(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
@@ -26052,7 +26140,7 @@ function makeServerDeps(env = process.env) {
     return loadLaneConfig(lanesPath).candidateLanes(category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
   };
   const delegate = async (request) => {
-    if (!existsSync7(lanesPath)) {
+    if (!existsSync8(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -26176,12 +26264,12 @@ function makeServerDeps(env = process.env) {
     // Gated egress — only non-blocked, gate-open, keyed api lanes get a /models call
     // (key only, no content); never when routing is globally disabled. Caches results.
     freshness: async () => {
-      if (globallyDisabled || !gateReady || !existsSync7(lanesPath)) return [];
+      if (globallyDisabled || !gateReady || !existsSync8(lanesPath)) return [];
       const registry2 = loadLaneConfig(lanesPath);
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname5(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join6(dirname6(statePath), "model-freshness.json");
       return reportFreshness(
         eligible,
         {
