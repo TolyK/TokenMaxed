@@ -25095,9 +25095,85 @@ async function fetchModelList(lane, deps) {
 }
 
 // ../mcp/src/summary-deps.ts
-import { existsSync as existsSync4, readFileSync as readFileSync3 } from "node:fs";
-import { dirname as dirname3, join as join4 } from "node:path";
+import { existsSync as existsSync5, readFileSync as readFileSync4 } from "node:fs";
+import { dirname as dirname4, join as join4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// ../mcp/src/lane-state.ts
+import { createHash } from "node:crypto";
+import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname3 } from "node:path";
+var STATE_VERSION = 1;
+function canonicalLane(l) {
+  return {
+    id: l.id,
+    kind: l.kind,
+    model: l.model,
+    // RAW (an @latest alias is config; price-table resolution is not)
+    model_family: l.model_family ?? null,
+    trust_mode: l.trust_mode,
+    costBasis: l.costBasis,
+    provenance: l.provenance,
+    jurisdiction: l.jurisdiction,
+    native: l.native ?? false,
+    manager_allowed: l.manager_allowed ?? false,
+    attestation: l.attestation ?? false,
+    repo_read_attestation: l.repo_read_attestation ?? false,
+    execution_mode: l.execution_mode ?? "answer-only",
+    roles: [...l.roles ?? []].sort(),
+    // a role SET — order-insensitive, sort for stability
+    command: l.command ?? null,
+    args: l.args ?? null,
+    // CLI arg ORDER is significant — preserve it
+    endpoint: l.endpoint ?? null,
+    authHandle: l.authHandle ?? null,
+    capability: sortedCapability(l.capability)
+  };
+}
+function sortedCapability(cap) {
+  if (!cap) return null;
+  const out = {};
+  for (const k of Object.keys(cap).sort()) out[k] = cap[k];
+  return out;
+}
+function laneSetFingerprint(lanes) {
+  const canonical = lanes.map(canonicalLane);
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+function emptyLaneReviewState() {
+  return { version: STATE_VERSION, byProject: /* @__PURE__ */ Object.create(null) };
+}
+function coerceLaneReviewState(raw) {
+  if (!raw || typeof raw !== "object" || raw.version !== STATE_VERSION) return emptyLaneReviewState();
+  const by = raw.byProject;
+  if (!by || typeof by !== "object" || Array.isArray(by)) return emptyLaneReviewState();
+  const out = emptyLaneReviewState();
+  for (const [key, v] of Object.entries(by)) {
+    const fp = v?.fingerprint;
+    if (typeof fp === "string" && fp !== "") out.byProject[key] = { fingerprint: fp };
+  }
+  return out;
+}
+function readLaneReviewState(path) {
+  try {
+    return existsSync4(path) ? coerceLaneReviewState(JSON.parse(readFileSync3(path, "utf8"))) : emptyLaneReviewState();
+  } catch {
+    return emptyLaneReviewState();
+  }
+}
+function writeLaneReviewState(path, state) {
+  try {
+    mkdirSync3(dirname3(path), { recursive: true });
+    writeFileSync3(path, JSON.stringify(state, null, 2) + "\n", "utf8");
+  } catch {
+  }
+}
+function markLanesSeen(state, projectKey, fingerprint) {
+  const next = emptyLaneReviewState();
+  Object.assign(next.byProject, state.byProject);
+  next.byProject[projectKey] = { fingerprint };
+  return next;
+}
 
 // ../mcp/src/manager-select.ts
 function selectManagerLane(lanes, policy, gateReady, available = null) {
@@ -25162,6 +25238,7 @@ function buildSummaryData(input) {
     windows,
     lanes: laneSummaries,
     ...reviewer ? { activeReviewerId: reviewer.id } : {},
+    ...input.laneReview ? { laneReview: input.laneReview } : {},
     empty: lifetime.offloads === 0
   };
 }
@@ -25201,6 +25278,11 @@ function formatSummaryBanner(data) {
   } else {
     lines.push("   No lanes configured yet \u2014 run /tokenmaxed:setup");
   }
+  if (data.lanes.length > 0 && data.laneReview === "changed") {
+    lines.push("   \u26A0 your lanes changed since you last reviewed them \u2014 run /tokenmaxed:setup to review");
+  } else if (data.lanes.length > 0 && data.laneReview === "first-review") {
+    lines.push("   \u2139 run /tokenmaxed:setup to review what each lane may see/do");
+  }
   const stale = data.lanes.filter((l) => l.stale);
   for (const l of stale) {
     lines.push(
@@ -25236,7 +25318,7 @@ function readOnlyToggleStore(statePath) {
   return {
     read: () => {
       try {
-        return existsSync4(statePath) ? JSON.parse(readFileSync3(statePath, "utf8")) : {};
+        return existsSync5(statePath) ? JSON.parse(readFileSync4(statePath, "utf8")) : {};
       } catch {
         return {};
       }
@@ -25257,13 +25339,15 @@ function makeSummaryFromEnv(env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
-  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname3(statePath), "model-freshness.json");
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname4(statePath), "model-freshness.json");
+  const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname4(statePath), "lane-review.json");
   return async () => {
-    const lanes = existsSync4(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+    const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     const now = Date.now();
     let staleness = [];
-    if (!globallyDisabled && existsSync4(pricesPath)) {
+    if (!globallyDisabled && existsSync5(pricesPath)) {
       try {
         staleness = await reportFreshness(
           lanes,
@@ -25283,6 +25367,12 @@ function makeSummaryFromEnv(env) {
         staleness = [];
       }
     }
+    let laneReview = "current";
+    if (lanes.length > 0) {
+      const prior = readLaneReviewState(laneStatePath).byProject[reviewProjectKey]?.fingerprint;
+      const fp = laneSetFingerprint(lanes);
+      laneReview = prior === void 0 ? "first-review" : prior !== fp ? "changed" : "current";
+    }
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
       lanes,
@@ -25293,7 +25383,8 @@ function makeSummaryFromEnv(env) {
       now,
       core: { summarize, tokenStats, filterEventsSince },
       selectManager: selectManagerLane,
-      staleness
+      staleness,
+      laneReview
     });
   };
 }
@@ -25301,7 +25392,7 @@ function makeSummaryFromEnv(env) {
 // ../mcp/src/host-review.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync5 } from "node:fs";
+import { existsSync as existsSync6 } from "node:fs";
 
 // ../mcp/src/reviewer.ts
 var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
@@ -25388,7 +25479,7 @@ function makeHostReviewDeps(env) {
 
 [diff truncated for review]` : diff;
     },
-    loadLanes: () => existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    loadLanes: () => existsSync6(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
     availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
@@ -25441,84 +25532,6 @@ async function runReviewWithBudget(runner, newId, opts) {
 import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
 import { dirname as dirname5, join as join5 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
-
-// ../mcp/src/lane-state.ts
-import { createHash } from "node:crypto";
-import { existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname4 } from "node:path";
-var STATE_VERSION = 1;
-function canonicalLane(l) {
-  return {
-    id: l.id,
-    kind: l.kind,
-    model: l.model,
-    // RAW (an @latest alias is config; price-table resolution is not)
-    model_family: l.model_family ?? null,
-    trust_mode: l.trust_mode,
-    costBasis: l.costBasis,
-    provenance: l.provenance,
-    jurisdiction: l.jurisdiction,
-    native: l.native ?? false,
-    manager_allowed: l.manager_allowed ?? false,
-    attestation: l.attestation ?? false,
-    repo_read_attestation: l.repo_read_attestation ?? false,
-    execution_mode: l.execution_mode ?? "answer-only",
-    roles: [...l.roles ?? []].sort(),
-    // a role SET — order-insensitive, sort for stability
-    command: l.command ?? null,
-    args: l.args ?? null,
-    // CLI arg ORDER is significant — preserve it
-    endpoint: l.endpoint ?? null,
-    authHandle: l.authHandle ?? null,
-    capability: sortedCapability(l.capability)
-  };
-}
-function sortedCapability(cap) {
-  if (!cap) return null;
-  const out = {};
-  for (const k of Object.keys(cap).sort()) out[k] = cap[k];
-  return out;
-}
-function laneSetFingerprint(lanes) {
-  const canonical = lanes.map(canonicalLane);
-  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
-}
-function emptyLaneReviewState() {
-  return { version: STATE_VERSION, byProject: /* @__PURE__ */ Object.create(null) };
-}
-function coerceLaneReviewState(raw) {
-  if (!raw || typeof raw !== "object" || raw.version !== STATE_VERSION) return emptyLaneReviewState();
-  const by = raw.byProject;
-  if (!by || typeof by !== "object" || Array.isArray(by)) return emptyLaneReviewState();
-  const out = emptyLaneReviewState();
-  for (const [key, v] of Object.entries(by)) {
-    const fp = v?.fingerprint;
-    if (typeof fp === "string" && fp !== "") out.byProject[key] = { fingerprint: fp };
-  }
-  return out;
-}
-function readLaneReviewState(path) {
-  try {
-    return existsSync6(path) ? coerceLaneReviewState(JSON.parse(readFileSync4(path, "utf8"))) : emptyLaneReviewState();
-  } catch {
-    return emptyLaneReviewState();
-  }
-}
-function writeLaneReviewState(path, state) {
-  try {
-    mkdirSync3(dirname4(path), { recursive: true });
-    writeFileSync3(path, JSON.stringify(state, null, 2) + "\n", "utf8");
-  } catch {
-  }
-}
-function markLanesSeen(state, projectKey, fingerprint) {
-  const next = emptyLaneReviewState();
-  Object.assign(next.byProject, state.byProject);
-  next.byProject[projectKey] = { fingerprint };
-  return next;
-}
-
-// ../mcp/src/setup.ts
 var LANES_STARTER = fileURLToPath3(new URL("../lanes.starter.yaml", import.meta.url));
 var POLICY_STARTER = fileURLToPath3(new URL("../policy.starter.yaml", import.meta.url));
 var DEFAULT_PRICES = fileURLToPath3(new URL("../prices.seed.json", import.meta.url));

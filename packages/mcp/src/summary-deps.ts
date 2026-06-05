@@ -19,6 +19,7 @@ import { JsonlLedger, loadLaneConfig, loadPriceTable } from '@tokenmaxed/core/no
 import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile, makeLoadPolicy } from './config.ts';
 import { reportFreshness } from './freshness-report.ts';
+import { laneSetFingerprint, readLaneReviewState } from './lane-state.ts';
 import { selectManagerLane } from './manager-select.ts';
 import { readFreshnessCache } from './model-cache.ts';
 import { buildSummaryData } from './summary.ts';
@@ -60,6 +61,9 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
   // the summary computes uses the SAME price table /status used to write the cache.
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath(new URL('../prices.seed.json', import.meta.url));
   const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
+  // SETUP-1 B: lane-review state — same key + path setup uses, so the hint matches.
+  const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? 'default';
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join(dirname(statePath), 'lane-review.json');
 
   return async () => {
     const lanes = existsSync(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
@@ -88,6 +92,14 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
         staleness = []; // a missing/bad price table or cache ⇒ just omit staleness
       }
     }
+    // SETUP-1 B hint: read-only — compare the RAW lane fingerprint to what setup last
+    // recorded for this project. NEVER write here (only /tokenmaxed:setup marks seen).
+    let laneReview: 'first-review' | 'changed' | 'current' = 'current';
+    if (lanes.length > 0) {
+      const prior = readLaneReviewState(laneStatePath).byProject[reviewProjectKey]?.fingerprint;
+      const fp = laneSetFingerprint(lanes);
+      laneReview = prior === undefined ? 'first-review' : prior !== fp ? 'changed' : 'current';
+    }
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
       lanes,
@@ -99,6 +111,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
       core: { summarize, tokenStats, filterEventsSince },
       selectManager: selectManagerLane,
       staleness,
+      laneReview,
     });
   };
 }

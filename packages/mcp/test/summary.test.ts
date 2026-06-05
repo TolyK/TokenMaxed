@@ -141,6 +141,18 @@ test('banner spells out a pricing-gap (newer model not priced)', () => {
   assert.match(banner, /newer minimax-m9 exists but isn't priced yet/);
 });
 
+test('banner hints to run setup when lanes changed / first-review (read-only nudge)', () => {
+  assert.match(formatSummaryBanner(build({ laneReview: 'changed' })), /lanes changed since you last reviewed them — run \/tokenmaxed:setup/);
+  assert.match(formatSummaryBanner(build({ laneReview: 'first-review' })), /run \/tokenmaxed:setup to review what each lane/);
+  assert.doesNotMatch(formatSummaryBanner(build({ laneReview: 'current' })), /\/tokenmaxed:setup to review/);
+  assert.doesNotMatch(formatSummaryBanner(build({})), /to review/); // absent ⇒ no hint
+});
+
+test('banner shows NO lane-review hint when there are no lanes (config-empty already nudges setup)', () => {
+  const banner = formatSummaryBanner(build({ lanes: [], staleness: [], laneReview: 'changed' }));
+  assert.doesNotMatch(banner, /lanes changed/);
+});
+
 test('banner shows a routing-OFF variant when disabled', () => {
   const banner = formatSummaryBanner(build({ enabled: false }));
   assert.match(banner, /routing is OFF/i);

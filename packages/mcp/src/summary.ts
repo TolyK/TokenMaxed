@@ -46,6 +46,12 @@ export interface SummaryInput {
    * and the newer one available. Empty when nothing is cached or nothing is stale.
    */
   staleness: readonly LaneStaleness[];
+  /**
+   * SETUP-1 B: lane-review status vs the configured set (read-only — the summary only
+   * HINTS, never marks seen; only /tokenmaxed:setup records a review). Default
+   * 'current' ⇒ no hint.
+   */
+  laneReview?: 'first-review' | 'changed' | 'current';
 }
 
 /** A stale-model finding for one lane (structural subset of a freshness warning). */
@@ -86,6 +92,8 @@ export interface SummaryData {
   windows: SummaryWindow[];
   lanes: LaneSummary[];
   activeReviewerId?: string;
+  /** SETUP-1 B: lane-review status (drives a read-only "run /tokenmaxed:setup" hint). */
+  laneReview?: 'first-review' | 'changed' | 'current';
   /** True when there are no routed task events yet (new user). */
   empty: boolean;
 }
@@ -149,6 +157,7 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
     windows,
     lanes: laneSummaries,
     ...(reviewer ? { activeReviewerId: reviewer.id } : {}),
+    ...(input.laneReview ? { laneReview: input.laneReview } : {}),
     empty: lifetime.offloads === 0,
   };
 }
@@ -197,6 +206,13 @@ export function formatSummaryBanner(data: SummaryData): string {
     lines.push(`   Lanes: ${laneStr}`);
   } else {
     lines.push('   No lanes configured yet — run /tokenmaxed:setup');
+  }
+  // SETUP-1 B hint (read-only — only /tokenmaxed:setup records a review). Only when
+  // lanes exist (an empty config already nudges to run setup above).
+  if (data.lanes.length > 0 && data.laneReview === 'changed') {
+    lines.push('   ⚠ your lanes changed since you last reviewed them — run /tokenmaxed:setup to review');
+  } else if (data.lanes.length > 0 && data.laneReview === 'first-review') {
+    lines.push('   ℹ run /tokenmaxed:setup to review what each lane may see/do');
   }
   // Spell out each stale lane (cache-derived; refreshed by /tokenmaxed:status).
   const stale = data.lanes.filter((l) => l.stale);
