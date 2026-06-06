@@ -226,3 +226,81 @@ export function formatSummaryBanner(data: SummaryData): string {
   lines.push('   /tokenmaxed:summary anytime · /tokenmaxed:why <category> to preview · /tokenmaxed:savings for detail');
   return lines.join('\n');
 }
+
+/** Pointer appended whenever {@link clampBanner} trims content. */
+const CLAMP_POINTER = '   … run /tokenmaxed:summary for full detail';
+
+/**
+ * Clamp a rendered banner for the SessionStart `systemMessage` surface — a UX
+ * tidiness guard, NOT a workaround for a host limit (the Claude Code host imposes
+ * no hard cap; `systemMessageChars` is a telemetry counter only). Keeps the
+ * headline, the three window lines, and the `Lanes:` line; drops the lowest-value
+ * trailing detail FIRST (the tips line, then per-stale-lane spell-outs, then the
+ * setup hint) and appends a pointer to the full summary when it trims. As a final
+ * postcondition it ellipsizes the longest remaining line (in practice the single,
+ * possibly long `Lanes:` line) so the result ALWAYS fits the budget while
+ * preserving that line's presence. Idempotent when already within budget.
+ *
+ * Postcondition: `out.length <= maxChars` for every input. Both budgets are
+ * normalized to NON-NEGATIVE INTEGERS (`Math.max(0, Math.floor(…))`), so negative,
+ * zero, and fractional budgets are all well-defined (a budget < 1 ⇒ 0 ⇒ empty
+ * output), and the inequality holds against the normalized budget.
+ *
+ * Pure string→string so one clamped source can feed BOTH the visible
+ * `systemMessage` and the model-context `additionalContext` (kept byte-identical).
+ */
+export function clampBanner(banner: string, opts: { maxLines?: number; maxChars?: number } = {}): string {
+  // Normalize to non-negative integers so the postcondition is exact for any real
+  // input (negative/fractional included): a budget < 1 floors to 0 ⇒ empty output.
+  const maxLines = Math.max(0, Math.floor(opts.maxLines ?? 12));
+  const maxChars = Math.max(0, Math.floor(opts.maxChars ?? 1500));
+  if (maxChars === 0) return '';
+  const fits = (s: string, ml: number, mc: number): boolean => s.split('\n').length <= ml && s.length <= mc;
+
+  if (fits(banner, maxLines, maxChars)) return banner;
+
+  // We are going to trim ⇒ reserve room for the pointer line in the effective budget.
+  const effLines = Math.max(1, maxLines - 1);
+  const effChars = Math.max(1, maxChars - (CLAMP_POINTER.length + 1));
+
+  // Drop-priority: higher = dropped sooner. 0 = required (never dropped by rank).
+  const dropRank = (line: string): number => {
+    if (line.includes('/tokenmaxed:summary anytime')) return 3; // the tips line
+    if (/^\s*⚠ .*— newer/.test(line)) return 2; // per-stale-lane spell-outs
+    if (line.includes('/tokenmaxed:setup')) return 1; // setup review hint(s)
+    return 0; // headline, window lines, Lanes line, blanks
+  };
+
+  let lines = banner.split('\n');
+  const removed = new Set<number>();
+  // Order droppable lines rank 3→1, bottom-most first within a rank.
+  const order = lines
+    .map((line, i) => ({ i, rank: dropRank(line) }))
+    .filter((x) => x.rank > 0)
+    .sort((a, b) => b.rank - a.rank || b.i - a.i);
+  for (const { i } of order) {
+    if (fits(lines.filter((_, j) => !removed.has(j)).join('\n'), effLines, effChars)) break;
+    removed.add(i);
+  }
+  lines = lines.filter((_, j) => !removed.has(j));
+  while (lines.length > 0 && lines[lines.length - 1]!.trim() === '') lines.pop(); // tidy trailing blanks
+  lines.push(CLAMP_POINTER);
+
+  // If STILL over maxChars (e.g. one very long Lanes line), ellipsize the longest
+  // line so the result fits while keeping every line's presence — the common case
+  // (a big lane set) lands here with the skeleton intact.
+  let out = lines.join('\n');
+  if (out.length > maxChars) {
+    let idx = 0;
+    for (let k = 1; k < lines.length; k++) if (lines[k]!.length > lines[idx]!.length) idx = k;
+    const overBy = out.length - maxChars;
+    const target = Math.max(0, lines[idx]!.length - overBy - 1); // -1 for the ellipsis char
+    lines[idx] = `${lines[idx]!.slice(0, target)}…`;
+    out = lines.join('\n');
+  }
+  // Hard postcondition backstop: GUARANTEE out.length <= maxChars even when the
+  // required skeleton alone exceeds it (a pathologically tiny budget). Line-aware
+  // ellipsis is preferred above; this is the absolute floor that can never be passed.
+  if (out.length > maxChars) out = `${out.slice(0, Math.max(0, maxChars - 1))}…`;
+  return out;
+}

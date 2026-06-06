@@ -10,7 +10,7 @@ import { filterEventsSince, summarize, tokenStats } from '../../core/src/index.t
 import type { LedgerEvent, Lane } from '../../core/src/index.ts';
 
 import { selectManagerLane } from '../src/manager-select.ts';
-import { buildSummaryData, formatSummaryBanner } from '../src/summary.ts';
+import { buildSummaryData, clampBanner, formatSummaryBanner } from '../src/summary.ts';
 
 const NOW = Date.parse('2026-06-04T12:00:00.000Z');
 const core = { summarize, tokenStats, filterEventsSince };
@@ -163,4 +163,61 @@ test('banner flags the offline lane and names the reviewer', () => {
   const banner = formatSummaryBanner(build());
   assert.match(banner, /ollama-llama3 \(full\) ⚠ offline/); // non-reviewer lanes show trust_mode
   assert.match(banner, /codex-cli \(reviewer\)/);
+});
+
+// --- clampBanner (the SessionStart systemMessage UX guard) ---------------------
+
+test('clampBanner is idempotent when the banner is already within budget', () => {
+  const banner = formatSummaryBanner(build());
+  assert.equal(clampBanner(banner), banner); // a normal banner is well under defaults
+  assert.doesNotMatch(clampBanner(banner), /run \/tokenmaxed:summary for full detail/);
+});
+
+test('clampBanner trims to the line budget, drops the tips line FIRST, and keeps headline+windows+lanes', () => {
+  // Force a tall banner: many stale lanes ⇒ many trailing spell-out lines.
+  const manyStale = Array.from({ length: 8 }, (_, i) => ({
+    laneId: i === 0 ? 'minimax-api' : `codex-cli`, // ids that exist in the fixture lanes
+    newest: `m-${i}`,
+    newestPriced: true,
+  }));
+  const banner = formatSummaryBanner(build({ staleness: manyStale }));
+  const out = clampBanner(banner, { maxLines: 10, maxChars: 5000 });
+  assert.ok(out.split('\n').length <= 10, 'within the line budget');
+  assert.match(out, /run \/tokenmaxed:summary for full detail/); // pointer appended when trimmed
+  assert.doesNotMatch(out, /\/tokenmaxed:summary anytime/); // the tips line is dropped first
+  // Required content survives:
+  assert.match(out, /TokenMaxed/);
+  assert.match(out, /Lanes:/);
+  assert.match(out, /24h/);
+  assert.match(out, /lifetime/);
+});
+
+test('clampBanner enforces maxChars by ellipsizing the long Lanes line while keeping it present', () => {
+  // A huge lane set makes the single `Lanes:` line very long; a feasible-but-tight
+  // budget (bigger than the skeleton) ⇒ the Lanes line is ellipsized, not dropped.
+  const bigLanes = Array.from({ length: 60 }, (_, i) =>
+    lane({ id: `lane-${i}-with-a-fairly-long-identifier`, command: 'x' }),
+  );
+  const banner = formatSummaryBanner(build({ lanes: bigLanes, availableLaneIds: [], staleness: [] }));
+  const out = clampBanner(banner, { maxLines: 12, maxChars: 600 });
+  assert.ok(out.length <= 600, `must fit maxChars, got ${out.length}`);
+  assert.match(out, /Lanes:/); // the line's presence is preserved
+  assert.match(out, /…/); // ellipsized
+});
+
+test('clampBanner GUARANTEES maxChars as a true postcondition even for a pathologically tiny budget', () => {
+  const banner = formatSummaryBanner(build()); // a normal multi-line banner
+  for (const maxChars of [10, 40, 80, 120]) {
+    const out = clampBanner(banner, { maxChars });
+    assert.ok(out.length <= maxChars, `budget ${maxChars}: got ${out.length}`);
+  }
+  // Budgets are normalized to non-negative integers: zero, negative, and fractional
+  // (< 1) all floor to 0 ⇒ empty string (no off-by-one '…' that would exceed budget).
+  assert.equal(clampBanner(banner, { maxChars: 0 }), '');
+  assert.equal(clampBanner('abcdef', { maxChars: 0 }), '');
+  assert.equal(clampBanner(banner, { maxChars: -1 }), '');
+  assert.equal(clampBanner('abcdef', { maxChars: -100 }), '');
+  assert.equal(clampBanner('abcdef', { maxChars: 0.5 }), ''); // fractional < 1 → 0
+  // A fractional budget >= 1 floors down, and the result still fits the floored budget.
+  assert.ok(clampBanner(banner, { maxChars: 80.9 }).length <= 80);
 });
