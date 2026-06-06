@@ -13,12 +13,14 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-import { review } from '@tokenmaxed/core';
+import { parseModelAlias, resolveLaneModel, review } from '@tokenmaxed/core';
 import type { Lane, OutcomeEventInput, Policy, ReviewVerdict } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   loadLaneConfig,
+  loadPriceTable,
   makeCliExecutor,
   makeTrustedApiExecutor,
   makeTrustedExecutor,
@@ -119,6 +121,9 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
   const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile('lanes.yaml');
   const ledgerPath = env.TOKENMAXED_LEDGER; // undefined ⇒ JsonlLedger default
+  // Same package-relative seed the server/summary use, so the review path resolves
+  // `<family>@latest` against the SAME price table everything else does.
+  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath(new URL('../prices.seed.json', import.meta.url));
   const resolveAuth = makeResolveAuth(env);
   const executor = makeTrustedExecutor({
     cli: makeCliExecutor(makeCliSpawn(REVIEW_CLI_TIMEOUT_MS)),
@@ -136,7 +141,22 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
       const diff = res.stdout;
       return diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}\n\n[diff truncated for review]` : diff;
     },
-    loadLanes: () => (existsSync(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null),
+    loadLanes: () => {
+      if (!existsSync(lanesPath)) return null;
+      const raw = [...loadLaneConfig(lanesPath).lanes];
+      // Resolve `<family>@latest` to a concrete priced id BEFORE manager selection /
+      // execution — otherwise a manager on an alias (e.g. claude-haiku@latest) would
+      // spawn `claude --model claude-haiku@latest` (invalid) or send the alias in an
+      // API body. Mirrors server.ts's routing path. Drop any STILL-unresolved alias
+      // (no priced family member) so it can never be selected and fail to spawn.
+      let table;
+      try {
+        table = loadPriceTable(pricesPath);
+      } catch {
+        return raw; // no price table ⇒ best-effort (concrete pins still work)
+      }
+      return raw.map((l) => resolveLaneModel(l, table)).filter((l) => !parseModelAlias(l.model).latest);
+    },
     availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,

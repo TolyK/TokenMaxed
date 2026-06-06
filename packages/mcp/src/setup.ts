@@ -71,6 +71,7 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
       model: resolved,
       ...(resolved !== l.model ? { rawModel: l.model } : {}),
       trustMode: l.trust_mode,
+      costBasis: l.costBasis,
       executionMode: (l.execution_mode ?? 'answer-only') as 'answer-only' | 'agentic',
       role,
       available: !!l.native || available.has(l.id),

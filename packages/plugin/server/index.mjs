@@ -14229,7 +14229,7 @@ var require_dist2 = __commonJS({
 import { randomUUID as randomUUID3 } from "node:crypto";
 import { existsSync as existsSync8, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync4 } from "node:fs";
 import { dirname as dirname6, join as join6 } from "node:path";
-import { fileURLToPath as fileURLToPath4 } from "node:url";
+import { fileURLToPath as fileURLToPath5 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
 var _a;
@@ -23389,6 +23389,21 @@ function resolveLaneModel(lane, table) {
   const concrete = newestPricedInFamily(table, spec.family);
   return concrete ? { ...lane, model: concrete } : lane;
 }
+function staleAgainstPriceTable(lanes, table) {
+  const out = [];
+  for (const lane of lanes) {
+    const spec = parseModelAlias(lane.model);
+    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
+    if (!pinned) continue;
+    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
+    if (!family) continue;
+    const newest = newestPricedInFamily(table, family);
+    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
+      out.push({ laneId: lane.id, family, pinned, newest });
+    }
+  }
+  return out;
+}
 function sameFamily(id, family) {
   if (id === family) return true;
   if (!id.startsWith(family)) return false;
@@ -23571,13 +23586,8 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at("endpoint")}: an api lane requires an endpoint.`);
     }
   }
-  if (lane.model.trim().endsWith("@latest")) {
-    if (lane.kind !== "api") {
-      throw new LaneConfigError(`${at("model")}: a "<family>@latest" alias is only supported on api lanes.`);
-    }
-    if (!parseModelAlias(lane.model).latest) {
-      throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "minimax@latest".`);
-    }
+  if (lane.model.trim().endsWith("@latest") && !parseModelAlias(lane.model).latest) {
+    throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "claude-opus@latest".`);
   }
   return lane;
 }
@@ -24749,7 +24759,8 @@ function makeCliExecutor(spawnImpl) {
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    const res = spawn(lane.command, lane.args ?? [], { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model));
+    const res = spawn(lane.command, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (res.error) throw new LaneFailure("provider_error", `cli lane "${lane.id}" failed to spawn`);
     if (res.status !== 0) throw new LaneFailure("provider_error", `cli lane "${lane.id}" exited with status ${res.status}`);
     return { resultText: res.stdout ?? "" };
@@ -25381,27 +25392,41 @@ function makeSummaryFromEnv(env) {
     const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     const now = Date.now();
-    let staleness = [];
-    if (!globallyDisabled && existsSync5(pricesPath)) {
+    let priceTable;
+    if (existsSync5(pricesPath)) {
       try {
-        staleness = await reportFreshness(
+        priceTable = loadPriceTable(pricesPath);
+      } catch {
+        priceTable = void 0;
+      }
+    }
+    const displayLanes = priceTable ? lanes.map((l) => resolveLaneModel(l, priceTable)) : lanes;
+    const staleByLane = /* @__PURE__ */ new Map();
+    if (!globallyDisabled && priceTable) {
+      for (const f of staleAgainstPriceTable(lanes, priceTable)) {
+        staleByLane.set(f.laneId, { laneId: f.laneId, newest: f.newest, newestPriced: true });
+      }
+      try {
+        for (const w of await reportFreshness(
           lanes,
           {
             fetchList: () => {
               throw new Error("summary path must not fetch");
             },
-            table: loadPriceTable(pricesPath),
+            table: priceTable,
             now,
             readCache: () => readFreshnessCache(cachePath),
             writeCache: () => {
             }
           },
           { refresh: false }
-        );
+        )) {
+          staleByLane.set(w.laneId, { laneId: w.laneId, newest: w.newest, newestPriced: w.newestPriced });
+        }
       } catch {
-        staleness = [];
       }
     }
+    const staleness = [...staleByLane.values()];
     let laneReview = "current";
     if (lanes.length > 0) {
       const prior = readLaneReviewState(laneStatePath).byProject[reviewProjectKey]?.fingerprint;
@@ -25410,7 +25435,7 @@ function makeSummaryFromEnv(env) {
     }
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
-      lanes,
+      lanes: displayLanes,
       policy: loadPolicy(),
       availableLaneIds: available,
       gateReady,
@@ -25428,6 +25453,7 @@ function makeSummaryFromEnv(env) {
 import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync6 } from "node:fs";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // ../mcp/src/reviewer.ts
 var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
@@ -25500,6 +25526,7 @@ function makeHostReviewDeps(env) {
   const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
+  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
   const resolveAuth = makeResolveAuth(env);
   const executor = makeTrustedExecutor({
     cli: makeCliExecutor(makeCliSpawn(REVIEW_CLI_TIMEOUT_MS)),
@@ -25514,7 +25541,17 @@ function makeHostReviewDeps(env) {
 
 [diff truncated for review]` : diff;
     },
-    loadLanes: () => existsSync6(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    loadLanes: () => {
+      if (!existsSync6(lanesPath)) return null;
+      const raw = [...loadLaneConfig(lanesPath).lanes];
+      let table;
+      try {
+        table = loadPriceTable(pricesPath);
+      } catch {
+        return raw;
+      }
+      return raw.map((l) => resolveLaneModel(l, table)).filter((l) => !parseModelAlias(l.model).latest);
+    },
     availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,
@@ -25566,10 +25603,10 @@ async function runReviewWithBudget(runner, newId, opts) {
 // ../mcp/src/setup.ts
 import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
 import { dirname as dirname5, join as join5 } from "node:path";
-import { fileURLToPath as fileURLToPath3 } from "node:url";
-var LANES_STARTER = fileURLToPath3(new URL("../lanes.starter.yaml", import.meta.url));
-var POLICY_STARTER = fileURLToPath3(new URL("../policy.starter.yaml", import.meta.url));
-var DEFAULT_PRICES = fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
+import { fileURLToPath as fileURLToPath4 } from "node:url";
+var LANES_STARTER = fileURLToPath4(new URL("../lanes.starter.yaml", import.meta.url));
+var POLICY_STARTER = fileURLToPath4(new URL("../policy.starter.yaml", import.meta.url));
+var DEFAULT_PRICES = fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
@@ -25603,6 +25640,7 @@ async function runSetup(env) {
       model: resolved,
       ...resolved !== l.model ? { rawModel: l.model } : {},
       trustMode: l.trust_mode,
+      costBasis: l.costBasis,
       executionMode: l.execution_mode ?? "answer-only",
       role,
       available: !!l.native || available.has(l.id),
@@ -25665,11 +25703,19 @@ var ROLE_LABEL = {
 function formatLaneSetup(rows) {
   if (rows.length === 0) return ["  (no lanes configured)"];
   const lines = ["Lanes (what each may see/do, and whether it can run now):"];
+  let anyApi = false;
   for (const r of rows) {
     const model = r.rawModel && r.rawModel !== r.model ? `${r.rawModel} \u2192 ${r.model}` : r.model;
     const caps = r.capability && Object.keys(r.capability).length > 0 ? " \xB7 caps " + Object.entries(r.capability).map(([c, v]) => `${c}=${v}`).join(",") : "";
+    const billing = r.kind === "api" ? ` \xB7 billing=${r.costBasis} (confirm: subscription vs metered)` : ` \xB7 billing=${r.costBasis}`;
+    if (r.kind === "api") anyApi = true;
     lines.push(
-      `  \u2022 ${r.id} [${r.kind}] ${model} \xB7 trust=${r.trustMode} \u2192 ${permissionFor(r.trustMode, r.executionMode)} \xB7 role=${ROLE_LABEL[r.role]} \xB7 ${r.available ? "available" : "unavailable now"}${caps}`
+      `  \u2022 ${r.id} [${r.kind}] ${model} \xB7 trust=${r.trustMode} \u2192 ${permissionFor(r.trustMode, r.executionMode)}${billing} \xB7 role=${ROLE_LABEL[r.role]} \xB7 ${r.available ? "available" : "unavailable now"}${caps}`
+    );
+  }
+  if (anyApi) {
+    lines.push(
+      "  \u24D8 For each api lane, confirm billing: a flat-rate subscription token (costBasis: subscription, treated as $0 and preferred) or pay-per-token (costBasis: metered). TokenMaxed never assumes \u2014 set it per YOUR plan."
     );
   }
   return lines;
@@ -26090,7 +26136,7 @@ function unknownKeys(inputSchema, args) {
 
 // ../mcp/src/server.ts
 var DEFAULT_LANES = homeFile("lanes.yaml");
-var DEFAULT_PRICES2 = fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
+var DEFAULT_PRICES2 = fileURLToPath5(new URL("../prices.seed.json", import.meta.url));
 function recordableLane(lane, priceTable) {
   if (lane.native || lane.costBasis !== "metered") return true;
   try {

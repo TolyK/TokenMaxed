@@ -33,7 +33,7 @@
 lanes:
   - id: claude-native
     kind: cli
-    model: claude-opus-4-7
+    model: claude-opus@latest   # self-updating: tracks the newest PRICED claude-opus (e.g. claude-opus-4-8) — never a hard-pinned version
     trust_mode: full
     costBasis: subscription
     provenance: anthropic
@@ -106,14 +106,14 @@ lanes:
   # run with TOKENMAXED_DISABLE=1 so they never re-enter routing / recurse.)
   - id: claude-haiku
     kind: cli
-    model: claude-haiku-4-5-20251001
+    model: claude-haiku@latest   # self-updating; the {model} arg below spawns the resolved id
     trust_mode: full
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
     execution_mode: answer-only
     command: claude
-    args: ["-p", "--model", "claude-haiku-4-5-20251001"]
+    args: ["-p", "--model", "{model}"]   # {model} ⇒ the resolved newest priced claude-haiku
     # Secondary / in-family manager. Codex above is the default host-turn reviewer
     # (first eligible in file order). On the escalation path this lane can only
     # independently review an offloaded output in categories where it isn't weaker
@@ -132,11 +132,37 @@ lanes:
       explain: 0.82
       codegen: 0.72
 
+  # Full-access Sonnet (Claude Code): a stronger in-family offload than Haiku for
+  # bounded subtasks, still on the same subscription (no metered $). Self-updating via
+  # claude-sonnet@latest; the {model} arg spawns the resolved id. As a manager it is a
+  # capable INDEPENDENT reviewer for Codex's strong categories (which Haiku can't cover).
+  - id: claude-sonnet
+    kind: cli
+    model: claude-sonnet@latest
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    execution_mode: answer-only
+    command: claude
+    args: ["-p", "--model", "{model}"]   # {model} ⇒ the resolved newest priced claude-sonnet
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      feature: 0.90
+      refactor: 0.86
+      bugfix: 0.85
+      boilerplate: 0.88
+      explain: 0.88
+      codegen: 0.85
+      docs: 0.86
+
   # --- Other provider lanes (SUPPORTED) ---------------------------------------
   # Popular vendors, shipped as SAFE inert TEMPLATES: each is `blocked` (never
-  # selected) until YOU pick a trust_mode. (The only enabled defaults ABOVE are the
-  # host `claude-native`, `codex-cli` (the default reviewer), and the in-family
-  # `claude-haiku` — all first-party or availability-gated. `ollama-llama3` ships
+  # selected) until YOU pick a trust_mode. (The enabled defaults ABOVE are the host
+  # `claude-native`, `codex-cli` (the default reviewer), and the in-family Claude Code
+  # lanes `claude-haiku` + `claude-sonnet` — all first-party or availability-gated.
+  # `ollama-llama3` ships
   # `blocked` too: a local server isn't assumed. In your own config, set every
   # lane's trust deliberately.) The vendor lanes here add nothing to your trust
   # surface until you change `blocked`. Trust ladder: blocked < worker < reader < full.
@@ -154,6 +180,10 @@ lanes:
   # BYOK api lanes: put the key in env TOKENMAXED_KEY_<authHandle> (never in this file).
   # api lanes speak the OpenAI /chat/completions schema — point `endpoint` at your
   # provider's OpenAI-COMPATIBLE chat-completions URL (not a vendor-proprietary one).
+  # COST: `costBasis` is YOUR billing model — NOT implied by `api`. Many vendors (e.g.
+  # MiniMax) are a flat-rate SUBSCRIPTION token ⇒ `costBasis: subscription` (treated as
+  # $0 and preferred by routing, like a CLI subscription); pay-per-token ⇒ `metered`.
+  # /tokenmaxed:setup ASKS you per api lane — TokenMaxed never assumes metered.
   # CLI lanes (gemini-cli, kimi-cli) can only be `full` or `blocked` — worker/reader
   # executors are API-only, so a CLI lane set to worker/reader loads but never routes.
 
@@ -199,9 +229,24 @@ lanes:
                                 #   automatically (family from the price table); for an
                                 #   unpriced pin add `model_family: minimax`.
     trust_mode: blocked         # → worker (no repo) or reader (repo-read; see above) or full
-    costBasis: metered
+    costBasis: subscription     # MiniMax is typically a flat-rate SUBSCRIPTION token (not pay-per-token); /tokenmaxed:setup confirms this with you
     provenance: minimax
     jurisdiction: CN
     endpoint: https://api.minimax.io/v1/chat/completions   # use the OpenAI-compatible URL
     authHandle: MINIMAX
     capability: { codegen: 0.80, boilerplate: 0.80, docs: 0.76 }
+
+  # Sonnet via Anthropic API (BYOK) — an OPT-IN alternative to the Claude Code CLI
+  # lane above, NOT a default. When the `claude` CLI is available, the subscription
+  # CLI lane runs Sonnet (no metered $); this is here only if you deliberately want
+  # Sonnet over the API. Flip trust_mode to worker/full to enable. Self-updating.
+  - id: claude-sonnet-api
+    kind: api
+    model: claude-sonnet@latest
+    trust_mode: blocked
+    costBasis: metered
+    provenance: anthropic
+    jurisdiction: US
+    endpoint: https://api.anthropic.com/v1/chat/completions   # Anthropic's OpenAI-compatible endpoint
+    authHandle: ANTHROPIC
+    capability: { codegen: 0.85, boilerplate: 0.86, docs: 0.86, explain: 0.88 }

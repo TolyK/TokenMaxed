@@ -18,18 +18,30 @@ test('permissionFor maps each trust mode with the right qualifiers', () => {
 });
 
 const row = (over: Partial<LaneSetupRow> & { id: string }): LaneSetupRow => ({
-  kind: 'cli', model: 'm', trustMode: 'full', executionMode: 'answer-only', role: 'none', available: true, ...over,
+  kind: 'cli', model: 'm', trustMode: 'full', costBasis: 'subscription', executionMode: 'answer-only', role: 'none', available: true, ...over,
 });
 
 test('formatLaneSetup renders model, trust→permission, role, and availability', () => {
   const lines = formatLaneSetup([
     row({ id: 'codex-cli', model: 'gpt-5.5', trustMode: 'full', role: 'active-reviewer' }),
-    row({ id: 'minimax-api', kind: 'api', model: 'minimax-m3', rawModel: 'minimax@latest', trustMode: 'worker', role: 'none', available: false }),
+    row({ id: 'minimax-api', kind: 'api', model: 'minimax-m3', rawModel: 'minimax@latest', trustMode: 'worker', costBasis: 'subscription', role: 'none', available: false }),
   ]);
   const text = lines.join('\n');
   assert.match(text, /codex-cli \[cli\] gpt-5\.5 · trust=full.*role=reviewer \(active\) · available/);
   // @latest shown as raw → resolved; unavailable + worker permission qualifier.
   assert.match(text, /minimax-api \[api\] minimax@latest → minimax-m3 · trust=worker.*NO repo.*role=— · unavailable now/);
+});
+
+test('formatLaneSetup surfaces billing and prompts to confirm it for api lanes', () => {
+  // api lane: billing is shown AND flagged to confirm (never assumed from "api").
+  const apiText = formatLaneSetup([row({ id: 'minimax-api', kind: 'api', costBasis: 'subscription' })]).join('\n');
+  assert.match(apiText, /billing=subscription \(confirm: subscription vs metered\)/);
+  assert.match(apiText, /For each api lane, confirm billing/);
+  // cli lane: billing shown, no confirm prompt (subscription/local is unambiguous).
+  const cliText = formatLaneSetup([row({ id: 'codex-cli', kind: 'cli', costBasis: 'subscription' })]).join('\n');
+  assert.match(cliText, /billing=subscription/);
+  assert.doesNotMatch(cliText, /confirm: subscription vs metered/);
+  assert.doesNotMatch(cliText, /For each api lane/);
 });
 
 test('formatLaneSetup shows declared capability when present, and handles empty', () => {

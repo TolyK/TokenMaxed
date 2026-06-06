@@ -7375,6 +7375,7 @@ import { join as join4 } from "node:path";
 import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { existsSync as existsSync3 } from "node:fs";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../core/src/types.ts
 var TRUST_MODES = ["full", "worker", "reader", "blocked"];
@@ -7580,6 +7581,51 @@ function parseModelAlias(model) {
   if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
   return { latest: false, id: model };
 }
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function releasedMs(table, id) {
+  const r = table.models[id]?.released;
+  return r === void 0 ? void 0 : Date.parse(r);
+}
+function compareNewestFirst(table, a, b) {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
+  return compareModelVersion(b, a);
+}
+function pricedIdsInFamily(table, family) {
+  return Object.keys(table.models).filter((id) => table.models[id].family === family);
+}
+function newestPricedInFamily(table, family) {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return void 0;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}
+function resolveLaneModel(lane, table) {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
 
 // ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
@@ -7744,13 +7790,8 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at("endpoint")}: an api lane requires an endpoint.`);
     }
   }
-  if (lane.model.trim().endsWith("@latest")) {
-    if (lane.kind !== "api") {
-      throw new LaneConfigError(`${at("model")}: a "<family>@latest" alias is only supported on api lanes.`);
-    }
-    if (!parseModelAlias(lane.model).latest) {
-      throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "minimax@latest".`);
-    }
+  if (lane.model.trim().endsWith("@latest") && !parseModelAlias(lane.model).latest) {
+    throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "claude-opus@latest".`);
   }
   return lane;
 }
@@ -7806,6 +7847,66 @@ function parseLaneConfig(text) {
     seen.add(lane.id);
   }
   return new LaneRegistry(lanes);
+}
+
+// ../core/src/price.ts
+var PriceError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PriceError";
+  }
+};
+function isPlainObject3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function requireNonNegativeNumber(value, where) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new PriceError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function validatePriceTable(data) {
+  if (!isPlainObject3(data)) {
+    throw new PriceError("Price table must be a JSON object.");
+  }
+  if (typeof data.schema_version !== "number") {
+    throw new PriceError('Price table "schema_version" must be a number.');
+  }
+  if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
+    throw new PriceError('Price table "frontier_model" must be a non-empty string.');
+  }
+  if (!isPlainObject3(data.models)) {
+    throw new PriceError('Price table "models" must be a mapping of model id to prices.');
+  }
+  const models = /* @__PURE__ */ Object.create(null);
+  for (const [model, raw] of Object.entries(data.models)) {
+    if (!isPlainObject3(raw)) {
+      throw new PriceError(`Price table models["${model}"] must be a mapping.`);
+    }
+    const entry = {
+      inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
+      outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`)
+    };
+    if (raw.family !== void 0) {
+      if (typeof raw.family !== "string" || raw.family.trim() === "") {
+        throw new PriceError(`models["${model}"].family must be a non-empty string when present.`);
+      }
+      entry.family = raw.family;
+    }
+    if (raw.released !== void 0) {
+      if (typeof raw.released !== "string" || Number.isNaN(Date.parse(raw.released))) {
+        throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
+      }
+      entry.released = raw.released;
+    }
+    models[model] = entry;
+  }
+  if (!Object.hasOwn(models, data.frontier_model)) {
+    throw new PriceError(
+      `Price table frontier_model "${data.frontier_model}" has no entry in models.`
+    );
+  }
+  return { schema_version: data.schema_version, frontier_model: data.frontier_model, models };
 }
 
 // ../core/src/ledger.ts
@@ -7872,7 +7973,7 @@ var LedgerError = class extends Error {
     this.name = "LedgerError";
   }
 };
-function isPlainObject3(value) {
+function isPlainObject4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireString2(value, where) {
@@ -7892,7 +7993,7 @@ function requireIsoTimestamp(value, where) {
   }
   return s;
 }
-function requireNonNegativeNumber(value, where) {
+function requireNonNegativeNumber2(value, where) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     throw new LedgerError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
   }
@@ -7917,9 +8018,9 @@ function requireEnum2(value, allowed, where) {
   return value;
 }
 function validateEventInput(input) {
-  const actual_cost = requireNonNegativeNumber(input.actual_cost, "task.actual_cost");
-  const frontier_cost = requireNonNegativeNumber(input.frontier_cost, "task.frontier_cost");
-  const metered_spent = requireNonNegativeNumber(input.metered_spent, "task.metered_spent");
+  const actual_cost = requireNonNegativeNumber2(input.actual_cost, "task.actual_cost");
+  const frontier_cost = requireNonNegativeNumber2(input.frontier_cost, "task.frontier_cost");
+  const metered_spent = requireNonNegativeNumber2(input.metered_spent, "task.metered_spent");
   const out = {
     task_id: requireString2(input.task_id, "task.task_id"),
     attempt: requireNonNegativeInt(input.attempt, "task.attempt"),
@@ -8009,7 +8110,7 @@ function backfillLegacyTask(obj) {
   };
 }
 function parseEvent(obj) {
-  if (!isPlainObject3(obj)) {
+  if (!isPlainObject4(obj)) {
     throw new LedgerError("Ledger record must be a JSON object.");
   }
   const meta = parseMeta(obj);
@@ -8107,6 +8208,24 @@ function loadLaneConfig(path) {
     throw new LaneConfigError(`Could not read lane config at "${filePath}": ${detail}`);
   }
   return parseLaneConfig(text);
+}
+function loadPriceTable(path) {
+  const filePath = typeof path === "string" ? path : fileURLToPath(path);
+  let text;
+  try {
+    text = readFileSync(filePath, "utf8");
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PriceError(`Could not read price table at "${filePath}": ${detail}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PriceError(`Could not parse price table at "${filePath}" as JSON: ${detail}`);
+  }
+  return validatePriceTable(parsed);
 }
 function loadPolicyConfig(path) {
   const filePath = typeof path === "string" ? path : fileURLToPath(path);
@@ -8233,7 +8352,8 @@ function makeCliExecutor(spawnImpl) {
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    const res = spawn(lane.command, lane.args ?? [], { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model));
+    const res = spawn(lane.command, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (res.error) throw new LaneFailure("provider_error", `cli lane "${lane.id}" failed to spawn`);
     if (res.status !== 0) throw new LaneFailure("provider_error", `cli lane "${lane.id}" exited with status ${res.status}`);
     return { resultText: res.stdout ?? "" };
@@ -8484,6 +8604,7 @@ function makeHostReviewDeps(env) {
   const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
+  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
   const resolveAuth = makeResolveAuth(env);
   const executor = makeTrustedExecutor({
     cli: makeCliExecutor(makeCliSpawn(REVIEW_CLI_TIMEOUT_MS)),
@@ -8498,7 +8619,17 @@ function makeHostReviewDeps(env) {
 
 [diff truncated for review]` : diff;
     },
-    loadLanes: () => existsSync3(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : null,
+    loadLanes: () => {
+      if (!existsSync3(lanesPath)) return null;
+      const raw = [...loadLaneConfig(lanesPath).lanes];
+      let table;
+      try {
+        table = loadPriceTable(pricesPath);
+      } catch {
+        return raw;
+      }
+      return raw.map((l) => resolveLaneModel(l, table)).filter((l) => !parseModelAlias(l.model).latest);
+    },
     availableLaneIds: makeAvailabilityProbe(env),
     loadPolicy: makeLoadPolicy(env),
     runManager: async (lane, prompt) => (await executor(lane, prompt)).resultText,

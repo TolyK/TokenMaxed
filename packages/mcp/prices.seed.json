@@ -1,8 +1,10 @@
 {
   "schema_version": 2,
-  "frontier_model": "claude-opus-4-7",
+  "frontier_model": "claude-opus-4-8",
   "models": {
+    "claude-opus-4-8": { "inputPer1M": 5, "outputPer1M": 25, "family": "claude-opus", "released": "2026-05-15" },
     "claude-opus-4-7": { "inputPer1M": 15, "outputPer1M": 75, "family": "claude-opus", "released": "2026-01-15" },
+    "claude-sonnet-4-6": { "inputPer1M": 3, "outputPer1M": 15, "family": "claude-sonnet", "released": "2025-11-14" },
     "claude-haiku-4-5-20251001": { "inputPer1M": 1, "outputPer1M": 5, "family": "claude-haiku", "released": "2025-10-01" },
     "gpt-5.5": { "inputPer1M": 10, "outputPer1M": 30, "family": "gpt", "released": "2026-02-01" },
     "llama3.1:8b": { "inputPer1M": 0, "outputPer1M": 0, "family": "llama", "released": "2024-07-23" },

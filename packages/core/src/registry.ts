@@ -226,17 +226,16 @@ function parseLane(entry: unknown, index: number): Lane {
       throw new LaneConfigError(`${at('endpoint')}: an api lane requires an endpoint.`);
     }
   }
-  // A `<family>@latest` alias is resolved against the price table at routing time.
-  // Reject anything ending in "@latest" that isn't a well-formed alias on an api
-  // lane: bare "@latest" (empty family stem) would otherwise parse as a concrete id
-  // and could reach execution literally; CLI/local lanes pin a concrete model.
-  if (lane.model.trim().endsWith('@latest')) {
-    if (lane.kind !== 'api') {
-      throw new LaneConfigError(`${at('model')}: a "<family>@latest" alias is only supported on api lanes.`);
-    }
-    if (!parseModelAlias(lane.model).latest) {
-      throw new LaneConfigError(`${at('model')}: "@latest" needs a family stem, e.g. "minimax@latest".`);
-    }
+  // A `<family>@latest` alias is resolved against the price table at routing time
+  // (and on the summary path), so a lane tracks the newest priced model in its family
+  // instead of hard-pinning a version that silently goes stale. Supported on ANY lane
+  // kind: api lanes send the resolved id in the request body; cli/local lanes spawn the
+  // resolved id via a `{model}` arg placeholder (see makeCliExecutor) or, for the native
+  // host lane, use it for pricing/display only. We only reject a MALFORMED alias — bare
+  // "@latest" with an empty family stem — which would otherwise parse as a concrete id
+  // and could reach execution literally.
+  if (lane.model.trim().endsWith('@latest') && !parseModelAlias(lane.model).latest) {
+    throw new LaneConfigError(`${at('model')}: "@latest" needs a family stem, e.g. "claude-opus@latest".`);
   }
   return lane;
 }

@@ -449,7 +449,13 @@ export function makeCliExecutor(spawnImpl?: SpawnLike): TrustedExecFn {
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    const res = spawn(lane.command, lane.args ?? [], { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    // `{model}` placeholder substitution: a CLI lane can pass `--model {model}` in its
+    // args instead of hard-pinning a version, so the spawn always uses the lane's
+    // CURRENT model. By the time a lane reaches the executor its `model` is already the
+    // concrete, price-table-resolved id (a `<family>@latest` alias has been resolved on
+    // the routing path), so this keeps CLI lanes self-updating with no stale literal.
+    const args = (lane.args ?? []).map((a) => a.replaceAll('{model}', lane.model));
+    const res = spawn(lane.command, args, { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     if (res.error) throw new LaneFailure('provider_error', `cli lane "${lane.id}" failed to spawn`);
     if (res.status !== 0) throw new LaneFailure('provider_error', `cli lane "${lane.id}" exited with status ${res.status}`);
     return { resultText: res.stdout ?? '' }; // CLIs rarely report tokens ⇒ estimated downstream

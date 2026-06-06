@@ -34,10 +34,11 @@ export {
   pricedIdsInFamily,
   newestPricedInFamily,
   resolveLaneModel,
+  staleAgainstPriceTable,
   sameFamily,
   assessStaleness,
 } from './model-freshness.ts';
-export type { ModelSpec, FamilyModel, StalenessReport } from './model-freshness.ts';
+export type { ModelSpec, FamilyModel, StalenessReport, PriceTableStaleness } from './model-freshness.ts';
 export {
   LedgerError,
   EVENT_FIELDS,

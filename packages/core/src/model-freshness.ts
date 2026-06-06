@@ -102,6 +102,50 @@ export function resolveLaneModel<L extends { model: string }>(lane: L, table: Pr
   return concrete ? { ...lane, model: concrete } : lane;
 }
 
+/** A price-table-derived staleness finding (egress-free; covers any lane kind). */
+export interface PriceTableStaleness {
+  laneId: string;
+  /** The family the comparison was made within. */
+  family: string;
+  /** The concrete model the lane currently uses (an `@latest` alias already resolved). */
+  pinned: string;
+  /** The newest priced model in the family — what the lane should be on. */
+  newest: string;
+}
+
+/**
+ * Check each lane against the PRICE TABLE ONLY (no vendor `/models` call), so it is
+ * safe to run on the session-start path for EVERY lane kind — including the CLI/native
+ * Claude lanes that the live, api-only staleness check never sees. A lane is flagged
+ * when the concrete model it would use (a `<family>@latest` alias resolved to the
+ * newest priced id; a concrete pin taken as-is) is OLDER than the newest priced model
+ * in its family. The family is taken from a `<family>@latest` stem, the lane's explicit
+ * `model_family`, or the price table's metadata for the concrete id — NEVER guessed
+ * from the id string. Lanes with no resolvable family (or already on the newest priced
+ * model) produce no finding. An `@latest` lane is therefore self-correcting: it always
+ * resolves to the newest priced model, so it is never flagged. Pure — no I/O.
+ */
+export function staleAgainstPriceTable<L extends { id: string; model: string; model_family?: string }>(
+  lanes: readonly L[],
+  table: PriceTable,
+): PriceTableStaleness[] {
+  const out: PriceTableStaleness[] = [];
+  for (const lane of lanes) {
+    const spec = parseModelAlias(lane.model);
+    // The concrete model the lane would actually use.
+    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
+    if (!pinned) continue; // an @latest alias with no priced family member ⇒ handled elsewhere.
+    const family = spec.latest ? spec.family : (lane.model_family ?? table.models[pinned]?.family);
+    if (!family) continue; // unknown family ⇒ can't judge (no prefix guessing).
+    const newest = newestPricedInFamily(table, family);
+    // Flag only when a strictly-newer priced model exists in the family.
+    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
+      out.push({ laneId: lane.id, family, pinned, newest });
+    }
+  }
+  return out;
+}
+
 /** A model id (optionally with a vendor `created` epoch) for family matching. */
 export interface FamilyModel {
   id: string;

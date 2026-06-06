@@ -13,6 +13,7 @@ import {
   pricedIdsInFamily,
   newestPricedInFamily,
   resolveLaneModel,
+  staleAgainstPriceTable,
   sameFamily,
   assessStaleness,
 } from '../src/model-freshness.ts';
@@ -126,4 +127,34 @@ test('newestPricedInFamily falls back to version order when releases are absent'
     },
   };
   assert.equal(newestPricedInFamily(noDates, 'foo'), 'foo-10'); // 10 > 2 numerically
+});
+
+// --- staleAgainstPriceTable: the egress-free "are the latest models in use?" check ---
+
+test('staleAgainstPriceTable flags a concrete pin behind the newest priced in family', () => {
+  // Covers ANY lane kind — here a cli lane pinned to an older minimax.
+  const found = staleAgainstPriceTable([{ id: 'l', model: 'minimax-m2' }], table);
+  assert.equal(found.length, 1);
+  assert.deepEqual(found[0], { laneId: 'l', family: 'minimax', pinned: 'minimax-m2', newest: 'minimax-m3' });
+});
+
+test('staleAgainstPriceTable does NOT flag a lane already on the newest priced model', () => {
+  assert.deepEqual(staleAgainstPriceTable([{ id: 'l', model: 'minimax-m3' }], table), []);
+});
+
+test('staleAgainstPriceTable never flags a <family>@latest lane (it resolves to newest)', () => {
+  // This is why @latest is the fix: a self-updating lane is never "behind".
+  assert.deepEqual(staleAgainstPriceTable([{ id: 'l', model: 'minimax@latest' }], table), []);
+});
+
+test('staleAgainstPriceTable skips a pin with no resolvable family (no prefix guessing)', () => {
+  // `opus` has no family metadata and the lane sets no model_family ⇒ cannot judge.
+  assert.deepEqual(staleAgainstPriceTable([{ id: 'l', model: 'opus' }], table), []);
+});
+
+test('staleAgainstPriceTable uses an explicit model_family to judge an unpriced pin', () => {
+  const found = staleAgainstPriceTable([{ id: 'l', model: 'minimax-m1', model_family: 'minimax' }], table);
+  assert.equal(found.length, 1);
+  assert.equal(found[0]!.pinned, 'minimax-m1');
+  assert.equal(found[0]!.newest, 'minimax-m3');
 });

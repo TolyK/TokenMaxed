@@ -492,8 +492,8 @@ test('setup reports the manager + open gate when present', async () => {
         readerEgress: true,
         tiered: true,
         lanes: [
-          { id: 'codex-cli', kind: 'cli', model: 'gpt-5.5', trustMode: 'full', executionMode: 'answer-only', role: 'active-reviewer', available: true },
-          { id: 'minimax-api', kind: 'api', model: 'minimax-m3', rawModel: 'minimax@latest', trustMode: 'worker', executionMode: 'answer-only', role: 'none', available: false },
+          { id: 'codex-cli', kind: 'cli', model: 'gpt-5.5', trustMode: 'full', costBasis: 'subscription', executionMode: 'answer-only', role: 'active-reviewer', available: true },
+          { id: 'minimax-api', kind: 'api', model: 'minimax-m3', rawModel: 'minimax@latest', trustMode: 'worker', costBasis: 'subscription', executionMode: 'answer-only', role: 'none', available: false },
         ],
         laneReview: 'changed',
       }),
