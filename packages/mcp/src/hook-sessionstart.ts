@@ -4,9 +4,16 @@
  *
  * Runs the SAME shared LOCAL summary code as /tokenmaxed:summary (makeSummaryFromEnv);
  * it does NOT call the MCP tool, because SessionStart can fire before the MCP server
- * has connected. Output is injected as additionalContext (per Claude Code hooks docs
- * it primes Claude's context, not a guaranteed visible terminal banner — the visible
- * surface is the /tokenmaxed:summary command).
+ * has connected.
+ *
+ * Visibility: the banner is emitted BOTH as `systemMessage` (rendered to the USER by
+ * the host — zero model turn) AND as `hookSpecificOutput.additionalContext` (primes
+ * Claude's context). Both carry the SAME clamped string, so user-visible and
+ * model-context text can never drift. Keeping additionalContext is deliberate: the
+ * model benefits from knowing the lane/availability setup at session start. The only
+ * cost is a small, ONE-TIME prompt-context add (the clamped banner) — not a model
+ * turn, not per-turn. The string is run through clampBanner so a config with many
+ * lanes/stale models can't print an unbounded wall (the host imposes no cap).
  *
  * Guardrails: SILENT under the TOKENMAXED_DISABLE kill-switch; a routing-OFF variant
  * is shown for the persisted project toggle (handled inside buildSummaryData via the
@@ -19,11 +26,11 @@
  * stdin (reading fd 0 synchronously could block until EOF, and we don't need the
  * session JSON). Claude Code's own hook timeout is the hard backstop for a wedged disk.
  *
- * Contract: exit 0 always; emit nothing, or {"hookSpecificOutput":{...}} JSON.
+ * Contract: exit 0 always; emit nothing, or {"systemMessage":...,"hookSpecificOutput":{...}} JSON.
  */
 
 import { makeSummaryFromEnv } from './summary-deps.ts';
-import { formatSummaryBanner } from './summary.ts';
+import { clampBanner, formatSummaryBanner } from './summary.ts';
 
 async function main(): Promise<void> {
   const env = process.env;
@@ -37,8 +44,14 @@ async function main(): Promise<void> {
     return; // fail open — silent on any error
   }
 
-  const banner = formatSummaryBanner(data);
-  await writeStdout(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: banner } }));
+  // One clamped source for BOTH surfaces ⇒ systemMessage === additionalContext.
+  const banner = clampBanner(formatSummaryBanner(data));
+  await writeStdout(
+    JSON.stringify({
+      systemMessage: banner,
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: banner },
+    }),
+  );
 }
 
 /** Write to stdout and resolve only once it has been flushed to the OS. */

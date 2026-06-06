@@ -8669,6 +8669,43 @@ function formatSummaryBanner(data) {
   lines.push("   /tokenmaxed:summary anytime \xB7 /tokenmaxed:why <category> to preview \xB7 /tokenmaxed:savings for detail");
   return lines.join("\n");
 }
+var CLAMP_POINTER = "   \u2026 run /tokenmaxed:summary for full detail";
+function clampBanner(banner, opts = {}) {
+  const maxLines = Math.max(0, Math.floor(opts.maxLines ?? 12));
+  const maxChars = Math.max(0, Math.floor(opts.maxChars ?? 1500));
+  if (maxChars === 0) return "";
+  const fits = (s, ml, mc) => s.split("\n").length <= ml && s.length <= mc;
+  if (fits(banner, maxLines, maxChars)) return banner;
+  const effLines = Math.max(1, maxLines - 1);
+  const effChars = Math.max(1, maxChars - (CLAMP_POINTER.length + 1));
+  const dropRank = (line) => {
+    if (line.includes("/tokenmaxed:summary anytime")) return 3;
+    if (/^\s*⚠ .*— newer/.test(line)) return 2;
+    if (line.includes("/tokenmaxed:setup")) return 1;
+    return 0;
+  };
+  let lines = banner.split("\n");
+  const removed = /* @__PURE__ */ new Set();
+  const order = lines.map((line, i) => ({ i, rank: dropRank(line) })).filter((x) => x.rank > 0).sort((a, b) => b.rank - a.rank || b.i - a.i);
+  for (const { i } of order) {
+    if (fits(lines.filter((_, j) => !removed.has(j)).join("\n"), effLines, effChars)) break;
+    removed.add(i);
+  }
+  lines = lines.filter((_, j) => !removed.has(j));
+  while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+  lines.push(CLAMP_POINTER);
+  let out = lines.join("\n");
+  if (out.length > maxChars) {
+    let idx = 0;
+    for (let k = 1; k < lines.length; k++) if (lines[k].length > lines[idx].length) idx = k;
+    const overBy = out.length - maxChars;
+    const target = Math.max(0, lines[idx].length - overBy - 1);
+    lines[idx] = `${lines[idx].slice(0, target)}\u2026`;
+    out = lines.join("\n");
+  }
+  if (out.length > maxChars) out = `${out.slice(0, Math.max(0, maxChars - 1))}\u2026`;
+  return out;
+}
 
 // ../mcp/src/toggle.ts
 var ENABLED_BY_DEFAULT = true;
@@ -8771,8 +8808,13 @@ async function main() {
   } catch {
     return;
   }
-  const banner = formatSummaryBanner(data);
-  await writeStdout(JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: banner } }));
+  const banner = clampBanner(formatSummaryBanner(data));
+  await writeStdout(
+    JSON.stringify({
+      systemMessage: banner,
+      hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: banner }
+    })
+  );
 }
 function writeStdout(s) {
   return new Promise((resolve) => {
