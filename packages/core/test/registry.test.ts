@@ -268,19 +268,38 @@ test('rejects native on a non-full lane (contradictory)', () => {
   assert.throws(() => parseLaneConfig(cfg), { message: /native is only valid on a full-trust lane/ });
 });
 
-test('rejects a <family>@latest alias on a non-api lane (api-only)', () => {
+test('accepts a <family>@latest alias on a cli lane (resolved at routing/spawn via {model})', () => {
+  // MODEL-FRESHNESS: cli/local/native lanes may now self-update via @latest too —
+  // not just api lanes. The alias is stored verbatim; routing resolves it to a
+  // concrete priced id, and the cli executor substitutes it into a {model} arg.
   const cli = `
 lanes:
   - id: x
     kind: cli
-    model: claude@latest
+    model: claude-opus@latest
     trust_mode: full
     costBasis: subscription
     provenance: anthropic
     jurisdiction: US
     command: claude
+    args: ["-p", "--model", "{model}"]
 `;
-  assert.throws(() => parseLaneConfig(cli), { message: /@latest" alias is only supported on api lanes/ });
+  assert.equal(parseLaneConfig(cli).byId('x')?.model, 'claude-opus@latest');
+});
+
+test('accepts a <family>@latest alias on the native lane (pricing/display only)', () => {
+  const native = `
+lanes:
+  - id: claude-native
+    kind: cli
+    model: claude-opus@latest
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    native: true
+`;
+  assert.equal(parseLaneConfig(native).byId('claude-native')?.model, 'claude-opus@latest');
 });
 
 test('rejects a bare "@latest" with no family stem (would otherwise execute literally)', () => {
@@ -319,8 +338,17 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   // Pass the file: URL directly; loadLaneConfig handles URL→path (and spaces).
   const examplePath = new URL('../../../config/lanes.example.yaml', import.meta.url);
   const reg = loadLaneConfig(examplePath);
-  assert.equal(reg.lanes.length, 8);
+  assert.equal(reg.lanes.length, 10);
   assert.ok(reg.byId('claude-native'));
+  // MODEL-FRESHNESS: the host lane self-updates via @latest instead of a hard pin.
+  assert.equal(reg.byId('claude-native')?.model, 'claude-opus@latest');
+  // Sonnet's DEFAULT is the full-access Claude Code (CLI subscription) lane, self-updating.
+  assert.equal(reg.byId('claude-sonnet')?.trust_mode, 'full');
+  assert.equal(reg.byId('claude-sonnet')?.kind, 'cli');
+  assert.equal(reg.byId('claude-sonnet')?.model, 'claude-sonnet@latest');
+  // The Anthropic API Sonnet lane ships as an OPT-IN template (blocked, not a default).
+  assert.equal(reg.byId('claude-sonnet-api')?.trust_mode, 'blocked');
+  assert.equal(reg.byId('claude-sonnet-api')?.kind, 'api');
   // CONFIG-1: enabled defaults are the host + the default reviewer (codex) + the
   // in-family cheaper-Claude lane — all first-party or availability-gated.
   assert.equal(reg.byId('codex-cli')?.trust_mode, 'full', 'codex-cli is the default reviewer (full)');
@@ -335,7 +363,7 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   // assumed) — it ships blocked alongside the named vendor templates. Only the host,
   // the reviewer, and the in-family lane are trusted out of the box; the rest are the
   // user's deliberate choice.
-  for (const id of ['ollama-llama3', 'gemini-cli', 'kimi-cli', 'glm-api', 'minimax-api']) {
+  for (const id of ['ollama-llama3', 'gemini-cli', 'kimi-cli', 'glm-api', 'minimax-api', 'claude-sonnet-api']) {
     assert.equal(reg.byId(id)?.trust_mode, 'blocked', `${id} must ship blocked`);
   }
   // MODEL-FRESHNESS: api vendor templates default to <family>@latest so enabling one

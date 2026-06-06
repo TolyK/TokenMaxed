@@ -64,6 +64,23 @@ test('makeCliExecutor throws on a non-zero exit (so runTask degrades)', async ()
   await assert.rejects(() => exec(codexCli, 'x'));
 });
 
+test('makeCliExecutor substitutes the {model} placeholder with the resolved lane model', async () => {
+  // MODEL-FRESHNESS: a cli lane uses `--model {model}` instead of a hard-pinned id, so
+  // the spawn always runs the lane's current (price-table-resolved) model.
+  let seen: readonly string[] = [];
+  const exec = makeCliExecutor((_cmd, args) => {
+    seen = args;
+    return { status: 0, stdout: 'ok' };
+  });
+  const sonnet: Lane = {
+    id: 'claude-sonnet', kind: 'cli', model: 'claude-sonnet-4-6', trust_mode: 'full',
+    costBasis: 'subscription', provenance: 'anthropic', jurisdiction: 'US',
+    command: 'claude', args: ['-p', '--model', '{model}'], capability: { codegen: 0.85 },
+  };
+  await exec(sonnet, 'do it');
+  assert.deepEqual(seen, ['-p', '--model', 'claude-sonnet-4-6']); // {model} ⇒ lane.model
+});
+
 test('makeOllamaExecutor posts to /api/generate and maps eval counts to usage', async () => {
   let url: string | undefined;
   const exec = makeOllamaExecutor(async (u) => {

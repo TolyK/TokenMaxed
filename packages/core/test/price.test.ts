@@ -171,10 +171,19 @@ test('validatePriceTable rejects a non-object', () => {
 test('loadPriceTable reads and validates the shipped seed file', () => {
   const seedPath = new URL('../../../config/prices.seed.json', import.meta.url);
   const t = loadPriceTable(seedPath);
-  assert.equal(t.frontier_model, 'claude-opus-4-7');
+  // MODEL-FRESHNESS: the frontier baseline tracks the current most-capable Claude
+  // (claude-opus-4-8); the previous frontier stays priced for back-compat.
+  assert.equal(t.frontier_model, 'claude-opus-4-8');
   assert.equal(t.schema_version, 2); // MODEL-FRESHNESS: metadata-carrying seed
-  assert.equal(Object.keys(t.models).length, 9);
+  assert.equal(Object.keys(t.models).length, 11);
+  assert.equal(t.models['claude-opus-4-8']?.inputPer1M, 5);
+  assert.equal(t.models['claude-opus-4-8']?.outputPer1M, 25);
+  assert.equal(t.models['claude-opus-4-8']?.family, 'claude-opus');
   assert.equal(t.models['claude-opus-4-7']?.inputPer1M, 15);
+  // Sonnet 4.6 priced + family-tagged so claude-sonnet@latest resolves to it.
+  assert.equal(t.models['claude-sonnet-4-6']?.inputPer1M, 3);
+  assert.equal(t.models['claude-sonnet-4-6']?.outputPer1M, 15);
+  assert.equal(t.models['claude-sonnet-4-6']?.family, 'claude-sonnet');
   assert.equal(t.models['claude-haiku-4-5-20251001']?.outputPer1M, 5);
   // F2-S5: metered vendor models priced so opted-up reader/worker lanes are routable.
   assert.ok(t.models['glm-5.1']);

@@ -7613,6 +7613,27 @@ function newestPricedInFamily(table, family) {
   if (ids.length === 0) return void 0;
   return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
 }
+function resolveLaneModel(lane, table) {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
+function staleAgainstPriceTable(lanes, table) {
+  const out = [];
+  for (const lane of lanes) {
+    const spec = parseModelAlias(lane.model);
+    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
+    if (!pinned) continue;
+    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
+    if (!family) continue;
+    const newest = newestPricedInFamily(table, family);
+    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
+      out.push({ laneId: lane.id, family, pinned, newest });
+    }
+  }
+  return out;
+}
 function sameFamily(id, family) {
   if (id === family) return true;
   if (!id.startsWith(family)) return false;
@@ -7795,13 +7816,8 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at("endpoint")}: an api lane requires an endpoint.`);
     }
   }
-  if (lane.model.trim().endsWith("@latest")) {
-    if (lane.kind !== "api") {
-      throw new LaneConfigError(`${at("model")}: a "<family>@latest" alias is only supported on api lanes.`);
-    }
-    if (!parseModelAlias(lane.model).latest) {
-      throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "minimax@latest".`);
-    }
+  if (lane.model.trim().endsWith("@latest") && !parseModelAlias(lane.model).latest) {
+    throw new LaneConfigError(`${at("model")}: "@latest" needs a family stem, e.g. "claude-opus@latest".`);
   }
   return lane;
 }
@@ -8790,27 +8806,41 @@ function makeSummaryFromEnv(env) {
     const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     const now = Date.now();
-    let staleness = [];
-    if (!globallyDisabled && existsSync5(pricesPath)) {
+    let priceTable;
+    if (existsSync5(pricesPath)) {
       try {
-        staleness = await reportFreshness(
+        priceTable = loadPriceTable(pricesPath);
+      } catch {
+        priceTable = void 0;
+      }
+    }
+    const displayLanes = priceTable ? lanes.map((l) => resolveLaneModel(l, priceTable)) : lanes;
+    const staleByLane = /* @__PURE__ */ new Map();
+    if (!globallyDisabled && priceTable) {
+      for (const f of staleAgainstPriceTable(lanes, priceTable)) {
+        staleByLane.set(f.laneId, { laneId: f.laneId, newest: f.newest, newestPriced: true });
+      }
+      try {
+        for (const w of await reportFreshness(
           lanes,
           {
             fetchList: () => {
               throw new Error("summary path must not fetch");
             },
-            table: loadPriceTable(pricesPath),
+            table: priceTable,
             now,
             readCache: () => readFreshnessCache(cachePath),
             writeCache: () => {
             }
           },
           { refresh: false }
-        );
+        )) {
+          staleByLane.set(w.laneId, { laneId: w.laneId, newest: w.newest, newestPriced: w.newestPriced });
+        }
       } catch {
-        staleness = [];
       }
     }
+    const staleness = [...staleByLane.values()];
     let laneReview = "current";
     if (lanes.length > 0) {
       const prior = readLaneReviewState(laneStatePath).byProject[reviewProjectKey]?.fingerprint;
@@ -8819,7 +8849,7 @@ function makeSummaryFromEnv(env) {
     }
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
-      lanes,
+      lanes: displayLanes,
       policy: loadPolicy(),
       availableLaneIds: available,
       gateReady,

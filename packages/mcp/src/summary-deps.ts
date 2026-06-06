@@ -13,7 +13,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { filterEventsSince, summarize, tokenStats } from '@tokenmaxed/core';
+import { filterEventsSince, resolveLaneModel, staleAgainstPriceTable, summarize, tokenStats } from '@tokenmaxed/core';
+import type { PriceTable } from '@tokenmaxed/core';
 import { JsonlLedger, loadLaneConfig, loadPriceTable } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
@@ -69,29 +70,55 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
     const lanes = existsSync(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     const now = Date.now();
-    // Staleness for the banner is CACHE-ONLY (refresh:false) — the summary/session
-    // start path must never make a /models call. The cache is populated by the
-    // explicit, networked /tokenmaxed:status. fetchList throws to prove no egress.
-    let staleness: { laneId: string; newest: string; newestPriced: boolean }[] = [];
-    if (!globallyDisabled && existsSync(pricesPath)) {
+    // Load the price table once: it both resolves `<family>@latest` to the concrete
+    // model the banner displays AND backs the egress-free latest-model check below.
+    let priceTable: PriceTable | undefined;
+    if (existsSync(pricesPath)) {
       try {
-        staleness = await reportFreshness(
+        priceTable = loadPriceTable(pricesPath);
+      } catch {
+        priceTable = undefined; // a missing/bad price table ⇒ display raw, skip staleness
+      }
+    }
+    // Display the RESOLVED model (e.g. claude-opus@latest ⇒ claude-opus-4-8), so the
+    // banner shows the concrete model in use rather than the alias. Falls back to the
+    // raw lane when there is no price table (or the family isn't priced).
+    const displayLanes = priceTable ? lanes.map((l) => resolveLaneModel(l, priceTable!)) : lanes;
+    // "Are the latest models in use?" — checked at session start for EVERY lane kind
+    // against the price table only (no /models egress). An `@latest` lane resolves to
+    // the newest priced model so it's never flagged; a concrete pin that's behind the
+    // newest priced model in its family IS flagged (incl. the CLI Claude lanes the
+    // api-only live check never sees). This is the primary up-to-date signal.
+    const staleByLane = new Map<string, { laneId: string; newest: string; newestPriced: boolean }>();
+    if (!globallyDisabled && priceTable) {
+      for (const f of staleAgainstPriceTable(lanes, priceTable)) {
+        staleByLane.set(f.laneId, { laneId: f.laneId, newest: f.newest, newestPriced: true });
+      }
+      // Overlay the CACHE-ONLY live check (api lanes): it can report a newer model that
+      // isn't priced yet (a pricing gap the price-table check can't see), so it takes
+      // precedence per lane. refresh:false ⇒ never a /models call here; fetchList throws
+      // to prove no egress on the session-start path.
+      try {
+        for (const w of await reportFreshness(
           lanes,
           {
             fetchList: () => {
               throw new Error('summary path must not fetch');
             },
-            table: loadPriceTable(pricesPath),
+            table: priceTable,
             now,
             readCache: () => readFreshnessCache(cachePath),
             writeCache: () => {},
           },
           { refresh: false },
-        );
+        )) {
+          staleByLane.set(w.laneId, { laneId: w.laneId, newest: w.newest, newestPriced: w.newestPriced });
+        }
       } catch {
-        staleness = []; // a missing/bad price table or cache ⇒ just omit staleness
+        /* a bad cache ⇒ keep the price-table findings already collected */
       }
     }
+    const staleness = [...staleByLane.values()];
     // SETUP-1 B hint: read-only — compare the RAW lane fingerprint to what setup last
     // recorded for this project. NEVER write here (only /tokenmaxed:setup marks seen).
     let laneReview: 'first-review' | 'changed' | 'current' = 'current';
@@ -102,7 +129,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
     }
     return buildSummaryData({
       events: new JsonlLedger(ledgerPath).readAll(),
-      lanes,
+      lanes: displayLanes,
       policy: loadPolicy(),
       availableLaneIds: available,
       gateReady,

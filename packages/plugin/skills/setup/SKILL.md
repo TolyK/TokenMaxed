@@ -10,7 +10,20 @@ disable-model-invocation: true
    starter templates if they don't exist (it never overwrites), validates them,
    and reports status.
 2. Present the status report to the user verbatim.
-3. Then guide them through any next steps the report implies:
+3. **For every `api` lane in the report, ASK the user how it is billed — never assume.**
+   An API endpoint is NOT inherently metered: many vendors (e.g. MiniMax) are accessed
+   via a flat-rate **subscription token**. For each `api` lane, ask whether their access
+   is:
+   - a **subscription** (flat-rate / prepaid token, no per-task charge) → set
+     `costBasis: subscription` in `~/.tokenmaxed/lanes.yaml` (treated as $0 and
+     preferred by routing, like a CLI subscription — true to the premise of maximizing
+     subscriptions), or
+   - **metered** (pay-per-token) → set `costBasis: metered` (priced per token).
+
+   Use the AskUserQuestion tool (one question per api lane, or one grouped question if
+   there are several) and then edit `costBasis` in `lanes.yaml` to match their answer.
+   This keeps the user from being mislabeled as metered when they are on a subscription.
+4. Then guide them through any next steps the report implies:
    - Edit `~/.tokenmaxed/lanes.yaml` to add/trust the lanes they want (provider
      CLIs like Codex/Gemini, a local Ollama, the cheaper-Claude lane, or a BYOK
      OpenAI-compatible worker).

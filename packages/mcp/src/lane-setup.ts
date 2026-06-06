@@ -19,6 +19,9 @@ export interface LaneSetupRow {
   /** The raw `model` when it differs from `model` (i.e. an unresolved/resolved alias). */
   rawModel?: string;
   trustMode: Lane['trust_mode'];
+  /** Billing model (how the user pays). For `api` lanes this is USER-ASSERTED, never
+   * inferred — setup asks subscription (flat token) vs metered (pay-per-token). */
+  costBasis: Lane['costBasis'];
   executionMode: 'answer-only' | 'agentic';
   /** 'reviewer' = the lane the host-turn review would use now; else manager-eligibility. */
   role: 'active-reviewer' | 'manager-eligible' | 'none';
@@ -60,14 +63,25 @@ const ROLE_LABEL: Record<LaneSetupRow['role'], string> = {
 export function formatLaneSetup(rows: readonly LaneSetupRow[]): string[] {
   if (rows.length === 0) return ['  (no lanes configured)'];
   const lines: string[] = ['Lanes (what each may see/do, and whether it can run now):'];
+  let anyApi = false;
   for (const r of rows) {
     const model = r.rawModel && r.rawModel !== r.model ? `${r.rawModel} → ${r.model}` : r.model;
     const caps = r.capability && Object.keys(r.capability).length > 0
       ? ' · caps ' + Object.entries(r.capability).map(([c, v]) => `${c}=${v}`).join(',')
       : '';
+    // Surface billing so the user can confirm it — and flag API lanes, whose costBasis
+    // is the user's plan (subscription token vs metered), never inferred from "api".
+    const billing = r.kind === 'api' ? ` · billing=${r.costBasis} (confirm: subscription vs metered)` : ` · billing=${r.costBasis}`;
+    if (r.kind === 'api') anyApi = true;
     lines.push(
       `  • ${r.id} [${r.kind}] ${model} · trust=${r.trustMode} → ${permissionFor(r.trustMode, r.executionMode)}` +
-        ` · role=${ROLE_LABEL[r.role]} · ${r.available ? 'available' : 'unavailable now'}${caps}`,
+        `${billing} · role=${ROLE_LABEL[r.role]} · ${r.available ? 'available' : 'unavailable now'}${caps}`,
+    );
+  }
+  if (anyApi) {
+    lines.push(
+      '  ⓘ For each api lane, confirm billing: a flat-rate subscription token (costBasis: subscription, ' +
+        'treated as $0 and preferred) or pay-per-token (costBasis: metered). TokenMaxed never assumes — set it per YOUR plan.',
     );
   }
   return lines;
