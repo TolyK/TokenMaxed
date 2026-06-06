@@ -75,6 +75,8 @@ export interface LaneSummary {
   kind: Lane['kind'];
   model: string;
   trustMode: Lane['trust_mode'];
+  /** Provenance/vendor, used to render a friendly name (anthropic ⇒ "Claude"). */
+  provenance: Lane['provenance'];
   /** True for the lane the review path would actually use right now. */
   isActiveReviewer: boolean;
   available: boolean;
@@ -143,6 +145,7 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       kind: l.kind,
       model: l.model,
       trustMode: l.trust_mode,
+      provenance: l.provenance,
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...(s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}),
@@ -196,16 +199,43 @@ export function formatSummaryBanner(data: SummaryData): string {
     }
   }
   lines.push('');
-  if (data.lanes.length > 0) {
-    const laneStr = data.lanes
-      .map((l) => {
-        const role = l.isActiveReviewer ? 'reviewer' : l.trustMode;
-        return `${l.id} (${role})${l.available ? '' : ' ⚠ offline'}${l.stale ? ' ⚠ stale' : ''}`;
-      })
-      .join(' · ');
-    lines.push(`   Lanes: ${laneStr}`);
+  // Lanes, grouped by access level. Only lanes that are actually SET UP are shown —
+  // available AND not blocked. Offline/blocked lanes are hidden entirely (an offline
+  // lane isn't usable, so showing "(full)" on it is misleading). Each lane on its own
+  // line, named by vendor + the specific model it runs.
+  const shown = data.lanes.filter((l) => l.available && l.trustMode !== 'blocked');
+  // Cap how many lanes are listed (and how many stale spell-outs follow, below) so a
+  // large config can't render a wall — the remainder is summarized with a pointer.
+  // Bounds the banner height by construction (the reviewer is still named even if it
+  // falls beyond the cap).
+  const MAX_LANES = 12;
+  const visible = shown.slice(0, MAX_LANES);
+  if (shown.length === 0) {
+    lines.push('   No lanes set up yet — run /tokenmaxed:setup');
   } else {
-    lines.push('   No lanes configured yet — run /tokenmaxed:setup');
+    const hidden = shown.length - visible.length;
+    const width = Math.max(...visible.map((l) => vendorName(l).length));
+    const laneLine = (l: LaneSummary): string =>
+      `     ${vendorName(l).padEnd(width)}  ${l.model}${l.stale ? ' ⚠ stale' : ''}`;
+    const groups: Array<{ title: string; mode: Lane['trust_mode'] }> = [
+      { title: 'Full access', mode: 'full' },
+      { title: 'Workers', mode: 'worker' },
+      { title: 'Readers', mode: 'reader' },
+    ];
+    for (const { title, mode } of groups) {
+      const g = visible.filter((l) => l.trustMode === mode);
+      if (g.length === 0) continue;
+      lines.push(`   ${title}`);
+      for (const l of g) lines.push(laneLine(l));
+    }
+    if (hidden > 0) {
+      lines.push(`     … and ${hidden} more set-up lane${hidden === 1 ? '' : 's'} — /tokenmaxed:summary`);
+    }
+    const reviewer = shown.find((l) => l.isActiveReviewer);
+    if (reviewer) {
+      lines.push('   Reviewer');
+      lines.push(`     ${vendorName(reviewer).padEnd(width)}  ${reviewer.model}`);
+    }
   }
   // SETUP-1 B hint (read-only — only /tokenmaxed:setup records a review). Only when
   // lanes exist (an empty config already nudges to run setup above).
@@ -214,17 +244,35 @@ export function formatSummaryBanner(data: SummaryData): string {
   } else if (data.lanes.length > 0 && data.laneReview === 'first-review') {
     lines.push('   ℹ run /tokenmaxed:setup to review what each lane may see/do');
   }
-  // Spell out each stale lane (cache-derived; refreshed by /tokenmaxed:status).
-  const stale = data.lanes.filter((l) => l.stale);
-  for (const l of stale) {
+  // Spell out stale models, but only for the VISIBLE (capped) lanes — so the spell-out
+  // count is bounded by MAX_LANES, never the full set. Offline/blocked lanes are
+  // hidden, so their staleness is moot here. (cache-derived; refreshed by /status.)
+  for (const l of visible.filter((l) => l.stale)) {
     lines.push(
       l.stale!.newestPriced
-        ? `   ⚠ ${l.id} on ${l.model} — newer available: ${l.stale!.newest} (set model: <family>@latest, or pin it)`
-        : `   ⚠ ${l.id} on ${l.model} — newer ${l.stale!.newest} exists but isn't priced yet`,
+        ? `   ⚠ ${vendorName(l)} on ${l.model} — newer available: ${l.stale!.newest} (set model: <family>@latest, or pin it)`
+        : `   ⚠ ${vendorName(l)} on ${l.model} — newer ${l.stale!.newest} exists but isn't priced yet`,
     );
   }
   lines.push('   /tokenmaxed:summary anytime · /tokenmaxed:why <category> to preview · /tokenmaxed:savings for detail');
   return lines.join('\n');
+}
+
+/** Friendly vendor name for a lane (falls back to the lane id when unmapped). */
+const VENDOR_NAME: Record<string, string> = {
+  anthropic: 'Claude',
+  openai: 'Codex',
+  minimax: 'MiniMax',
+  google: 'Gemini',
+  moonshot: 'Kimi',
+  zhipu: 'GLM',
+  meta: 'Llama',
+  mistral: 'Mistral',
+  xai: 'Grok',
+  deepseek: 'DeepSeek',
+};
+function vendorName(l: Pick<LaneSummary, 'provenance' | 'id'>): string {
+  return VENDOR_NAME[l.provenance] ?? l.id;
 }
 
 /** Pointer appended whenever {@link clampBanner} trims content. */
@@ -241,10 +289,15 @@ const CLAMP_POINTER = '   … run /tokenmaxed:summary for full detail';
  * possibly long `Lanes:` line) so the result ALWAYS fits the budget while
  * preserving that line's presence. Idempotent when already within budget.
  *
- * Postcondition: `out.length <= maxChars` for every input. Both budgets are
- * normalized to NON-NEGATIVE INTEGERS (`Math.max(0, Math.floor(…))`), so negative,
- * zero, and fractional budgets are all well-defined (a budget < 1 ⇒ 0 ⇒ empty
- * output), and the inequality holds against the normalized budget.
+ * Budget semantics: `maxChars` is a HARD postcondition — `out.length <= maxChars`
+ * for every input (line-aware ellipsis, then a final truncation backstop). `maxLines`
+ * is ADVISORY: the drop loop removes lower-value trailing detail (tips → stale → hint)
+ * toward it, but it will NOT drop required content (a group of set-up lanes), so a
+ * large lane set can exceed it. (The renderer caps the lane list with a "… N more"
+ * pointer, so in practice the banner stays small; `maxChars` is the absolute bound.)
+ * Both budgets are normalized to NON-NEGATIVE INTEGERS (`Math.max(0, Math.floor(…))`),
+ * so negative, zero, and fractional budgets are well-defined (a budget < 1 ⇒ 0 ⇒
+ * empty output).
  *
  * Pure string→string so one clamped source can feed BOTH the visible
  * `systemMessage` and the model-context `additionalContext` (kept byte-identical).
@@ -252,8 +305,11 @@ const CLAMP_POINTER = '   … run /tokenmaxed:summary for full detail';
 export function clampBanner(banner: string, opts: { maxLines?: number; maxChars?: number } = {}): string {
   // Normalize to non-negative integers so the postcondition is exact for any real
   // input (negative/fractional included): a budget < 1 floors to 0 ⇒ empty output.
-  const maxLines = Math.max(0, Math.floor(opts.maxLines ?? 12));
-  const maxChars = Math.max(0, Math.floor(opts.maxChars ?? 1500));
+  // Defaults sized for the grouped layout (headline + windows + a few access groups,
+  // each lane on its own line): a typical set-up is ~14–18 lines, so 20/2000 leaves a
+  // normal banner untrimmed and only clamps a pathologically large one.
+  const maxLines = Math.max(0, Math.floor(opts.maxLines ?? 20));
+  const maxChars = Math.max(0, Math.floor(opts.maxChars ?? 2000));
   if (maxChars === 0) return '';
   const fits = (s: string, ml: number, mc: number): boolean => s.split('\n').length <= ml && s.length <= mc;
 

@@ -152,14 +152,16 @@ test('router_summary renders the injected summary data verbatim', async () => {
         { label: '7d', tokens: 18900000, meteredAvoided: 0.71, offloads: 41 },
         { label: 'lifetime', tokens: 102400000, meteredAvoided: 4.1, offloads: 233 },
       ],
-      lanes: [{ id: 'codex-cli', kind: 'cli', model: 'm', trustMode: 'full', isActiveReviewer: true, available: true }],
+      lanes: [
+        { id: 'codex-cli', kind: 'cli', model: 'm', trustMode: 'full', provenance: 'openai', isActiveReviewer: true, available: true },
+      ],
       activeReviewerId: 'codex-cli',
       empty: false,
     }),
   }));
   assert.notEqual(r.isError, true);
   assert.match(r.content[0]!.text, /Saved \$4\.10 in metered API spend/);
-  assert.match(r.content[0]!.text, /codex-cli \(reviewer\)/);
+  assert.match(r.content[0]!.text, /Reviewer\n\s+Codex/); // grouped + vendor-named
   assert.ok((r.structuredContent!.summary as { enabled: boolean }).enabled);
 });
 

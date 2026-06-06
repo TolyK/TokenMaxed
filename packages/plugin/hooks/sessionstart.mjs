@@ -8602,6 +8602,7 @@ function buildSummaryData(input) {
       kind: l.kind,
       model: l.model,
       trustMode: l.trust_mode,
+      provenance: l.provenance,
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
@@ -8646,33 +8647,67 @@ function formatSummaryBanner(data) {
     }
   }
   lines.push("");
-  if (data.lanes.length > 0) {
-    const laneStr = data.lanes.map((l) => {
-      const role = l.isActiveReviewer ? "reviewer" : l.trustMode;
-      return `${l.id} (${role})${l.available ? "" : " \u26A0 offline"}${l.stale ? " \u26A0 stale" : ""}`;
-    }).join(" \xB7 ");
-    lines.push(`   Lanes: ${laneStr}`);
+  const shown = data.lanes.filter((l) => l.available && l.trustMode !== "blocked");
+  const MAX_LANES = 12;
+  const visible = shown.slice(0, MAX_LANES);
+  if (shown.length === 0) {
+    lines.push("   No lanes set up yet \u2014 run /tokenmaxed:setup");
   } else {
-    lines.push("   No lanes configured yet \u2014 run /tokenmaxed:setup");
+    const hidden = shown.length - visible.length;
+    const width = Math.max(...visible.map((l) => vendorName(l).length));
+    const laneLine = (l) => `     ${vendorName(l).padEnd(width)}  ${l.model}${l.stale ? " \u26A0 stale" : ""}`;
+    const groups = [
+      { title: "Full access", mode: "full" },
+      { title: "Workers", mode: "worker" },
+      { title: "Readers", mode: "reader" }
+    ];
+    for (const { title, mode } of groups) {
+      const g = visible.filter((l) => l.trustMode === mode);
+      if (g.length === 0) continue;
+      lines.push(`   ${title}`);
+      for (const l of g) lines.push(laneLine(l));
+    }
+    if (hidden > 0) {
+      lines.push(`     \u2026 and ${hidden} more set-up lane${hidden === 1 ? "" : "s"} \u2014 /tokenmaxed:summary`);
+    }
+    const reviewer = shown.find((l) => l.isActiveReviewer);
+    if (reviewer) {
+      lines.push("   Reviewer");
+      lines.push(`     ${vendorName(reviewer).padEnd(width)}  ${reviewer.model}`);
+    }
   }
   if (data.lanes.length > 0 && data.laneReview === "changed") {
     lines.push("   \u26A0 your lanes changed since you last reviewed them \u2014 run /tokenmaxed:setup to review");
   } else if (data.lanes.length > 0 && data.laneReview === "first-review") {
     lines.push("   \u2139 run /tokenmaxed:setup to review what each lane may see/do");
   }
-  const stale = data.lanes.filter((l) => l.stale);
-  for (const l of stale) {
+  for (const l of visible.filter((l2) => l2.stale)) {
     lines.push(
-      l.stale.newestPriced ? `   \u26A0 ${l.id} on ${l.model} \u2014 newer available: ${l.stale.newest} (set model: <family>@latest, or pin it)` : `   \u26A0 ${l.id} on ${l.model} \u2014 newer ${l.stale.newest} exists but isn't priced yet`
+      l.stale.newestPriced ? `   \u26A0 ${vendorName(l)} on ${l.model} \u2014 newer available: ${l.stale.newest} (set model: <family>@latest, or pin it)` : `   \u26A0 ${vendorName(l)} on ${l.model} \u2014 newer ${l.stale.newest} exists but isn't priced yet`
     );
   }
   lines.push("   /tokenmaxed:summary anytime \xB7 /tokenmaxed:why <category> to preview \xB7 /tokenmaxed:savings for detail");
   return lines.join("\n");
 }
+var VENDOR_NAME = {
+  anthropic: "Claude",
+  openai: "Codex",
+  minimax: "MiniMax",
+  google: "Gemini",
+  moonshot: "Kimi",
+  zhipu: "GLM",
+  meta: "Llama",
+  mistral: "Mistral",
+  xai: "Grok",
+  deepseek: "DeepSeek"
+};
+function vendorName(l) {
+  return VENDOR_NAME[l.provenance] ?? l.id;
+}
 var CLAMP_POINTER = "   \u2026 run /tokenmaxed:summary for full detail";
 function clampBanner(banner, opts = {}) {
-  const maxLines = Math.max(0, Math.floor(opts.maxLines ?? 12));
-  const maxChars = Math.max(0, Math.floor(opts.maxChars ?? 1500));
+  const maxLines = Math.max(0, Math.floor(opts.maxLines ?? 20));
+  const maxChars = Math.max(0, Math.floor(opts.maxChars ?? 2e3));
   if (maxChars === 0) return "";
   const fits = (s, ml, mc) => s.split("\n").length <= ml && s.length <= mc;
   if (fits(banner, maxLines, maxChars)) return banner;

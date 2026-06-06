@@ -126,16 +126,20 @@ test('banner headline is finance-grade (metered $), never the frontier hypotheti
   assert.doesNotMatch(banner, /trees|coffee/i); // no unlabeled relatable units
 });
 
-test('banner flags a stale lane from the (cache-derived) staleness input', () => {
+test('banner flags a stale lane (shown only when it is actually set up)', () => {
+  // minimax-api must be available to appear at all (offline lanes are hidden).
   const banner = formatSummaryBanner(build({
+    availableLaneIds: ['codex-cli', 'claude-haiku', 'minimax-api'],
     staleness: [{ laneId: 'minimax-api', newest: 'minimax-m3', newestPriced: true }],
   }));
-  assert.match(banner, /minimax-api \(worker\).*⚠ stale/); // marked in the Lanes line (after any offline flag)
-  assert.match(banner, /minimax-api on minimax-m2 — newer available: minimax-m3/); // spelled out
+  assert.match(banner, /Workers/); // worker-trust lane gets its own group
+  assert.match(banner, /MiniMax.*⚠ stale/); // marked on its lane line (vendor-named)
+  assert.match(banner, /MiniMax on minimax-m2 — newer available: minimax-m3/); // spelled out
 });
 
 test('banner spells out a pricing-gap (newer model not priced)', () => {
   const banner = formatSummaryBanner(build({
+    availableLaneIds: ['codex-cli', 'claude-haiku', 'minimax-api'],
     staleness: [{ laneId: 'minimax-api', newest: 'minimax-m9', newestPriced: false }],
   }));
   assert.match(banner, /newer minimax-m9 exists but isn't priced yet/);
@@ -159,10 +163,19 @@ test('banner shows a routing-OFF variant when disabled', () => {
   assert.doesNotMatch(banner, /Saved \$/); // no stats when off
 });
 
-test('banner flags the offline lane and names the reviewer', () => {
+test('banner HIDES offline/blocked lanes entirely and groups the set-up ones by access level', () => {
   const banner = formatSummaryBanner(build());
-  assert.match(banner, /ollama-llama3 \(full\) ⚠ offline/); // non-reviewer lanes show trust_mode
-  assert.match(banner, /codex-cli \(reviewer\)/);
+  // Offline (ollama, not in availableLaneIds) and offline minimax are hidden — not
+  // shown as "(full) ⚠ offline" (which was misleading: offline ⇒ not set up).
+  assert.doesNotMatch(banner, /offline/i);
+  assert.doesNotMatch(banner, /llama|ollama|Llama/i);
+  assert.doesNotMatch(banner, /MiniMax/); // worker lane is offline ⇒ hidden
+  // The available, non-blocked lanes are grouped and vendor-named.
+  assert.match(banner, /Full access/);
+  assert.match(banner, /Codex/); // codex-cli (openai) is available
+  assert.match(banner, /Claude/); // claude-haiku (anthropic) is available
+  // The active reviewer gets its own line.
+  assert.match(banner, /Reviewer\n\s+Codex/);
 });
 
 // --- clampBanner (the SessionStart systemMessage UX guard) ---------------------
@@ -173,36 +186,51 @@ test('clampBanner is idempotent when the banner is already within budget', () =>
   assert.doesNotMatch(clampBanner(banner), /run \/tokenmaxed:summary for full detail/);
 });
 
-test('clampBanner trims to the line budget, drops the tips line FIRST, and keeps headline+windows+lanes', () => {
-  // Force a tall banner: many stale lanes ⇒ many trailing spell-out lines.
-  const manyStale = Array.from({ length: 8 }, (_, i) => ({
-    laneId: i === 0 ? 'minimax-api' : `codex-cli`, // ids that exist in the fixture lanes
-    newest: `m-${i}`,
-    newestPriced: true,
+test('clampBanner drops trailing detail in rank order: tips, then stale, before the setup hint', () => {
+  // A banner with all three droppable kinds: a stale spell-out (shown lane), a setup
+  // hint, and the tips line. Drop-rank: tips(3) > stale(2) > setup-hint(1).
+  const full = formatSummaryBanner(build({
+    availableLaneIds: ['codex-cli', 'claude-haiku', 'minimax-api'],
+    staleness: [{ laneId: 'minimax-api', newest: 'minimax-m3', newestPriced: true }],
+    laneReview: 'first-review',
   }));
-  const banner = formatSummaryBanner(build({ staleness: manyStale }));
-  const out = clampBanner(banner, { maxLines: 10, maxChars: 5000 });
-  assert.ok(out.split('\n').length <= 10, 'within the line budget');
-  assert.match(out, /run \/tokenmaxed:summary for full detail/); // pointer appended when trimmed
-  assert.doesNotMatch(out, /\/tokenmaxed:summary anytime/); // the tips line is dropped first
+  const n = full.split('\n').length;
+  // Force a net one-line reduction: a trim removes a content line AND appends the
+  // pointer, so reaching n-1 visible lines drops the two highest-rank lines.
+  const out = clampBanner(full, { maxLines: n - 1, maxChars: 999_999 });
+  assert.match(out, /run \/tokenmaxed:summary for full detail/); // pointer appended on trim
+  assert.doesNotMatch(out, /\/tokenmaxed:summary anytime/); // tips (rank 3) dropped
+  assert.doesNotMatch(out, /MiniMax on minimax-m2 — newer available/); // stale (rank 2) dropped next
+  assert.match(out, /run \/tokenmaxed:setup to review what each lane/); // setup hint (rank 1) survives — proves order
   // Required content survives:
-  assert.match(out, /TokenMaxed/);
-  assert.match(out, /Lanes:/);
+  assert.match(out, /Full access/);
   assert.match(out, /24h/);
   assert.match(out, /lifetime/);
 });
 
-test('clampBanner enforces maxChars by ellipsizing the long Lanes line while keeping it present', () => {
-  // A huge lane set makes the single `Lanes:` line very long; a feasible-but-tight
-  // budget (bigger than the skeleton) ⇒ the Lanes line is ellipsized, not dropped.
-  const bigLanes = Array.from({ length: 60 }, (_, i) =>
-    lane({ id: `lane-${i}-with-a-fairly-long-identifier`, command: 'x' }),
-  );
-  const banner = formatSummaryBanner(build({ lanes: bigLanes, availableLaneIds: [], staleness: [] }));
-  const out = clampBanner(banner, { maxLines: 12, maxChars: 600 });
-  assert.ok(out.length <= 600, `must fit maxChars, got ${out.length}`);
-  assert.match(out, /Lanes:/); // the line's presence is preserved
-  assert.match(out, /…/); // ellipsized
+test('renderer caps the set-up list AND its stale spell-outs (height bounded by construction)', () => {
+  // Build N stale set-up lanes. Boundedness is proven by the banner height being
+  // INDEPENDENT of N (a 30-lane and a 300-lane config must render the same height).
+  const make = (n: number): string => {
+    const lanes = Array.from({ length: n }, (_, i) => lane({ id: `lane-${i}`, command: 'x', provenance: 'minimax' }));
+    const staleness = lanes.map((l) => ({ laneId: l.id, newest: 'minimax-m9', newestPriced: true }));
+    return formatSummaryBanner(build({ lanes, availableLaneIds: lanes.map((l) => l.id), staleness }));
+  };
+  const b30 = make(30);
+  const b300 = make(300);
+  assert.equal(b30.split('\n').length, b300.split('\n').length); // height independent of lane count
+  assert.match(b30, /… and 18 more set-up lanes — \/tokenmaxed:summary/); // 30 shown − 12 cap
+  const staleLines = b30.split('\n').filter((l) => /— newer available/.test(l));
+  assert.ok(staleLines.length <= 12, `stale spell-outs bounded by the cap, got ${staleLines.length}`);
+});
+
+test('clampBanner keeps maxChars hard even when required lane lines exceed maxLines (advisory)', () => {
+  const many = Array.from({ length: 30 }, (_, i) => lane({ id: `lane-${i}`, command: 'x', provenance: 'minimax' }));
+  const banner = formatSummaryBanner(build({ lanes: many, availableLaneIds: many.map((l) => l.id), staleness: [] }));
+  // maxLines is advisory: required lane lines can't be dropped, so the line count may
+  // exceed it — but maxChars is always honored (the only guarantee at a tight budget).
+  const out = clampBanner(banner, { maxLines: 5, maxChars: 500 });
+  assert.ok(out.length <= 500, `must fit maxChars, got ${out.length}`);
 });
 
 test('clampBanner GUARANTEES maxChars as a true postcondition even for a pathologically tiny budget', () => {
