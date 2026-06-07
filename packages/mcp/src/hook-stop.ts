@@ -6,10 +6,12 @@
  * back so Claude reworks, then re-reviews — iterating until the reviewer passes.
  *
  * Protections (all decided in reviewer.ts, kept pure/testable):
- *   A — never wedged by error: fails OPEN on any reviewer error/timeout, but
- *       SURFACES it (systemMessage) so a failed review is never a silent pass.
- *   B — never stuck: a per-session block counter (temp file) bounds the loop to
- *       maxRounds; on reaching it without a pass we YIELD with a clear message.
+ *   A — the review must actually run: on any reviewer error/timeout it RE-FIRES
+ *       (blocks + retries on the next turn) instead of passing silently, so a
+ *       transient git/reviewer hiccup self-heals and the review still happens.
+ *   B — never stuck: a per-session block counter (temp file) bounds BOTH reworks
+ *       and error-retries to maxRounds; on reaching it we YIELD with a clear
+ *       message (so even a PERSISTENT failure can't trap the session).
  *   C — agent can't forget: this is a deterministic Stop hook (always runs) that
  *       always reports its terminal state (pass = silent, else surfaced).
  *

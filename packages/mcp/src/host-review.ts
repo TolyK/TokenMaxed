@@ -58,6 +58,8 @@ export interface DiffRead {
    * EMPTY-but-incomplete read is surfaced as a review error, never a silent pass.
    */
   incomplete: boolean;
+  /** Why the read failed (git's own stderr/error), so the surfaced retry is actionable. */
+  incompleteReason?: string;
 }
 
 /** Injected I/O for {@link runHostTurnReview} (real impls from makeHostReviewDeps). */
@@ -81,16 +83,10 @@ export interface HostReviewDeps {
 
 /** Review the turn's diff with a configured manager. Pure over its injected deps. */
 export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): Promise<HostReviewResult> {
-  const { diff, incomplete } = deps.readDiff();
-  if (!diff.trim()) {
-    // Empty AND incomplete ⇒ we couldn't acquire the diff (git failed). Surface it
-    // as an ERROR (Protection A) rather than a silent "no changes" pass.
-    if (incomplete) {
-      return { reviewed: false, errored: true, reason: 'could not read the working-tree diff (git failed)' };
-    }
-    return { reviewed: false, reason: 'no working-tree changes to review' };
-  }
-
+  // Establish a usable REVIEWER first — BEFORE reading the diff. A diff-read error
+  // (e.g. broken/absent git) is only worth surfacing/re-firing when a reviewer
+  // actually exists; if none is configured, "nothing is reviewed" is the documented
+  // opt-out, so we must not block such a session over a git failure.
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: 'no lanes configured yet — run /tokenmaxed:setup' };
 
@@ -104,6 +100,19 @@ export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): P
       reason:
         'no usable manager lane configured (needs manager_allowed on a trusted CLI/local lane, not policy-blocked; an API manager needs the safety gate open)',
     };
+  }
+
+  // A reviewer exists — now read the diff.
+  const { diff, incomplete, incompleteReason } = deps.readDiff();
+  if (!diff.trim()) {
+    // Empty AND incomplete ⇒ we couldn't acquire the diff (git failed). Surface it
+    // as an ERROR (Protection A) — the Stop hook RE-FIRES on it — never a silent
+    // "no changes" pass. Carry git's own reason so the retry message is actionable.
+    if (incomplete) {
+      const detail = incompleteReason ? `: ${incompleteReason}` : ' (git failed)';
+      return { reviewed: false, errored: true, reason: `could not read the working-tree diff${detail}` };
+    }
+    return { reviewed: false, reason: 'no working-tree changes to review' };
   }
 
   const result = await review(
@@ -227,6 +236,12 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
       const res = spawnSync('git', ['diff', 'HEAD'], { cwd, encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
       const trackedOk = res.status === 0 && typeof res.stdout === 'string';
       const tracked = trackedOk ? (res.stdout as string) : '';
+      // Capture WHY a failed read failed (git's first stderr line, or a spawn error)
+      // so the surfaced retry/yield message is actionable, e.g. "not a git repository".
+      const trackedFailReason = trackedOk
+        ? undefined
+        : (typeof res.stderr === 'string' && res.stderr.trim().split('\n')[0]) ||
+          (res.error ? `git not runnable: ${res.error.message}` : 'git diff HEAD failed');
       // REVIEW-LOOP — "review ALL changed code" includes UNTRACKED/new files (the
       // old v0 gap). Hard-bounded + fails soft so it can't wedge or starve the
       // Stop hook; degrades to tracked-only on any error (and flags it incomplete).
@@ -250,8 +265,11 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
       // the `incomplete` flag drives the empty+incomplete → review-error branch.
       if (gaps.length > 0 && body.trim()) out += `\n\n[NOTE: review coverage is INCOMPLETE — omitted: ${gaps.join('; ')}]`;
       // incomplete drives the EMPTY-diff branch: empty + incomplete = acquisition
-      // failure (surface as a review error), empty + complete = genuinely no changes.
-      return { diff: out, incomplete: !trackedOk || untracked.enumerationFailed || untracked.omitted > 0 };
+      // failure (surface as a review error → the hook re-fires), empty + complete =
+      // genuinely no changes. incompleteReason carries git's own message for the UI.
+      const incomplete = !trackedOk || untracked.enumerationFailed || untracked.omitted > 0;
+      const incompleteReason = trackedFailReason ?? (untracked.enumerationFailed ? 'git ls-files (untracked enumeration) failed' : undefined);
+      return { diff: out, incomplete, ...(incompleteReason ? { incompleteReason } : {}) };
     },
     loadLanes: () => {
       if (!existsSync(lanesPath)) return null;

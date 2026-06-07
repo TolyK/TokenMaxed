@@ -156,21 +156,38 @@ export interface StopHookInput {
 
 /**
  * Decide the Stop hook's action — the heart of the default-on review-iterate
- * rule. Terminal states are ALWAYS explicit (Protection C: a deterministic gate
- * that the agent can't forget and that never finishes silently when the user
- * should know):
+ * rule. The review MUST actually happen and iterate until approved; the only
+ * thing that ends the turn unapproved is exhausting the bounded round budget (so
+ * a permanent failure can't trap the session). Terminal states are ALWAYS
+ * explicit (Protection C: a deterministic gate the agent can't forget):
  *   - reviewed pass / no changes / no reviewer ⇒ allow (silent success or skip)
- *   - reviewer error or timeout                ⇒ notify (NEVER a silent pass — Protection A)
+ *   - reviewer error/timeout within the budget ⇒ block + RE-FIRE next turn
+ *                                                 (Protection A — never a silent pass)
  *   - non-pass within the round budget         ⇒ block (rework, then re-review)
- *   - still non-pass at maxRounds              ⇒ notify + yield (Protection B — never stuck)
+ *   - still erroring OR non-pass at maxRounds   ⇒ notify + yield (Protection B — never stuck)
  */
 export function stopHookAction(input: StopHookInput): StopHookAction {
   if (!input.reviewed) {
     if (input.errored) {
+      // An error/timeout is NOT a pass. Keep the gate CLOSED and RE-FIRE the review
+      // on the next turn (Protection A — the review has to actually run, not bail).
+      // Bounded by maxRounds (Protection B) so a PERSISTENT failure yields rather
+      // than trapping the session forever.
       const why = input.reason ? ` (${input.reason})` : '';
+      if (input.priorBlocks < input.maxRounds) {
+        return {
+          kind: 'block',
+          reason:
+            `TokenMaxed: the manager review could not run${why} — retrying (attempt ${input.priorBlocks + 1}/${input.maxRounds}). ` +
+            'Your changes are NOT yet reviewed. If this persists, confirm you are inside the git repo and a reviewer lane is reachable, then continue.',
+        };
+      }
       return {
         kind: 'notify',
-        message: `⚠ TokenMaxed: the manager review could not run${why}. Your changes were NOT reviewed — finishing without a verdict. Re-run /tokenmaxed:review to retry.`,
+        message:
+          `⚠ TokenMaxed: the manager review still could not run${why} after ${input.priorBlocks} ` +
+          `attempt${input.priorBlocks === 1 ? '' : 's'} (max ${input.maxRounds}); yielding so you're not stuck. ` +
+          'Your changes were NOT reviewed — fix the cause (inside a git repo? reviewer lane reachable?) and re-run /tokenmaxed:review.',
       };
     }
     // No working-tree changes, or no usable reviewer lane configured ⇒ silent

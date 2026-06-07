@@ -62,12 +62,26 @@ test('no changes / no reviewer ⇒ allow (silent skip = opt-out-by-absence)', ()
   assert.deepEqual(stopHookAction({ reviewed: false, priorBlocks: 0, maxRounds: 5 }), { kind: 'allow' });
 });
 
-test('Protection A — reviewer error ⇒ notify, NEVER a silent pass', () => {
+test('Protection A — reviewer error within budget ⇒ BLOCK + re-fire (never a silent pass)', () => {
   const a = stopHookAction({ reviewed: false, errored: true, reason: 'review timed out', priorBlocks: 0, maxRounds: 5 });
-  assert.equal(a.kind, 'notify');
-  assert.match((a as { message: string }).message, /could not run/);
-  assert.match((a as { message: string }).message, /timed out/);
-  assert.match((a as { message: string }).message, /NOT reviewed/);
+  assert.equal(a.kind, 'block', 'an error must keep the gate closed and retry, not finish');
+  assert.match((a as { reason: string }).reason, /could not run/);
+  assert.match((a as { reason: string }).reason, /timed out/);
+  assert.match((a as { reason: string }).reason, /retrying \(attempt 1\/5\)/);
+  assert.match((a as { reason: string }).reason, /NOT yet reviewed/);
+});
+
+test('Protection A+B — a PERSISTENT error yields only after the round budget (never traps)', () => {
+  // Within budget it keeps re-firing...
+  for (let pb = 0; pb < 5; pb++) {
+    assert.equal(stopHookAction({ reviewed: false, errored: true, reason: 'git failed', priorBlocks: pb, maxRounds: 5 }).kind, 'block', `retry ${pb}`);
+  }
+  // ...at the budget it yields with an actionable message rather than blocking forever.
+  const y = stopHookAction({ reviewed: false, errored: true, reason: 'git failed', priorBlocks: 5, maxRounds: 5 });
+  assert.equal(y.kind, 'notify');
+  assert.match((y as { message: string }).message, /still could not run/);
+  assert.match((y as { message: string }).message, /git failed/);
+  assert.match((y as { message: string }).message, /yielding/);
 });
 
 test('non-pass within the budget ⇒ block with the notes fed back (iterate)', () => {

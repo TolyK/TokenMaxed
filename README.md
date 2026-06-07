@@ -237,10 +237,11 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     coverage); on a non-pass verdict Claude is told to rework and
     the change is **re-reviewed**, iterating until the reviewer passes. It is
     deterministic (a `Stop` hook — Claude can't forget to run it) and protected so
-    it can't hold you up: a reviewer error/timeout **fails open but is surfaced**
-    (never a silent pass), and the loop is **bounded** — after
-    `TOKENMAXED_REVIEW_MAX_ROUNDS` rework rounds (default 5) without a pass it
-    **yields** with the outstanding notes so you're never stuck. **Opt out** of
+    the review *actually happens* without holding you up: a reviewer error/timeout
+    doesn't pass silently — the review **re-fires (retries) on the next turn** until
+    it succeeds, and the whole loop (reworks *and* retries) is **bounded** by
+    `TOKENMAXED_REVIEW_MAX_ROUNDS` (default 5); only after that does it **yield**
+    with the outstanding notes so even a persistent failure can't trap you. **Opt out** of
     reviewing entirely with `TOKENMAXED_REVIEW_ON_STOP=false` (or simply configure
     no reviewer lane — then nothing is reviewed). A **full CLI** reviewer (e.g.
     Codex) needs no safety gate; an API/BYOK reviewer needs `TOKENMAXED_GATE_READY=true`.
