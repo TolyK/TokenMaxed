@@ -33,3 +33,6 @@ npm-debug.log*
 
 # Agent worktrees (created by Claude Code subagent isolation)
 .claude/worktrees/
+# Runtime locks/state (machine- & session-specific; never commit)
+.claude/scheduled_tasks.lock
+.claude/*.lock
