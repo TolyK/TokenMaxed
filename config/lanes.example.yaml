@@ -58,7 +58,10 @@ lanes:
     provenance: openai
     jurisdiction: US
     execution_mode: answer-only
-    command: codex          # the provider CLI to spawn (exact flags verified per tool)
+    command: codex          # the provider CLI to spawn (exact flags verified per tool).
+                            # If the plugin host spawns hooks under a Node whose bin dir
+                            # lacks this CLI and it "failed to spawn", set an ABSOLUTE path
+                            # here (e.g. /abs/path/to/codex) — PATH-independent.
     args: [exec]
     # Default reviewer for all code: the host-turn review (/tokenmaxed:review and
     # the default-on Stop review loop) sends the working-tree diff to the FIRST
