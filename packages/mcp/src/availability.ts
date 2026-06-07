@@ -21,7 +21,7 @@ import { join } from 'node:path';
 
 import type { Lane } from '@tokenmaxed/core';
 
-import { makeResolveAuth } from './config.ts';
+import { makeResolveAuth, spawnPath } from './config.ts';
 
 /** A minimal fetch shape (so tests can inject one without DOM types). */
 type FetchLike = (url: string, init?: { method?: string; signal?: AbortSignal }) => Promise<{ ok: boolean }>;
@@ -96,5 +96,9 @@ export async function availableLaneIds(lanes: readonly Lane[], deps: Availabilit
 export function makeAvailabilityProbe(env: NodeJS.ProcessEnv): (lanes: readonly Lane[]) => Promise<string[]> {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch as unknown as FetchLike | undefined;
-  return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...(fetchImpl ? { fetchImpl } : {}) });
+  // Use the SAME augmented PATH that makeCliSpawn spawns with — otherwise a CLI
+  // installed beside Node (nvm/global-npm, e.g. codex) could be marked unavailable
+  // under a stripped host PATH and never even reach the spawn that would find it.
+  const path = spawnPath(process.execPath, env.PATH);
+  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...(fetchImpl ? { fetchImpl } : {}) });
 }

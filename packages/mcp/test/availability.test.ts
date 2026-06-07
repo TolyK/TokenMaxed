@@ -7,10 +7,10 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 
-import { availableLaneIds, commandOnPath, isLaneAvailable } from '../src/availability.ts';
+import { availableLaneIds, commandOnPath, isLaneAvailable, makeAvailabilityProbe } from '../src/availability.ts';
 import type { Lane } from '@tokenmaxed/core';
 
 const base: Lane = {
@@ -103,4 +103,13 @@ test('availableLaneIds returns only the runnable ids', async () => {
   ];
   const ids = await availableLaneIds(lanes, { path: dir, resolveAuth: (h) => (h === 'ZHIPU' ? 'k' : '') });
   assert.deepEqual(ids.sort(), ['codex', 'glm', 'host']);
+});
+
+test('makeAvailabilityProbe finds a CLI installed beside Node even when the host PATH omits it', async () => {
+  // Regression: under a stripped host/hook PATH a bare-command CLI lane was marked
+  // unavailable, so it never reached the spawn that augments PATH. The probe must
+  // use the SAME augmented PATH — `node` always lives in dirname(process.execPath).
+  const probe = makeAvailabilityProbe({ PATH: '' } as NodeJS.ProcessEnv);
+  const lane: Lane = { ...base, id: 'beside-node', kind: 'cli', command: 'node' };
+  assert.deepEqual(await probe([lane]), ['beside-node'], `node should resolve via ${dirname(process.execPath)}`);
 });
