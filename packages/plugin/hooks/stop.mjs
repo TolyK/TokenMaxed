@@ -8440,7 +8440,7 @@ import { join as join3 } from "node:path";
 import { spawnSync as spawnSync2 } from "node:child_process";
 import { existsSync as existsSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { join as join2 } from "node:path";
+import { delimiter, dirname as dirname2, join as join2 } from "node:path";
 var HOME_TM = join2(homedir2(), ".tokenmaxed");
 function homeFile(name) {
   return join2(HOME_TM, name);
@@ -8461,10 +8461,18 @@ function makeResolveAuth(env) {
   };
 }
 var DEFAULT_CLI_TIMEOUT_MS = 3e5;
+function spawnPath(execPath = process.execPath, base = process.env.PATH) {
+  const binDir = dirname2(execPath);
+  const parts = (base ?? "").split(delimiter).filter(Boolean);
+  if (parts.includes(binDir)) return parts.join(delimiter);
+  return [binDir, ...parts].join(delimiter);
+}
 function makeCliSpawn(timeoutMs = DEFAULT_CLI_TIMEOUT_MS) {
   return (command, args, options) => spawnSync2(command, [...args], {
     ...options,
-    env: { ...process.env, TOKENMAXED_DISABLE: "1" },
+    // Augment PATH so a CLI installed next to this Node (nvm/global-npm) is found
+    // even under a stripped host PATH; TOKENMAXED_DISABLE=1 stops child recursion.
+    env: { ...process.env, PATH: spawnPath(), TOKENMAXED_DISABLE: "1" },
     timeout: timeoutMs
   });
 }
@@ -8514,7 +8522,8 @@ async function availableLaneIds(lanes, deps) {
 function makeAvailabilityProbe(env) {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch;
-  return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
+  const path = spawnPath(process.execPath, env.PATH);
+  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
 // ../mcp/src/manager-select.ts
@@ -8589,9 +8598,15 @@ function stopHookAction(input) {
   if (!input.reviewed) {
     if (input.errored) {
       const why = input.reason ? ` (${input.reason})` : "";
+      if (input.priorBlocks < input.maxRounds) {
+        return {
+          kind: "block",
+          reason: `TokenMaxed: the manager review could not run${why} \u2014 retrying (attempt ${input.priorBlocks + 1}/${input.maxRounds}). Your changes are NOT yet reviewed. If this persists, confirm you are inside the git repo and a reviewer lane is reachable, then continue.`
+        };
+      }
       return {
         kind: "notify",
-        message: `\u26A0 TokenMaxed: the manager review could not run${why}. Your changes were NOT reviewed \u2014 finishing without a verdict. Re-run /tokenmaxed:review to retry.`
+        message: `\u26A0 TokenMaxed: the manager review still could not run${why} after ${input.priorBlocks} attempt${input.priorBlocks === 1 ? "" : "s"} (max ${input.maxRounds}); yielding so you're not stuck. Your changes were NOT reviewed \u2014 fix the cause (inside a git repo? reviewer lane reachable?) and re-run /tokenmaxed:review.`
       };
     }
     return { kind: "allow" };
@@ -8623,13 +8638,6 @@ ${notes}` : "";
 
 // ../mcp/src/host-review.ts
 async function runHostTurnReview(turnId, deps) {
-  const { diff, incomplete } = deps.readDiff();
-  if (!diff.trim()) {
-    if (incomplete) {
-      return { reviewed: false, errored: true, reason: "could not read the working-tree diff (git failed)" };
-    }
-    return { reviewed: false, reason: "no working-tree changes to review" };
-  }
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
   const available = new Set(await deps.availableLaneIds(lanes));
@@ -8639,6 +8647,14 @@ async function runHostTurnReview(turnId, deps) {
       reviewed: false,
       reason: "no usable manager lane configured (needs manager_allowed on a trusted CLI/local lane, not policy-blocked; an API manager needs the safety gate open)"
     };
+  }
+  const { diff, incomplete, incompleteReason } = deps.readDiff();
+  if (!diff.trim()) {
+    if (incomplete) {
+      const detail = incompleteReason ? `: ${incompleteReason}` : " (git failed)";
+      return { reviewed: false, errored: true, reason: `could not read the working-tree diff${detail}` };
+    }
+    return { reviewed: false, reason: "no working-tree changes to review" };
   }
   const result = await review(
     { turn_id: turnId, category: "refactor", content: diff },
@@ -8713,6 +8729,7 @@ function makeHostReviewDeps(env) {
       const res = spawnSync3("git", ["diff", "HEAD"], { cwd, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
       const trackedOk = res.status === 0 && typeof res.stdout === "string";
       const tracked = trackedOk ? res.stdout : "";
+      const trackedFailReason = trackedOk ? void 0 : typeof res.stderr === "string" && res.stderr.trim().split("\n")[0] || (res.error ? `git not runnable: ${res.error.message}` : "git diff HEAD failed");
       let untracked = { diff: "", omitted: 0, enumerationFailed: false };
       try {
         untracked = readUntrackedDiff(cwd);
@@ -8730,7 +8747,9 @@ function makeHostReviewDeps(env) {
       if (gaps.length > 0 && body.trim()) out += `
 
 [NOTE: review coverage is INCOMPLETE \u2014 omitted: ${gaps.join("; ")}]`;
-      return { diff: out, incomplete: !trackedOk || untracked.enumerationFailed || untracked.omitted > 0 };
+      const incomplete = !trackedOk || untracked.enumerationFailed || untracked.omitted > 0;
+      const incompleteReason = trackedFailReason ?? (untracked.enumerationFailed ? "git ls-files (untracked enumeration) failed" : void 0);
+      return { diff: out, incomplete, ...incompleteReason ? { incompleteReason } : {} };
     },
     loadLanes: () => {
       if (!existsSync3(lanesPath)) return null;

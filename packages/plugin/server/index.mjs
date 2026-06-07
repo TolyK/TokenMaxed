@@ -14228,7 +14228,7 @@ var require_dist2 = __commonJS({
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
 import { existsSync as existsSync8, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync4 } from "node:fs";
-import { dirname as dirname6, join as join6 } from "node:path";
+import { dirname as dirname7, join as join6 } from "node:path";
 import { fileURLToPath as fileURLToPath5 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
@@ -24855,7 +24855,7 @@ import { join as join3 } from "node:path";
 import { spawnSync as spawnSync2 } from "node:child_process";
 import { existsSync as existsSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { join as join2 } from "node:path";
+import { delimiter, dirname as dirname2, join as join2 } from "node:path";
 var HOME_TM = join2(homedir2(), ".tokenmaxed");
 function homeFile(name) {
   return join2(HOME_TM, name);
@@ -24876,10 +24876,18 @@ function makeResolveAuth(env) {
   };
 }
 var DEFAULT_CLI_TIMEOUT_MS = 3e5;
+function spawnPath(execPath = process.execPath, base = process.env.PATH) {
+  const binDir = dirname2(execPath);
+  const parts = (base ?? "").split(delimiter).filter(Boolean);
+  if (parts.includes(binDir)) return parts.join(delimiter);
+  return [binDir, ...parts].join(delimiter);
+}
 function makeCliSpawn(timeoutMs = DEFAULT_CLI_TIMEOUT_MS) {
   return (command, args, options) => spawnSync2(command, [...args], {
     ...options,
-    env: { ...process.env, TOKENMAXED_DISABLE: "1" },
+    // Augment PATH so a CLI installed next to this Node (nvm/global-npm) is found
+    // even under a stripped host PATH; TOKENMAXED_DISABLE=1 stops child recursion.
+    env: { ...process.env, PATH: spawnPath(), TOKENMAXED_DISABLE: "1" },
     timeout: timeoutMs
   });
 }
@@ -24929,12 +24937,13 @@ async function availableLaneIds(lanes, deps) {
 function makeAvailabilityProbe(env) {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch;
-  return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
+  const path = spawnPath(process.execPath, env.PATH);
+  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
 // ../mcp/src/model-cache.ts
 import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname as dirname2 } from "node:path";
+import { dirname as dirname3 } from "node:path";
 var CACHE_VERSION = 1;
 function emptyCache() {
   return { version: CACHE_VERSION, endpoints: /* @__PURE__ */ Object.create(null) };
@@ -24978,7 +24987,7 @@ function readFreshnessCache(path) {
 }
 function writeFreshnessCache(path, cache) {
   try {
-    mkdirSync2(dirname2(path), { recursive: true });
+    mkdirSync2(dirname3(path), { recursive: true });
     writeFileSync2(path, JSON.stringify(cache, null, 2) + "\n", "utf8");
   } catch {
   }
@@ -25107,13 +25116,13 @@ async function fetchModelList(lane, deps) {
 
 // ../mcp/src/summary-deps.ts
 import { existsSync as existsSync5, readFileSync as readFileSync4 } from "node:fs";
-import { dirname as dirname4, join as join4 } from "node:path";
+import { dirname as dirname5, join as join4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../mcp/src/lane-state.ts
 import { createHash } from "node:crypto";
 import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname3 } from "node:path";
+import { dirname as dirname4 } from "node:path";
 var STATE_VERSION = 1;
 function canonicalLane(l) {
   return {
@@ -25174,7 +25183,7 @@ function readLaneReviewState(path) {
 }
 function writeLaneReviewState(path, state) {
   try {
-    mkdirSync3(dirname3(path), { recursive: true });
+    mkdirSync3(dirname4(path), { recursive: true });
     writeFileSync3(path, JSON.stringify(state, null, 2) + "\n", "utf8");
   } catch {
   }
@@ -25385,9 +25394,9 @@ function makeSummaryFromEnv(env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
-  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname4(statePath), "model-freshness.json");
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname5(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname4(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname5(statePath), "lane-review.json");
   return async () => {
     const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
@@ -25503,13 +25512,6 @@ function parseMaxRounds(env) {
 
 // ../mcp/src/host-review.ts
 async function runHostTurnReview(turnId, deps) {
-  const { diff, incomplete } = deps.readDiff();
-  if (!diff.trim()) {
-    if (incomplete) {
-      return { reviewed: false, errored: true, reason: "could not read the working-tree diff (git failed)" };
-    }
-    return { reviewed: false, reason: "no working-tree changes to review" };
-  }
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
   const available = new Set(await deps.availableLaneIds(lanes));
@@ -25519,6 +25521,14 @@ async function runHostTurnReview(turnId, deps) {
       reviewed: false,
       reason: "no usable manager lane configured (needs manager_allowed on a trusted CLI/local lane, not policy-blocked; an API manager needs the safety gate open)"
     };
+  }
+  const { diff, incomplete, incompleteReason } = deps.readDiff();
+  if (!diff.trim()) {
+    if (incomplete) {
+      const detail = incompleteReason ? `: ${incompleteReason}` : " (git failed)";
+      return { reviewed: false, errored: true, reason: `could not read the working-tree diff${detail}` };
+    }
+    return { reviewed: false, reason: "no working-tree changes to review" };
   }
   const result = await review(
     { turn_id: turnId, category: "refactor", content: diff },
@@ -25593,6 +25603,7 @@ function makeHostReviewDeps(env) {
       const res = spawnSync3("git", ["diff", "HEAD"], { cwd, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
       const trackedOk = res.status === 0 && typeof res.stdout === "string";
       const tracked = trackedOk ? res.stdout : "";
+      const trackedFailReason = trackedOk ? void 0 : typeof res.stderr === "string" && res.stderr.trim().split("\n")[0] || (res.error ? `git not runnable: ${res.error.message}` : "git diff HEAD failed");
       let untracked = { diff: "", omitted: 0, enumerationFailed: false };
       try {
         untracked = readUntrackedDiff(cwd);
@@ -25610,7 +25621,9 @@ function makeHostReviewDeps(env) {
       if (gaps.length > 0 && body.trim()) out += `
 
 [NOTE: review coverage is INCOMPLETE \u2014 omitted: ${gaps.join("; ")}]`;
-      return { diff: out, incomplete: !trackedOk || untracked.enumerationFailed || untracked.omitted > 0 };
+      const incomplete = !trackedOk || untracked.enumerationFailed || untracked.omitted > 0;
+      const incompleteReason = trackedFailReason ?? (untracked.enumerationFailed ? "git ls-files (untracked enumeration) failed" : void 0);
+      return { diff: out, incomplete, ...incompleteReason ? { incompleteReason } : {} };
     },
     loadLanes: () => {
       if (!existsSync6(lanesPath)) return null;
@@ -25673,7 +25686,7 @@ async function runReviewWithBudget(runner, newId, opts) {
 
 // ../mcp/src/setup.ts
 import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
-import { dirname as dirname5, join as join5 } from "node:path";
+import { dirname as dirname6, join as join5 } from "node:path";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
 var LANES_STARTER = fileURLToPath4(new URL("../lanes.starter.yaml", import.meta.url));
 var POLICY_STARTER = fileURLToPath4(new URL("../policy.starter.yaml", import.meta.url));
@@ -25683,12 +25696,12 @@ async function runSetup(env) {
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
   const lanesExisted = existsSync7(lanesPath);
   if (!lanesExisted) {
-    mkdirSync4(dirname5(lanesPath), { recursive: true });
+    mkdirSync4(dirname6(lanesPath), { recursive: true });
     copyFileSync(LANES_STARTER, lanesPath);
   }
   const policyExisted = existsSync7(policyPath);
   if (!policyExisted) {
-    mkdirSync4(dirname5(policyPath), { recursive: true });
+    mkdirSync4(dirname6(policyPath), { recursive: true });
     copyFileSync(POLICY_STARTER, policyPath);
   }
   const registry2 = loadLaneConfig(lanesPath);
@@ -25720,7 +25733,7 @@ async function runSetup(env) {
   });
   const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
   const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join5(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname5(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname6(statePath), "lane-review.json");
   const fingerprint = laneSetFingerprint(registry2.lanes);
   const reviewState = readLaneReviewState(laneStatePath);
   const prior = Object.hasOwn(reviewState.byProject, projectKey) ? reviewState.byProject[projectKey].fingerprint : void 0;
@@ -26257,7 +26270,7 @@ function fileToggleStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync5(dirname6(statePath), { recursive: true });
+      mkdirSync5(dirname7(statePath), { recursive: true });
       writeFileSync4(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -26437,7 +26450,7 @@ function makeServerDeps(env = process.env) {
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join6(dirname6(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join6(dirname7(statePath), "model-freshness.json");
       return reportFreshness(
         eligible,
         {

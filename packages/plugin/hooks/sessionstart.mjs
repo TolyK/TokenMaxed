@@ -7367,7 +7367,7 @@ var require_dist = __commonJS({
 
 // ../mcp/src/summary-deps.ts
 import { existsSync as existsSync5, readFileSync as readFileSync4 } from "node:fs";
-import { dirname as dirname2, join as join4 } from "node:path";
+import { dirname as dirname3, join as join4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../core/src/types.ts
@@ -8356,7 +8356,7 @@ import { join as join3 } from "node:path";
 // ../mcp/src/config.ts
 import { existsSync as existsSync2 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { join as join2 } from "node:path";
+import { delimiter, dirname as dirname2, join as join2 } from "node:path";
 var HOME_TM = join2(homedir2(), ".tokenmaxed");
 function homeFile(name) {
   return join2(HOME_TM, name);
@@ -8375,6 +8375,12 @@ function makeResolveAuth(env) {
     if (!/^[A-Za-z0-9_]+$/.test(authHandle)) return "";
     return env[`TOKENMAXED_KEY_${authHandle}`] ?? "";
   };
+}
+function spawnPath(execPath = process.execPath, base = process.env.PATH) {
+  const binDir = dirname2(execPath);
+  const parts = (base ?? "").split(delimiter).filter(Boolean);
+  if (parts.includes(binDir)) return parts.join(delimiter);
+  return [binDir, ...parts].join(delimiter);
 }
 
 // ../mcp/src/availability.ts
@@ -8422,7 +8428,8 @@ async function availableLaneIds(lanes, deps) {
 function makeAvailabilityProbe(env) {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch;
-  return (lanes) => availableLaneIds(lanes, { path: env.PATH, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
+  const path = spawnPath(process.execPath, env.PATH);
+  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
 // ../mcp/src/model-cache.ts
@@ -8799,9 +8806,9 @@ function makeSummaryFromEnv(env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
-  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname2(statePath), "model-freshness.json");
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname3(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname2(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname3(statePath), "lane-review.json");
   return async () => {
     const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
