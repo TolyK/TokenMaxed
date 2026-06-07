@@ -1,14 +1,22 @@
 #!/usr/bin/env node
 /**
- * A-7 — Stop gate (OPT-IN). When TOKENMAXED_REVIEW_ON_STOP=true, review the
- * turn's working-tree diff with the configured manager; on a non-pass verdict,
- * BLOCK finishing and feed the reviewer notes back so Claude reworks.
+ * REVIEW-LOOP — Stop gate (DEFAULT-ON when a reviewer lane exists). Reviews the
+ * turn's working-tree diff (tracked AND untracked changes) with the configured
+ * manager; on a non-pass verdict, BLOCK finishing and feed the reviewer notes
+ * back so Claude reworks, then re-reviews — iterating until the reviewer passes.
  *
- * Loop guard: Claude Code has no built-in stop-loop protection, so we keep a
- * per-session block counter in a temp file and YIELD after MAX_BLOCKS to never
- * trap the user. Fails OPEN on any error (never wedge a session over a backstop).
+ * Protections (all decided in reviewer.ts, kept pure/testable):
+ *   A — never wedged by error: fails OPEN on any reviewer error/timeout, but
+ *       SURFACES it (systemMessage) so a failed review is never a silent pass.
+ *   B — never stuck: a per-session block counter (temp file) bounds the loop to
+ *       maxRounds; on reaching it without a pass we YIELD with a clear message.
+ *   C — agent can't forget: this is a deterministic Stop hook (always runs) that
+ *       always reports its terminal state (pass = silent, else surfaced).
  *
- * Contract: exit 0 always; allow ⇒ no output, block ⇒ {"decision":"block",...}.
+ * Opt out entirely with TOKENMAXED_REVIEW_ON_STOP=false (or no reviewer lane).
+ *
+ * Contract: exit 0 always; allow ⇒ no output, block ⇒ {"decision":"block",...},
+ * terminal-to-surface ⇒ {"systemMessage":"..."}.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -18,9 +26,7 @@ import { join } from 'node:path';
 
 import { makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
 import { runReviewWithBudget } from './review-budget.ts';
-import { stopGateDecision } from './reviewer.ts';
-
-const MAX_BLOCKS = 2; // consecutive Stop blocks before yielding (loop guard)
+import { parseMaxRounds, reviewLoopEnabled, stopHookAction } from './reviewer.ts';
 
 function readCounter(file: string): number {
   try {
@@ -44,9 +50,11 @@ function writeCounter(file: string, n: number): boolean {
 
 async function main(): Promise<void> {
   const env = process.env;
-  // Opt-in only; never run inside a recursion-guarded child.
-  if (env.TOKENMAXED_REVIEW_ON_STOP !== 'true') return;
-  if (env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true') return;
+  // DEFAULT-ON: runs unless explicitly opted out (TOKENMAXED_REVIEW_ON_STOP=false)
+  // or globally disabled (TOKENMAXED_DISABLE, also our recursion guard). When no
+  // reviewer lane is configured the review no-ops downstream, so default-on means
+  // "on whenever a usable reviewer exists" — the user's chosen posture.
+  if (!reviewLoopEnabled(env)) return;
 
   let input: { session_id?: unknown } = {};
   try {
@@ -56,43 +64,63 @@ async function main(): Promise<void> {
   }
   const sessionId = (typeof input.session_id === 'string' ? input.session_id : 'default').replace(/[^A-Za-z0-9_.-]/g, '_');
   const counterFile = join(tmpdir(), 'tokenmaxed-stop', sessionId);
+  const maxRounds = parseMaxRounds(env);
 
   const deps = makeHostReviewDeps(env);
   // runReviewWithBudget caps the total wait to 120 s across up to 2 attempts, so
   // a hung API manager or a stalled CLI (the real backstop: OS spawnSync timeout)
-  // can never wedge this Stop hook indefinitely. Fails OPEN on every error/timeout.
+  // can never wedge this Stop hook indefinitely. Fails OPEN on every error/timeout
+  // (returns errored:true so we surface it rather than silently passing).
   const result = await runReviewWithBudget(makeReviewRunner(deps), randomUUID, {
     totalBudgetMs: 120_000,
     maxRetries: 1,
   });
-  // Nothing to gate (no changes / no manager / pass) ⇒ allow + reset the counter.
-  if (!result.reviewed || !result.verdict) {
+
+  const priorBlocks = readCounter(counterFile);
+  const action = stopHookAction({
+    reviewed: result.reviewed,
+    errored: result.errored,
+    reason: result.reason,
+    verdict: result.verdict,
+    notes: result.notes,
+    managerLaneId: result.managerLaneId,
+    priorBlocks,
+    maxRounds,
+  });
+
+  if (action.kind === 'allow') {
+    // Silent pass / no-changes / no-reviewer ⇒ allow + reset the loop counter.
     writeCounter(counterFile, 0);
     return;
   }
 
-  const priorBlocks = readCounter(counterFile);
-  const decision = stopGateDecision(result.verdict, priorBlocks, MAX_BLOCKS);
-  if (!decision.block) {
-    writeCounter(counterFile, 0); // pass, or yielded after the budget — reset
+  if (action.kind === 'notify') {
+    // Terminal state worth surfacing (reviewer error, or yielded-unconverged) —
+    // reset the counter, then emit a non-blocking systemMessage to the USER.
+    writeCounter(counterFile, 0);
+    await writeStdout(JSON.stringify({ systemMessage: action.message }));
     return;
   }
 
-  // Only block if we can PERSIST the incremented counter — otherwise the loop
-  // guard would be defeated (every Stop re-reads 0 and blocks forever), so fail
-  // open instead of risking trapping the session.
-  if (!writeCounter(counterFile, priorBlocks + 1)) return;
-  const head = `Manager review (${result.managerLaneId ?? 'manager'}) returned ${result.verdict}. Address the issues, then continue.`;
-  // Put the reviewer's notes in BOTH the block reason (what drives the block) and
-  // additionalContext, so Claude actually receives the actionable feedback.
-  const reason = result.notes ? `${head}\n\nReviewer notes:\n${result.notes}` : head;
+  // action.kind === 'block' — only block if we can PERSIST the incremented counter,
+  // else the loop guard is defeated (every Stop re-reads the same count and blocks
+  // forever). Fail OPEN, but SURFACE it (don't pretend the review passed).
+  if (!writeCounter(counterFile, priorBlocks + 1)) {
+    await writeStdout(
+      JSON.stringify({
+        systemMessage:
+          '⚠ TokenMaxed: review wanted rework but the loop-state file could not be written; not blocking to avoid a stuck session. Run /tokenmaxed:review to see the notes.',
+      }),
+    );
+    return;
+  }
   // Await the flush: the block JSON can exceed the pipe buffer with verbose notes,
   // and exiting before it drains would truncate it (Claude would ignore the block).
   await writeStdout(
     JSON.stringify({
       decision: 'block',
-      reason,
-      hookSpecificOutput: { hookEventName: 'Stop', additionalContext: reason },
+      reason: action.reason,
+      hookSpecificOutput: { hookEventName: 'Stop', additionalContext: action.reason },
     }),
   );
 }

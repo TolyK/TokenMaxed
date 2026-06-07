@@ -158,7 +158,10 @@ export interface SetupReport {
   managerLaneId?: string;
   gitleaksAvailable: boolean;
   gateReady: boolean;
+  /** REVIEW-LOOP: whether the default-on review-iterate loop runs (on unless opted out). */
   reviewOnStop: boolean;
+  /** REVIEW-LOOP: rework rounds the loop drives before yielding (Protection B bound). */
+  reviewMaxRounds?: number;
   /** C-13: whether quality escalation is enabled (TOKENMAXED_ESCALATE). */
   escalate: boolean;
   /** F-1: whether learned capability feedback is enabled (TOKENMAXED_LEARN_CAPABILITY). */
@@ -646,7 +649,7 @@ export function createTools(core: CorePort): ToolDef[] {
   const setupTool: ToolDef = {
     name: 'router_setup',
     description:
-      'Set up TokenMaxed: create the user-owned config (~/.tokenmaxed/lanes.yaml + policy.yaml) from starter templates if missing (never overwrites), validate it, and report status — configured lanes, the manager lane, whether a secret scanner (gitleaks) is installed, and the worker-gate / review-on-stop state. Powers /tokenmaxed:setup.',
+      'Set up TokenMaxed: create the user-owned config (~/.tokenmaxed/lanes.yaml + policy.yaml) from starter templates if missing (never overwrites), validate it, and report status — configured lanes, the manager lane, whether a secret scanner (gitleaks) is installed, and the worker-gate / review-loop state. Powers /tokenmaxed:setup.',
     inputSchema: { type: 'object', additionalProperties: false, properties: {} },
     handler: (deps) =>
       guardedAsync(async () => {
@@ -658,7 +661,7 @@ export function createTools(core: CorePort): ToolDef[] {
           `  ${r.laneCount} lane(s) configured; manager: ${r.managerLaneId ?? 'none (set manager_allowed on a trusted CLI/local lane)'}`,
           `  secret scanner (gitleaks): ${r.gitleaksAvailable ? 'available' : 'NOT installed — untrusted worker lanes stay disabled until it is'}`,
           `  worker gate: ${r.gateReady ? 'open' : 'closed'} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? '' : ' — install gitleaks first'})`,
-          `  review-on-stop: ${r.reviewOnStop ? 'on' : 'off'} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
+          `  review loop: ${r.reviewOnStop ? `ON (default — reviews every finishing turn when a reviewer exists; up to ${r.reviewMaxRounds ?? 5} rework round(s))` : 'off'} (opt out with TOKENMAXED_REVIEW_ON_STOP=false; tune rounds with TOKENMAXED_REVIEW_MAX_ROUNDS)`,
           `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
           `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
           `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,

@@ -39,12 +39,31 @@ export interface HostReviewResult {
   managerLaneId?: string;
   /** Why no review ran (no changes, no manager, …). */
   reason?: string;
+  /**
+   * REVIEW-LOOP: true ⇒ no review because of an ERROR/timeout (distinct from the
+   * benign "no changes" / "no manager" skips). The Stop hook surfaces this so a
+   * failed review is never mistaken for a silent pass (Protection A).
+   */
+  errored?: boolean;
+}
+
+/** The working-tree diff read for review, plus whether it was fully acquired. */
+export interface DiffRead {
+  /** The diff handed to the manager (carries an appended coverage NOTE if partial). */
+  diff: string;
+  /**
+   * true ⇒ the diff could NOT be fully acquired — `git diff HEAD` failed, untracked
+   * enumeration failed, or some untracked files were dropped for the size/time
+   * budget. A non-empty diff is still reviewed (the NOTE warns the manager); an
+   * EMPTY-but-incomplete read is surfaced as a review error, never a silent pass.
+   */
+  incomplete: boolean;
 }
 
 /** Injected I/O for {@link runHostTurnReview} (real impls from makeHostReviewDeps). */
 export interface HostReviewDeps {
-  /** The turn's working-tree diff (empty ⇒ nothing to review). */
-  readDiff: () => string;
+  /** The turn's working-tree diff (empty + complete ⇒ nothing to review). */
+  readDiff: () => DiffRead;
   /** Configured lanes, or null when no config file exists yet. */
   loadLanes: () => Lane[] | null;
   /** Ids of lanes that can actually run now, so an unavailable manager isn't picked. */
@@ -62,8 +81,15 @@ export interface HostReviewDeps {
 
 /** Review the turn's diff with a configured manager. Pure over its injected deps. */
 export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): Promise<HostReviewResult> {
-  const diff = deps.readDiff();
-  if (!diff.trim()) return { reviewed: false, reason: 'no working-tree changes to review' };
+  const { diff, incomplete } = deps.readDiff();
+  if (!diff.trim()) {
+    // Empty AND incomplete ⇒ we couldn't acquire the diff (git failed). Surface it
+    // as an ERROR (Protection A) rather than a silent "no changes" pass.
+    if (incomplete) {
+      return { reviewed: false, errored: true, reason: 'could not read the working-tree diff (git failed)' };
+    }
+    return { reviewed: false, reason: 'no working-tree changes to review' };
+  }
 
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: 'no lanes configured yet — run /tokenmaxed:setup' };
@@ -113,6 +139,69 @@ const MAX_DIFF_BYTES = 256 * 1024; // truncate what we hand the manager
 const GIT_MAX_BUFFER = 64 * 1024 * 1024; // read big diffs without ENOBUFS, then truncate
 const GIT_TIMEOUT_MS = 15_000; // git diff is fast; bound it so a wedged git can't hang us
 const REVIEW_CLI_TIMEOUT_MS = 90_000; // a manager review of a diff should be quick
+const MAX_UNTRACKED_FILES = 50; // hard cap on how many new files we synthesize add-diffs for
+const UNTRACKED_BUDGET_MS = 8_000; // total wall-clock cap for the whole untracked pass
+const UNTRACKED_FILE_TIMEOUT_MS = 5_000; // per-file git timeout (was 15 s — too long × N)
+const UNTRACKED_FILE_MAXBUF = 4 * 1024 * 1024; // per-file read bound (combined is truncated anyway)
+
+/**
+ * REVIEW-LOOP — "review ALL changed code": synthesize add-style diffs for
+ * UNTRACKED (new, not-yet-`git add`ed) files so the reviewer sees them too
+ * (`git diff HEAD` alone misses them — the old v0 gap). NON-MUTATING (never
+ * touches the index) and fails soft to empty on any error so the Stop hook
+ * degrades to the tracked-only diff rather than erroring.
+ *
+ * HARD-BOUNDED so it can never wedge the default-on Stop hook: each `git diff` is
+ * a synchronous `spawnSync` the review budget cannot preempt, so we stop the pass
+ * as soon as we hit ANY of — the byte budget (we truncate to MAX_DIFF_BYTES
+ * downstream anyway), the file cap, or the wall-clock budget.
+ *
+ * Coverage honesty: `omitted` counts every enumerated file NOT actually included
+ * in the returned diff — files we never reached (a bound tripped) AND files we
+ * attempted but got nothing usable from (a per-file diff failure/timeout). It is
+ * computed from what made it IN, so a skipped file can't hide. `enumerationFailed`
+ * flags the case where `git ls-files` itself failed (we don't even know the set).
+ * The caller turns either signal into an explicit incomplete-coverage marker.
+ */
+function readUntrackedDiff(cwd: string): { diff: string; omitted: number; enumerationFailed: boolean } {
+  const list = spawnSync('git', ['ls-files', '--others', '--exclude-standard', '-z'], {
+    cwd,
+    encoding: 'utf8',
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: GIT_TIMEOUT_MS,
+  });
+  if (list.status !== 0 || typeof list.stdout !== 'string') return { diff: '', omitted: 0, enumerationFailed: true };
+  const all = list.stdout.split('\0').filter(Boolean);
+  const parts: string[] = [];
+  let bytes = 0;
+  let included = 0;
+  const startedAt = Date.now();
+  for (const f of all) {
+    // Stop early on any bound — keeps Stop snappy and within the review budget.
+    if (bytes >= MAX_DIFF_BYTES || included >= MAX_UNTRACKED_FILES || Date.now() - startedAt > UNTRACKED_BUDGET_MS) {
+      break;
+    }
+    // `git diff --no-index -- /dev/null <f>` emits an add-style patch. It exits 1
+    // when the inputs differ (always true vs the empty null device), so we take
+    // stdout regardless of status (don't gate on status === 0). git treats
+    // `/dev/null` specially even on Windows; if it can't, this file is skipped
+    // (and counted as omitted below). A new file always yields a non-empty patch
+    // header, so empty stdout means the per-file diff genuinely failed/timed out.
+    const d = spawnSync('git', ['diff', '--no-index', '--', '/dev/null', f], {
+      cwd,
+      encoding: 'utf8',
+      maxBuffer: UNTRACKED_FILE_MAXBUF,
+      timeout: UNTRACKED_FILE_TIMEOUT_MS,
+    });
+    if (typeof d.stdout === 'string' && d.stdout) {
+      parts.push(d.stdout);
+      bytes += d.stdout.length;
+      included += 1;
+    }
+  }
+  // Everything enumerated but NOT included (bound-skipped or per-file failure).
+  return { diff: parts.join('\n'), omitted: Math.max(0, all.length - included), enumerationFailed: false };
+}
 
 /** Build the real host-review deps from the environment (git + executor + ledger). */
 export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
@@ -131,15 +220,38 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
   });
 
   return {
-    readDiff: () => {
-      // All tracked changes vs HEAD (staged + unstaged). Untracked files are not
-      // included — a known v0 limitation (documented). Read with a large buffer so
-      // a big diff doesn't ENOBUFS (which would look like "no changes"), then
-      // truncate explicitly for the manager.
+    readDiff: (): DiffRead => {
+      // All tracked changes vs HEAD (staged + unstaged). Read with a large buffer
+      // so a big diff doesn't ENOBUFS (which would look like "no changes"). A git
+      // FAILURE here is tracked (trackedOk) so we don't pass it off as "no changes".
       const res = spawnSync('git', ['diff', 'HEAD'], { cwd, encoding: 'utf8', maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
-      if (res.status !== 0 || typeof res.stdout !== 'string') return '';
-      const diff = res.stdout;
-      return diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}\n\n[diff truncated for review]` : diff;
+      const trackedOk = res.status === 0 && typeof res.stdout === 'string';
+      const tracked = trackedOk ? (res.stdout as string) : '';
+      // REVIEW-LOOP — "review ALL changed code" includes UNTRACKED/new files (the
+      // old v0 gap). Hard-bounded + fails soft so it can't wedge or starve the
+      // Stop hook; degrades to tracked-only on any error (and flags it incomplete).
+      let untracked = { diff: '', omitted: 0, enumerationFailed: false };
+      try {
+        untracked = readUntrackedDiff(cwd);
+      } catch {
+        untracked = { diff: '', omitted: 0, enumerationFailed: true };
+      }
+      const body = [tracked, untracked.diff].filter((s) => s.trim()).join('\n');
+      // Truncate the body FIRST, then append coverage markers so they always survive
+      // (a silent omission must never read as complete coverage to the reviewer).
+      let out = body.length > MAX_DIFF_BYTES ? `${body.slice(0, MAX_DIFF_BYTES)}\n\n[diff truncated for review]` : body;
+      const gaps: string[] = [];
+      if (!trackedOk) gaps.push('tracked changes (git diff HEAD failed)');
+      if (untracked.enumerationFailed) gaps.push('untracked files (git ls-files failed)');
+      if (untracked.omitted > 0) gaps.push(`${untracked.omitted} untracked file(s) (exceeded the review size/time budget)`);
+      // Annotate ONLY a real (non-empty) body. If there is no diff content we must
+      // NOT manufacture a note-only "diff" — that would defeat runHostTurnReview's
+      // empty check and let the manager "pass" a note. Instead leave `out` empty so
+      // the `incomplete` flag drives the empty+incomplete → review-error branch.
+      if (gaps.length > 0 && body.trim()) out += `\n\n[NOTE: review coverage is INCOMPLETE — omitted: ${gaps.join('; ')}]`;
+      // incomplete drives the EMPTY-diff branch: empty + incomplete = acquisition
+      // failure (surface as a review error), empty + complete = genuinely no changes.
+      return { diff: out, incomplete: !trackedOk || untracked.enumerationFailed || untracked.omitted > 0 };
     },
     loadLanes: () => {
       if (!existsSync(lanesPath)) return null;

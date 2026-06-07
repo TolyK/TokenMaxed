@@ -19,6 +19,7 @@ import { homeFile } from './config.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
 import { laneSetFingerprint, markLanesSeen, readLaneReviewState, writeLaneReviewState } from './lane-state.ts';
 import { selectManagerLane } from './manager-select.ts';
+import { parseMaxRounds, reviewLoopEnabled } from './reviewer.ts';
 import type { SetupReport } from './tools.ts';
 
 const LANES_STARTER = fileURLToPath(new URL('../lanes.starter.yaml', import.meta.url));
@@ -107,7 +108,10 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     ...(manager ? { managerLaneId: manager.id } : {}),
     gitleaksAvailable,
     gateReady,
-    reviewOnStop: env.TOKENMAXED_REVIEW_ON_STOP === 'true',
+    // REVIEW-LOOP: default-ON (on whenever a usable reviewer lane exists); opt out
+    // with TOKENMAXED_REVIEW_ON_STOP=false. Reported with its rework-round bound.
+    reviewOnStop: reviewLoopEnabled(env),
+    reviewMaxRounds: parseMaxRounds(env),
     // Mirror makeServerDeps: the global kill-switch disables escalation.
     escalate:
       env.TOKENMAXED_ESCALATE === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),

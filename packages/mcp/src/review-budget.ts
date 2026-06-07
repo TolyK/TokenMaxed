@@ -62,7 +62,7 @@ export async function runReviewWithBudget(
   const perAttemptMs = Math.floor(totalBudgetMs / nAttempts);
 
   if (perAttemptMs <= 0) {
-    return { reviewed: false, reason: 'review budget too small' };
+    return { reviewed: false, errored: true, reason: 'review budget too small' };
   }
 
   // One turn ID across all retries so any late duplicate appendOutcome writes
@@ -112,5 +112,7 @@ export async function runReviewWithBudget(
     // else: timed out or errored — continue to next attempt if budget allows
   }
 
-  return { reviewed: false, reason: lastReason };
+  // Every attempt timed out or threw ⇒ fail OPEN, but flag it as an ERROR so the
+  // Stop hook surfaces "not reviewed" instead of silently allowing as if it passed.
+  return { reviewed: false, errored: true, reason: lastReason };
 }

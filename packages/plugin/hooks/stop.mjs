@@ -8562,11 +8562,74 @@ function stopGateDecision(verdict, priorBlocks, maxAttempts) {
   }
   return { block: true, reason: verdict };
 }
+var OFF_VALUES = /* @__PURE__ */ new Set(["false", "0", "off", "no"]);
+function reviewLoopEnabled(env) {
+  if (env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true") return false;
+  const v = env.TOKENMAXED_REVIEW_ON_STOP;
+  if (v !== void 0 && OFF_VALUES.has(v.trim().toLowerCase())) return false;
+  return true;
+}
+var DEFAULT_REVIEW_MAX_ROUNDS = 5;
+var MAX_REVIEW_ROUNDS_CAP = 20;
+function parseMaxRounds(env) {
+  const raw = env.TOKENMAXED_REVIEW_MAX_ROUNDS;
+  if (raw === void 0) return DEFAULT_REVIEW_MAX_ROUNDS;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_REVIEW_MAX_ROUNDS;
+  return Math.min(n, MAX_REVIEW_ROUNDS_CAP);
+}
+var NOTES_SUMMARY_MAX = 1500;
+function summarizeNotes(notes) {
+  const t = (notes ?? "").trim();
+  if (!t) return "";
+  return t.length > NOTES_SUMMARY_MAX ? `${t.slice(0, NOTES_SUMMARY_MAX)}
+\u2026[notes truncated]` : t;
+}
+function stopHookAction(input) {
+  if (!input.reviewed) {
+    if (input.errored) {
+      const why = input.reason ? ` (${input.reason})` : "";
+      return {
+        kind: "notify",
+        message: `\u26A0 TokenMaxed: the manager review could not run${why}. Your changes were NOT reviewed \u2014 finishing without a verdict. Re-run /tokenmaxed:review to retry.`
+      };
+    }
+    return { kind: "allow" };
+  }
+  const verdict = input.verdict ?? "pass";
+  const decision = stopGateDecision(verdict, input.priorBlocks, input.maxRounds);
+  if (decision.block) {
+    const who = input.managerLaneId ?? "manager";
+    const head = `Manager review (${who}) returned ${verdict}. Address the issues, then continue.`;
+    const notes = summarizeNotes(input.notes);
+    return { kind: "block", reason: notes ? `${head}
+
+Reviewer notes:
+${notes}` : head };
+  }
+  if (decision.reason) {
+    const notes = summarizeNotes(input.notes);
+    const tail = notes ? `
+
+Outstanding reviewer notes:
+${notes}` : "";
+    return {
+      kind: "notify",
+      message: `\u26A0 TokenMaxed: review still "${verdict}" after ${input.priorBlocks} rework round(s) (max ${input.maxRounds}); yielding so you're not stuck. Review the changes yourself, or raise TOKENMAXED_REVIEW_MAX_ROUNDS.${tail}`
+    };
+  }
+  return { kind: "allow" };
+}
 
 // ../mcp/src/host-review.ts
 async function runHostTurnReview(turnId, deps) {
-  const diff = deps.readDiff();
-  if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };
+  const { diff, incomplete } = deps.readDiff();
+  if (!diff.trim()) {
+    if (incomplete) {
+      return { reviewed: false, errored: true, reason: "could not read the working-tree diff (git failed)" };
+    }
+    return { reviewed: false, reason: "no working-tree changes to review" };
+  }
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
   const available = new Set(await deps.availableLaneIds(lanes));
@@ -8600,6 +8663,41 @@ var MAX_DIFF_BYTES = 256 * 1024;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var GIT_TIMEOUT_MS = 15e3;
 var REVIEW_CLI_TIMEOUT_MS = 9e4;
+var MAX_UNTRACKED_FILES = 50;
+var UNTRACKED_BUDGET_MS = 8e3;
+var UNTRACKED_FILE_TIMEOUT_MS = 5e3;
+var UNTRACKED_FILE_MAXBUF = 4 * 1024 * 1024;
+function readUntrackedDiff(cwd) {
+  const list = spawnSync3("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: GIT_TIMEOUT_MS
+  });
+  if (list.status !== 0 || typeof list.stdout !== "string") return { diff: "", omitted: 0, enumerationFailed: true };
+  const all = list.stdout.split("\0").filter(Boolean);
+  const parts = [];
+  let bytes = 0;
+  let included = 0;
+  const startedAt = Date.now();
+  for (const f of all) {
+    if (bytes >= MAX_DIFF_BYTES || included >= MAX_UNTRACKED_FILES || Date.now() - startedAt > UNTRACKED_BUDGET_MS) {
+      break;
+    }
+    const d = spawnSync3("git", ["diff", "--no-index", "--", "/dev/null", f], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: UNTRACKED_FILE_MAXBUF,
+      timeout: UNTRACKED_FILE_TIMEOUT_MS
+    });
+    if (typeof d.stdout === "string" && d.stdout) {
+      parts.push(d.stdout);
+      bytes += d.stdout.length;
+      included += 1;
+    }
+  }
+  return { diff: parts.join("\n"), omitted: Math.max(0, all.length - included), enumerationFailed: false };
+}
 function makeHostReviewDeps(env) {
   const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
@@ -8613,11 +8711,26 @@ function makeHostReviewDeps(env) {
   return {
     readDiff: () => {
       const res = spawnSync3("git", ["diff", "HEAD"], { cwd, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
-      if (res.status !== 0 || typeof res.stdout !== "string") return "";
-      const diff = res.stdout;
-      return diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}
+      const trackedOk = res.status === 0 && typeof res.stdout === "string";
+      const tracked = trackedOk ? res.stdout : "";
+      let untracked = { diff: "", omitted: 0, enumerationFailed: false };
+      try {
+        untracked = readUntrackedDiff(cwd);
+      } catch {
+        untracked = { diff: "", omitted: 0, enumerationFailed: true };
+      }
+      const body = [tracked, untracked.diff].filter((s) => s.trim()).join("\n");
+      let out = body.length > MAX_DIFF_BYTES ? `${body.slice(0, MAX_DIFF_BYTES)}
 
-[diff truncated for review]` : diff;
+[diff truncated for review]` : body;
+      const gaps = [];
+      if (!trackedOk) gaps.push("tracked changes (git diff HEAD failed)");
+      if (untracked.enumerationFailed) gaps.push("untracked files (git ls-files failed)");
+      if (untracked.omitted > 0) gaps.push(`${untracked.omitted} untracked file(s) (exceeded the review size/time budget)`);
+      if (gaps.length > 0 && body.trim()) out += `
+
+[NOTE: review coverage is INCOMPLETE \u2014 omitted: ${gaps.join("; ")}]`;
+      return { diff: out, incomplete: !trackedOk || untracked.enumerationFailed || untracked.omitted > 0 };
     },
     loadLanes: () => {
       if (!existsSync3(lanesPath)) return null;
@@ -8648,7 +8761,7 @@ async function runReviewWithBudget(runner, newId, opts) {
   const nAttempts = maxRetries + 1;
   const perAttemptMs = Math.floor(totalBudgetMs / nAttempts);
   if (perAttemptMs <= 0) {
-    return { reviewed: false, reason: "review budget too small" };
+    return { reviewed: false, errored: true, reason: "review budget too small" };
   }
   const turnId = newId();
   const deadlineAt = Date.now() + totalBudgetMs;
@@ -8675,11 +8788,10 @@ async function runReviewWithBudget(runner, newId, opts) {
     });
     if (result !== TIMEOUT) return result;
   }
-  return { reviewed: false, reason: lastReason };
+  return { reviewed: false, errored: true, reason: lastReason };
 }
 
 // ../mcp/src/hook-stop.ts
-var MAX_BLOCKS = 2;
 function readCounter(file) {
   try {
     const n = Number.parseInt(readFileSync2(file, "utf8"), 10);
@@ -8699,8 +8811,7 @@ function writeCounter(file, n) {
 }
 async function main() {
   const env = process.env;
-  if (env.TOKENMAXED_REVIEW_ON_STOP !== "true") return;
-  if (env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true") return;
+  if (!reviewLoopEnabled(env)) return;
   let input = {};
   try {
     input = JSON.parse(readFileSync2(0, "utf8") || "{}");
@@ -8708,32 +8819,45 @@ async function main() {
   }
   const sessionId = (typeof input.session_id === "string" ? input.session_id : "default").replace(/[^A-Za-z0-9_.-]/g, "_");
   const counterFile = join4(tmpdir2(), "tokenmaxed-stop", sessionId);
+  const maxRounds = parseMaxRounds(env);
   const deps = makeHostReviewDeps(env);
   const result = await runReviewWithBudget(makeReviewRunner(deps), randomUUID3, {
     totalBudgetMs: 12e4,
     maxRetries: 1
   });
-  if (!result.reviewed || !result.verdict) {
-    writeCounter(counterFile, 0);
-    return;
-  }
   const priorBlocks = readCounter(counterFile);
-  const decision = stopGateDecision(result.verdict, priorBlocks, MAX_BLOCKS);
-  if (!decision.block) {
+  const action = stopHookAction({
+    reviewed: result.reviewed,
+    errored: result.errored,
+    reason: result.reason,
+    verdict: result.verdict,
+    notes: result.notes,
+    managerLaneId: result.managerLaneId,
+    priorBlocks,
+    maxRounds
+  });
+  if (action.kind === "allow") {
     writeCounter(counterFile, 0);
     return;
   }
-  if (!writeCounter(counterFile, priorBlocks + 1)) return;
-  const head = `Manager review (${result.managerLaneId ?? "manager"}) returned ${result.verdict}. Address the issues, then continue.`;
-  const reason = result.notes ? `${head}
-
-Reviewer notes:
-${result.notes}` : head;
+  if (action.kind === "notify") {
+    writeCounter(counterFile, 0);
+    await writeStdout(JSON.stringify({ systemMessage: action.message }));
+    return;
+  }
+  if (!writeCounter(counterFile, priorBlocks + 1)) {
+    await writeStdout(
+      JSON.stringify({
+        systemMessage: "\u26A0 TokenMaxed: review wanted rework but the loop-state file could not be written; not blocking to avoid a stuck session. Run /tokenmaxed:review to see the notes."
+      })
+    );
+    return;
+  }
   await writeStdout(
     JSON.stringify({
       decision: "block",
-      reason,
-      hookSpecificOutput: { hookEventName: "Stop", additionalContext: reason }
+      reason: action.reason,
+      hookSpecificOutput: { hookEventName: "Stop", additionalContext: action.reason }
     })
   );
 }

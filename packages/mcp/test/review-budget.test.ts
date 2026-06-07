@@ -39,6 +39,7 @@ test('runReviewWithBudget — slow runner times out, fails open with reviewed:fa
       maxRetries: 0, // one attempt only
     });
     assert.equal(result.reviewed, false, 'should fail open on timeout');
+    assert.equal(result.errored, true, 'a timeout is flagged errored so the hook surfaces it');
     assert.ok(typeof result.reason === 'string' && result.reason.length > 0, 'should have a reason');
   } finally {
     cancelRunner?.();
@@ -89,6 +90,7 @@ test('runReviewWithBudget — budget too small returns immediately with reason',
     maxRetries: 1,
   });
   assert.equal(result.reviewed, false);
+  assert.equal(result.errored, true, 'budget-too-small is an error, not a benign skip');
   assert.match(result.reason ?? '', /budget/);
 });
 
@@ -117,6 +119,7 @@ test('runReviewWithBudget — reason distinguishes error from timeout', async ()
     maxRetries: 0,
   });
   assert.equal(result.reviewed, false);
+  assert.equal(result.errored, true, 'a thrown review is flagged errored so the hook surfaces it');
   assert.match(result.reason ?? '', /specific error message/, 'reason should include the error message');
 });
 

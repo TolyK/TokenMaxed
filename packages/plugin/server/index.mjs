@@ -25484,11 +25484,32 @@ function parseManagerVerdict(text) {
   void matched;
   return out;
 }
+var OFF_VALUES = /* @__PURE__ */ new Set(["false", "0", "off", "no"]);
+function reviewLoopEnabled(env) {
+  if (env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true") return false;
+  const v = env.TOKENMAXED_REVIEW_ON_STOP;
+  if (v !== void 0 && OFF_VALUES.has(v.trim().toLowerCase())) return false;
+  return true;
+}
+var DEFAULT_REVIEW_MAX_ROUNDS = 5;
+var MAX_REVIEW_ROUNDS_CAP = 20;
+function parseMaxRounds(env) {
+  const raw = env.TOKENMAXED_REVIEW_MAX_ROUNDS;
+  if (raw === void 0) return DEFAULT_REVIEW_MAX_ROUNDS;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_REVIEW_MAX_ROUNDS;
+  return Math.min(n, MAX_REVIEW_ROUNDS_CAP);
+}
 
 // ../mcp/src/host-review.ts
 async function runHostTurnReview(turnId, deps) {
-  const diff = deps.readDiff();
-  if (!diff.trim()) return { reviewed: false, reason: "no working-tree changes to review" };
+  const { diff, incomplete } = deps.readDiff();
+  if (!diff.trim()) {
+    if (incomplete) {
+      return { reviewed: false, errored: true, reason: "could not read the working-tree diff (git failed)" };
+    }
+    return { reviewed: false, reason: "no working-tree changes to review" };
+  }
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
   const available = new Set(await deps.availableLaneIds(lanes));
@@ -25522,6 +25543,41 @@ var MAX_DIFF_BYTES = 256 * 1024;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var GIT_TIMEOUT_MS = 15e3;
 var REVIEW_CLI_TIMEOUT_MS = 9e4;
+var MAX_UNTRACKED_FILES = 50;
+var UNTRACKED_BUDGET_MS = 8e3;
+var UNTRACKED_FILE_TIMEOUT_MS = 5e3;
+var UNTRACKED_FILE_MAXBUF = 4 * 1024 * 1024;
+function readUntrackedDiff(cwd) {
+  const list = spawnSync3("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd,
+    encoding: "utf8",
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: GIT_TIMEOUT_MS
+  });
+  if (list.status !== 0 || typeof list.stdout !== "string") return { diff: "", omitted: 0, enumerationFailed: true };
+  const all = list.stdout.split("\0").filter(Boolean);
+  const parts = [];
+  let bytes = 0;
+  let included = 0;
+  const startedAt = Date.now();
+  for (const f of all) {
+    if (bytes >= MAX_DIFF_BYTES || included >= MAX_UNTRACKED_FILES || Date.now() - startedAt > UNTRACKED_BUDGET_MS) {
+      break;
+    }
+    const d = spawnSync3("git", ["diff", "--no-index", "--", "/dev/null", f], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: UNTRACKED_FILE_MAXBUF,
+      timeout: UNTRACKED_FILE_TIMEOUT_MS
+    });
+    if (typeof d.stdout === "string" && d.stdout) {
+      parts.push(d.stdout);
+      bytes += d.stdout.length;
+      included += 1;
+    }
+  }
+  return { diff: parts.join("\n"), omitted: Math.max(0, all.length - included), enumerationFailed: false };
+}
 function makeHostReviewDeps(env) {
   const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
@@ -25535,11 +25591,26 @@ function makeHostReviewDeps(env) {
   return {
     readDiff: () => {
       const res = spawnSync3("git", ["diff", "HEAD"], { cwd, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER, timeout: GIT_TIMEOUT_MS });
-      if (res.status !== 0 || typeof res.stdout !== "string") return "";
-      const diff = res.stdout;
-      return diff.length > MAX_DIFF_BYTES ? `${diff.slice(0, MAX_DIFF_BYTES)}
+      const trackedOk = res.status === 0 && typeof res.stdout === "string";
+      const tracked = trackedOk ? res.stdout : "";
+      let untracked = { diff: "", omitted: 0, enumerationFailed: false };
+      try {
+        untracked = readUntrackedDiff(cwd);
+      } catch {
+        untracked = { diff: "", omitted: 0, enumerationFailed: true };
+      }
+      const body = [tracked, untracked.diff].filter((s) => s.trim()).join("\n");
+      let out = body.length > MAX_DIFF_BYTES ? `${body.slice(0, MAX_DIFF_BYTES)}
 
-[diff truncated for review]` : diff;
+[diff truncated for review]` : body;
+      const gaps = [];
+      if (!trackedOk) gaps.push("tracked changes (git diff HEAD failed)");
+      if (untracked.enumerationFailed) gaps.push("untracked files (git ls-files failed)");
+      if (untracked.omitted > 0) gaps.push(`${untracked.omitted} untracked file(s) (exceeded the review size/time budget)`);
+      if (gaps.length > 0 && body.trim()) out += `
+
+[NOTE: review coverage is INCOMPLETE \u2014 omitted: ${gaps.join("; ")}]`;
+      return { diff: out, incomplete: !trackedOk || untracked.enumerationFailed || untracked.omitted > 0 };
     },
     loadLanes: () => {
       if (!existsSync6(lanesPath)) return null;
@@ -25570,7 +25641,7 @@ async function runReviewWithBudget(runner, newId, opts) {
   const nAttempts = maxRetries + 1;
   const perAttemptMs = Math.floor(totalBudgetMs / nAttempts);
   if (perAttemptMs <= 0) {
-    return { reviewed: false, reason: "review budget too small" };
+    return { reviewed: false, errored: true, reason: "review budget too small" };
   }
   const turnId = newId();
   const deadlineAt = Date.now() + totalBudgetMs;
@@ -25597,7 +25668,7 @@ async function runReviewWithBudget(runner, newId, opts) {
     });
     if (result !== TIMEOUT) return result;
   }
-  return { reviewed: false, reason: lastReason };
+  return { reviewed: false, errored: true, reason: lastReason };
 }
 
 // ../mcp/src/setup.ts
@@ -25666,7 +25737,10 @@ async function runSetup(env) {
     ...manager ? { managerLaneId: manager.id } : {},
     gitleaksAvailable,
     gateReady,
-    reviewOnStop: env.TOKENMAXED_REVIEW_ON_STOP === "true",
+    // REVIEW-LOOP: default-ON (on whenever a usable reviewer lane exists); opt out
+    // with TOKENMAXED_REVIEW_ON_STOP=false. Reported with its rework-round bound.
+    reviewOnStop: reviewLoopEnabled(env),
+    reviewMaxRounds: parseMaxRounds(env),
     // Mirror makeServerDeps: the global kill-switch disables escalation.
     escalate: env.TOKENMAXED_ESCALATE === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // F-1 learned capability; also disabled by the global kill-switch.
@@ -26046,7 +26120,7 @@ ${r.notes}` : "";
   };
   const setupTool = {
     name: "router_setup",
-    description: "Set up TokenMaxed: create the user-owned config (~/.tokenmaxed/lanes.yaml + policy.yaml) from starter templates if missing (never overwrites), validate it, and report status \u2014 configured lanes, the manager lane, whether a secret scanner (gitleaks) is installed, and the worker-gate / review-on-stop state. Powers /tokenmaxed:setup.",
+    description: "Set up TokenMaxed: create the user-owned config (~/.tokenmaxed/lanes.yaml + policy.yaml) from starter templates if missing (never overwrites), validate it, and report status \u2014 configured lanes, the manager lane, whether a secret scanner (gitleaks) is installed, and the worker-gate / review-loop state. Powers /tokenmaxed:setup.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
     handler: (deps) => guardedAsync(async () => {
       const r = await deps.setup();
@@ -26057,7 +26131,7 @@ ${r.notes}` : "";
         `  ${r.laneCount} lane(s) configured; manager: ${r.managerLaneId ?? "none (set manager_allowed on a trusted CLI/local lane)"}`,
         `  secret scanner (gitleaks): ${r.gitleaksAvailable ? "available" : "NOT installed \u2014 untrusted worker lanes stay disabled until it is"}`,
         `  worker gate: ${r.gateReady ? "open" : "closed"} (open with TOKENMAXED_GATE_READY=true${r.gitleaksAvailable ? "" : " \u2014 install gitleaks first"})`,
-        `  review-on-stop: ${r.reviewOnStop ? "on" : "off"} (enable with TOKENMAXED_REVIEW_ON_STOP=true)`,
+        `  review loop: ${r.reviewOnStop ? `ON (default \u2014 reviews every finishing turn when a reviewer exists; up to ${r.reviewMaxRounds ?? 5} rework round(s))` : "off"} (opt out with TOKENMAXED_REVIEW_ON_STOP=false; tune rounds with TOKENMAXED_REVIEW_MAX_ROUNDS)`,
         `  quality escalation: ${r.escalate ? "on" : "off"} (enable with TOKENMAXED_ESCALATE=true \u2014 offloads a failed cheap result up to a stronger lane)`,
         `  learned capability: ${r.learnCapability ? "on" : "off"} (enable with TOKENMAXED_LEARN_CAPABILITY=true \u2014 review outcomes adjust routing over time)`,
         `  reader egress: ${r.readerEgress ? "on" : "off"} (enable with TOKENMAXED_READER_EGRESS=true \u2014 lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
