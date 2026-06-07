@@ -61,10 +61,11 @@ lanes:
     command: codex          # the provider CLI to spawn (exact flags verified per tool)
     args: [exec]
     # Default reviewer for all code: the host-turn review (/tokenmaxed:review and
-    # the opt-in Stop gate) sends the working-tree diff to the FIRST eligible
-    # manager in file order, and codex-cli is listed before claude-haiku — so
-    # Codex reviews by default. (A full CLI manager needs no safety gate; only
-    # TOKENMAXED_REVIEW_ON_STOP=true to auto-review at turn end.) The host-turn
+    # the default-on Stop review loop) sends the working-tree diff to the FIRST
+    # eligible manager in file order, and codex-cli is listed before claude-haiku
+    # — so Codex reviews by default. (A full CLI manager needs no safety gate; the
+    # review loop is ON by default — opt out with TOKENMAXED_REVIEW_ON_STOP=false.)
+    # The host-turn
     # path has no capability gate, so this works for any diff.
     # NOTE on the SEPARATE escalation path (C-13, reviewing an offloaded output):
     # selectReviewManager requires an INDEPENDENT manager that is at-least-as-

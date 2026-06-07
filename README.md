@@ -130,8 +130,10 @@ subtask to the cheapest capable lane via the `router_delegate` tool — the trus
 subscription CLI lanes enabled by default (Codex, the cheaper-Claude lane) work
 with **no flags** (a local Ollama is an opt-in template — flip `blocked`→`full`
 once a server is running). The plugin's hooks don't route on their own; they only gate delegation
-when routing is off (a deterministic backstop) and run the optional turn-end
-review. The env flags below switch on the *optional* features.
+when routing is off (a deterministic backstop) and run the turn-end review-iterate
+loop (ON by default when a reviewer lane exists; opt out with
+`TOKENMAXED_REVIEW_ON_STOP=false`). The env flags below switch on the other
+*optional* features.
 
 The optional features are opt-in **environment flags you set when you launch
 Claude Code**. In the shell they go *before* `claude` (they're environment
@@ -142,15 +144,16 @@ variables, not CLI arguments):
 claude --plugin-dir packages/plugin
 
 # Common "turn the safe extras on" launch: open the safety gate (needs gitleaks)
-# so API/BYOK worker lanes and full API lanes can run, plus review your changes
-# at turn end. (Reader lanes need MORE than the gate — TOKENMAXED_READER_EGRESS,
-# per-lane attestation, and a policy allow rule; see Reader lanes below.)
-TOKENMAXED_GATE_READY=true TOKENMAXED_REVIEW_ON_STOP=true \
+# so API/BYOK worker lanes and full API lanes can run. (The review-iterate loop is
+# already ON by default when a reviewer lane exists — no flag needed; opt out with
+# TOKENMAXED_REVIEW_ON_STOP=false. Reader lanes need MORE than the gate —
+# TOKENMAXED_READER_EGRESS, per-lane attestation, a policy allow rule; see below.)
+TOKENMAXED_GATE_READY=true \
   claude --plugin-dir packages/plugin
 
 # Same, but also skip Claude Code's per-tool permission prompts (you trust the
 # offloads to run unattended):
-TOKENMAXED_GATE_READY=true TOKENMAXED_REVIEW_ON_STOP=true \
+TOKENMAXED_GATE_READY=true \
   claude --dangerously-skip-permissions --plugin-dir packages/plugin
 ```
 
@@ -162,8 +165,8 @@ TOKENMAXED_GATE_READY=true TOKENMAXED_REVIEW_ON_STOP=true \
 
 Each flag is described under [Configure & extend](#configure--extend) below;
 combine whichever you want on one launch line. Note: a **full CLI** reviewer
-(e.g. Codex) needs no safety gate — only `TOKENMAXED_REVIEW_ON_STOP=true` to run
-the turn-end review; the gate is needed only for API/BYOK egress.
+(e.g. Codex) needs no safety gate to run the (default-on) turn-end review; the
+gate is needed only for API/BYOK egress.
 
 #### Optional: a `tmax` shortcut (so you don't retype the flags)
 
@@ -178,16 +181,17 @@ so add just the `env` keys:
 {
   "env": {
     "TOKENMAXED_GATE_READY": "true",
-    "TOKENMAXED_REVIEW_ON_STOP": "true",
     "TOKENMAXED_ESCALATE": "true"
   }
 }
 ```
 
 (`TOKENMAXED_GATE_READY` opens the safety gate so API/BYOK egress is allowed — for
-both worker/reader lanes and `full` API lanes; `TOKENMAXED_REVIEW_ON_STOP` reviews
-your changes at turn end; `TOKENMAXED_ESCALATE` reworks/escalates offloads that fail
-review instead of shipping them unreviewed.)
+both worker/reader lanes and `full` API lanes; `TOKENMAXED_ESCALATE` reworks/escalates
+offloads that fail review instead of shipping them unreviewed. The turn-end
+review-iterate loop is **on by default** — no flag — so it isn't listed here; set
+`TOKENMAXED_REVIEW_ON_STOP=false` to opt out, or `TOKENMAXED_REVIEW_MAX_ROUNDS` to
+change the rework-round bound.)
 
 **2. Alias the launch.** Pick **one** of these — the same word can't be both a
 standalone command and an appended argument (in zsh the later definition wins):
@@ -205,7 +209,8 @@ alias -g tmax='--plugin-dir /ABS/PATH/TO/packages/plugin'
 
 Use an **absolute** `--plugin-dir` path so it works from any directory. With the
 flags in settings (step 1), every form above launches fully configured — gate
-open, turn-end review on, and offloads escalated rather than shipped unreviewed.
+open, the turn-end review-iterate loop on (its default), and offloads escalated
+rather than shipped unreviewed.
 (`TOKENMAXED_GATE_READY` in global settings is inert until the plugin is loaded;
 once loaded it affects `/tokenmaxed:why`/`setup` and gates **all** API/BYOK egress
 — worker, reader, and `full` API lanes. Drop it from settings and prepend it
@@ -225,8 +230,20 @@ per-launch if you'd rather opt into the gate explicitly each time.)
   - **Untrusted worker lanes** — install
     [`gitleaks`](https://github.com/gitleaks/gitleaks) and start Claude Code with
     `TOKENMAXED_GATE_READY=true`.
-  - **Turn-end review gate** — a trusted manager reviews your changes and can
-    require rework before Claude finishes; enable with `TOKENMAXED_REVIEW_ON_STOP=true`.
+  - **Review-iterate loop (ON by default when a reviewer lane exists)** — at the
+    end of a turn a trusted manager reviews **all** your changed code (tracked
+    *and* untracked/new files; a very large/numerous untracked set is bounded for
+    speed and any omission is flagged in the diff so a pass never reads as complete
+    coverage); on a non-pass verdict Claude is told to rework and
+    the change is **re-reviewed**, iterating until the reviewer passes. It is
+    deterministic (a `Stop` hook — Claude can't forget to run it) and protected so
+    it can't hold you up: a reviewer error/timeout **fails open but is surfaced**
+    (never a silent pass), and the loop is **bounded** — after
+    `TOKENMAXED_REVIEW_MAX_ROUNDS` rework rounds (default 5) without a pass it
+    **yields** with the outstanding notes so you're never stuck. **Opt out** of
+    reviewing entirely with `TOKENMAXED_REVIEW_ON_STOP=false` (or simply configure
+    no reviewer lane — then nothing is reviewed). A **full CLI** reviewer (e.g.
+    Codex) needs no safety gate; an API/BYOK reviewer needs `TOKENMAXED_GATE_READY=true`.
   - **Quality escalation** — when an offloaded result fails its manager review,
     retry it on a more capable lane (and ultimately give the task back to Claude
     rather than ship something that failed review); enable with

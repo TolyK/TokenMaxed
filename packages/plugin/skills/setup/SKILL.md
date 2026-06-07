@@ -31,6 +31,9 @@ disable-model-invocation: true
      `TOKENMAXED_KEY_<authHandle>` (e.g. `TOKENMAXED_KEY_OPENAI`).
    - To allow untrusted worker lanes, install `gitleaks` and start Claude Code
      with `TOKENMAXED_GATE_READY=true`.
-   - To turn on the turn-end review gate, set `TOKENMAXED_REVIEW_ON_STOP=true`.
+   - The turn-end review-iterate loop is **ON by default** whenever a usable
+     reviewer (manager) lane exists — no flag needed. Opt out with
+     `TOKENMAXED_REVIEW_ON_STOP=false`, or tune the rework-round bound with
+     `TOKENMAXED_REVIEW_MAX_ROUNDS` (default 5).
 
 Keep it concise and only mention the steps relevant to what the report showed.

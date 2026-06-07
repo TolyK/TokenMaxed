@@ -22,6 +22,7 @@ const BUNDLE = readFileSync(new URL('../server/index.mjs', import.meta.url), 'ut
 const OPT_IN_FLAGS = [
   'TOKENMAXED_GATE_READY',
   'TOKENMAXED_REVIEW_ON_STOP',
+  'TOKENMAXED_REVIEW_MAX_ROUNDS',
   'TOKENMAXED_ESCALATE',
   'TOKENMAXED_LEARN_CAPABILITY',
   'TOKENMAXED_READER_EGRESS',
@@ -93,6 +94,17 @@ test('the learned-capability toggle is documented (F-1) with its prior + explain
   // ...including the prior framing and where the user sees the adjustment.
   assert.match(README, /prior/i, 'README must frame declared capability as a prior');
   assert.match(README, /learned: declared/, 'README must show the /tokenmaxed:why learned annotation example');
+});
+
+test('the review-iterate loop is documented (REVIEW-LOOP) as default-on with its opt-out + bound', () => {
+  // The shipped server reads both flags (setup reports them), so the README must
+  // document them — and frame the loop as ON BY DEFAULT with an explicit opt-out.
+  assert.ok(BUNDLE.includes('TOKENMAXED_REVIEW_ON_STOP'), 'bundle should read TOKENMAXED_REVIEW_ON_STOP');
+  assert.ok(BUNDLE.includes('TOKENMAXED_REVIEW_MAX_ROUNDS'), 'bundle should read TOKENMAXED_REVIEW_MAX_ROUNDS');
+  assert.match(README, /TOKENMAXED_REVIEW_ON_STOP=false/, 'README must document opting OUT (=false), not enabling');
+  assert.match(README, /TOKENMAXED_REVIEW_MAX_ROUNDS/, 'README must document the rework-round bound');
+  assert.match(README, /by default/i, 'README must frame the review loop as on by default');
+  assert.match(README, /untracked/i, 'README must state the review covers untracked/new files too');
 });
 
 test('the reader trust tier is documented (F-2) with its high-friction opt-ins', () => {
