@@ -8468,13 +8468,29 @@ function spawnPath(execPath = process.execPath, base = process.env.PATH) {
   return [binDir, ...parts].join(delimiter);
 }
 function makeCliSpawn(timeoutMs = DEFAULT_CLI_TIMEOUT_MS) {
-  return (command, args, options) => spawnSync2(command, [...args], {
-    ...options,
-    // Augment PATH so a CLI installed next to this Node (nvm/global-npm) is found
-    // even under a stripped host PATH; TOKENMAXED_DISABLE=1 stops child recursion.
-    env: { ...process.env, PATH: spawnPath(), TOKENMAXED_DISABLE: "1" },
-    timeout: timeoutMs
-  });
+  return (command, args, options) => {
+    const spawnOptions = {
+      ...options,
+      // Augment PATH so a CLI installed next to this Node (nvm/global-npm) is found
+      // even under a stripped host PATH; TOKENMAXED_DISABLE=1 stops child recursion.
+      env: { ...process.env, PATH: spawnPath(), TOKENMAXED_DISABLE: "1" },
+      timeout: timeoutMs,
+      // Own process group so we can reap the WHOLE tree (listeners included) below.
+      detached: true
+    };
+    const res = spawnSync2(command, [...args], spawnOptions);
+    if (typeof res.pid === "number") {
+      try {
+        if (process.platform === "win32") {
+          spawnSync2("taskkill", ["/pid", String(res.pid), "/t", "/f"]);
+        } else {
+          process.kill(-res.pid, "SIGKILL");
+        }
+      } catch {
+      }
+    }
+    return res;
+  };
 }
 
 // ../mcp/src/availability.ts
