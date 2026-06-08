@@ -7393,6 +7393,7 @@ var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
 // ../core/src/boundary.ts
+var RECOVERY_MAX_COMPLETION_TOKENS = 32e3;
 function isExecutorCertified(lane) {
   return lane.kind === "api";
 }
@@ -8122,12 +8123,32 @@ function parseEvent(obj) {
 }
 
 // ../core/src/failure.ts
+function isTransient(kind) {
+  switch (kind) {
+    case "timeout":
+    case "rate_limited":
+    case "quota_exhausted":
+    case "provider_error":
+      return true;
+    case "auth_failed":
+    case "bad_request":
+    case "policy_blocked":
+      return false;
+  }
+}
 var LaneFailure = class extends Error {
   failureKind;
-  constructor(failureKind, message) {
+  /**
+   * Usage the lane reported BEFORE failing, when known (e.g. a reasoning model that
+   * billed a first call, then the retry hit 429/400). Carried so runTask records the
+   * real spend instead of ZERO_USAGE — a metered failed attempt is never under-reported.
+   */
+  reported;
+  constructor(failureKind, message, reported) {
     super(message ?? failureKind);
     this.name = "LaneFailure";
     this.failureKind = failureKind;
+    if (reported) this.reported = reported;
   }
 };
 function classifyHttpStatus(status) {
@@ -8189,6 +8210,12 @@ async function review(request, deps) {
   if (out.notes !== void 0) result.notes = out.notes;
   if (out.suggested_lane_id !== void 0) result.suggested_lane_id = out.suggested_lane_id;
   return result;
+}
+
+// ../core/src/usage.ts
+function estimateTokens(text) {
+  if (text.length === 0) return 0;
+  return Math.ceil(text.length / 4);
 }
 
 // ../core/src/node.ts
@@ -8263,6 +8290,53 @@ function wrapWithFetchTimeout(fn, timeoutMs) {
       })
     );
   });
+}
+function extractText(data) {
+  const choices = data?.choices;
+  const content = choices?.[0]?.message?.content;
+  return typeof content === "string" ? content : "";
+}
+function extractUsage(data) {
+  const u = data?.usage;
+  if (!u) return void 0;
+  const num = (v) => typeof v === "number" ? v : void 0;
+  return { tokens_in: num(u.prompt_tokens), tokens_out: num(u.completion_tokens) };
+}
+function extractFinishReason(data) {
+  const c = data?.choices;
+  const fr = c?.[0]?.finish_reason;
+  return typeof fr === "string" ? fr : void 0;
+}
+function combineRecoveryUsage(first, firstResultText, retry, retryResultText, promptText) {
+  const completeOne = (u, resultText) => {
+    const hasIn = typeof u?.tokens_in === "number";
+    const hasOut = typeof u?.tokens_out === "number";
+    const usage = {
+      tokens_in: hasIn ? u.tokens_in : estimateTokens(promptText),
+      tokens_out: hasOut ? u.tokens_out : estimateTokens(resultText),
+      ...u?.cache_read_input_tokens !== void 0 ? { cache_read_input_tokens: u.cache_read_input_tokens } : {},
+      ...u?.cache_creation_input_tokens !== void 0 ? { cache_creation_input_tokens: u.cache_creation_input_tokens } : {}
+    };
+    return { usage, estimated: !hasIn || !hasOut };
+  };
+  const a = completeOne(first, firstResultText);
+  const b = completeOne(retry, retryResultText);
+  return { usage: addUsage(a.usage, b.usage), estimated: a.estimated || b.estimated };
+}
+function recoveryRetryFailureKind(status) {
+  const kind = classifyHttpStatus(status);
+  return isTransient(kind) ? kind : "provider_error";
+}
+function addUsage(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const sum = (x, y) => x === void 0 && y === void 0 ? void 0 : (x ?? 0) + (y ?? 0);
+  const out = { tokens_in: sum(a.tokens_in, b.tokens_in), tokens_out: sum(a.tokens_out, b.tokens_out) };
+  const cacheRead = sum(a.cache_read_input_tokens, b.cache_read_input_tokens);
+  if (cacheRead !== void 0) out.cache_read_input_tokens = cacheRead;
+  const cacheCreate = sum(a.cache_creation_input_tokens, b.cache_creation_input_tokens);
+  if (cacheCreate !== void 0) out.cache_creation_input_tokens = cacheCreate;
+  return out;
 }
 function defaultLedgerPath() {
   return join(homedir(), ".tokenmaxed", "ledger.jsonl");
@@ -8354,8 +8428,16 @@ function makeCliExecutor(spawnImpl) {
     const input = combinedPrompt(instruction, attachments);
     const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model));
     const res = spawn(lane.command, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-    if (res.error) throw new LaneFailure("provider_error", `cli lane "${lane.id}" failed to spawn`);
-    if (res.status !== 0) throw new LaneFailure("provider_error", `cli lane "${lane.id}" exited with status ${res.status}`);
+    if (res.error) {
+      const code = res.error.code;
+      if (code === "ENOBUFS") throw new LaneFailure("provider_error", `cli lane "${lane.id}" produced too much output (exceeded the buffer limit)`);
+      if (code === "ETIMEDOUT" || res.signal === "SIGTERM") throw new LaneFailure("timeout", `cli lane "${lane.id}" (command "${lane.command}") timed out`);
+      if (code === "ENOENT" || code === "EACCES") throw new LaneFailure("provider_error", `cli lane "${lane.id}" failed to spawn: command "${lane.command}" ${code === "ENOENT" ? "not found" : "not executable"} (check the lane's absolute command path / PATH)`);
+      throw new LaneFailure("provider_error", `cli lane "${lane.id}" failed to spawn${code ? ` (${code})` : ""}`);
+    }
+    if (res.status !== 0) {
+      throw new LaneFailure("provider_error", `cli lane "${lane.id}" exited with status ${res.status}`);
+    }
     return { resultText: res.stdout ?? "" };
   };
 }
@@ -8401,21 +8483,43 @@ function makeTrustedApiExecutor(deps = {}) {
       if (!token) throw new LaneFailure("auth_failed", `auth resolution failed for api lane "${lane.id}"`);
       headers.authorization = `Bearer ${token}`;
     }
-    const body = JSON.stringify({
-      model: lane.model,
-      messages: [{ role: "user", content: combinedPrompt(instruction, attachments) }]
+    let billedUsage;
+    const { ok, status, data, reported, reportedEstimated } = await wrapWithFetchTimeout(async (signal) => {
+      const buildBody = (recovery = false) => JSON.stringify({
+        model: lane.model,
+        messages: [{ role: "user", content: combinedPrompt(instruction, attachments) }],
+        ...recovery ? { max_tokens: RECOVERY_MAX_COMPLETION_TOKENS } : {}
+      });
+      const res = await doFetch(lane.endpoint, { method: "POST", headers, body: buildBody(), signal });
+      if (!res.ok) return { ok: false, status: res.status, data: void 0, reported: void 0, reportedEstimated: false };
+      let data2 = await res.json();
+      let reported2 = extractUsage(data2);
+      let reportedEstimated2 = false;
+      billedUsage = reported2;
+      if (extractText(data2) === "" && extractFinishReason(data2) === "length") {
+        const res2 = await doFetch(lane.endpoint, { method: "POST", headers, body: buildBody(true), signal });
+        if (!res2.ok) throw new LaneFailure(recoveryRetryFailureKind(res2.status), `api lane "${lane.id}" recovery retry returned status ${res2.status}`, reported2);
+        data2 = await res2.json();
+        const combined = combineRecoveryUsage(reported2, "", extractUsage(data2), extractText(data2), combinedPrompt(instruction, attachments));
+        reported2 = combined.usage;
+        reportedEstimated2 = combined.estimated;
+        billedUsage = reported2;
+      }
+      return { ok: true, status: res.status, data: data2, reported: reported2, reportedEstimated: reportedEstimated2 };
+    }, fetchTimeoutMs).catch((err) => {
+      const alreadyHasUsage = err instanceof LaneFailure && err.reported !== void 0;
+      if (billedUsage && !alreadyHasUsage) {
+        const kind = err instanceof LaneFailure ? err.failureKind : "provider_error";
+        throw new LaneFailure(kind, `api lane "${lane.id}" failed after billing the first call`, billedUsage);
+      }
+      throw err;
     });
-    const { ok, status, data } = await wrapWithFetchTimeout(async (signal) => {
-      const res = await doFetch(lane.endpoint, { method: "POST", headers, body, signal });
-      if (!res.ok) return { ok: false, status: res.status, data: void 0 };
-      const data2 = await res.json();
-      return { ok: true, status: res.status, data: data2 };
-    }, fetchTimeoutMs);
-    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `api lane "${lane.id}" returned status ${status}`);
+    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `api lane "${lane.id}" returned status ${status}`, reported);
     const content = data.choices?.[0]?.message?.content;
     return {
       resultText: typeof content === "string" ? content : "",
-      reported: { tokens_in: numOrUndef(data.usage?.prompt_tokens), tokens_out: numOrUndef(data.usage?.completion_tokens) }
+      reported,
+      ...reportedEstimated ? { reportedEstimated: true } : {}
     };
   };
 }
@@ -8694,11 +8798,13 @@ function makeReviewRunner(deps) {
 var MAX_DIFF_BYTES = 256 * 1024;
 var GIT_MAX_BUFFER = 64 * 1024 * 1024;
 var GIT_TIMEOUT_MS = 15e3;
-var REVIEW_CLI_TIMEOUT_MS = 9e4;
 var MAX_UNTRACKED_FILES = 50;
 var UNTRACKED_BUDGET_MS = 8e3;
 var UNTRACKED_FILE_TIMEOUT_MS = 5e3;
 var UNTRACKED_FILE_MAXBUF = 4 * 1024 * 1024;
+var REVIEW_BUDGET_MS = 3e5;
+var DIFF_ACQUISITION_HEADROOM_MS = GIT_TIMEOUT_MS + GIT_TIMEOUT_MS + UNTRACKED_BUDGET_MS + UNTRACKED_FILE_TIMEOUT_MS;
+var REVIEW_CLI_TIMEOUT_MS = REVIEW_BUDGET_MS - DIFF_ACQUISITION_HEADROOM_MS;
 function readUntrackedDiff(cwd) {
   const list = spawnSync3("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
     cwd,
@@ -8857,8 +8963,8 @@ async function main() {
   const maxRounds = parseMaxRounds(env);
   const deps = makeHostReviewDeps(env);
   const result = await runReviewWithBudget(makeReviewRunner(deps), randomUUID3, {
-    totalBudgetMs: 12e4,
-    maxRetries: 1
+    totalBudgetMs: REVIEW_BUDGET_MS,
+    maxRetries: 0
   });
   const priorBlocks = readCounter(counterFile);
   const action = stopHookAction({

@@ -8620,6 +8620,7 @@ function buildSummaryData(input) {
   const zeroMeteredShare = allTok > 0 ? zeroTok / allTok : 1;
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
+  const byLane = core.tokenStats(events).byLane;
   const laneSummaries = lanes.map((l) => {
     const s = staleByLane.get(l.id);
     return {
@@ -8628,6 +8629,7 @@ function buildSummaryData(input) {
       model: l.model,
       trustMode: l.trust_mode,
       provenance: l.provenance,
+      tokensRouted: byLane[l.id]?.total ?? 0,
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
@@ -8680,7 +8682,7 @@ function formatSummaryBanner(data) {
   } else {
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
-    const laneLine = (l) => `     ${vendorName(l).padEnd(width)}  ${l.model}${l.stale ? " \u26A0 stale" : ""}`;
+    const laneLine = (l) => `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${l.stale ? " \u26A0 stale" : ""}`;
     const groups = [
       { title: "Full access", mode: "full" },
       { title: "Workers", mode: "worker" },
