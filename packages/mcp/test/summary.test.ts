@@ -110,6 +110,19 @@ test('an unavailable lane is flagged offline', () => {
   assert.equal(d.lanes.find((l) => l.id === 'codex-cli')!.available, true);
 });
 
+test('per-lane tokensRouted is attributed from the ledger (byLane), 0 for a lane with no events', () => {
+  const d = build();
+  assert.equal(d.lanes.find((l) => l.id === 'codex-cli')!.tokensRouted, 150); // 100 + 50
+  assert.equal(d.lanes.find((l) => l.id === 'minimax-api')!.tokensRouted, 300); // 200 + 100
+  assert.equal(d.lanes.find((l) => l.id === 'claude-haiku')!.tokensRouted, 0); // no routed events
+});
+
+test('banner shows per-lane routed token counts next to each model (exact, not 0k-rounded)', () => {
+  const banner = formatSummaryBanner(build());
+  assert.match(banner, /Codex\s+m · 150 tok/); // codex-cli routed 150 tokens, shown exactly
+  assert.doesNotMatch(banner, /· 0 tok/); // a zero-token lane shows NO token suffix (no "· 0 tok")
+});
+
 test('empty ledger reports empty without throwing', () => {
   const d = build({ events: [] });
   assert.equal(d.empty, true);

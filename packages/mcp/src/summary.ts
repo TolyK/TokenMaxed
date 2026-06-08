@@ -77,6 +77,8 @@ export interface LaneSummary {
   trustMode: Lane['trust_mode'];
   /** Provenance/vendor, used to render a friendly name (anthropic ⇒ "Claude"). */
   provenance: Lane['provenance'];
+  /** Lifetime tokens routed to THIS lane (from tokenStats().byLane); 0 if none yet. */
+  tokensRouted: number;
   /** True for the lane the review path would actually use right now. */
   isActiveReviewer: boolean;
   available: boolean;
@@ -138,6 +140,8 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
 
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
+  // Lifetime tokens routed per lane (the summary is global ⇒ all events).
+  const byLane = core.tokenStats(events).byLane;
   const laneSummaries: LaneSummary[] = lanes.map((l) => {
     const s = staleByLane.get(l.id);
     return {
@@ -146,6 +150,7 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       model: l.model,
       trustMode: l.trust_mode,
       provenance: l.provenance,
+      tokensRouted: byLane[l.id]?.total ?? 0,
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...(s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}),
@@ -215,8 +220,10 @@ export function formatSummaryBanner(data: SummaryData): string {
   } else {
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
+    // Per-lane counts are often small, so show the EXACT count (grouped) rather than
+    // tok()'s thousands-rounding, which would render e.g. 150 tokens as a misleading "0k".
     const laneLine = (l: LaneSummary): string =>
-      `     ${vendorName(l).padEnd(width)}  ${l.model}${l.stale ? ' ⚠ stale' : ''}`;
+      `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` · ${l.tokensRouted.toLocaleString('en-US')} tok` : ''}${l.stale ? ' ⚠ stale' : ''}`;
     const groups: Array<{ title: string; mode: Lane['trust_mode'] }> = [
       { title: 'Full access', mode: 'full' },
       { title: 'Workers', mode: 'worker' },

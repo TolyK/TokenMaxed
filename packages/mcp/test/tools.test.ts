@@ -154,7 +154,7 @@ test('router_summary renders the injected summary data verbatim', async () => {
         { label: 'lifetime', tokens: 102400000, meteredAvoided: 4.1, offloads: 233 },
       ],
       lanes: [
-        { id: 'codex-cli', kind: 'cli', model: 'm', trustMode: 'full', provenance: 'openai', isActiveReviewer: true, available: true },
+        { id: 'codex-cli', kind: 'cli', model: 'm', trustMode: 'full', provenance: 'openai', tokensRouted: 0, isActiveReviewer: true, available: true },
       ],
       activeReviewerId: 'codex-cli',
       empty: false,
