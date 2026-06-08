@@ -128,9 +128,17 @@ export type SecretScanner = (texts: readonly string[]) => Promise<SecretScanResu
 /** Size limits — oversized inputs are blocked rather than truncated. */
 export const LIMITS = {
   maxInstructionChars: 8_000,
-  maxAttachmentChars: 8_000,
-  maxAttachments: 8,
-  maxTotalChars: 24_000,
+  // Per-file attach cap raised from 8 KB so real source files (most exceed 8 KB)
+  // can be attached VERBATIM for the worker-visibility / anti-hallucination lever,
+  // instead of being dropped and re-paraphrased (which reintroduces the very
+  // hallucination risk attaching was meant to kill).
+  maxAttachmentChars: 64_000,
+  maxAttachments: 24,
+  // Total egress bound across instruction + attachments. Sits BELOW 3×attachment
+  // (197 KB) so the oversized-total guard still trips on pathological payloads,
+  // yet comfortably above one max-size file + instruction so the bigger per-file
+  // cap is actually usable (not dead on arrival under the old 24 KB total).
+  maxTotalChars: 192_000,
 } as const;
 
 /** A block outcome — the shared `ok: false` arm of both result types. */
