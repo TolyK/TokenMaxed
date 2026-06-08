@@ -120,6 +120,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:why <category>` | preview which lane would handle a category — nothing runs |
 | `/tokenmaxed:review` | manager review of your current working-tree changes |
 | `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
+| `/tokenmaxed:prefer <lane>` · `/tokenmaxed:prefer off` | temporarily favor one configured lane (any vendor, CLI or API) over normal routing — e.g. to push a sprint's work to a cheaper subscription while another's credits run low; clears with `off`. Honored only when that lane is eligible, available, and capable for the task (else it falls back to normal routing). Persisted per project; no relaunch. |
 
 ### Launch it (and turn on optional features)
 

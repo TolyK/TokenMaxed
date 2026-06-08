@@ -30,8 +30,8 @@ import type {
   TokenStats,
 } from '@tokenmaxed/core';
 
-import { renderStalenessWarnings } from './freshness-report.ts';
-import type { StalenessWarning } from './freshness-report.ts';
+import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshness-report.ts';
+import type { ModelIdMismatchWarning, StalenessWarning } from './freshness-report.ts';
 import { formatLaneSetup } from './lane-setup.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
 import { formatSummaryBanner } from './summary.ts';
@@ -117,8 +117,24 @@ export interface ToolDeps {
    * per stale lane. Optional so non-networked callers/tests can omit it.
    */
   freshness?: () => Promise<StalenessWarning[]>;
+  /**
+   * UNIVERSAL guard: after a freshness refresh, check whether each api lane's resolved
+   * model id is actually accepted (exact casing) by the vendor's live /models list, so
+   * a wrong/miscased id can never silently ship for any provider. CACHE-ONLY; call
+   * after `freshness()` on the same path. Optional so non-networked callers/tests omit it.
+   */
+  idMismatch?: () => Promise<ModelIdMismatchWarning[]>;
   /** Persist the project's enabled state (A-4 toggle). */
   setEnabled: (enabled: boolean) => void;
+  /**
+   * The per-project PREFERRED lane id (universal offload override), or undefined when
+   * unset. router_preview and router_delegate route with this as `preferLaneId` so the
+   * router favors that lane when it is eligible/available/capable. Absent ⇒ normal
+   * capability-ranked routing.
+   */
+  preferredLane?: () => string | undefined;
+  /** Set (lane id) or clear (undefined) the per-project preferred lane. Powers /tokenmaxed:prefer. */
+  setPreferredLane?: (laneId: string | undefined) => void;
   /**
    * Run one bounded subtask through the core path (gate → minimize-if-worker →
    * execute → record) and return its outcome (A-5). Injected so tools.ts stays
@@ -498,6 +514,9 @@ export function createTools(core: CorePort): ToolDef[] {
                 ...(deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}),
               }
             : {};
+        // The per-project preferred lane (universal offload override): mirror it into the
+        // preview ctx so /tokenmaxed:why shows the SAME pick router_delegate would make.
+        const preferLaneId = deps.preferredLane?.();
         const ctx: RouteContext = {
           lanes,
           gateReady,
@@ -506,6 +525,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(observedCapability ? { observedCapability } : {}),
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
+          ...(preferLaneId ? { preferLaneId } : {}),
         };
 
         let decision: RouteDecision;
@@ -522,13 +542,20 @@ export function createTools(core: CorePort): ToolDef[] {
         const lane = lanes.find((l) => l.id === decision.laneId);
         // Surface the policy verdict explicitly so /router:why can explain a forced lane.
         const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy).verdict : decision.policyVerdict;
+        // When a preferred lane is set but did NOT win, say why it fell back — so the
+        // user isn't surprised the "use lane X for now" override didn't apply here.
+        const preferNote =
+          preferLaneId && decision.laneId !== preferLaneId
+            ? `  note: preferred lane "${preferLaneId}" was not used — it isn't eligible, available, or capable for this category (fell back to normal routing).`
+            : undefined;
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
           `  why: ${decision.reason}`,
+          ...(preferNote ? [preferNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, ...(preferLaneId ? { preferLaneId } : {}) });
       }),
   };
 
@@ -541,7 +568,17 @@ export function createTools(core: CorePort): ToolDef[] {
       guardedAsync(async () => {
         const enabled = deps.getEnabled();
         const warnings = enabled && deps.freshness ? await deps.freshness() : [];
+        // UNIVERSAL id guard: after the freshness refresh populated the cache, flag any
+        // lane whose resolved model id the vendor would reject (wrong casing / absent).
+        const mismatches = enabled && deps.idMismatch ? await deps.idMismatch() : [];
+        const preferred = deps.preferredLane?.();
         const lines = [`TokenMaxed routing is ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`];
+        if (preferred) {
+          lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
+        }
+        if (mismatches.length > 0) {
+          lines.push('', 'Model ids the vendor will REJECT (fix before offloading):', ...renderModelIdMismatchWarnings(mismatches));
+        }
         if (warnings.length > 0) {
           lines.push('', 'Stale pinned models (you can keep them, or move to the latest):', ...renderStalenessWarnings(warnings));
         } else if (enabled && deps.freshness) {
@@ -549,7 +586,12 @@ export function createTools(core: CorePort): ToolDef[] {
           // (no key, unreachable provider, unknown family) — not a positive freshness claim.
           lines.push('No stale models flagged (only enabled, keyed API lanes with a known family are checked).');
         }
-        return ok(lines.join('\n'), { enabled, staleness: warnings as unknown as Record<string, unknown>[] });
+        return ok(lines.join('\n'), {
+          enabled,
+          ...(preferred ? { preferLaneId: preferred } : {}),
+          staleness: warnings as unknown as Record<string, unknown>[],
+          idMismatch: mismatches as unknown as Record<string, unknown>[],
+        });
       }),
   };
 
@@ -571,6 +613,37 @@ export function createTools(core: CorePort): ToolDef[] {
         return ok(
           `TokenMaxed routing ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`,
           { enabled },
+        );
+      }),
+  };
+
+  const setPreferTool: ToolDef = {
+    name: 'router_set_prefer',
+    description:
+      "Set or clear a per-project PREFERRED lane for TokenMaxed routing. When set, the router favors that lane over the normal capability ranking whenever it is eligible, available, and capable for the task. Use this to temporarily push work to a specific lane (e.g. when one subscription's credits are running low) — works with ANY configured lane (any vendor, CLI or API). Clearing the preference restores normal capability-ranked routing. The setting is persisted per project and survives restarts; no relaunch is needed. Powers /tokenmaxed:prefer.",
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: 'string',
+          description:
+            'The lane id to prefer (any configured lane — any vendor, CLI or API). Omit or pass an empty string to CLEAR the preference (restore normal routing).',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const raw = optString(args, 'lane');
+        const lane = typeof raw === 'string' ? raw.trim() : undefined;
+        if (!lane) {
+          deps.setPreferredLane?.(undefined);
+          return ok('Lane preference CLEARED — TokenMaxed will route normally for this project.', { preferLaneId: null });
+        }
+        deps.setPreferredLane?.(lane);
+        return ok(
+          `Preferred lane set to "${lane}" for this project — routing will favor it when it is eligible, available, and capable for the task (else it falls back to normal routing). Run /tokenmaxed:prefer off to clear.`,
+          { preferLaneId: lane },
         );
       }),
   };
@@ -680,7 +753,7 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, delegateTool, reviewTool, setupTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

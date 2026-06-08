@@ -7635,10 +7635,12 @@ function staleAgainstPriceTable(lanes, table) {
   return out;
 }
 function sameFamily(id, family) {
-  if (id === family) return true;
-  if (!id.startsWith(family)) return false;
-  const next = id.charAt(family.length);
-  return next !== "" && !/[a-z0-9]/i.test(next);
+  const i = id.toLowerCase();
+  const f = family.toLowerCase();
+  if (i === f) return true;
+  if (!i.startsWith(f)) return false;
+  const next = i.charAt(f.length);
+  return next !== "" && !/[a-z0-9]/.test(next);
 }
 function assessStaleness(pinnedId, family, remote, table) {
   const fam = remote.filter((m) => sameFamily(m.id, family));

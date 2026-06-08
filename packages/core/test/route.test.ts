@@ -439,3 +439,34 @@ test('tiered: a true floor-clear winner DOES say tiered', () => {
 test('tiered: default strategy (maximize) is unchanged', () => {
   assert.equal(routeDecide({ category: 'docs' }, { lanes: tierLanes }, noPolicy).laneId, 'exp'); // most capable
 });
+
+// --- preferLaneId (universal offload override) ---------------------------------
+
+test('preferLaneId picks an eligible lane over the higher-capability default', () => {
+  // feature: claude (0.95) normally wins; prefer codex-cli ⇒ it wins instead.
+  const d = routeDecide({ category: 'feature' }, { lanes: [claude, codex, ollama], preferLaneId: 'codex-cli' }, noPolicy);
+  assert.equal(d.laneId, 'codex-cli');
+  assert.equal(d.scores[0]!.laneId, 'codex-cli'); // winner-is-scores[0] invariant holds
+  assert.match(d.reason, /preferred lane/);
+});
+
+test('preferLaneId is ignored when the lane is not a candidate', () => {
+  const d = routeDecide({ category: 'feature' }, { lanes: [claude, codex], preferLaneId: 'nonexistent' }, noPolicy);
+  assert.equal(d.laneId, 'claude-native'); // normal ranking
+  assert.doesNotMatch(d.reason, /preferred lane/);
+});
+
+test('preferLaneId never resurrects a capability-0 (hard opt-out) lane', () => {
+  const optedOut: Lane = { ...codex, capability: { codegen: 0 } };
+  const d = routeDecide({ category: 'codegen' }, { lanes: [claude, optedOut], preferLaneId: 'codex-cli' }, noPolicy);
+  assert.equal(d.laneId, 'claude-native'); // opted-out preferred lane is not picked
+});
+
+test('preferLaneId respects availability (an unavailable preferred lane falls back)', () => {
+  const d = routeDecide(
+    { category: 'feature' },
+    { lanes: [claude, codex], preferLaneId: 'codex-cli', availableLaneIds: ['claude-native'] },
+    noPolicy,
+  );
+  assert.equal(d.laneId, 'claude-native');
+});

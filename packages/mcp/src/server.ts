@@ -52,7 +52,7 @@ import {
 } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
-import { reportFreshness } from './freshness-report.ts';
+import { reportFreshness, reportModelIdMismatches } from './freshness-report.ts';
 import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
 import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
@@ -63,6 +63,8 @@ import { runSetup } from './setup.ts';
 import { createTools, dispatch } from './tools.ts';
 import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
+import { readPreferred, writePreferred } from './prefer.ts';
+import type { PreferStore } from './prefer.ts';
 import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
 
 // User-owned (NOT repo-controlled) — see the SECURITY note above. HOME_TM and the
@@ -73,6 +75,13 @@ const DEFAULT_LANES = homeFile('lanes.yaml');
 // (../prices.seed.json sits next to dist/ in the package and next to server/ in
 // the plugin bundle.) reference data only — no execution.
 const DEFAULT_PRICES = fileURLToPath(new URL('../prices.seed.json', import.meta.url));
+
+/**
+ * Freshness for the id-mismatch guard: it reads the cache freshness() just wrote on the
+ * same router_status call, so a generous window is fine — this only prevents judging
+ * against a stale list when freshness didn't actually refresh (e.g. provider offline).
+ */
+const ID_MISMATCH_TTL_MS = 10 * 60_000;
 
 /**
  * Whether a lane can actually be used for an offload: a METERED lane whose model
@@ -128,6 +137,24 @@ function fileToggleStore(statePath: string): ToggleStore {
         return JSON.parse(readFileSync(statePath, 'utf8'));
       } catch {
         return {}; // corrupt file ⇒ treat as empty (default enabled)
+      }
+    },
+    write: (state) => {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    },
+  };
+}
+
+/** A JSON-file-backed {@link PreferStore} (string-valued); tolerant of a missing/corrupt file. */
+function filePreferStore(statePath: string): PreferStore {
+  return {
+    read: () => {
+      if (!existsSync(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync(statePath, 'utf8'));
+      } catch {
+        return {}; // corrupt file ⇒ treat as no preference
       }
     },
     write: (state) => {
@@ -207,6 +234,15 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const reservedForReview = (lane: Lane): boolean =>
     isManagerEligible(lane) && (lane.costBasis === 'subscription' || lane.costBasis === 'local');
   const store = fileToggleStore(statePath);
+  // Universal "preferred lane" override (per-project, no relaunch): a single lane id
+  // routing favors when it is eligible/available/capable. Persisted in its own file
+  // (string-valued, so it never mixes with the boolean enable/disable map). An env
+  // var TOKENMAXED_PREFER_LANE is a fallback default for headless/CI; the per-project
+  // state (set via /tokenmaxed:prefer) wins when present.
+  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join(dirname(statePath), 'prefer.json');
+  const preferStore = filePreferStore(preferStatePath);
+  const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || undefined;
+  const readPreferredLane = (): string | undefined => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
   // Namespaced BYOK auth (see config.ts): a repo-supplied lanes.yaml can't name an
   // arbitrary secret env var; unknown ⇒ '' ⇒ the executor fails closed.
   const resolveAuth = makeResolveAuth(env);
@@ -291,6 +327,12 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       ...(tieredStrategy === 'tiered'
         ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(lanes, priceTable) }
         : {}),
+      // Universal preferred-lane override: favor this lane when it is an eligible+
+      // available+capable candidate (hard rails still gate it). Absent ⇒ normal ranking.
+      ...((): { preferLaneId?: string } => {
+        const p = readPreferredLane();
+        return p ? { preferLaneId: p } : {};
+      })(),
     };
     const eligible = eligibleLanes({ category: request.category }, baseCtx, policy).map((e) => e.lane);
     const available = await probeAvailable(eligible);
@@ -404,6 +446,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // overriding the per-project toggle.
     getEnabled: () => (globallyDisabled ? false : readEnabled(store, projectKey)),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
+    // Universal preferred-lane override (per-project state + env fallback).
+    preferredLane: readPreferredLane,
+    setPreferredLane: (laneId) => writePreferred(preferStore, projectKey, laneId),
     // Session summary (router_summary / /tokenmaxed:summary), composed from the same
     // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
     // one source of truth. Read-only.
@@ -430,6 +475,24 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         },
         { refresh: true },
       );
+    },
+    // UNIVERSAL id guard (router_status): after the freshness refresh populated the
+    // cache, flag any keyed api lane whose RESOLVED model id the vendor would reject
+    // (wrong casing / absent) — so a bad id can't silently ship for any provider.
+    // CACHE-ONLY (no extra egress); reads the list freshness() just wrote.
+    idMismatch: async () => {
+      if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
+      const registry = loadLaneConfig(lanesPath);
+      const eligible = registry.lanes.filter(
+        (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
+      );
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
+      return reportModelIdMismatches(eligible, {
+        table: loadPriceTable(pricesPath),
+        now: Date.now(),
+        ttlMs: ID_MISMATCH_TTL_MS,
+        readCache: () => readFreshnessCache(cachePath),
+      });
     },
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the same

@@ -9,10 +9,10 @@
  * check. Here we just resolve each lane's model list and compare.
  */
 
-import { assessStaleness, newestPricedInFamily, parseModelAlias } from '@tokenmaxed/core';
+import { assessStaleness, detectModelIdMismatch, newestPricedInFamily, parseModelAlias } from '@tokenmaxed/core';
 import type { Lane, PriceTable } from '@tokenmaxed/core';
 
-import { getEntry, putEntry } from './model-cache.ts';
+import { getEntry, isFresh, putEntry } from './model-cache.ts';
 import type { FreshnessCache } from './model-cache.ts';
 import type { ModelListResult } from './model-list.ts';
 
@@ -102,5 +102,57 @@ export function renderStalenessWarnings(warnings: readonly StalenessWarning[]): 
     w.newestPriced
       ? `  ⚠ ${w.laneId}: using ${w.pinned}; newer available: ${w.newest} (set model: ${w.family}@latest, or pin ${w.newest})`
       : `  ⚠ ${w.laneId}: using ${w.pinned}; newer ${w.newest} exists but isn't priced yet — add it to the price table to route it`,
+  );
+}
+
+/** A vendor-id-mismatch finding for one lane, surfaced to the user (status). */
+export interface ModelIdMismatchWarning {
+  laneId: string;
+  sent: string;
+  vendorId?: string;
+}
+
+export interface IdMismatchDeps {
+  table: PriceTable;
+  now: number;
+  ttlMs: number;
+  readCache: () => FreshnessCache;
+}
+
+/**
+ * CACHE-ONLY (no egress): for each api lane, compare the exact id it would SEND to the
+ * vendor (the same resolution execution uses: `<family>@latest` ⇒ newest priced; else
+ * the concrete pin) against the cached live `/models` list. Returns one warning per lane
+ * whose sent id the vendor's list does not contain with exact casing — the universal
+ * guard that a wrong/miscased id can't silently ship for any provider. A lane with no
+ * FRESH cache entry is skipped (can't judge), so call this AFTER reportFreshness(refresh:
+ * true) on the same path so the cache is fresh. Pure over the injected cache; never throws.
+ */
+export async function reportModelIdMismatches(
+  lanes: readonly Lane[],
+  deps: IdMismatchDeps,
+): Promise<ModelIdMismatchWarning[]> {
+  const cache = deps.readCache();
+  const out: ModelIdMismatchWarning[] = [];
+  for (const lane of lanes) {
+    if (lane.kind !== 'api' || !lane.endpoint) continue;
+    const spec = parseModelAlias(lane.model);
+    const sent = spec.latest ? newestPricedInFamily(deps.table, spec.family) : spec.id;
+    if (sent === undefined) continue;
+    const entry = getEntry(cache, lane.endpoint);
+    if (!entry || !isFresh(entry, deps.now, deps.ttlMs)) continue;
+    const m = detectModelIdMismatch(sent, entry.models);
+    if (m === null) continue;
+    out.push({ laneId: lane.id, sent: m.sent, ...(m.vendorId !== undefined ? { vendorId: m.vendorId } : {}) });
+  }
+  return out;
+}
+
+/** Render id-mismatch warnings as human lines for status output. Empty ⇒ []. */
+export function renderModelIdMismatchWarnings(warnings: readonly ModelIdMismatchWarning[]): string[] {
+  return warnings.map((w) =>
+    w.vendorId !== undefined
+      ? `  ✗ ${w.laneId}: model id "${w.sent}" will be REJECTED by the vendor — it expects "${w.vendorId}" (exact casing). Fix the price table / lane model id.`
+      : `  ✗ ${w.laneId}: model id "${w.sent}" is not in the vendor's live model list — it will be rejected. Check the id.`,
   );
 }

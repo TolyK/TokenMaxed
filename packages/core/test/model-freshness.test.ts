@@ -16,6 +16,7 @@ import {
   staleAgainstPriceTable,
   sameFamily,
   assessStaleness,
+  detectModelIdMismatch,
 } from '../src/model-freshness.ts';
 import type { PriceTable } from '../src/price.ts';
 
@@ -157,4 +158,31 @@ test('staleAgainstPriceTable uses an explicit model_family to judge an unpriced 
   assert.equal(found.length, 1);
   assert.equal(found[0]!.pinned, 'minimax-m1');
   assert.equal(found[0]!.newest, 'minimax-m3');
+});
+
+// --- detectModelIdMismatch (universal vendor-id guard) + case-insensitive family ---
+
+test('detectModelIdMismatch: exact-casing member ⇒ null', () => {
+  assert.equal(detectModelIdMismatch('MiniMax-M3', [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2' }]), null);
+});
+
+test("detectModelIdMismatch: casing mismatch ⇒ reports the vendor's exact id", () => {
+  assert.deepEqual(detectModelIdMismatch('minimax-m3', [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2' }]), {
+    sent: 'minimax-m3',
+    vendorId: 'MiniMax-M3',
+  });
+});
+
+test('detectModelIdMismatch: absent id ⇒ {sent} with no vendorId', () => {
+  assert.deepEqual(detectModelIdMismatch('gpt-9', [{ id: 'MiniMax-M3' }]), { sent: 'gpt-9' });
+});
+
+test('detectModelIdMismatch: empty remote ⇒ null (cannot judge)', () => {
+  assert.equal(detectModelIdMismatch('x', []), null);
+});
+
+test('sameFamily is case-insensitive', () => {
+  assert.equal(sameFamily('MiniMax-M3', 'minimax'), true);
+  assert.equal(sameFamily('MINIMAX', 'minimax'), true);
+  assert.equal(sameFamily('glm-5.1', 'minimax'), false);
 });

@@ -257,13 +257,16 @@ function compareScores(a: LaneScore, b: LaneScore): number {
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
 
-function describe(lane: Lane, best: LaneScore, task: Task, tiered = false): string {
+function describe(lane: Lane, best: LaneScore, task: Task, tiered = false, preferred = false): string {
   const f = best.factors;
   const cap = f.capability.toFixed(2);
-  let reason = tiered
-    ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the ` +
-      `capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.`
-    : `Selected ${lane.id} (${lane.model}) for ${task.category}: ` + `capability ${cap} at ${lane.costBasis} cost.`;
+  let reason = preferred
+    ? `Selected ${lane.id} (${lane.model}) for ${task.category}: preferred lane (explicit offload), ` +
+      `capability ${cap} at ${lane.costBasis} cost.`
+    : tiered
+      ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the ` +
+        `capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.`
+      : `Selected ${lane.id} (${lane.model}) for ${task.category}: ` + `capability ${cap} at ${lane.costBasis} cost.`;
   // Annotate only when evidence actually moved the score (avoid overstating tiny
   // samples): at least one weighted review AND a different rounded value.
   if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
@@ -339,15 +342,34 @@ export function routeDecide(
   // `maximize` (default): most capable wins. `tiered`: cheapest lane clearing the
   // capability floor wins ("start cheap"); falls back to maximize if none clear it.
   const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
+
+  // PREFERENCE (universal, opt-in): honor an explicit `preferLaneId` — ANY configured
+  // lane id (any vendor, CLI or API) — when it is an eligible+available candidate and
+  // is NOT a hard opt-out (effective capability > 0 for the category). It is moved to
+  // the front of `scores` so the winner-is-scores[0] invariant holds; the hard rails
+  // (gate, policy, sensitivity/repo_class, availability) still gate candidacy, so a
+  // preference can never bypass them — an ineligible/unknown preferred lane simply
+  // falls back to the normal ranking. Capability-0 opt-outs are never honored.
+  let preferred = false;
+  if (ctx.preferLaneId != null) {
+    const idx = scores.findIndex((s) => s.laneId === ctx.preferLaneId && s.factors.capability > 0);
+    if (idx >= 0) {
+      const picked = scores.splice(idx, 1)[0]!;
+      scores.unshift(picked);
+      preferred = true;
+    }
+  }
+
   const winner = scores[0]!;
   const winningLane = candidates.find((lane) => lane.id === winner.laneId)!;
   // Only claim "tiered" in the reason when the winner ACTUALLY cleared the floor — a
   // no-clear fallback used the maximize ranking, so it must not say "clearing the floor".
-  const wonByTier = tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
+  const wonByTier =
+    !preferred && tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
 
   return {
     laneId: winner.laneId,
-    reason: describe(winningLane, winner, task, wonByTier),
+    reason: describe(winningLane, winner, task, wonByTier, preferred),
     scores,
     policyVerdict: verdicts.get(winner.laneId)!,
   };

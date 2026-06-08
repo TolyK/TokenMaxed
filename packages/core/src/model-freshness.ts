@@ -152,6 +152,44 @@ export interface FamilyModel {
   created?: number;
 }
 
+/** A model id the vendor's live list will reject as-sent (wrong casing, or absent). */
+export interface ModelIdMismatch {
+  /** The exact id the lane would send to the vendor. */
+  sent: string;
+  /** The vendor's id that case-insensitively matches `sent` (the correct casing), if any. */
+  vendorId?: string;
+}
+
+/**
+ * Detect whether a model id the router would send to a vendor will be rejected by the
+ * vendor's live `/models` list. Universal (any provider, any id) and the systemic guard
+ * against shipping a wrong/miscased id: the resolved `@latest`/pinned id is only ever as
+ * good as the price-table key, so this checks that key against ground truth. Pure, total,
+ * never throws.
+ *
+ *  - `remote` empty                          ⇒ `null` (no live list ⇒ can't judge)
+ *  - exact-casing member of `remote`         ⇒ `null` (fine as-sent)
+ *  - case-insensitive (not exact) member     ⇒ `{ sent, vendorId }` (a casing bug — 400)
+ *  - no case-insensitive member              ⇒ `{ sent }` (absent — vendor rejects)
+ */
+export function detectModelIdMismatch(
+  sentId: string,
+  remote: readonly FamilyModel[],
+): ModelIdMismatch | null {
+  if (remote.length === 0) return null;
+  // Exact-casing pass: the lane is fine as-sent.
+  for (const m of remote) {
+    if (m.id === sentId) return null;
+  }
+  // Casing-mismatch pass: report the vendor's correctly-cased id.
+  const sentLower = sentId.toLowerCase();
+  for (const m of remote) {
+    if (m.id.toLowerCase() === sentLower) return { sent: sentId, vendorId: m.id };
+  }
+  // Absent entirely: vendor will reject.
+  return { sent: sentId };
+}
+
 /**
  * Whether `id` belongs to the EXPLICIT `family`: an exact match, or `family` followed
  * by a non-alphanumeric boundary (so "minimax" matches "minimax-m3" but NOT "minimaxx").
@@ -159,10 +197,16 @@ export interface FamilyModel {
  * alias stem) — we never infer it from an id.
  */
 export function sameFamily(id: string, family: string): boolean {
-  if (id === family) return true;
-  if (!id.startsWith(family)) return false;
-  const next = id.charAt(family.length);
-  return next !== '' && !/[a-z0-9]/i.test(next);
+  // Case-INSENSITIVE: a vendor's id casing (e.g. `MiniMax-M3`) need not match the
+  // family stem the user wrote (`minimax@latest` ⇒ family `minimax`). Comparing
+  // case-folded keeps family matching robust across every vendor's id convention,
+  // so staleness/`@latest` checks don't silently go `unknown` on a casing diff.
+  const i = id.toLowerCase();
+  const f = family.toLowerCase();
+  if (i === f) return true;
+  if (!i.startsWith(f)) return false;
+  const next = i.charAt(f.length);
+  return next !== '' && !/[a-z0-9]/.test(next);
 }
 
 /** Staleness of a pinned model vs the vendor's live same-family list. */

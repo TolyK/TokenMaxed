@@ -187,13 +187,15 @@ test('loadPriceTable reads and validates the shipped seed file', () => {
   assert.equal(t.models['claude-haiku-4-5-20251001']?.outputPer1M, 5);
   // F2-S5: metered vendor models priced so opted-up reader/worker lanes are routable.
   assert.ok(t.models['glm-5.1']);
-  assert.ok(t.models['minimax-m2']);
-  // MODEL-FRESHNESS: the family advanced to m3, now priced + tagged so @latest can
+  // Vendor-EXACT id casing (the provider's /models ids are CamelCase: MiniMax-M3) so a
+  // resolved `@latest` is accepted verbatim by the API — a lowercase key would 400.
+  assert.ok(t.models['MiniMax-M2']);
+  // MODEL-FRESHNESS: the family advanced to M3, now priced + tagged so @latest can
   // resolve to it and staleness can be detected against the explicit family.
-  assert.ok(t.models['minimax-m3']);
-  assert.equal(t.models['minimax-m2']?.family, 'minimax');
-  assert.equal(t.models['minimax-m3']?.family, 'minimax');
-  assert.ok(t.models['minimax-m3']?.released);
+  assert.ok(t.models['MiniMax-M3']);
+  assert.equal(t.models['MiniMax-M2']?.family, 'minimax');
+  assert.equal(t.models['MiniMax-M3']?.family, 'minimax');
+  assert.ok(t.models['MiniMax-M3']?.released);
 });
 
 test('loadPriceTable gives a clear error for a missing file', () => {

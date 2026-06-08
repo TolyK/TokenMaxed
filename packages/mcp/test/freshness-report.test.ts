@@ -6,7 +6,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { reportFreshness, renderStalenessWarnings } from '../src/freshness-report.ts';
+import {
+  renderModelIdMismatchWarnings,
+  renderStalenessWarnings,
+  reportFreshness,
+  reportModelIdMismatches,
+} from '../src/freshness-report.ts';
+import type { ModelIdMismatchWarning } from '../src/freshness-report.ts';
 import { emptyCache, getEntry, putEntry } from '../src/model-cache.ts';
 import type { FreshnessCache } from '../src/model-cache.ts';
 import type { ModelListResult } from '../src/model-list.ts';
@@ -129,4 +135,49 @@ test('renderStalenessWarnings distinguishes priced vs pricing-gap', () => {
   assert.match(priced[0]!, /newer available: minimax-m3/);
   const gap = renderStalenessWarnings([{ laneId: 'l', family: 'minimax', pinned: 'minimax-m2', newest: 'minimax-m9', newestPriced: false }]);
   assert.match(gap[0]!, /isn't priced yet/);
+});
+
+// --- reportModelIdMismatches: universal "vendor will reject this id" guard ---------
+
+const MM_ENDPOINT = 'https://api.minimax.io/v1/chat/completions';
+
+test('reportModelIdMismatches flags a casing mismatch with the vendor exact id', async () => {
+  // Exact-casing concrete pin ⇒ no warning.
+  const okCache = putEntry(emptyCache(), MM_ENDPOINT, [{ id: 'MiniMax-M3' }], 1000);
+  assert.deepEqual(
+    await reportModelIdMismatches([lane({ model: 'MiniMax-M3' })], { table, now: 1000, ttlMs: 10_000, readCache: () => okCache }),
+    [],
+  );
+  // Lowercase concrete pin vs the vendor's CamelCase id ⇒ one casing warning.
+  const badCache = putEntry(emptyCache(), MM_ENDPOINT, [{ id: 'MiniMax-M3' }], 1000);
+  assert.deepEqual(
+    await reportModelIdMismatches([lane({ model: 'minimax-m3' })], { table, now: 1000, ttlMs: 10_000, readCache: () => badCache }),
+    [{ laneId: 'minimax-api', sent: 'minimax-m3', vendorId: 'MiniMax-M3' }],
+  );
+});
+
+test('reportModelIdMismatches skips a lane with a stale (TTL-expired) cache entry', async () => {
+  const cache = putEntry(emptyCache(), MM_ENDPOINT, [{ id: 'MiniMax-M3' }], 0);
+  assert.deepEqual(
+    await reportModelIdMismatches([lane({ model: 'minimax-m3' })], { table, now: 100_000, ttlMs: 10_000, readCache: () => cache }),
+    [],
+  );
+});
+
+test('reportModelIdMismatches resolves @latest to the priced id before checking', async () => {
+  // @latest resolves (price table) to minimax-m3; vendor lists MiniMax-M3 ⇒ casing warning.
+  const cache = putEntry(emptyCache(), MM_ENDPOINT, [{ id: 'MiniMax-M3' }], 1000);
+  assert.deepEqual(
+    await reportModelIdMismatches([lane({ model: 'minimax@latest' })], { table, now: 1000, ttlMs: 10_000, readCache: () => cache }),
+    [{ laneId: 'minimax-api', sent: 'minimax-m3', vendorId: 'MiniMax-M3' }],
+  );
+});
+
+test('renderModelIdMismatchWarnings renders casing-fix and absent lines', () => {
+  const casing: ModelIdMismatchWarning[] = [{ laneId: 'l', sent: 'minimax-m3', vendorId: 'MiniMax-M3' }];
+  const [line] = renderModelIdMismatchWarnings(casing);
+  assert.match(line!, /will be REJECTED/);
+  assert.ok(line!.includes('minimax-m3') && line!.includes('MiniMax-M3'));
+  const absent = renderModelIdMismatchWarnings([{ laneId: 'l', sent: 'gpt-9' }]);
+  assert.match(absent[0]!, /not in the vendor's live model list/);
 });

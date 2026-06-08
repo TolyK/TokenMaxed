@@ -250,6 +250,18 @@ export interface RouteContext {
    * stays pure and only reads the resulting id list.
    */
   availableLaneIds?: readonly string[];
+  /**
+   * Optional explicit lane preference (universal "offload this sprint" override):
+   * the id of ANY configured lane the user wants routing to favor — any vendor,
+   * CLI or API. When set and that lane is an eligible+available candidate that is
+   * NOT a hard opt-out (effective capability > 0 for the category), `routeDecide`
+   * picks it over the normal capability ranking. It NEVER relaxes the hard rails
+   * (gate, policy, sensitivity/repo_class, executor certification, availability):
+   * an ineligible or unknown preferred lane is ignored and routing falls back to
+   * the normal ranking. Set by the host adapter from a per-project toggle / env so
+   * the user can flip "use lane X for now" on and off easily without a relaunch.
+   */
+  preferLaneId?: string;
 }
 
 /**

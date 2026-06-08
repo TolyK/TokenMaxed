@@ -11,7 +11,7 @@
     "gemini-3.5-flash": { "inputPer1M": 0.3, "outputPer1M": 2.5, "family": "gemini-flash", "released": "2026-03-01" },
     "kimi-k2": { "inputPer1M": 0.6, "outputPer1M": 2.5, "family": "kimi", "released": "2025-07-01" },
     "glm-5.1": { "inputPer1M": 0.6, "outputPer1M": 2.2, "family": "glm", "released": "2026-04-01" },
-    "minimax-m2": { "inputPer1M": 0.3, "outputPer1M": 1.2, "family": "minimax", "released": "2025-10-01" },
-    "minimax-m3": { "inputPer1M": 0.5, "outputPer1M": 2.0, "family": "minimax", "released": "2026-06-01" }
+    "MiniMax-M2": { "inputPer1M": 0.3, "outputPer1M": 1.2, "family": "minimax", "released": "2025-10-01" },
+    "MiniMax-M3": { "inputPer1M": 0.5, "outputPer1M": 2.0, "family": "minimax", "released": "2026-06-01" }
   }
 }

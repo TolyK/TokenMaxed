@@ -37,8 +37,9 @@ export {
   staleAgainstPriceTable,
   sameFamily,
   assessStaleness,
+  detectModelIdMismatch,
 } from './model-freshness.ts';
-export type { ModelSpec, FamilyModel, StalenessReport, PriceTableStaleness } from './model-freshness.ts';
+export type { ModelSpec, FamilyModel, StalenessReport, PriceTableStaleness, ModelIdMismatch } from './model-freshness.ts';
 export {
   LedgerError,
   EVENT_FIELDS,

@@ -23211,10 +23211,10 @@ function compareScores(a, b) {
   if (b.score !== a.score) return b.score - a.score;
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
-function describe2(lane, best, task, tiered = false) {
+function describe2(lane, best, task, tiered = false, preferred = false) {
   const f = best.factors;
   const cap = f.capability.toFixed(2);
-  let reason = tiered ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.` : `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
+  let reason = preferred ? `Selected ${lane.id} (${lane.model}) for ${task.category}: preferred lane (explicit offload), capability ${cap} at ${lane.costBasis} cost.` : tiered ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.` : `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
   if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
     reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
   }
@@ -23250,12 +23250,21 @@ function routeDecide(task, ctx, policy) {
   const strategy = ctx.strategy ?? "maximize";
   const tiered = strategy === "tiered";
   const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
+  let preferred = false;
+  if (ctx.preferLaneId != null) {
+    const idx = scores.findIndex((s) => s.laneId === ctx.preferLaneId && s.factors.capability > 0);
+    if (idx >= 0) {
+      const picked = scores.splice(idx, 1)[0];
+      scores.unshift(picked);
+      preferred = true;
+    }
+  }
   const winner = scores[0];
   const winningLane = candidates.find((lane) => lane.id === winner.laneId);
-  const wonByTier = tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
+  const wonByTier = !preferred && tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
   return {
     laneId: winner.laneId,
-    reason: describe2(winningLane, winner, task, wonByTier),
+    reason: describe2(winningLane, winner, task, wonByTier, preferred),
     scores,
     policyVerdict: verdicts.get(winner.laneId)
   };
@@ -23404,11 +23413,24 @@ function staleAgainstPriceTable(lanes, table) {
   }
   return out;
 }
+function detectModelIdMismatch(sentId, remote) {
+  if (remote.length === 0) return null;
+  for (const m of remote) {
+    if (m.id === sentId) return null;
+  }
+  const sentLower = sentId.toLowerCase();
+  for (const m of remote) {
+    if (m.id.toLowerCase() === sentLower) return { sent: sentId, vendorId: m.id };
+  }
+  return { sent: sentId };
+}
 function sameFamily(id, family) {
-  if (id === family) return true;
-  if (!id.startsWith(family)) return false;
-  const next = id.charAt(family.length);
-  return next !== "" && !/[a-z0-9]/i.test(next);
+  const i = id.toLowerCase();
+  const f = family.toLowerCase();
+  if (i === f) return true;
+  if (!i.startsWith(f)) return false;
+  const next = i.charAt(f.length);
+  return next !== "" && !/[a-z0-9]/.test(next);
 }
 function assessStaleness(pinnedId, family, remote, table) {
   const fam = remote.filter((m) => sameFamily(m.id, family));
@@ -24985,6 +25007,9 @@ function coerceCache(raw) {
   }
   return out;
 }
+function isFresh(entry, now, ttlMs) {
+  return !!entry && now - entry.checkedAt < ttlMs && now >= entry.checkedAt;
+}
 function getEntry(cache, endpoint) {
   return Object.hasOwn(cache.endpoints, endpoint) ? cache.endpoints[endpoint] : void 0;
 }
@@ -25048,6 +25073,27 @@ async function reportFreshness(lanes, deps, opts) {
 function renderStalenessWarnings(warnings) {
   return warnings.map(
     (w) => w.newestPriced ? `  \u26A0 ${w.laneId}: using ${w.pinned}; newer available: ${w.newest} (set model: ${w.family}@latest, or pin ${w.newest})` : `  \u26A0 ${w.laneId}: using ${w.pinned}; newer ${w.newest} exists but isn't priced yet \u2014 add it to the price table to route it`
+  );
+}
+async function reportModelIdMismatches(lanes, deps) {
+  const cache = deps.readCache();
+  const out = [];
+  for (const lane of lanes) {
+    if (lane.kind !== "api" || !lane.endpoint) continue;
+    const spec = parseModelAlias(lane.model);
+    const sent = spec.latest ? newestPricedInFamily(deps.table, spec.family) : spec.id;
+    if (sent === void 0) continue;
+    const entry = getEntry(cache, lane.endpoint);
+    if (!entry || !isFresh(entry, deps.now, deps.ttlMs)) continue;
+    const m = detectModelIdMismatch(sent, entry.models);
+    if (m === null) continue;
+    out.push({ laneId: lane.id, sent: m.sent, ...m.vendorId !== void 0 ? { vendorId: m.vendorId } : {} });
+  }
+  return out;
+}
+function renderModelIdMismatchWarnings(warnings) {
+  return warnings.map(
+    (w) => w.vendorId !== void 0 ? `  \u2717 ${w.laneId}: model id "${w.sent}" will be REJECTED by the vendor \u2014 it expects "${w.vendorId}" (exact casing). Fix the price table / lane model id.` : `  \u2717 ${w.laneId}: model id "${w.sent}" is not in the vendor's live model list \u2014 it will be rejected. Check the id.`
   );
 }
 
@@ -26021,6 +26067,7 @@ function createTools(core) {
         ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {},
         ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}
       } : {};
+      const preferLaneId = deps.preferredLane?.();
       const ctx = {
         lanes,
         gateReady,
@@ -26028,7 +26075,8 @@ function createTools(core) {
         policyContext,
         ...observedCapability ? { observedCapability } : {},
         ...availableIds ? { availableLaneIds: availableIds } : {},
-        ...tieredCtx
+        ...tieredCtx,
+        ...preferLaneId ? { preferLaneId } : {}
       };
       let decision;
       try {
@@ -26041,13 +26089,15 @@ function createTools(core) {
       }
       const lane = lanes.find((l) => l.id === decision.laneId);
       const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy).verdict : decision.policyVerdict;
+      const preferNote = preferLaneId && decision.laneId !== preferLaneId ? `  note: preferred lane "${preferLaneId}" was not used \u2014 it isn't eligible, available, or capable for this category (fell back to normal routing).` : void 0;
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
-        `  why: ${decision.reason}`
+        `  why: ${decision.reason}`,
+        ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, ...preferLaneId ? { preferLaneId } : {} });
     })
   };
   const statusTool = {
@@ -26057,13 +26107,26 @@ function createTools(core) {
     handler: (deps) => guardedAsync(async () => {
       const enabled = deps.getEnabled();
       const warnings = enabled && deps.freshness ? await deps.freshness() : [];
+      const mismatches = enabled && deps.idMismatch ? await deps.idMismatch() : [];
+      const preferred = deps.preferredLane?.();
       const lines = [`TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`];
+      if (preferred) {
+        lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
+      }
+      if (mismatches.length > 0) {
+        lines.push("", "Model ids the vendor will REJECT (fix before offloading):", ...renderModelIdMismatchWarnings(mismatches));
+      }
       if (warnings.length > 0) {
         lines.push("", "Stale pinned models (you can keep them, or move to the latest):", ...renderStalenessWarnings(warnings));
       } else if (enabled && deps.freshness) {
         lines.push("No stale models flagged (only enabled, keyed API lanes with a known family are checked).");
       }
-      return ok(lines.join("\n"), { enabled, staleness: warnings });
+      return ok(lines.join("\n"), {
+        enabled,
+        ...preferred ? { preferLaneId: preferred } : {},
+        staleness: warnings,
+        idMismatch: mismatches
+      });
     })
   };
   const setEnabledTool = {
@@ -26082,6 +26145,33 @@ function createTools(core) {
       return ok(
         `TokenMaxed routing ${enabled ? "ENABLED" : "DISABLED"} for this project.`,
         { enabled }
+      );
+    })
+  };
+  const setPreferTool = {
+    name: "router_set_prefer",
+    description: "Set or clear a per-project PREFERRED lane for TokenMaxed routing. When set, the router favors that lane over the normal capability ranking whenever it is eligible, available, and capable for the task. Use this to temporarily push work to a specific lane (e.g. when one subscription's credits are running low) \u2014 works with ANY configured lane (any vendor, CLI or API). Clearing the preference restores normal capability-ranked routing. The setting is persisted per project and survives restarts; no relaunch is needed. Powers /tokenmaxed:prefer.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: "string",
+          description: "The lane id to prefer (any configured lane \u2014 any vendor, CLI or API). Omit or pass an empty string to CLEAR the preference (restore normal routing)."
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const raw = optString(args, "lane");
+      const lane = typeof raw === "string" ? raw.trim() : void 0;
+      if (!lane) {
+        deps.setPreferredLane?.(void 0);
+        return ok("Lane preference CLEARED \u2014 TokenMaxed will route normally for this project.", { preferLaneId: null });
+      }
+      deps.setPreferredLane?.(lane);
+      return ok(
+        `Preferred lane set to "${lane}" for this project \u2014 routing will favor it when it is eligible, available, and capable for the task (else it falls back to normal routing). Run /tokenmaxed:prefer off to clear.`,
+        { preferLaneId: lane }
       );
     })
   };
@@ -26174,7 +26264,7 @@ ${r.notes}` : "";
       return ok(lines.join("\n"), { ...r });
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, delegateTool, reviewTool, setupTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, delegateTool, reviewTool, setupTool];
 }
 function renderDelegate(o) {
   if (o.native || o.status !== "ok") {
@@ -26237,9 +26327,33 @@ function unknownKeys(inputSchema, args) {
   return `Unknown argument(s): ${extras.join(", ")}. Allowed: ${allowed.length ? allowed.join(", ") : "(none)"}.`;
 }
 
+// ../mcp/src/prefer.ts
+function asMap2(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "string" && v.length > 0) out[k] = v;
+  }
+  return out;
+}
+function readPreferred(store, projectKey) {
+  const map = asMap2(store.read());
+  return Object.hasOwn(map, projectKey) ? map[projectKey] : void 0;
+}
+function writePreferred(store, projectKey, laneId) {
+  const map = asMap2(store.read());
+  if (typeof laneId === "string" && laneId.length > 0) {
+    map[projectKey] = laneId;
+  } else {
+    delete map[projectKey];
+  }
+  store.write(map);
+}
+
 // ../mcp/src/server.ts
 var DEFAULT_LANES = homeFile("lanes.yaml");
 var DEFAULT_PRICES2 = fileURLToPath5(new URL("../prices.seed.json", import.meta.url));
+var ID_MISMATCH_TTL_MS = 10 * 6e4;
 function recordableLane(lane, priceTable) {
   if (lane.native || lane.costBasis !== "metered") return true;
   try {
@@ -26291,6 +26405,22 @@ function fileToggleStore(statePath) {
     }
   };
 }
+function filePreferStore(statePath) {
+  return {
+    read: () => {
+      if (!existsSync8(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync5(statePath, "utf8"));
+      } catch {
+        return {};
+      }
+    },
+    write: (state) => {
+      mkdirSync5(dirname7(statePath), { recursive: true });
+      writeFileSync4(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+    }
+  };
+}
 var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
@@ -26325,6 +26455,10 @@ function makeServerDeps(env = process.env) {
   };
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
+  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join6(dirname7(statePath), "prefer.json");
+  const preferStore = filePreferStore(preferStatePath);
+  const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
+  const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
   const resolveAuth = makeResolveAuth(env);
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
@@ -26360,7 +26494,13 @@ function makeServerDeps(env = process.env) {
       policyContext: request.policyContext ?? {},
       ...observedCapability ? { observedCapability } : {},
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
-      ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(lanes, priceTable) } : {}
+      ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(lanes, priceTable) } : {},
+      // Universal preferred-lane override: favor this lane when it is an eligible+
+      // available+capable candidate (hard rails still gate it). Absent ⇒ normal ranking.
+      ...(() => {
+        const p = readPreferredLane();
+        return p ? { preferLaneId: p } : {};
+      })()
     };
     const eligible = eligibleLanes({ category: request.category }, baseCtx, policy).map((e) => e.lane);
     const available = await probeAvailable(eligible);
@@ -26453,6 +26593,9 @@ function makeServerDeps(env = process.env) {
     // overriding the per-project toggle.
     getEnabled: () => globallyDisabled ? false : readEnabled(store, projectKey),
     setEnabled: (enabled) => writeEnabled(store, projectKey, enabled),
+    // Universal preferred-lane override (per-project state + env fallback).
+    preferredLane: readPreferredLane,
+    setPreferredLane: (laneId) => writePreferred(preferStore, projectKey, laneId),
     // Session summary (router_summary / /tokenmaxed:summary), composed from the same
     // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
     // one source of truth. Read-only.
@@ -26478,6 +26621,24 @@ function makeServerDeps(env = process.env) {
         },
         { refresh: true }
       );
+    },
+    // UNIVERSAL id guard (router_status): after the freshness refresh populated the
+    // cache, flag any keyed api lane whose RESOLVED model id the vendor would reject
+    // (wrong casing / absent) — so a bad id can't silently ship for any provider.
+    // CACHE-ONLY (no extra egress); reads the list freshness() just wrote.
+    idMismatch: async () => {
+      if (globallyDisabled || !gateReady || !existsSync8(lanesPath)) return [];
+      const registry2 = loadLaneConfig(lanesPath);
+      const eligible = registry2.lanes.filter(
+        (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
+      );
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join6(dirname7(statePath), "model-freshness.json");
+      return reportModelIdMismatches(eligible, {
+        table: loadPriceTable(pricesPath),
+        now: Date.now(),
+        ttlMs: ID_MISMATCH_TTL_MS,
+        readCache: () => readFreshnessCache(cachePath)
+      });
     },
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the same
