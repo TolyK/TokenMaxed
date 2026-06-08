@@ -591,7 +591,7 @@ type SpawnLike = (
   command: string,
   args: readonly string[],
   options: { input: string; encoding: 'utf8'; maxBuffer: number },
-) => { status: number | null; stdout?: string; error?: Error };
+) => { status: number | null; stdout?: string; error?: Error; signal?: NodeJS.Signals | null };
 
 /**
  * Generic CLI-lane executor (answer-only): spawn the lane's `command` with its
@@ -624,8 +624,26 @@ export function makeCliExecutor(spawnImpl?: SpawnLike): TrustedExecFn {
     // the routing path), so this keeps CLI lanes self-updating with no stale literal.
     const args = (lane.args ?? []).map((a) => a.replaceAll('{model}', lane.model));
     const res = spawn(lane.command, args, { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-    if (res.error) throw new LaneFailure('provider_error', `cli lane "${lane.id}" failed to spawn`);
-    if (res.status !== 0) throw new LaneFailure('provider_error', `cli lane "${lane.id}" exited with status ${res.status}`);
+    if (res.error) {
+      // Distinguish a TIMEOUT (the common "review took too long" case — spawnSync sets
+      // ETIMEDOUT + a SIGTERM signal) from a real spawn failure, so the surfaced error
+      // is actionable instead of a blanket "failed to spawn". All fields used here are
+      // content-free: the failure CODE and the lane's own configured command — never
+      // the prompt/diff (which the CLI receives on stdin and could echo to stderr).
+      const code = (res.error as NodeJS.ErrnoException).code;
+      // ENOBUFS (CLI output exceeded maxBuffer) ALSO kills the child with SIGTERM, so it
+      // must be ruled out BEFORE the SIGTERM⇒timeout heuristic — otherwise oversized
+      // output is mislabeled "timed out", hiding the real, actionable cause.
+      if (code === 'ENOBUFS') throw new LaneFailure('provider_error', `cli lane "${lane.id}" produced too much output (exceeded the buffer limit)`);
+      if (code === 'ETIMEDOUT' || res.signal === 'SIGTERM') throw new LaneFailure('timeout', `cli lane "${lane.id}" (command "${lane.command}") timed out`);
+      if (code === 'ENOENT' || code === 'EACCES') throw new LaneFailure('provider_error', `cli lane "${lane.id}" failed to spawn: command "${lane.command}" ${code === 'ENOENT' ? 'not found' : 'not executable'} (check the lane's absolute command path / PATH)`);
+      throw new LaneFailure('provider_error', `cli lane "${lane.id}" failed to spawn${code ? ` (${code})` : ''}`);
+    }
+    if (res.status !== 0) {
+      // Content-free: a manager CLI receives the full prompt/diff on stdin and may echo
+      // it to stderr, so we surface ONLY the exit status — never raw stderr (a leak path).
+      throw new LaneFailure('provider_error', `cli lane "${lane.id}" exited with status ${res.status}`);
+    }
     return { resultText: res.stdout ?? '' }; // CLIs rarely report tokens ⇒ estimated downstream
   };
 }

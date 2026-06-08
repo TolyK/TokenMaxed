@@ -26,7 +26,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
+import { REVIEW_BUDGET_MS, makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
 import { runReviewWithBudget } from './review-budget.ts';
 import { parseMaxRounds, reviewLoopEnabled, stopHookAction } from './reviewer.ts';
 
@@ -69,13 +69,15 @@ async function main(): Promise<void> {
   const maxRounds = parseMaxRounds(env);
 
   const deps = makeHostReviewDeps(env);
-  // runReviewWithBudget caps the total wait to 120 s across up to 2 attempts, so
-  // a hung API manager or a stalled CLI (the real backstop: OS spawnSync timeout)
-  // can never wedge this Stop hook indefinitely. Fails OPEN on every error/timeout
-  // (returns errored:true so we surface it rather than silently passing).
+  // SINGLE attempt bounded by REVIEW_BUDGET_MS. A CLI review's spawnSync can't be
+  // preempted by Promise.race, so the budget must COVER the CLI's own OS timeout PLUS
+  // the synchronous diff acquisition that precedes it (host-review reserves that
+  // headroom: CLI timeout = budget − headroom). A reasoning-model review of a real diff
+  // genuinely takes minutes; a 2nd attempt on the same diff rarely helps and would
+  // double the wall-clock. Fails OPEN on timeout/error (errored:true → surfaced).
   const result = await runReviewWithBudget(makeReviewRunner(deps), randomUUID, {
-    totalBudgetMs: 120_000,
-    maxRetries: 1,
+    totalBudgetMs: REVIEW_BUDGET_MS,
+    maxRetries: 0,
   });
 
   const priorBlocks = readCounter(counterFile);

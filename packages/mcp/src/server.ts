@@ -58,7 +58,7 @@ import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
 import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
-import { makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
+import { REVIEW_BUDGET_MS, makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
 import { runReviewWithBudget } from './review-budget.ts';
 import { runSetup } from './setup.ts';
 import { createTools, dispatch } from './tools.ts';
@@ -536,11 +536,16 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the same
     // path independently. Honor the global kill-switch so a recursion-guarded child
     // (TOKENMAXED_DISABLE=1) can't review + spawn again. runReviewWithBudget bounds
-    // the call (total deadline + retry) so a hung manager never stalls the turn.
+    // the call with a SINGLE attempt within REVIEW_BUDGET_MS; host-review sets the CLI's
+    // OS timeout to that budget MINUS the synchronous diff-acquisition headroom (a CLI
+    // spawnSync can't be preempted), so diff-read + review never overrun the budget.
     review: (): Promise<ReviewOutcome> =>
       globallyDisabled
         ? Promise.resolve({ reviewed: false, reason: 'routing is disabled (TOKENMAXED_DISABLE)' })
-        : runReviewWithBudget(makeReviewRunner(makeHostReviewDeps(env)), randomUUID),
+        : runReviewWithBudget(makeReviewRunner(makeHostReviewDeps(env)), randomUUID, {
+            totalBudgetMs: REVIEW_BUDGET_MS,
+            maxRetries: 0,
+          }),
     // Create/validate user config + report status (A-8).
     setup: () => runSetup(env),
     now: () => Date.now(),

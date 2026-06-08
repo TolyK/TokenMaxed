@@ -64,6 +64,35 @@ test('makeCliExecutor throws on a non-zero exit (so runTask degrades)', async ()
   await assert.rejects(() => exec(codexCli, 'x'));
 });
 
+test('makeCliExecutor: a TIMEOUT is reported as a timeout, not "failed to spawn"', async () => {
+  // spawnSync on timeout sets status null, signal SIGTERM, and error.code ETIMEDOUT.
+  const exec = makeCliExecutor(() => ({ status: null, signal: 'SIGTERM', error: Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' }) }));
+  await assert.rejects(() => exec(codexCli, 'x'), (e: unknown) => {
+    assert.ok(e instanceof LaneFailure);
+    assert.equal(e.failureKind, 'timeout');
+    assert.match(e.message, /timed out/);
+    assert.ok(!/failed to spawn/.test(e.message)); // no longer mislabeled
+    return true;
+  });
+});
+
+test('makeCliExecutor: ENOENT is a clear "command not found" spawn failure', async () => {
+  const exec = makeCliExecutor(() => ({ status: null, error: Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }) }));
+  await assert.rejects(() => exec(codexCli, 'x'), /failed to spawn.*not found/);
+});
+
+test('makeCliExecutor: a non-zero exit is reported CONTENT-FREE (status only, never raw stderr)', async () => {
+  // A manager CLI receives the diff on stdin and may echo it to stderr; that must
+  // never reach the surfaced error. The message carries the exit status, not stderr.
+  const exec = makeCliExecutor(() => ({ status: 2, stdout: '', stderr: 'PRIVATE_REPO_SECRET_abc123' }));
+  await assert.rejects(() => exec(codexCli, 'x'), (e: unknown) => {
+    assert.ok(e instanceof LaneFailure);
+    assert.match(e.message, /exited with status 2/);
+    assert.ok(!e.message.includes('PRIVATE_REPO_SECRET_abc123')); // stderr never leaked
+    return true;
+  });
+});
+
 test('makeTrustedApiExecutor: a recovery retry with PARTIAL usage keeps the first call\'s billed spend + estimates the call that omitted usage', async () => {
   let calls = 0;
   const exec = makeTrustedApiExecutor({

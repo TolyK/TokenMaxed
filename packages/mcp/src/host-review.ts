@@ -147,11 +147,32 @@ export function makeReviewRunner(
 const MAX_DIFF_BYTES = 256 * 1024; // truncate what we hand the manager
 const GIT_MAX_BUFFER = 64 * 1024 * 1024; // read big diffs without ENOBUFS, then truncate
 const GIT_TIMEOUT_MS = 15_000; // git diff is fast; bound it so a wedged git can't hang us
-const REVIEW_CLI_TIMEOUT_MS = 90_000; // a manager review of a diff should be quick
 const MAX_UNTRACKED_FILES = 50; // hard cap on how many new files we synthesize add-diffs for
 const UNTRACKED_BUDGET_MS = 8_000; // total wall-clock cap for the whole untracked pass
 const UNTRACKED_FILE_TIMEOUT_MS = 5_000; // per-file git timeout (was 15 s — too long × N)
 const UNTRACKED_FILE_MAXBUF = 4 * 1024 * 1024; // per-file read bound (combined is truncated anyway)
+
+/**
+ * Total wall-clock budget for one host review — every call site passes this as
+ * `totalBudgetMs` (single attempt). A reasoning-model review of a real diff takes
+ * minutes; 90s was too short (ETIMEDOUT mislabeled as "failed to spawn").
+ */
+export const REVIEW_BUDGET_MS = 300_000;
+/**
+ * Headroom the budget reserves for the SYNCHRONOUS diff acquisition that runs BEFORE
+ * the CLI spawn and which the budget's slot guard cannot preempt. The CLI's OWN OS
+ * timeout is the budget MINUS this headroom, so diff-read + CLI stay within the
+ * advertised budget even in the WORST case. Derived from the actual diff-read timeouts
+ * (not a guess): tracked `git diff HEAD` + untracked `git ls-files` (each GIT_TIMEOUT_MS)
+ * + the untracked per-file wall-clock budget + a final per-file diff started just under
+ * that budget (UNTRACKED_FILE_TIMEOUT_MS overrun).
+ */
+const DIFF_ACQUISITION_HEADROOM_MS =
+  GIT_TIMEOUT_MS + GIT_TIMEOUT_MS + UNTRACKED_BUDGET_MS + UNTRACKED_FILE_TIMEOUT_MS;
+// The CLI lane's OS-level spawn timeout (spawnSync is synchronous — Promise.race can't
+// preempt it, so this is the real backstop). Strictly LESS than REVIEW_BUDGET_MS by the
+// full diff-acquisition headroom, so diff-read + CLI ≤ REVIEW_BUDGET_MS always.
+const REVIEW_CLI_TIMEOUT_MS = REVIEW_BUDGET_MS - DIFF_ACQUISITION_HEADROOM_MS;
 
 /**
  * REVIEW-LOOP — "review ALL changed code": synthesize add-style diffs for

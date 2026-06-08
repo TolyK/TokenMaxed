@@ -101,7 +101,7 @@ export function makeCliSpawn(timeoutMs: number = DEFAULT_CLI_TIMEOUT_MS): (
   command: string,
   args: readonly string[],
   options: { input: string; encoding: 'utf8'; maxBuffer: number },
-) => { status: number | null; stdout?: string; error?: Error } {
+) => { status: number | null; stdout?: string; error?: Error; signal?: NodeJS.Signals | null } {
   return (command, args, options) => {
     // `detached` is honored by libuv for spawnSync (own process group) but is missing
     // from @types/node's SpawnSyncOptions, so widen the type explicitly.
@@ -119,6 +119,7 @@ export function makeCliSpawn(timeoutMs: number = DEFAULT_CLI_TIMEOUT_MS): (
       status: number | null;
       stdout?: string;
       error?: Error;
+      signal?: NodeJS.Signals | null;
     };
     // Reap any listener/loop the CLI left running (normal exit or timeout). The
     // tree is usually already gone for a clean one-shot ⇒ ignore the resulting error.

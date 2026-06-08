@@ -13,15 +13,16 @@
  *     spawnSync call; the OS-level CLI timeout in makeCliSpawn is the real backstop
  *     for a wedged child. Starting an attempt with an insufficient slot would still
  *     run the full spawnSync timeout and blow past the total budget.
- *   - NOTE ON CLI TIMEOUT ALIGNMENT: makeCliSpawn uses REVIEW_CLI_TIMEOUT_MS = 90 s
- *     for CLI managers, while the default per-attempt slot is 60 s (120 s / 2). A
- *     CLI manager that blocks for the full 90 s will exceed its 60 s slot. The
- *     Promise.race timeout fires at 60 s, but spawnSync continues until 90 s. This
- *     means a stalled CLI review can take up to 90 s per attempt, potentially
- *     exceeding the 120 s total budget for two attempts. The fetch timeout
- *     (wrapWithFetchTimeout, 90 s) IS enforceable for API managers; for CLI managers,
- *     the OS spawnSync timeout is the real backstop. This is a known, documented
- *     residual: the budget bounds async paths tightly; CLI is bounded by the OS.
+ *   - CLI TIMEOUT ALIGNMENT: because Promise.race cannot preempt a synchronous
+ *     spawnSync (nor the synchronous git diff acquisition that precedes it), a CLI
+ *     review is bounded only by host-review's OS-level timeouts. So both call sites
+ *     pass `{ totalBudgetMs: REVIEW_BUDGET_MS, maxRetries: 0 }` (a SINGLE attempt) and
+ *     host-review sets the CLI's OS timeout to REVIEW_BUDGET_MS MINUS a diff-acquisition
+ *     headroom, so diff-read + CLI spawn together stay within the budget — a hung CLI
+ *     review can never overrun it. (A budget SHORTER than the CLI timeout, or equal to
+ *     it without headroom for the synchronous diff read, would let one review overrun
+ *     the whole budget — the bug this alignment fixes.) For API managers the fetch
+ *     timeout (wrapWithFetchTimeout) is independently enforceable.
  *   - After a timeout, the superseded runner call continues until OS cleanup. A
  *     shared `turnId` across all retries ensures any late duplicate appendOutcome
  *     writes correlate to the same review subject in the ledger.
