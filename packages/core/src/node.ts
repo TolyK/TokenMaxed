@@ -19,13 +19,14 @@ import type { PriceTable } from './price.ts';
 import { PolicyConfigError, parsePolicyConfig } from './policy.ts';
 import { isMinimizedPayload, isReaderPayload } from './minimize.ts';
 import type { SecretScanner } from './minimize.ts';
-import { buildReaderRequestBody, buildUntrustedRequestBody } from './boundary.ts';
+import { READER_SYSTEM_FRAMING, RECOVERY_MAX_COMPLETION_TOKENS, buildReaderRequestBody, buildUntrustedRequestBody } from './boundary.ts';
 import type { SafeReaderEnvelope, SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
+import { estimateTokens } from './usage.ts';
 import type { RawUsage } from './usage.ts';
 import { runTask } from './run.ts';
 import type { RunDeps, RunRequest, RunResult, TrustedExecResult } from './run.ts';
 import type { Lane, Policy, RouteContext } from './types.ts';
-import { classifyHttpStatus, LaneFailure } from './failure.ts';
+import { classifyHttpStatus, isTransient, LaneFailure } from './failure.ts';
 import type { FailureKind } from './failure.ts';
 import {
   LedgerError,
@@ -207,6 +208,8 @@ export interface UntrustedExecResult {
   ok: boolean;
   resultText?: string;
   reported?: RawUsage;
+  /** true ⇒ `reported` includes ESTIMATED parts (recovery retry; log estimated, not exact). */
+  reportedEstimated?: boolean;
   error?: string;
   failureKind?: FailureKind;
 }
@@ -222,6 +225,81 @@ function extractUsage(data: unknown): RawUsage | undefined {
   if (!u) return undefined;
   const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
   return { tokens_in: num(u.prompt_tokens), tokens_out: num(u.completion_tokens) };
+}
+
+function extractFinishReason(data: unknown): string | undefined {
+  const c = (data as { choices?: { finish_reason?: unknown }[] })?.choices;
+  const fr = c?.[0]?.finish_reason;
+  return typeof fr === 'string' ? fr : undefined;
+}
+
+/**
+ * A COMPLETE best-effort usage total across the two recovery calls. Use each call's
+ * provider-reported usage where present; for a call that OMITTED `usage` (some
+ * OpenAI-compatible proxies do), estimate that call's tokens from its prompt+result
+ * text. This loses neither the first call's billed hidden-reasoning spend (when it
+ * reported, as the empty+`length` call typically does) nor the other call's work, and
+ * never records only one call as if it were the exact total. Each call re-sends the
+ * full prompt, so an omitted call's input ≈ the prompt estimate.
+ */
+function combineRecoveryUsage(
+  first: RawUsage | undefined,
+  firstResultText: string,
+  retry: RawUsage | undefined,
+  retryResultText: string,
+  promptText: string,
+): { usage: RawUsage; estimated: boolean } {
+  // Complete ONE call's usage field-by-field: keep each provider-reported side, ESTIMATE
+  // any MISSING side from text (a request re-sends the full prompt ⇒ input ≈ prompt est).
+  // RawUsage is PARTIAL by type, so check tokens_in AND tokens_out per call — a provider
+  // that reports only one side must NOT be treated as a complete, exact total.
+  const completeOne = (u: RawUsage | undefined, resultText: string): { usage: RawUsage; estimated: boolean } => {
+    const hasIn = typeof u?.tokens_in === 'number';
+    const hasOut = typeof u?.tokens_out === 'number';
+    const usage: RawUsage = {
+      tokens_in: hasIn ? (u!.tokens_in as number) : estimateTokens(promptText),
+      tokens_out: hasOut ? (u!.tokens_out as number) : estimateTokens(resultText),
+      ...(u?.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: u.cache_read_input_tokens } : {}),
+      ...(u?.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: u.cache_creation_input_tokens } : {}),
+    };
+    return { usage, estimated: !hasIn || !hasOut };
+  };
+  const a = completeOne(first, firstResultText);
+  const b = completeOne(retry, retryResultText);
+  // `estimated` ⇒ at least one field of either call had to be text-estimated, so the
+  // total is NOT provider-exact and must be logged `tokens_estimated: true`.
+  return { usage: addUsage(a.usage, b.usage) as RawUsage, estimated: a.estimated || b.estimated };
+}
+
+/**
+ * Failure kind for a BEST-EFFORT recovery-retry that came back non-OK. Keep a
+ * genuine TRANSIENT capacity signal (rate_limited / quota_exhausted / timeout) so
+ * `shouldCooldown` still cools the exhausted lane down — but remap a PERMANENT
+ * classification (e.g. a 400 rejecting OUR injected `max_tokens`) to a transient
+ * `provider_error` so an optional recovery attempt can never poison routing into a
+ * non-fallback `bad_request`.
+ */
+function recoveryRetryFailureKind(status: number): FailureKind {
+  const kind = classifyHttpStatus(status);
+  return isTransient(kind) ? kind : 'provider_error';
+}
+
+/**
+ * Sum two RawUsage records so a retry's spend ADDS to (never replaces) the first
+ * call's. Mirrors {@link extractUsage}'s shape — tokens_in/tokens_out always
+ * present (possibly undefined), optional cache fields included ONLY when a side
+ * reported them — so a summed result deep-equals a single-call result.
+ */
+function addUsage(a: RawUsage | undefined, b: RawUsage | undefined): RawUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  const sum = (x?: number, y?: number) => (x === undefined && y === undefined ? undefined : (x ?? 0) + (y ?? 0));
+  const out: RawUsage = { tokens_in: sum(a.tokens_in, b.tokens_in), tokens_out: sum(a.tokens_out, b.tokens_out) };
+  const cacheRead = sum(a.cache_read_input_tokens, b.cache_read_input_tokens);
+  if (cacheRead !== undefined) out.cache_read_input_tokens = cacheRead;
+  const cacheCreate = sum(a.cache_creation_input_tokens, b.cache_creation_input_tokens);
+  if (cacheCreate !== undefined) out.cache_creation_input_tokens = cacheCreate;
+  return out;
 }
 
 /**
@@ -263,7 +341,51 @@ export async function executeUntrusted(
       return { ok: false, error: `untrusted lane returned status ${res.status}`, failureKind: classifyHttpStatus(res.status) };
     }
     const data = await res.json();
-    return { ok: true, resultText: extractText(data), reported: extractUsage(data) };
+    let result = data;
+    let text = extractText(result);
+    let reported = extractUsage(result);
+    let reportedEstimated = false;
+    // One-shot retry: reasoning-heavy models (e.g. MiniMax-M3) can exhaust the
+    // default cap on hidden reasoning and return empty content with
+    // finish_reason: "length". Retry once with a larger CONSTANT max_tokens to
+    // recover. (max_tokens is never sourced from caller content — see
+    // boundary.ts allowlist.) The first call ALREADY consumed tokens, so its
+    // usage is ACCUMULATED with the retry's (and reported even if the retry fails).
+    if (text === '' && extractFinishReason(result) === 'length') {
+      try {
+        const body2 = JSON.stringify(buildUntrustedRequestBody(env, true));
+        // Bound the retry with the same fetch timeout + AbortSignal the trusted/Ollama
+        // executors use, so a recovery retry can never hang indefinitely and block
+        // fallback (the first call returned promptly; the retry must too or fail fast).
+        const retry = await wrapWithFetchTimeout(async (signal) => {
+          const res2 = await doFetch(env.lane.endpoint, { method: 'POST', headers, body: body2, signal });
+          if (!res2.ok) return { ok: false as const, status: res2.status, data: undefined };
+          return { ok: true as const, status: res2.status, data: await res2.json() };
+        }, DEFAULT_FETCH_TIMEOUT_MS);
+        if (!retry.ok) {
+          // Best-effort recovery non-OK: keep a real capacity signal (so the lane cools
+          // down) but remap a permanent 400 (model rejecting our injected max_tokens) to
+          // transient so it never blocks fallback; carry the first call's usage.
+          return { ok: false, error: `untrusted lane recovery retry returned status ${retry.status}`, failureKind: recoveryRetryFailureKind(retry.status), ...(reported ? { reported } : {}) };
+        }
+        const promptText = [env.payload.instruction, ...env.payload.attachments.map((a) => a.content)].join('\n\n');
+        result = retry.data;
+        text = extractText(result);
+        // Complete best-effort total: each call's reported usage where present, a text
+        // estimate where a call omitted `usage` — so neither the first call's billed
+        // (hidden-reasoning) spend nor the retry's output is ever lost. `estimated`
+        // flags that the total is NOT provider-exact (logged tokens_estimated:true).
+        const combined = combineRecoveryUsage(reported, '', extractUsage(result), text, promptText);
+        reported = combined.usage;
+        reportedEstimated = combined.estimated;
+      } catch {
+        // The retry itself threw (network / parse / timeout) AFTER the first call
+        // already billed — preserve that spend so a metered failed attempt is never
+        // under-recorded (content-free, like the outer catch).
+        return { ok: false, error: 'untrusted lane request failed', failureKind: 'provider_error', ...(reported ? { reported } : {}) };
+      }
+    }
+    return { ok: true, resultText: text, reported, ...(reportedEstimated ? { reportedEstimated: true } : {}) };
   } catch {
     // Content-free: never surface payload/repo text (or a resolver's raw error).
     return { ok: false, error: 'untrusted lane request failed', failureKind: 'provider_error' };
@@ -309,7 +431,53 @@ export async function executeReader(
       return { ok: false, error: `reader lane returned status ${res.status}`, failureKind: classifyHttpStatus(res.status) };
     }
     const data = await res.json();
-    return { ok: true, resultText: extractText(data), reported: extractUsage(data) };
+    let result = data;
+    let text = extractText(result);
+    let reported = extractUsage(result);
+    let reportedEstimated = false;
+    // One-shot retry: reasoning-heavy models (e.g. MiniMax-M3) can exhaust the
+    // default cap on hidden reasoning and return empty content with
+    // finish_reason: "length". Retry once with a larger CONSTANT max_tokens to
+    // recover. (max_tokens is never sourced from caller content — see
+    // boundary.ts allowlist.) First-call usage is ACCUMULATED with the retry's
+    // (and reported even if the retry fails) so metered spend is never under-recorded.
+    if (text === '' && extractFinishReason(result) === 'length') {
+      try {
+        const body2 = JSON.stringify(buildReaderRequestBody(env, true));
+        // Bound the retry with the same fetch timeout + AbortSignal the trusted/Ollama
+        // executors use, so a recovery retry can never hang indefinitely and block
+        // fallback (the first call returned promptly; the retry must too or fail fast).
+        const retry = await wrapWithFetchTimeout(async (signal) => {
+          const res2 = await doFetch(env.lane.endpoint, { method: 'POST', headers, body: body2, signal });
+          if (!res2.ok) return { ok: false as const, status: res2.status, data: undefined };
+          return { ok: true as const, status: res2.status, data: await res2.json() };
+        }, DEFAULT_FETCH_TIMEOUT_MS);
+        if (!retry.ok) {
+          // Best-effort recovery non-OK: keep a real capacity signal (so the lane cools
+          // down) but remap a permanent 400 (model rejecting our injected max_tokens) to
+          // transient so it never blocks fallback; carry the first call's usage.
+          return { ok: false, error: `reader lane recovery retry returned status ${retry.status}`, failureKind: recoveryRetryFailureKind(retry.status), ...(reported ? { reported } : {}) };
+        }
+        // Reader requests prepend READER_SYSTEM_FRAMING (buildReaderRequestBody), so the
+        // estimate's prompt MUST include it too or reader input tokens are undercounted.
+        const promptText = [READER_SYSTEM_FRAMING, env.payload.instruction, ...env.payload.attachments.map((a) => a.content)].join('\n\n');
+        result = retry.data;
+        text = extractText(result);
+        // Complete best-effort total: each call's reported usage where present, a text
+        // estimate where a call omitted `usage` — so neither the first call's billed
+        // (hidden-reasoning) spend nor the retry's output is ever lost. `estimated` flags
+        // that the total is NOT provider-exact (logged tokens_estimated:true).
+        const combined = combineRecoveryUsage(reported, '', extractUsage(result), text, promptText);
+        reported = combined.usage;
+        reportedEstimated = combined.estimated;
+      } catch {
+        // The retry itself threw (network / parse / timeout) AFTER the first call
+        // already billed — preserve that spend so a metered failed attempt is never
+        // under-recorded (content-free, like the outer catch).
+        return { ok: false, error: 'reader lane request failed', failureKind: 'provider_error', ...(reported ? { reported } : {}) };
+      }
+    }
+    return { ok: true, resultText: text, reported, ...(reportedEstimated ? { reportedEstimated: true } : {}) };
   } catch {
     // Content-free: never surface payload/repo text (or a resolver's raw error).
     return { ok: false, error: 'reader lane request failed', failureKind: 'provider_error' };
@@ -532,25 +700,68 @@ export function makeTrustedApiExecutor(
       if (!token) throw new LaneFailure('auth_failed', `auth resolution failed for api lane "${lane.id}"`);
       headers.authorization = `Bearer ${token}`;
     }
-    const body = JSON.stringify({
-      model: lane.model,
-      messages: [{ role: 'user', content: combinedPrompt(instruction, attachments) }],
-    });
+    // First call carries NO max_tokens (so a lane whose model rejects it / needs a
+    // different field / caps lower is never broken); the cap is added ONLY on the
+    // empty+`length` recovery retry (a constant, never from caller content). Spend the
+    // first call billed is captured in `billedUsage` (outer scope) so that even if the
+    // wrapper REJECTS (timeout/abort) during the retry, the thrown failure still
+    // reports it — a metered failed attempt is never under-recorded.
+    let billedUsage: RawUsage | undefined;
     // Wrap fetch + json() together so the AbortController stays active through body
-    // parsing. A stalled response body (not just the initial connection) can also
-    // hang indefinitely. res.ok is checked before res.json() so a non-OK response
-    // with invalid JSON produces the right classifyHttpStatus failure.
-    const { ok, status, data } = await wrapWithFetchTimeout(async (signal) => {
-      const res = await doFetch(lane.endpoint!, { method: 'POST', headers, body, signal });
-      if (!res.ok) return { ok: false as const, status: res.status, data: undefined };
-      const data = (await res.json()) as { choices?: { message?: { content?: unknown } }[]; usage?: Record<string, unknown> };
-      return { ok: true as const, status: res.status, data };
-    }, fetchTimeoutMs);
-    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `api lane "${lane.id}" returned status ${status}`);
+    // parsing. res.ok is checked before res.json() so a non-OK response with invalid
+    // JSON produces the right classifyHttpStatus failure.
+    const { ok, status, data, reported, reportedEstimated } = await wrapWithFetchTimeout(async (signal) => {
+      const buildBody = (recovery = false) => JSON.stringify({
+        model: lane.model,
+        messages: [{ role: 'user', content: combinedPrompt(instruction, attachments) }],
+        ...(recovery ? { max_tokens: RECOVERY_MAX_COMPLETION_TOKENS } : {}),
+      });
+      const res = await doFetch(lane.endpoint!, { method: 'POST', headers, body: buildBody(), signal });
+      if (!res.ok) return { ok: false as const, status: res.status, data: undefined, reported: undefined, reportedEstimated: false };
+      let data = (await res.json()) as { choices?: { message?: { content?: unknown } }[]; usage?: Record<string, unknown> };
+      let reported = extractUsage(data);
+      let reportedEstimated = false;
+      billedUsage = reported;
+      // One-shot retry: reasoning-heavy models (e.g. MiniMax-M3) can exhaust the
+      // provider default on hidden reasoning and return empty content with
+      // finish_reason: "length". Retry once WITH a constant max_tokens cap to
+      // recover. The first call already consumed tokens, so ACCUMULATE its usage.
+      if (extractText(data) === '' && extractFinishReason(data) === 'length') {
+        const res2 = await doFetch(lane.endpoint!, { method: 'POST', headers, body: buildBody(true), signal });
+        // The retry is BEST-EFFORT recovery. Keep a real capacity signal (so the lane
+        // cools down) but remap a permanent 400 (model rejecting our injected max_tokens)
+        // to transient so it never blocks fallback; carry the first call's billed usage.
+        // Status is a number (content-free).
+        if (!res2.ok) throw new LaneFailure(recoveryRetryFailureKind(res2.status), `api lane "${lane.id}" recovery retry returned status ${res2.status}`, reported);
+        data = (await res2.json()) as { choices?: { message?: { content?: unknown } }[]; usage?: Record<string, unknown> };
+        // Complete best-effort total: each call's reported usage where present, a text
+        // estimate where a call omitted `usage` — so neither the first call's billed
+        // reasoning nor the retry's output is lost. `estimated` flags a non-exact total.
+        const combined = combineRecoveryUsage(reported, '', extractUsage(data), extractText(data), combinedPrompt(instruction, attachments));
+        reported = combined.usage;
+        reportedEstimated = combined.estimated;
+        billedUsage = reported;
+      }
+      return { ok: true as const, status: res.status, data, reported, reportedEstimated };
+    }, fetchTimeoutMs).catch((err: unknown) => {
+      // ANY rejection AFTER the first call billed (wrap timeout/abort, a plain fetch
+      // error, a json() throw, or the retry-failure above) must carry that spend so
+      // runTask records real usage, not ZERO. Keep a typed failure's own kind (e.g. a
+      // wrap 'timeout'); otherwise mark transient ('provider_error') so routing can
+      // fall back. Skip if the error ALREADY carries usage. Message is content-free.
+      const alreadyHasUsage = err instanceof LaneFailure && err.reported !== undefined;
+      if (billedUsage && !alreadyHasUsage) {
+        const kind: FailureKind = err instanceof LaneFailure ? err.failureKind : 'provider_error';
+        throw new LaneFailure(kind, `api lane "${lane.id}" failed after billing the first call`, billedUsage);
+      }
+      throw err;
+    });
+    if (!ok) throw new LaneFailure(classifyHttpStatus(status), `api lane "${lane.id}" returned status ${status}`, reported);
     const content = data!.choices?.[0]?.message?.content;
     return {
       resultText: typeof content === 'string' ? content : '',
-      reported: { tokens_in: numOrUndef(data!.usage?.prompt_tokens), tokens_out: numOrUndef(data!.usage?.completion_tokens) },
+      reported,
+      ...(reportedEstimated ? { reportedEstimated: true } : {}),
     };
   };
 }

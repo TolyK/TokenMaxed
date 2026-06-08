@@ -13,7 +13,7 @@ import {
   makeTrustedExecutor,
   runAndRecord,
 } from '../src/node.ts';
-import { LaneFailure } from '../src/failure.ts';
+import { LaneFailure, isTransient } from '../src/failure.ts';
 import type { PriceTable } from '../src/price.ts';
 import type { Lane, RouteContext } from '../src/types.ts';
 
@@ -62,6 +62,141 @@ test('makeCliExecutor spawns the command with the instruction on stdin and retur
 test('makeCliExecutor throws on a non-zero exit (so runTask degrades)', async () => {
   const exec = makeCliExecutor(() => ({ status: 1, stdout: '' }));
   await assert.rejects(() => exec(codexCli, 'x'));
+});
+
+test('makeTrustedApiExecutor: a recovery retry with PARTIAL usage keeps the first call\'s billed spend + estimates the call that omitted usage', async () => {
+  let calls = 0;
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async () => {
+      calls++;
+      // First call reports usage (incl. the hidden reasoning that burned the budget) but
+      // is empty+length; the retry succeeds but OMITS usage (e.g. an OpenAI-compatible
+      // proxy). The total must preserve the first call's 200 completion tokens AND count
+      // the retry's output — never drop one or record only one as exact.
+      if (calls === 1) return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '' }, finish_reason: 'length' }], usage: { prompt_tokens: 100, completion_tokens: 200 } }) };
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'recovered' } }] }) }; // no usage field
+    },
+    resolveAuth: () => 'tok',
+  });
+  const apiLane: Lane = { id: 'mm', kind: 'api', model: 'MiniMax-M3', trust_mode: 'full', costBasis: 'metered', provenance: 'minimax', jurisdiction: 'CN', endpoint: 'https://mm/v1/chat', authHandle: 'h', capability: { codegen: 0.8 } };
+  const r = await exec(apiLane, 'do it');
+  assert.equal(r.resultText, 'recovered');
+  assert.ok(r.reported); // a complete best-effort total (not dropped, not partial-as-exact)
+  assert.ok(r.reported!.tokens_in! >= 100); // first call's input preserved
+  assert.ok(r.reported!.tokens_out! > 200); // first call's billed reasoning (200) preserved + retry output estimated on top
+  assert.equal(r.reportedEstimated, true); // flagged non-exact (one call's usage was estimated) → logged tokens_estimated:true
+});
+
+test('makeTrustedApiExecutor: a recovery retry reporting only ONE usage side is treated as estimated (not exact)', async () => {
+  let calls = 0;
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async () => {
+      calls++;
+      if (calls === 1) return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '' }, finish_reason: 'length' }], usage: { prompt_tokens: 100, completion_tokens: 200 } }) };
+      // Retry succeeds but reports ONLY prompt_tokens (partial RawUsage) — the missing
+      // completion side must be estimated, and the total flagged non-exact.
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'recovered' } }], usage: { prompt_tokens: 5 } }) };
+    },
+    resolveAuth: () => 'tok',
+  });
+  const apiLane: Lane = { id: 'mm', kind: 'api', model: 'MiniMax-M3', trust_mode: 'full', costBasis: 'metered', provenance: 'minimax', jurisdiction: 'CN', endpoint: 'https://mm/v1/chat', authHandle: 'h', capability: { codegen: 0.8 } };
+  const r = await exec(apiLane, 'do it');
+  assert.equal(r.resultText, 'recovered');
+  assert.equal(r.reported!.tokens_in, 105); // 100 (first) + 5 (retry, reported)
+  assert.ok(r.reported!.tokens_out! > 200); // 200 (first) + estimated retry completion (the missing side)
+  assert.equal(r.reportedEstimated, true); // a partial side was estimated ⇒ non-exact
+});
+
+test('makeTrustedApiExecutor: a recovery retry that 429s KEEPS rate_limited (so the lane cools down)', async () => {
+  let calls = 0;
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async () => {
+      calls++;
+      if (calls === 1) return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '' }, finish_reason: 'length' }], usage: { prompt_tokens: 50, completion_tokens: 60 } }) };
+      return { ok: false, status: 429, json: async () => ({}) }; // genuine capacity signal on the retry
+    },
+    resolveAuth: () => 'tok',
+  });
+  const apiLane: Lane = { id: 'mm', kind: 'api', model: 'MiniMax-M3', trust_mode: 'full', costBasis: 'metered', provenance: 'minimax', jurisdiction: 'CN', endpoint: 'https://mm/v1/chat', authHandle: 'h', capability: { codegen: 0.8 } };
+  await assert.rejects(() => exec(apiLane, 'do it'), (e: unknown) => {
+    assert.ok(e instanceof LaneFailure);
+    assert.equal(e.failureKind, 'rate_limited'); // real capacity signal preserved (cooldown), NOT flattened
+    assert.deepEqual(e.reported, { tokens_in: 50, tokens_out: 60 }); // first-call spend still preserved
+    return true;
+  });
+});
+
+test('makeTrustedApiExecutor: the FIRST call sends NO max_tokens (no regression for lanes whose model rejects it)', async () => {
+  let firstBody: string | undefined;
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async (_url, init) => { firstBody ??= init.body; return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'ok' } }], usage: { prompt_tokens: 1, completion_tokens: 1 } }) }; },
+    resolveAuth: () => 'tok',
+  });
+  const apiLane: Lane = { id: 'k', kind: 'api', model: 'some-model', trust_mode: 'full', costBasis: 'metered', provenance: 'x', jurisdiction: 'US', endpoint: 'https://k/v1/chat', authHandle: 'h', capability: { codegen: 0.8 } };
+  await exec(apiLane, 'do it');
+  assert.deepEqual(Object.keys(JSON.parse(firstBody!)), ['model', 'messages']); // no max_tokens on the normal path
+});
+
+test('makeTrustedApiExecutor: empty content + finish_reason length triggers ONE retry with a higher max_tokens', async () => {
+  const bodies: string[] = [];
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async (_url, init) => {
+      bodies.push(init.body);
+      // First call: the reasoning model spent the whole budget on reasoning ⇒ empty + length,
+      // BUT it still consumed (and reported) tokens — that spend must not be lost.
+      if (bodies.length === 1) {
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '' }, finish_reason: 'length' }], usage: { prompt_tokens: 100, completion_tokens: 200 } }) };
+      }
+      // Retry call: returns real content + its own usage.
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'recovered' } }], usage: { prompt_tokens: 4, completion_tokens: 9 } }) };
+    },
+    resolveAuth: () => 'tok',
+  });
+  const apiLane: Lane = { id: 'mm', kind: 'api', model: 'MiniMax-M3', trust_mode: 'full', costBasis: 'subscription', provenance: 'minimax', jurisdiction: 'CN', endpoint: 'https://mm/v1/chat', authHandle: 'h', capability: { codegen: 0.8 } };
+  const r = await exec(apiLane, 'do it');
+  assert.equal(r.resultText, 'recovered');
+  assert.equal(bodies.length, 2); // retried exactly once
+  assert.equal(JSON.parse(bodies[0]!).max_tokens, undefined); // first call sends NO cap (no regression for other lanes)
+  assert.equal(JSON.parse(bodies[1]!).max_tokens, 32_000); // cap applied ONLY on the recovery retry
+  // Usage ACCUMULATES across both calls (the first call's spend is never discarded).
+  assert.deepEqual(r.reported, { tokens_in: 104, tokens_out: 209 });
+});
+
+test('makeTrustedApiExecutor: a failed retry still preserves the first call\'s reported usage (no ZERO_USAGE)', async () => {
+  let calls = 0;
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async () => {
+      calls++;
+      // First call billed tokens but returned empty+length; the retry then 400s
+      // (the model rejects our injected max_tokens) — the case that must NOT become a
+      // permanent bad_request that blocks fallback.
+      if (calls === 1) return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '' }, finish_reason: 'length' }], usage: { prompt_tokens: 100, completion_tokens: 200 } }) };
+      return { ok: false, status: 400, json: async () => ({}) };
+    },
+    resolveAuth: () => 'tok',
+  });
+  const apiLane: Lane = { id: 'mm', kind: 'api', model: 'MiniMax-M3', trust_mode: 'full', costBasis: 'subscription', provenance: 'minimax', jurisdiction: 'CN', endpoint: 'https://mm/v1/chat', authHandle: 'h', capability: { codegen: 0.8 } };
+  await assert.rejects(() => exec(apiLane, 'do it'), (e: unknown) => {
+    assert.ok(e instanceof LaneFailure);
+    // The retry is best-effort recovery; its failure is TRANSIENT (so routing can fall
+    // back) rather than a permanent classification, and never permanent bad_request.
+    assert.equal(e.failureKind, 'provider_error');
+    assert.ok(isTransient(e.failureKind)); // routeable — does not block fallback
+    assert.deepEqual(e.reported, { tokens_in: 100, tokens_out: 200 }); // first-call spend preserved
+    return true;
+  });
+});
+
+test('makeTrustedApiExecutor: non-empty content does NOT retry (only empty+length does)', async () => {
+  let calls = 0;
+  const exec = makeTrustedApiExecutor({
+    fetchImpl: async () => { calls++; return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'fine' }, finish_reason: 'length' }] }) }; },
+    resolveAuth: () => 'tok',
+  });
+  const apiLane: Lane = { id: 'mm', kind: 'api', model: 'MiniMax-M3', trust_mode: 'full', costBasis: 'subscription', provenance: 'minimax', jurisdiction: 'CN', endpoint: 'https://mm/v1/chat', authHandle: 'h', capability: { codegen: 0.8 } };
+  const r = await exec(apiLane, 'do it');
+  assert.equal(r.resultText, 'fine');
+  assert.equal(calls, 1); // content present ⇒ no retry even though finish_reason was length
 });
 
 test('makeCliExecutor substitutes the {model} placeholder with the resolved lane model', async () => {

@@ -5,6 +5,8 @@
  * permanent ones disable the lane / surface an error without blind retries.
  */
 
+import type { RawUsage } from './usage.ts';
+
 /** Normalized failure categories across lanes/providers. */
 export type FailureKind =
   | 'timeout'
@@ -62,10 +64,17 @@ export function shouldCooldown(kind: FailureKind): boolean {
  */
 export class LaneFailure extends Error {
   readonly failureKind: FailureKind;
-  constructor(failureKind: FailureKind, message?: string) {
+  /**
+   * Usage the lane reported BEFORE failing, when known (e.g. a reasoning model that
+   * billed a first call, then the retry hit 429/400). Carried so runTask records the
+   * real spend instead of ZERO_USAGE — a metered failed attempt is never under-reported.
+   */
+  readonly reported?: RawUsage;
+  constructor(failureKind: FailureKind, message?: string, reported?: RawUsage) {
     super(message ?? failureKind);
     this.name = 'LaneFailure';
     this.failureKind = failureKind;
+    if (reported) this.reported = reported;
   }
 }
 

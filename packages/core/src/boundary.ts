@@ -14,6 +14,16 @@ import { isMinimizedPayload, isReaderPayload } from './minimize.ts';
 import type { MinimizedPayload, ReaderPayload } from './minimize.ts';
 import type { Lane } from './types.ts';
 
+/**
+ * The completion-token cap applied ONLY on the empty+`finish_reason:"length"`
+ * recovery retry (a reasoning model that burned the provider default on hidden
+ * reasoning and returned no content). It is a PACKAGE-OWNED constant — callers opt
+ * in with a boolean `recovery` flag on the builders, never by supplying a number —
+ * so the egress allowlist's "max_tokens is a fixed constant, never caller-controlled"
+ * invariant holds (no NaN/negative/fractional/huge value can reach the wire).
+ */
+export const RECOVERY_MAX_COMPLETION_TOKENS = 32_000;
+
 /** The minimal lane facts an untrusted executor may see. No repo/ctx/secrets. */
 export interface UntrustedLaneDTO {
   id: string;
@@ -30,10 +40,17 @@ export interface SafeUntrustedEnvelope {
   lane: UntrustedLaneDTO;
 }
 
-/** The allowlisted outbound request body — ONLY model + minimized content. */
+/**
+ * The allowlisted outbound request body — ONLY model + minimized content, plus an
+ * OPTIONAL constant max_tokens cap. The cap is OMITTED by default (so a lane whose
+ * model rejects `max_tokens`, needs a different field, or caps lower is unaffected)
+ * and added ONLY on the empty+`length` recovery retry. When present it is a constant
+ * int — NEVER sourced from caller content.
+ */
 export interface UntrustedRequestBody {
   model: string;
   messages: { role: 'user'; content: string }[];
+  max_tokens?: number;
 }
 
 /**
@@ -41,7 +58,7 @@ export interface UntrustedRequestBody {
  * construction: only `lane.model` and the minimized payload's text are included —
  * never the lane id, endpoint, authHandle, or any other field.
  */
-export function buildUntrustedRequestBody(env: SafeUntrustedEnvelope): UntrustedRequestBody {
+export function buildUntrustedRequestBody(env: SafeUntrustedEnvelope, recovery = false): UntrustedRequestBody {
   // Enforce the runtime boundary here too (this helper is exported): a spread/
   // cloned payload carries the copyable type brand but is not genuine.
   if (!isMinimizedPayload(env.payload)) {
@@ -49,7 +66,7 @@ export function buildUntrustedRequestBody(env: SafeUntrustedEnvelope): Untrusted
   }
   const { payload, lane } = env;
   const content = [payload.instruction, ...payload.attachments.map((a) => a.content)].join('\n\n');
-  return { model: lane.model, messages: [{ role: 'user', content }] };
+  return { model: lane.model, messages: [{ role: 'user', content }], ...(recovery ? { max_tokens: RECOVERY_MAX_COMPLETION_TOKENS } : {}) };
 }
 
 /**
@@ -74,10 +91,15 @@ export interface SafeReaderEnvelope {
   lane: UntrustedLaneDTO;
 }
 
-/** The allowlisted outbound reader request body — model + an answer-only system framing + content. */
+/**
+ * The allowlisted outbound reader request body — model + an answer-only system
+ * framing + content, plus an OPTIONAL constant max_tokens cap (omitted by default,
+ * added only on the empty+`length` recovery retry; a constant int when present).
+ */
 export interface ReaderRequestBody {
   model: string;
   messages: { role: 'system' | 'user'; content: string }[];
+  max_tokens?: number;
 }
 
 /**
@@ -98,7 +120,7 @@ export const READER_SYSTEM_FRAMING =
  * included — never the lane id, endpoint, authHandle, or any other field. Enforces
  * the runtime brand check (a spread/cloned payload is refused).
  */
-export function buildReaderRequestBody(env: SafeReaderEnvelope): ReaderRequestBody {
+export function buildReaderRequestBody(env: SafeReaderEnvelope, recovery = false): ReaderRequestBody {
   if (!isReaderPayload(env.payload)) {
     throw new Error('buildReaderRequestBody: payload was not produced by minimizeForReader()');
   }
@@ -110,6 +132,7 @@ export function buildReaderRequestBody(env: SafeReaderEnvelope): ReaderRequestBo
       { role: 'system', content: READER_SYSTEM_FRAMING },
       { role: 'user', content },
     ],
+    ...(recovery ? { max_tokens: RECOVERY_MAX_COMPLETION_TOKENS } : {}),
   };
 }
 

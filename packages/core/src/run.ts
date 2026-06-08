@@ -44,6 +44,12 @@ export interface RunRequest {
 export interface TrustedExecResult {
   resultText: string;
   reported?: RawUsage;
+  /**
+   * true ⇒ `reported` is a COMPLETE total that includes ESTIMATED parts (a recovery
+   * retry where a call omitted provider `usage`), so it must be logged
+   * `tokens_estimated: true` even though numbers are present — never as exact.
+   */
+  reportedEstimated?: boolean;
   native?: boolean;
 }
 
@@ -52,6 +58,8 @@ export interface UntrustedExecResultLite {
   ok: boolean;
   resultText?: string;
   reported?: RawUsage;
+  /** true ⇒ `reported` includes ESTIMATED parts (recovery retry; log estimated, not exact). */
+  reportedEstimated?: boolean;
   error?: string;
   /** Normalized failure category (drives trust-preserving fallback). */
   failureKind?: FailureKind;
@@ -95,6 +103,20 @@ export interface RunResult {
 }
 
 const ZERO_USAGE: ResolvedUsage = { tokens_in: 0, tokens_out: 0, tokens_estimated: true };
+
+/**
+ * {@link resolveUsage}, but FORCE the estimated flag when the executor reported a
+ * total it had to partly estimate (a recovery retry where a provider omitted
+ * `usage`). The numbers are the complete best-effort total; the flag honestly marks
+ * it non-exact rather than recording an estimate-blended sum as provider-reported.
+ */
+function resolveUsageMaybeEstimated(
+  args: { reported?: RawUsage; promptText?: string; resultText?: string },
+  reportedEstimated?: boolean,
+): ResolvedUsage {
+  const usage = resolveUsage(args);
+  return reportedEstimated && !usage.tokens_estimated ? { ...usage, tokens_estimated: true } : usage;
+}
 
 /** Text used for token estimation when a lane doesn't report usage (incl. attachments). */
 function combinedText(instruction: string, attachments?: readonly { content: string }[]): string {
@@ -157,17 +179,24 @@ export async function runTask(
         // The host performed it — not recorded (unobservable usage; never lie).
         return { decision, laneId: lane.id, status: 'ok', native: true, resultText: r.resultText, events: [] };
       }
-      const usage = resolveUsage({
-        reported: r.reported,
-        promptText: combinedText(request.instruction, request.attachments),
-        resultText: r.resultText,
-      });
+      const usage = resolveUsageMaybeEstimated(
+        {
+          reported: r.reported,
+          promptText: combinedText(request.instruction, request.attachments),
+          resultText: r.resultText,
+        },
+        r.reportedEstimated,
+      );
       return { decision, laneId: lane.id, status: 'ok', resultText: r.resultText, events: [event('ok', usage)] };
     } catch (err) {
       // Preserve a typed lane failure (e.g. 402/429/401) so fallback can cool down
       // or stop; otherwise treat an unknown throw as a transient provider error.
       const failureKind: FailureKind = err instanceof LaneFailure ? err.failureKind : 'provider_error';
-      return { decision, laneId: lane.id, status: 'failed', native: true, failureKind, events: [event('failed', ZERO_USAGE)] };
+      // Preserve any spend the lane billed BEFORE throwing (e.g. a reasoning model
+      // that billed a first call, then the retry failed) so a metered failed attempt
+      // is never under-recorded as ZERO_USAGE.
+      const usage = err instanceof LaneFailure && err.reported ? usageFromReported(err.reported) : ZERO_USAGE;
+      return { decision, laneId: lane.id, status: 'failed', native: true, failureKind, events: [event('failed', usage)] };
     }
   }
 
@@ -213,7 +242,7 @@ export async function runTask(
           events: [event('failed', usage)],
         };
       }
-      const usage = resolveUsage({ reported: r.reported, promptText, resultText: r.resultText });
+      const usage = resolveUsageMaybeEstimated({ reported: r.reported, promptText, resultText: r.resultText }, r.reportedEstimated);
       return { decision, laneId: lane.id, status: 'ok', resultText: r.resultText, readerDerived: true, events: [event('ok', usage)] };
     } catch {
       return { decision, laneId: lane.id, status: 'failed', native: true, failureKind: 'provider_error', events: [event('failed', ZERO_USAGE)] };
@@ -254,7 +283,7 @@ export async function runTask(
         events: [event('failed', usage)],
       };
     }
-    const usage = resolveUsage({ reported: r.reported, promptText, resultText: r.resultText });
+    const usage = resolveUsageMaybeEstimated({ reported: r.reported, promptText, resultText: r.resultText }, r.reportedEstimated);
     return { decision, laneId: lane.id, status: 'ok', resultText: r.resultText, events: [event('ok', usage)] };
   } catch {
     return { decision, laneId: lane.id, status: 'failed', native: true, failureKind: 'provider_error', events: [event('failed', ZERO_USAGE)] };
