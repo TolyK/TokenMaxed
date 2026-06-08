@@ -10859,10 +10859,10 @@ var require_resolve_block_map = __commonJS({
       let offset = bm.offset;
       let commentEnd = null;
       for (const collItem of bm.items) {
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const keyProps = resolveProps.resolveProps(start, {
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: bm.indent,
@@ -10876,7 +10876,7 @@ var require_resolve_block_map = __commonJS({
             else if ("indent" in key && key.indent !== bm.indent)
               onError(offset, "BAD_INDENT", startColMsg);
           }
-          if (!keyProps.anchor && !keyProps.tag && !sep) {
+          if (!keyProps.anchor && !keyProps.tag && !sep2) {
             commentEnd = keyProps.end;
             if (keyProps.comment) {
               if (map.comment)
@@ -10900,7 +10900,7 @@ var require_resolve_block_map = __commonJS({
         ctx.atKey = false;
         if (utilMapIncludes.mapIncludes(ctx, map.items, keyNode))
           onError(keyStart, "DUPLICATE_KEY", "Map keys must be unique");
-        const valueProps = resolveProps.resolveProps(sep ?? [], {
+        const valueProps = resolveProps.resolveProps(sep2 ?? [], {
           indicator: "map-value-ind",
           next: value,
           offset: keyNode.range[2],
@@ -10916,7 +10916,7 @@ var require_resolve_block_map = __commonJS({
             if (ctx.options.strict && keyProps.start < valueProps.found.offset - 1024)
               onError(keyNode.range, "KEY_OVER_1024_CHARS", "The : indicator must be at most 1024 chars after the start of an implicit block mapping key");
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep, null, valueProps, onError);
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : composeEmptyNode(ctx, offset, sep2, null, valueProps, onError);
           if (ctx.schema.compat)
             utilFlowIndentCheck.flowIndentCheck(bm.indent, value, onError);
           offset = valueNode.range[2];
@@ -11007,7 +11007,7 @@ var require_resolve_end = __commonJS({
       let comment = "";
       if (end) {
         let hasSpace = false;
-        let sep = "";
+        let sep2 = "";
         for (const token of end) {
           const { source, type } = token;
           switch (type) {
@@ -11021,13 +11021,13 @@ var require_resolve_end = __commonJS({
               if (!comment)
                 comment = cb;
               else
-                comment += sep + cb;
-              sep = "";
+                comment += sep2 + cb;
+              sep2 = "";
               break;
             }
             case "newline":
               if (comment)
-                sep += source;
+                sep2 += source;
               hasSpace = true;
               break;
             default:
@@ -11070,18 +11070,18 @@ var require_resolve_flow_collection = __commonJS({
       let offset = fc.offset + fc.start.source.length;
       for (let i = 0; i < fc.items.length; ++i) {
         const collItem = fc.items[i];
-        const { start, key, sep, value } = collItem;
+        const { start, key, sep: sep2, value } = collItem;
         const props = resolveProps.resolveProps(start, {
           flow: fcName,
           indicator: "explicit-key-ind",
-          next: key ?? sep?.[0],
+          next: key ?? sep2?.[0],
           offset,
           onError,
           parentIndent: fc.indent,
           startOnNewline: false
         });
         if (!props.found) {
-          if (!props.anchor && !props.tag && !sep && !value) {
+          if (!props.anchor && !props.tag && !sep2 && !value) {
             if (i === 0 && props.comma)
               onError(props.comma, "UNEXPECTED_TOKEN", `Unexpected , in ${fcName}`);
             else if (i < fc.items.length - 1)
@@ -11135,8 +11135,8 @@ var require_resolve_flow_collection = __commonJS({
             }
           }
         }
-        if (!isMap && !sep && !props.found) {
-          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep, null, props, onError);
+        if (!isMap && !sep2 && !props.found) {
+          const valueNode = value ? composeNode(ctx, value, props, onError) : composeEmptyNode(ctx, props.end, sep2, null, props, onError);
           coll.items.push(valueNode);
           offset = valueNode.range[2];
           if (isBlock(value))
@@ -11148,7 +11148,7 @@ var require_resolve_flow_collection = __commonJS({
           if (isBlock(key))
             onError(keyNode.range, "BLOCK_IN_FLOW", blockMsg);
           ctx.atKey = false;
-          const valueProps = resolveProps.resolveProps(sep ?? [], {
+          const valueProps = resolveProps.resolveProps(sep2 ?? [], {
             flow: fcName,
             indicator: "map-value-ind",
             next: value,
@@ -11159,8 +11159,8 @@ var require_resolve_flow_collection = __commonJS({
           });
           if (valueProps.found) {
             if (!isMap && !props.found && ctx.options.strict) {
-              if (sep)
-                for (const st of sep) {
+              if (sep2)
+                for (const st of sep2) {
                   if (st === valueProps.found)
                     break;
                   if (st.type === "newline") {
@@ -11177,7 +11177,7 @@ var require_resolve_flow_collection = __commonJS({
             else
               onError(valueProps.start, "MISSING_CHAR", `Missing , or : between ${fcName} items`);
           }
-          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep, null, valueProps, onError) : null;
+          const valueNode = value ? composeNode(ctx, value, valueProps, onError) : valueProps.found ? composeEmptyNode(ctx, valueProps.end, sep2, null, valueProps, onError) : null;
           if (valueNode) {
             if (isBlock(value))
               onError(valueNode.range, "BLOCK_IN_FLOW", blockMsg);
@@ -11357,7 +11357,7 @@ var require_resolve_block_scalar = __commonJS({
           chompStart = i + 1;
       }
       let value = "";
-      let sep = "";
+      let sep2 = "";
       let prevMoreIndented = false;
       for (let i = 0; i < contentStart; ++i)
         value += lines[i][0].slice(trimIndent) + "\n";
@@ -11374,24 +11374,24 @@ var require_resolve_block_scalar = __commonJS({
           indent = "";
         }
         if (type === Scalar.Scalar.BLOCK_LITERAL) {
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
         } else if (indent.length > trimIndent || content[0] === "	") {
-          if (sep === " ")
-            sep = "\n";
-          else if (!prevMoreIndented && sep === "\n")
-            sep = "\n\n";
-          value += sep + indent.slice(trimIndent) + content;
-          sep = "\n";
+          if (sep2 === " ")
+            sep2 = "\n";
+          else if (!prevMoreIndented && sep2 === "\n")
+            sep2 = "\n\n";
+          value += sep2 + indent.slice(trimIndent) + content;
+          sep2 = "\n";
           prevMoreIndented = true;
         } else if (content === "") {
-          if (sep === "\n")
+          if (sep2 === "\n")
             value += "\n";
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          value += sep + content;
-          sep = " ";
+          value += sep2 + content;
+          sep2 = " ";
           prevMoreIndented = false;
         }
       }
@@ -11573,25 +11573,25 @@ var require_resolve_flow_scalar = __commonJS({
       if (!match)
         return source;
       let res = match[1];
-      let sep = " ";
+      let sep2 = " ";
       let pos = first.lastIndex;
       line.lastIndex = pos;
       while (match = line.exec(source)) {
         if (match[1] === "") {
-          if (sep === "\n")
-            res += sep;
+          if (sep2 === "\n")
+            res += sep2;
           else
-            sep = "\n";
+            sep2 = "\n";
         } else {
-          res += sep + match[1];
-          sep = " ";
+          res += sep2 + match[1];
+          sep2 = " ";
         }
         pos = line.lastIndex;
       }
       const last = /[ \t]*(.*)/sy;
       last.lastIndex = pos;
       match = last.exec(source);
-      return res + sep + (match?.[1] ?? "");
+      return res + sep2 + (match?.[1] ?? "");
     }
     function doubleQuotedValue(source, onError) {
       let res = "";
@@ -12401,14 +12401,14 @@ var require_cst_stringify = __commonJS({
         }
       }
     }
-    function stringifyItem({ start, key, sep, value }) {
+    function stringifyItem({ start, key, sep: sep2, value }) {
       let res = "";
       for (const st of start)
         res += st.source;
       if (key)
         res += stringifyToken(key);
-      if (sep)
-        for (const st of sep)
+      if (sep2)
+        for (const st of sep2)
           res += st.source;
       if (value)
         res += stringifyToken(value);
@@ -13575,18 +13575,18 @@ var require_parser = __commonJS({
         if (this.type === "map-value-ind") {
           const prev = getPrevProps(this.peek(2));
           const start = getFirstKeyStartProps(prev);
-          let sep;
+          let sep2;
           if (scalar.end) {
-            sep = scalar.end;
-            sep.push(this.sourceToken);
+            sep2 = scalar.end;
+            sep2.push(this.sourceToken);
             delete scalar.end;
           } else
-            sep = [this.sourceToken];
+            sep2 = [this.sourceToken];
           const map = {
             type: "block-map",
             offset: scalar.offset,
             indent: scalar.indent,
-            items: [{ start, key: scalar, sep }]
+            items: [{ start, key: scalar, sep: sep2 }]
           };
           this.onKeyLine = true;
           this.stack[this.stack.length - 1] = map;
@@ -13739,15 +13739,15 @@ var require_parser = __commonJS({
                 } else if (isFlowToken(it.key) && !includesToken(it.sep, "newline")) {
                   const start2 = getFirstKeyStartProps(it.start);
                   const key = it.key;
-                  const sep = it.sep;
-                  sep.push(this.sourceToken);
+                  const sep2 = it.sep;
+                  sep2.push(this.sourceToken);
                   delete it.key;
                   delete it.sep;
                   this.stack.push({
                     type: "block-map",
                     offset: this.offset,
                     indent: this.indent,
-                    items: [{ start: start2, key, sep }]
+                    items: [{ start: start2, key, sep: sep2 }]
                   });
                 } else if (start.length > 0) {
                   it.sep = it.sep.concat(start, this.sourceToken);
@@ -13941,13 +13941,13 @@ var require_parser = __commonJS({
             const prev = getPrevProps(parent);
             const start = getFirstKeyStartProps(prev);
             fixFlowSeqItems(fc);
-            const sep = fc.end.splice(1, fc.end.length);
-            sep.push(this.sourceToken);
+            const sep2 = fc.end.splice(1, fc.end.length);
+            sep2.push(this.sourceToken);
             const map = {
               type: "block-map",
               offset: fc.offset,
               indent: fc.indent,
-              items: [{ start, key: fc, sep }]
+              items: [{ start, key: fc, sep: sep2 }]
             };
             this.onKeyLine = true;
             this.stack[this.stack.length - 1] = map;
@@ -14227,8 +14227,8 @@ var require_dist2 = __commonJS({
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync8, mkdirSync as mkdirSync5, readFileSync as readFileSync5, writeFileSync as writeFileSync4 } from "node:fs";
-import { dirname as dirname7, join as join6 } from "node:path";
+import { existsSync as existsSync8, mkdirSync as mkdirSync5, readFileSync as readFileSync5, realpathSync, statSync as statSync2, writeFileSync as writeFileSync4 } from "node:fs";
+import { dirname as dirname7, join as join7 } from "node:path";
 import { fileURLToPath as fileURLToPath5 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
@@ -25097,6 +25097,83 @@ function renderModelIdMismatchWarnings(warnings) {
   );
 }
 
+// ../mcp/src/read-files.ts
+import { isAbsolute, join as join4, sep } from "node:path";
+function readRepoFiles(paths, deps) {
+  const attachments = [];
+  const skipped = [];
+  if (!deps.projectDir) {
+    for (const p of paths) {
+      skipped.push({ path: p, reason: "no project directory (CLAUDE_PROJECT_DIR) \u2014 cannot read repo files safely" });
+    }
+    return { attachments, skipped };
+  }
+  let rootReal;
+  try {
+    rootReal = deps.realpath(deps.projectDir);
+  } catch {
+    for (const p of paths) {
+      skipped.push({ path: p, reason: "project directory not found" });
+    }
+    return { attachments, skipped };
+  }
+  for (let i = 0; i < paths.length; i++) {
+    const p = paths[i];
+    if (i >= LIMITS.maxAttachments) {
+      skipped.push({ path: p, reason: `too many files (max ${LIMITS.maxAttachments})` });
+      continue;
+    }
+    if (isAbsolute(p)) {
+      skipped.push({ path: p, reason: "must be a repo-relative path" });
+      continue;
+    }
+    if (p.split(/[/\\]/).includes("..")) {
+      skipped.push({ path: p, reason: "path escapes the repo (..)" });
+      continue;
+    }
+    const abs = join4(rootReal, p);
+    let real;
+    try {
+      real = deps.realpath(abs);
+    } catch {
+      skipped.push({ path: p, reason: "not found" });
+      continue;
+    }
+    if (real !== rootReal && !real.startsWith(rootReal + sep)) {
+      skipped.push({ path: p, reason: "resolves outside the repo" });
+      continue;
+    }
+    let st;
+    try {
+      st = deps.stat(real);
+    } catch {
+      skipped.push({ path: p, reason: "unreadable" });
+      continue;
+    }
+    if (!st.isFile) {
+      skipped.push({ path: p, reason: "not a regular file" });
+      continue;
+    }
+    if (st.size > LIMITS.maxAttachmentChars) {
+      skipped.push({ path: p, reason: `too large (> ${LIMITS.maxAttachmentChars} chars) \u2014 excerpt it in the instruction instead` });
+      continue;
+    }
+    let content;
+    try {
+      content = deps.readFile(real);
+    } catch {
+      skipped.push({ path: p, reason: "unreadable" });
+      continue;
+    }
+    if (content.length > LIMITS.maxAttachmentChars) {
+      skipped.push({ path: p, reason: `too large (> ${LIMITS.maxAttachmentChars} chars) \u2014 excerpt it in the instruction instead` });
+      continue;
+    }
+    attachments.push({ content, provenance: "host-authored", repo_derived: true });
+  }
+  return { attachments, skipped };
+}
+
 // ../mcp/src/model-list.ts
 var DEFAULT_TIMEOUT_MS = 2e3;
 var MAX_MODELS = 500;
@@ -25178,7 +25255,7 @@ async function fetchModelList(lane, deps) {
 
 // ../mcp/src/summary-deps.ts
 import { existsSync as existsSync5, readFileSync as readFileSync4 } from "node:fs";
-import { dirname as dirname5, join as join4 } from "node:path";
+import { dirname as dirname5, join as join5 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // ../mcp/src/lane-state.ts
@@ -25448,7 +25525,7 @@ function readOnlyToggleStore(statePath) {
 function makeSummaryFromEnv(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
-  const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join4(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
+  const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join5(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
@@ -25456,9 +25533,9 @@ function makeSummaryFromEnv(env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
-  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname5(statePath), "model-freshness.json");
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname5(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname5(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname5(statePath), "lane-review.json");
   return async () => {
     const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
@@ -25748,7 +25825,7 @@ async function runReviewWithBudget(runner, newId, opts) {
 
 // ../mcp/src/setup.ts
 import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
-import { dirname as dirname6, join as join5 } from "node:path";
+import { dirname as dirname6, join as join6 } from "node:path";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
 var LANES_STARTER = fileURLToPath4(new URL("../lanes.starter.yaml", import.meta.url));
 var POLICY_STARTER = fileURLToPath4(new URL("../policy.starter.yaml", import.meta.url));
@@ -25794,8 +25871,8 @@ async function runSetup(env) {
     };
   });
   const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
-  const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join5(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname6(statePath), "lane-review.json");
+  const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join6(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join6(dirname6(statePath), "lane-review.json");
   const fingerprint = laneSetFingerprint(registry2.lanes);
   const reviewState = readLaneReviewState(laneStatePath);
   const prior = Object.hasOwn(reviewState.byProject, projectKey) ? reviewState.byProject[projectKey].fingerprint : void 0;
@@ -25893,6 +25970,14 @@ function optString(args, key) {
   const v = args[key];
   if (v === void 0 || v === null) return void 0;
   if (typeof v !== "string") throw new ToolInputError(`"${key}" must be a string.`);
+  return v;
+}
+function optStringArray(args, key) {
+  const v = args[key];
+  if (v === void 0 || v === null) return void 0;
+  if (!Array.isArray(v) || v.some((e) => typeof e !== "string")) {
+    throw new ToolInputError(`"${key}" must be an array of strings.`);
+  }
   return v;
 }
 function optBool(args, key) {
@@ -26186,7 +26271,12 @@ function createTools(core) {
         category: { type: "string", enum: [...core.taskCategories], description: "Task category (drives lane choice)." },
         instruction: {
           type: "string",
-          description: "The self-contained subtask to perform. Include all needed context IN this text \u2014 an untrusted lane receives nothing else (no repo, no files, no tools)."
+          description: "The self-contained subtask to perform. Include all needed context IN this text. A lane receives nothing else BEYOND any files you pass in `files` \u2014 no repo, no tools."
+        },
+        files: {
+          type: "array",
+          items: { type: "string" },
+          description: 'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing \u2014 kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounded + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.'
         },
         repo_class: { type: "string", enum: [...REPO_CLASSES2], description: "Repository class for policy (default unknown)." },
         sensitivity: { type: "string", enum: [...SENSITIVITIES2], description: "Content sensitivity for policy (default unknown)." }
@@ -26197,6 +26287,7 @@ function createTools(core) {
       if (category === void 0) throw new ToolInputError('"category" is required.');
       const instruction = optString(args, "instruction");
       if (!instruction || instruction.trim() === "") throw new ToolInputError('"instruction" is required (non-empty).');
+      const files = optStringArray(args, "files");
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       if (!deps.getEnabled()) {
@@ -26212,7 +26303,8 @@ function createTools(core) {
       const outcome = await deps.delegate({
         category,
         instruction,
-        ...Object.keys(policyContext).length ? { policyContext } : {}
+        ...Object.keys(policyContext).length ? { policyContext } : {},
+        ...files && files.length ? { files } : {}
       });
       return renderDelegate(outcome);
     })
@@ -26269,12 +26361,14 @@ ${r.notes}` : "";
 function renderDelegate(o) {
   if (o.native || o.status !== "ok") {
     const why = o.status === "blocked" ? "blocked by policy/minimization (sensitive content stays on the host)" : o.status === "failed" ? `lane failed (${o.failureKind ?? "error"})` : o.reason ?? "no cheaper capable lane available";
+    const reasonNote = (o.status === "blocked" || o.status === "failed") && o.reason ? ` \u2014 ${o.reason}` : "";
     const note2 = o.recordingFailed ? " (note: this attempt could not be recorded to the ledger)" : "";
     const taint2 = o.readerDerived ? "\n\n\u26A0\uFE0F reader-derived: any quoted reader output above may include private repo code \u2014 do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts." : "";
-    return ok(`Handle this task yourself (native): ${why}.${note2}${taint2}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
+      ...o.reason ? { reason: o.reason } : {},
       ...o.failureKind ? { failureKind: o.failureKind } : {},
       ...o.readerDerived ? { readerDerived: true } : {},
       ...o.recordingFailed ? { recordingFailed: true } : {}
@@ -26289,7 +26383,7 @@ function renderDelegate(o) {
       `Offloaded to ${lane} \u2014 UNREVIEWED (${o.reason ?? "manager review unavailable"}). Inspect it yourself before using:
 
 ${o.resultText ?? ""}${taint}${note}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {} }
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {} }
     );
   }
   const how = o.reason ? ` (${o.reason})` : "";
@@ -26362,6 +26456,10 @@ function recordableLane(lane, priceTable) {
   } catch {
     return false;
   }
+}
+function withSkippedNote(outcome, note) {
+  if (!note) return outcome;
+  return { ...outcome, reason: `${outcome.reason ?? ""}${note}` };
 }
 function escToOutcome(esc2, modelOf, recordingFailed) {
   const r = esc2.result;
@@ -26455,7 +26553,7 @@ function makeServerDeps(env = process.env) {
   };
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
-  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join6(dirname7(statePath), "prefer.json");
+  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname7(statePath), "prefer.json");
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
   const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
@@ -26518,11 +26616,22 @@ function makeServerDeps(env = process.env) {
       priceTable,
       newId: () => randomUUID3()
     };
+    const fileResult = request.files?.length ? readRepoFiles(request.files, {
+      projectDir: env.CLAUDE_PROJECT_DIR,
+      realpath: realpathSync,
+      readFile: (p) => readFileSync5(p, "utf8"),
+      stat: (p) => {
+        const s = statSync2(p);
+        return { isFile: s.isFile(), size: s.size };
+      }
+    }) : { attachments: [], skipped: [] };
     const taskInput = {
       category: request.category,
       instruction: request.instruction,
-      ...request.policyContext ? { policyContext: request.policyContext } : {}
+      ...request.policyContext ? { policyContext: request.policyContext } : {},
+      ...fileResult.attachments.length ? { attachments: fileResult.attachments } : {}
     };
+    const skippedNote = fileResult.skipped.length > 0 ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join("; ")})` : "";
     if (escalateEnabled) {
       const escDeps = {
         ...runDeps,
@@ -26539,7 +26648,7 @@ function makeServerDeps(env = process.env) {
       } catch {
         escRecordingFailed = true;
       }
-      return escToOutcome(esc2, modelOf, escRecordingFailed);
+      return withSkippedNote(escToOutcome(esc2, modelOf, escRecordingFailed), skippedNote);
     }
     const result = await runTask(taskInput, ctx, policy, runDeps);
     let recordingFailed = false;
@@ -26549,17 +26658,20 @@ function makeServerDeps(env = process.env) {
       recordingFailed = true;
     }
     const resultModel = modelOf(result.laneId);
-    return {
-      laneId: result.laneId,
-      status: result.status,
-      ...result.native ? { native: true } : {},
-      ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
-      ...resultModel ? { model: resultModel } : {},
-      ...result.failureKind ? { failureKind: result.failureKind } : {},
-      ...result.decision?.reason ? { reason: result.decision.reason } : {},
-      ...result.readerDerived ? { readerDerived: true } : {},
-      ...recordingFailed ? { recordingFailed: true } : {}
-    };
+    return withSkippedNote(
+      {
+        laneId: result.laneId,
+        status: result.status,
+        ...result.native ? { native: true } : {},
+        ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
+        ...resultModel ? { model: resultModel } : {},
+        ...result.failureKind ? { failureKind: result.failureKind } : {},
+        ...result.decision?.reason ? { reason: result.decision.reason } : {},
+        ...result.readerDerived ? { readerDerived: true } : {},
+        ...recordingFailed ? { recordingFailed: true } : {}
+      },
+      skippedNote
+    );
   };
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
@@ -26609,7 +26721,7 @@ function makeServerDeps(env = process.env) {
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join6(dirname7(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname7(statePath), "model-freshness.json");
       return reportFreshness(
         eligible,
         {
@@ -26632,7 +26744,7 @@ function makeServerDeps(env = process.env) {
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join6(dirname7(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname7(statePath), "model-freshness.json");
       return reportModelIdMismatches(eligible, {
         table: loadPriceTable(pricesPath),
         now: Date.now(),

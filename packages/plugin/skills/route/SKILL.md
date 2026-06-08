@@ -12,8 +12,16 @@ How to offload:
 
 1. Call the MCP tool `mcp__plugin_tokenmaxed_tokenmaxed__router_delegate` with the
    task `category` and a complete, self-contained `instruction`. Put **everything
-   the lane needs inside the instruction text** — an untrusted lane receives
-   nothing else (no repo, no files, no tools).
+   the lane needs inside the instruction text** — a lane receives nothing else
+   beyond any files you pass in `files` (no repo, no tools).
+   - **To stop the lane hallucinating repo facts it can't see** (model prices,
+     enum values, a test-fixture call idiom), pass the relevant repo-relative
+     paths in **`files`** — the file being edited, the registry/config it touches,
+     the test fixtures. They're read VERBATIM (server-side, path-confined) and
+     attached, so the lane copies real values instead of inventing them. Prefer
+     naming the exact files over pasting paraphrased snippets. (Private-repo files
+     only reach a reader-trust lane with reader egress enabled; otherwise they're
+     dropped and the reply says so.)
    - **Always set `repo_class` and `sensitivity` honestly** so policy can apply:
      - public repo → `repo_class: "public"`; non-sensitive content → `sensitivity: "normal"`.
      - private repo → `repo_class: "private"`; secrets/proprietary/PII → `sensitivity: "sensitive"`.

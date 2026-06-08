@@ -26,7 +26,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -53,6 +53,7 @@ import {
 
 import { makeAvailabilityProbe } from './availability.ts';
 import { reportFreshness, reportModelIdMismatches } from './freshness-report.ts';
+import { readRepoFiles } from './read-files.ts';
 import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
 import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
@@ -98,6 +99,16 @@ function recordableLane(lane: Lane, priceTable: PriceTable): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Append a "files not attached" note to an outcome's reason so a dropped repo file
+ * never silently degrades into the hallucination it was meant to fix. Empty note ⇒
+ * outcome unchanged. Ensures a `reason` exists when there is a note to carry.
+ */
+function withSkippedNote(outcome: DelegateOutcome, note: string): DelegateOutcome {
+  if (!note) return outcome;
+  return { ...outcome, reason: `${outcome.reason ?? ''}${note}` };
 }
 
 /** Map a C-13 EscalationResult onto the adapter's DelegateOutcome for rendering. */
@@ -358,11 +369,35 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       priceTable,
       newId: () => randomUUID(),
     };
+    // Repo-file attachments (universal "let the lane see real repo facts"): read the
+    // caller-named files VERBATIM, path-confined to the project dir. The minimizer
+    // then scrubs + size-bounds + policy-gates them before any egress (and a worker
+    // lane on a private repo blocks repo-derived attachments — only a reader lane,
+    // gated, may receive private code). Files that can't be read safely are dropped
+    // and surfaced to the caller (never silently). No files requested ⇒ unchanged.
+    const fileResult = request.files?.length
+      ? readRepoFiles(request.files, {
+          projectDir: env.CLAUDE_PROJECT_DIR,
+          realpath: realpathSync,
+          readFile: (p) => readFileSync(p, 'utf8'),
+          stat: (p) => {
+            const s = statSync(p);
+            return { isFile: s.isFile(), size: s.size };
+          },
+        })
+      : { attachments: [], skipped: [] };
     const taskInput = {
       category: request.category,
       instruction: request.instruction,
       ...(request.policyContext ? { policyContext: request.policyContext } : {}),
+      ...(fileResult.attachments.length ? { attachments: fileResult.attachments } : {}),
     };
+    // Note for the outcome: which requested files were NOT attached (and why), so a
+    // dropped file never silently degrades into the hallucination it was meant to fix.
+    const skippedNote =
+      fileResult.skipped.length > 0
+        ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join('; ')})`
+        : '';
 
     // C-13 (opt-in): offload → review → escalate/rework/give_back. The manager
     // runs via the same trusted executor (core restricts managers to marginal-free
@@ -390,7 +425,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       } catch {
         escRecordingFailed = true;
       }
-      return escToOutcome(esc, modelOf, escRecordingFailed);
+      return withSkippedNote(escToOutcome(esc, modelOf, escRecordingFailed), skippedNote);
     }
 
     const result = await runTask(taskInput, ctx, policy, runDeps);
@@ -401,17 +436,20 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       recordingFailed = true; // keep the result; recording is best-effort
     }
     const resultModel = modelOf(result.laneId);
-    return {
-      laneId: result.laneId,
-      status: result.status,
-      ...(result.native ? { native: true } : {}),
-      ...(result.resultText !== undefined ? { resultText: result.resultText } : {}),
-      ...(resultModel ? { model: resultModel } : {}),
-      ...(result.failureKind ? { failureKind: result.failureKind } : {}),
-      ...(result.decision?.reason ? { reason: result.decision.reason } : {}),
-      ...(result.readerDerived ? { readerDerived: true } : {}),
-      ...(recordingFailed ? { recordingFailed: true } : {}),
-    };
+    return withSkippedNote(
+      {
+        laneId: result.laneId,
+        status: result.status,
+        ...(result.native ? { native: true } : {}),
+        ...(result.resultText !== undefined ? { resultText: result.resultText } : {}),
+        ...(resultModel ? { model: resultModel } : {}),
+        ...(result.failureKind ? { failureKind: result.failureKind } : {}),
+        ...(result.decision?.reason ? { reason: result.decision.reason } : {}),
+        ...(result.readerDerived ? { readerDerived: true } : {}),
+        ...(recordingFailed ? { recordingFailed: true } : {}),
+      },
+      skippedNote,
+    );
   };
 
   return {

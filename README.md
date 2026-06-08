@@ -136,6 +136,16 @@ loop (ON by default when a reviewer lane exists; opt out with
 `TOKENMAXED_REVIEW_ON_STOP=false`). The env flags below switch on the other
 *optional* features.
 
+A worker lane's one weakness is that it's **blind to your repo** — it can
+hallucinate plausible-but-wrong facts it can't see (a model price, an enum value,
+a test-fixture idiom). To prevent that, `router_delegate` takes an optional
+**`files`** list of repo-relative paths: they're read verbatim (server-side,
+path-confined to the project), then scrubbed + size-bounded + policy-gated by the
+minimizer, so the lane copies real values instead of inventing them. Private-repo
+files only reach a **reader**-trust lane with reader egress enabled; otherwise
+they're dropped and the reply says which and why. Still review offloaded output —
+visibility fixes facts, not logic.
+
 The optional features are opt-in **environment flags you set when you launch
 Claude Code**. In the shell they go *before* `claude` (they're environment
 variables, not CLI arguments):

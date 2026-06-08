@@ -24,7 +24,7 @@ import {
 import type { Lane, LedgerEvent, Policy } from '../../core/src/index.ts';
 
 import { createTools, dispatch } from '../src/tools.ts';
-import type { CorePort, DelegateOutcome, ReviewOutcome, SetupReport, ToolDeps } from '../src/tools.ts';
+import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, SetupReport, ToolDeps } from '../src/tools.ts';
 
 // --- harness -------------------------------------------------------------------
 
@@ -312,6 +312,32 @@ test('delegate offloads and returns the lane result to use', async () => {
   assert.match(r.content[0]!.text, /done\(\)/);
 });
 
+test('delegate forwards repo-relative `files` to the delegate dep (verbatim repo facts)', async () => {
+  let captured: DelegateRequest | undefined;
+  const r = await call(
+    'router_delegate',
+    deps({
+      delegate: async (req: DelegateRequest) => {
+        captured = req;
+        return { laneId: 'minimax-api', model: 'MiniMax-M3', status: 'ok', resultText: 'ok' };
+      },
+    }),
+    { category: 'codegen', instruction: 'add a row', files: ['video_models.py', 'test_video_service.py'] },
+  );
+  assert.notEqual(r.isError, true);
+  assert.deepEqual(captured?.files, ['video_models.py', 'test_video_service.py']);
+});
+
+test('delegate rejects a non-string-array `files` arg', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'x', status: 'ok' as const }) }),
+    { category: 'codegen', instruction: 'x', files: 'video_models.py' },
+  );
+  assert.equal(r.isError, true);
+  assert.match(r.content[0]!.text, /must be an array of strings/);
+});
+
 test('delegate surfaces the reader-derived taint warning (F-2)', async () => {
   const r = await call(
     'router_delegate',
@@ -376,6 +402,7 @@ test('delegate flags a review-unavailable offload as UNREVIEWED (no "use this re
     { category: 'bugfix', instruction: 'x' },
   );
   assert.equal(r.structuredContent!.reviewUnavailable as boolean, true);
+  assert.equal(r.structuredContent!.reason as string, 'no eligible manager'); // reason preserved in structured output (carries skipped-file notes)
   assert.match(r.content[0]!.text, /UNREVIEWED/);
   assert.doesNotMatch(r.content[0]!.text, /Use this result/);
 });

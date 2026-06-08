@@ -211,6 +211,14 @@ export interface DelegateRequest {
   category: TaskCategory;
   instruction: string;
   policyContext?: PolicyContext;
+  /**
+   * OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo
+   * facts (the file being edited, a registry, test fixtures) instead of guessing. The
+   * server reads them path-confined to the project; the minimizer then scrubs +
+   * size-bounds + policy-gates them (private-repo files require a reader-trust lane +
+   * its egress opt-in). Files that can't be safely read are dropped + surfaced.
+   */
+  files?: string[];
 }
 
 /** The outcome of an offload (content-free; the host decides what to do with it). */
@@ -283,6 +291,16 @@ function optString(args: Record<string, unknown>, key: string): string | undefin
   if (v === undefined || v === null) return undefined;
   if (typeof v !== 'string') throw new ToolInputError(`"${key}" must be a string.`);
   return v;
+}
+
+/** Read an optional string[] arg; reject non-arrays / non-string elements (schema enforcement). */
+function optStringArray(args: Record<string, unknown>, key: string): string[] | undefined {
+  const v = args[key];
+  if (v === undefined || v === null) return undefined;
+  if (!Array.isArray(v) || v.some((e) => typeof e !== 'string')) {
+    throw new ToolInputError(`"${key}" must be an array of strings.`);
+  }
+  return v as string[];
 }
 
 /** Read an optional boolean arg; reject other types so the schema is enforced. */
@@ -661,7 +679,13 @@ export function createTools(core: CorePort): ToolDef[] {
         instruction: {
           type: 'string',
           description:
-            'The self-contained subtask to perform. Include all needed context IN this text — an untrusted lane receives nothing else (no repo, no files, no tools).',
+            'The self-contained subtask to perform. Include all needed context IN this text. A lane receives nothing else BEYOND any files you pass in `files` — no repo, no tools.',
+        },
+        files: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing — kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounded + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.',
         },
         repo_class: { type: 'string', enum: [...REPO_CLASSES], description: 'Repository class for policy (default unknown).' },
         sensitivity: { type: 'string', enum: [...SENSITIVITIES], description: 'Content sensitivity for policy (default unknown).' },
@@ -673,6 +697,7 @@ export function createTools(core: CorePort): ToolDef[] {
         if (category === undefined) throw new ToolInputError('"category" is required.');
         const instruction = optString(args, 'instruction');
         if (!instruction || instruction.trim() === '') throw new ToolInputError('"instruction" is required (non-empty).');
+        const files = optStringArray(args, 'files');
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
 
@@ -693,6 +718,7 @@ export function createTools(core: CorePort): ToolDef[] {
           category,
           instruction,
           ...(Object.keys(policyContext).length ? { policyContext } : {}),
+          ...(files && files.length ? { files } : {}),
         });
         return renderDelegate(outcome);
       }),
@@ -766,6 +792,11 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
         : o.status === 'failed'
           ? `lane failed (${o.failureKind ?? 'error'})`
           : (o.reason ?? 'no cheaper capable lane available');
+    // On blocked/failed the `why` is a fixed string, so `o.reason` (which carries
+    // any "files not attached" note) would be hidden — append it so a dropped repo
+    // file is never silently swallowed on the common minimization-blocked path.
+    const reasonNote =
+      (o.status === 'blocked' || o.status === 'failed') && o.reason ? ` — ${o.reason}` : '';
     // A failed metered attempt that also couldn't be recorded must be flagged, so
     // the user isn't unaware that spend happened off-ledger.
     const note = o.recordingFailed ? ' (note: this attempt could not be recorded to the ledger)' : '';
@@ -774,10 +805,11 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     const taint = o.readerDerived
       ? '\n\n⚠️ reader-derived: any quoted reader output above may include private repo code — do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts.'
       : '';
-    return ok(`Handle this task yourself (native): ${why}.${note}${taint}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note}${taint}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
+      ...(o.reason ? { reason: o.reason } : {}),
       ...(o.failureKind ? { failureKind: o.failureKind } : {}),
       ...(o.readerDerived ? { readerDerived: true } : {}),
       ...(o.recordingFailed ? { recordingFailed: true } : {}),
@@ -797,7 +829,7 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
   if (o.reviewUnavailable) {
     return ok(
       `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}) },
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.reason ? { reason: o.reason } : {}), ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}) },
     );
   }
   // C-13: `reason` may carry "escalated to X" / "reworked on X" (accept_after_*).
