@@ -149,9 +149,9 @@ test('router_summary renders the injected summary data verbatim', async () => {
       meteredAvoided7d: 0.71,
       zeroMeteredShare: 0.8,
       windows: [
-        { label: '24h', tokens: 1240000, meteredAvoided: 0.04, offloads: 3 },
-        { label: '7d', tokens: 18900000, meteredAvoided: 0.71, offloads: 41 },
-        { label: 'lifetime', tokens: 102400000, meteredAvoided: 4.1, offloads: 233 },
+        { label: '24h', tokens: 1240000, meteredAvoided: 0.04, offloads: 3, nativeFallbacks: 0 },
+        { label: '7d', tokens: 18900000, meteredAvoided: 0.71, offloads: 41, nativeFallbacks: 0 },
+        { label: 'lifetime', tokens: 102400000, meteredAvoided: 4.1, offloads: 233, nativeFallbacks: 0 },
       ],
       lanes: [
         { id: 'codex-cli', kind: 'cli', model: 'm', trustMode: 'full', provenance: 'openai', tokensRouted: 0, isActiveReviewer: true, available: true },

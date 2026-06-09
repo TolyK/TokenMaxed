@@ -19,9 +19,18 @@ import type { PolicyVerdict, TaskCategory, TrustMode } from './types.ts';
 /** Current ledger schema version (stamped on every event). */
 export const SCHEMA_VERSION = 1;
 
-/** Status of an executed/attempted task. Only `ok` feeds savings claims. */
-export type TaskStatus = 'ok' | 'failed' | 'blocked' | 'fallback';
-const TASK_STATUSES: readonly TaskStatus[] = ['ok', 'failed', 'blocked', 'fallback'];
+/**
+ * Status of an executed/attempted task. Only `ok` feeds savings claims. `native` is
+ * a content-free BREADCRUMB: the task degraded to the host (no lane ran it). It
+ * carries zero spend/tokens and is excluded from offloads, blocks, lane mix, and
+ * savings by {@link summarize} — it exists only so a silent native degrade is visible.
+ */
+export type TaskStatus = 'ok' | 'failed' | 'blocked' | 'fallback' | 'native';
+const TASK_STATUSES: readonly TaskStatus[] = ['ok', 'failed', 'blocked', 'fallback', 'native'];
+
+/** Why a task degraded to native (host did it). Set ONLY on a `native`-status event. */
+export type NativeReason = 'no_route' | 'host_native';
+const NATIVE_REASONS: readonly NativeReason[] = ['no_route', 'host_native'];
 
 /** Review verdict (reuses the dogfood scale). */
 export type ReviewVerdict = 'pass' | 'needs-rework' | 'fail';
@@ -83,6 +92,12 @@ export interface TaskEventInput {
    * savings baseline (a discarded leg is not a saving). Optional; absent ⇒ false.
    */
   superseded?: boolean;
+  /**
+   * Why a delegated task degraded to native (the host did it). Set ONLY on a
+   * `status: 'native'` breadcrumb: `no_route` = routing found no selectable lane;
+   * `host_native` = the chosen full lane was the host itself. Absent otherwise.
+   */
+  native_reason?: NativeReason;
 }
 
 /** What a caller provides for an outcome (review) event. */
@@ -124,7 +139,7 @@ export const EVENT_FIELDS = [
   'trust_mode', 'provenance', 'status',
   'tokens_in', 'tokens_out', 'tokens_estimated',
   'actual_cost', 'frontier_cost', 'metered_spent', 'frontier_avoided', 'metered_avoided',
-  'policy_verdict', 'superseded',
+  'policy_verdict', 'superseded', 'native_reason',
 ] as const satisfies readonly (keyof TaskEvent)[];
 
 /** Allowlisted outcome-event fields. */
@@ -228,6 +243,9 @@ export function validateEventInput(input: TaskEventInput): TaskEventInput {
   const parent = optionalString(input.parent_task_id, 'task.parent_task_id');
   if (parent !== undefined) out.parent_task_id = parent;
   if (input.superseded !== undefined) out.superseded = requireBoolean(input.superseded, 'task.superseded');
+  if (input.native_reason !== undefined) {
+    out.native_reason = requireEnum(input.native_reason, NATIVE_REASONS, 'task.native_reason');
+  }
   return out;
 }
 
@@ -353,10 +371,16 @@ export interface LedgerSummary {
   actual_cost: number;
   /** Σ metered_spent over ALL task events (real metered spend). */
   metered_spent_total: number;
-  /** Event count per lane id (all task events). */
+  /** Event count per lane id (real attempts only — excludes `native` breadcrumbs). */
   laneMix: Record<string, number>;
   /** Number of task events whose status is `blocked`. */
   blockCount: number;
+  /**
+   * Number of `native` breadcrumbs: delegated tasks that degraded to the host with
+   * no lane running them. NOT counted in `events` (offloads), `laneMix`, or savings —
+   * a separate visibility tally so a silent native degrade shows up.
+   */
+  nativeFallbacks: number;
 }
 
 /**
@@ -370,11 +394,21 @@ export interface LedgerSummary {
 export function summarize(events: readonly LedgerEvent[]): LedgerSummary {
   const tasks = taskEventsOf(events);
   let frontier_cost = 0; // baseline over delivered (ok) work
-  let actual_cost = 0; // real spend over ALL tasks
-  let metered_spent_total = 0; // real metered spend over ALL tasks
+  let actual_cost = 0; // real spend over ALL real attempts
+  let metered_spent_total = 0; // real metered spend over ALL real attempts
   let blockCount = 0;
+  let nativeFallbacks = 0;
+  let realEvents = 0; // task events that actually attempted a lane (excludes native breadcrumbs)
   const laneMix: Record<string, number> = Object.create(null);
   for (const e of tasks) {
+    // A `native` breadcrumb is not a real attempt: no lane ran it. It carries zero
+    // spend/tokens and must not count as an offload, a block, lane mix, or savings —
+    // only as a native-fallback tally for visibility.
+    if (e.status === 'native') {
+      nativeFallbacks += 1;
+      continue;
+    }
+    realEvents += 1;
     actual_cost += e.actual_cost;
     metered_spent_total += e.metered_spent;
     if (e.status === 'blocked') blockCount += 1;
@@ -395,7 +429,7 @@ export function summarize(events: readonly LedgerEvent[]): LedgerSummary {
     frontier_avoided_pct: pct(frontier_avoided),
     metered_avoided_pct: pct(metered_avoided),
   };
-  return { events: tasks.length, savings, actual_cost, metered_spent_total, laneMix, blockCount };
+  return { events: realEvents, savings, actual_cost, metered_spent_total, laneMix, blockCount, nativeFallbacks };
 }
 
 /** in/out/total token counts, split into estimated vs reported. */

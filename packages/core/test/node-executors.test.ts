@@ -330,13 +330,21 @@ test('runAndRecord runs a trusted lane and appends a task event to the ledger', 
   }
 });
 
-test('runAndRecord degrades to native and records nothing extra when the host lane is chosen', async () => {
+test('runAndRecord degrades to native and records a content-free breadcrumb when the host lane is chosen', async () => {
   const { dir, ledger } = tempLedger();
   try {
     const ctx: RouteContext = { lanes: [hostLane] };
     const r = await runAndRecord({ category: 'feature', instruction: 'do it' }, ctx, {}, { ledger, priceTable: TABLE });
     assert.equal(r.native, true);
-    assert.equal(ledger.readAll().length, 0); // native isn't recorded
+    // The native degrade now leaves ONE content-free breadcrumb (status native,
+    // reason host_native, zero usage) so it isn't invisible in the ledger.
+    const all = ledger.readAll();
+    assert.equal(all.length, 1);
+    const ev = all[0] as { event_type: string; status?: string; native_reason?: string; tokens_in?: number };
+    assert.equal(ev.event_type, 'task');
+    assert.equal(ev.status, 'native');
+    assert.equal(ev.native_reason, 'host_native');
+    assert.equal(ev.tokens_in, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

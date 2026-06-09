@@ -144,7 +144,33 @@ export async function runTask(
   try {
     decision = routeDecide({ category: request.category }, effectiveCtx, policy);
   } catch {
-    return { laneId: 'native', status: 'ok', native: true, events: [] };
+    // No selectable lane (lanes empty, gated, disabled, or policy-blocked — e.g. a
+    // reader lane blocked on a private/unknown repo). The host does it, but we leave
+    // a content-free breadcrumb so this silent degrade is visible in the ledger.
+    // There is no lane/decision here, so synthesize a host identity inline (the
+    // `event` closure below needs `lane`/`decision`, which don't exist yet). Zero
+    // spend/tokens; summarize() counts it as a native fallback, never an offload.
+    const breadcrumb: TaskEventInput = {
+      task_id: request.task_id ?? deps.newId(),
+      attempt: request.attempt ?? 0,
+      category: request.category,
+      laneId: 'native',
+      model: 'native',
+      trust_mode: 'full',
+      provenance: 'host',
+      status: 'native',
+      tokens_in: 0,
+      tokens_out: 0,
+      tokens_estimated: true,
+      actual_cost: 0,
+      frontier_cost: 0,
+      metered_spent: 0,
+      frontier_avoided: 0,
+      metered_avoided: 0,
+      policy_verdict: 'allow',
+      native_reason: 'no_route',
+    };
+    return { laneId: 'native', status: 'ok', native: true, events: [breadcrumb] };
   }
   const lane = effectiveCtx.lanes.find((l) => l.id === decision.laneId)!;
   const task_id = request.task_id ?? deps.newId();
@@ -176,8 +202,18 @@ export async function runTask(
     try {
       const r = await deps.executeTrusted(lane, request.instruction, request.attachments);
       if (r.native) {
-        // The host performed it — not recorded (unobservable usage; never lie).
-        return { decision, laneId: lane.id, status: 'ok', native: true, resultText: r.resultText, events: [] };
+        // The host performed it — usage is unobservable (never lie about tokens), so
+        // the breadcrumb carries ZERO_USAGE. status 'native' + reason 'host_native'
+        // makes the degrade visible without claiming spend; summarize() counts it as
+        // a native fallback, never an offload.
+        return {
+          decision,
+          laneId: lane.id,
+          status: 'ok',
+          native: true,
+          resultText: r.resultText,
+          events: [{ ...event('native', ZERO_USAGE), native_reason: 'host_native' }],
+        };
       }
       const usage = resolveUsageMaybeEstimated(
         {

@@ -7,7 +7,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -487,6 +487,69 @@ export async function executeReader(
 /** Default ledger location: `~/.tokenmaxed/ledger.jsonl`. */
 export function defaultLedgerPath(): string {
   return join(homedir(), '.tokenmaxed', 'ledger.jsonl');
+}
+
+/** Per-model token usage `{ in, out }` read from host transcripts. */
+export type CliUsageByModel = Record<string, { in: number; out: number }>;
+
+/**
+ * Read the HOST CLI's own per-model token usage from Claude Code's transcript
+ * JSONL for THIS project, so the summary can fold native main-session usage into
+ * the per-lane counts (e.g. the Opus you're talking to now). These are REAL
+ * provider-reported numbers off disk — not estimates — so surfacing them never
+ * violates the "never lie about unobservable usage" rule.
+ *
+ * Claude Code stores transcripts at `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`,
+ * where the cwd's every non-alphanumeric char is replaced by `-`. Assistant turns
+ * carry `{ type:'assistant', message:{ model, usage:{ input_tokens, output_tokens,
+ * cache_read_input_tokens?, cache_creation_input_tokens? } } }`.
+ *
+ * Best-effort and FAIL-OPEN: any error (missing dir, bad JSON, unreadable file)
+ * yields `{}` — the summary must never break because a transcript couldn't be read.
+ * A byte budget bounds the work on the SessionStart path.
+ */
+export function readCliUsageByModel(projectDir?: string): CliUsageByModel {
+  const out: CliUsageByModel = Object.create(null);
+  try {
+    const dir = projectDir ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+    const encoded = dir.replace(/[^A-Za-z0-9]/g, '-');
+    const tdir = join(homedir(), '.claude', 'projects', encoded);
+    if (!existsSync(tdir)) return out;
+    let budget = 64 * 1024 * 1024; // cap total bytes parsed (perf guard for SessionStart)
+    for (const f of readdirSync(tdir)) {
+      if (!f.endsWith('.jsonl')) continue;
+      let text: string;
+      try {
+        text = readFileSync(join(tdir, f), 'utf8');
+      } catch {
+        continue;
+      }
+      budget -= Buffer.byteLength(text);
+      for (const line of text.split('\n')) {
+        if (!line) continue;
+        let e: { type?: unknown; message?: { model?: unknown; usage?: Record<string, unknown> } };
+        try {
+          e = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (e?.type !== 'assistant') continue;
+        const model = e.message?.model;
+        const u = e.message?.usage;
+        if (typeof model !== 'string' || !u) continue;
+        const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+        const inc = num(u.input_tokens) + num(u.cache_read_input_tokens) + num(u.cache_creation_input_tokens);
+        const outc = num(u.output_tokens);
+        const g = out[model] ?? (out[model] = { in: 0, out: 0 });
+        g.in += inc;
+        g.out += outc;
+      }
+      if (budget <= 0) break;
+    }
+  } catch {
+    /* best-effort: fail open with whatever we gathered */
+  }
+  return out;
 }
 
 /**

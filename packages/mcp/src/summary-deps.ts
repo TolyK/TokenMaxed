@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 import { filterEventsSince, resolveLaneModel, staleAgainstPriceTable, summarize, tokenStats } from '@tokenmaxed/core';
 import type { PriceTable } from '@tokenmaxed/core';
-import { JsonlLedger, loadLaneConfig, loadPriceTable } from '@tokenmaxed/core/node';
+import { JsonlLedger, loadLaneConfig, loadPriceTable, readCliUsageByModel } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile, makeLoadPolicy } from './config.ts';
@@ -139,6 +139,10 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
       selectManager: selectManagerLane,
       staleness,
       laneReview,
+      // Fold the host CLI's own per-model usage (real, transcript-derived) into the
+      // per-lane counts. Best-effort: readCliUsageByModel fails open to {} so the
+      // summary never breaks if transcripts are unreadable.
+      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR),
     });
   };
 }

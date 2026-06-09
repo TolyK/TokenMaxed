@@ -61,11 +61,15 @@ test('full lane: executes, records one ok event with cost primitives', async () 
   assert.ok((r.events[0]?.frontier_cost ?? 0) >= 0);
 });
 
-test('native lane: records nothing (host does it; unobservable)', async () => {
+test('native lane (host chosen): records a content-free breadcrumb (host_native, zero usage)', async () => {
   const d = deps({ executeTrusted: async () => ({ resultText: 'host did it', native: true }) });
   const r = await runTask({ category: 'feature', instruction: 'do it' }, trustedCtx, noPolicy, d);
   assert.equal(r.native, true);
-  assert.equal(r.events.length, 0);
+  assert.equal(r.events.length, 1);
+  assert.equal(r.events[0]?.status, 'native');
+  assert.equal(r.events[0]?.native_reason, 'host_native');
+  assert.equal(r.events[0]?.tokens_in, 0);
+  assert.equal(r.events[0]?.tokens_out, 0);
 });
 
 test('full lane failure: degrades to native and records a failed attempt', async () => {
@@ -122,13 +126,19 @@ test('worker minimize is gated by context: unsafe context never reaches the work
   assert.equal(r.laneId, 'claude-native');
 });
 
-test('no selectable lane degrades to native instead of throwing', async () => {
+test('no selectable lane degrades to native and records a no_route breadcrumb', async () => {
   // Only a worker, gate not ready ⇒ routeDecide would throw; runTask degrades.
   const r = await runTask({ category: 'bugfix', instruction: 'x' }, { lanes: [worker] }, noPolicy, deps());
   assert.equal(r.native, true);
   assert.equal(r.laneId, 'native');
-  assert.equal(r.events.length, 0);
   assert.equal(r.decision, undefined);
+  // A content-free breadcrumb makes the silent degrade visible (zero spend).
+  assert.equal(r.events.length, 1);
+  assert.equal(r.events[0]?.status, 'native');
+  assert.equal(r.events[0]?.native_reason, 'no_route');
+  assert.equal(r.events[0]?.laneId, 'native');
+  assert.equal(r.events[0]?.tokens_in, 0);
+  assert.equal(r.events[0]?.tokens_out, 0);
 });
 
 test('a failed worker attempt preserves reported spend (does not under-report)', async () => {
@@ -376,7 +386,10 @@ test('escalation: a native/host offload is not reviewed (accept as-is)', async (
   const r = await runWithEscalation(eReq, eCtx, noPolicy, d, { candidates: ePool });
   assert.equal(r.final_action, 'accept');
   assert.equal(r.result.native, true);
-  assert.deepEqual(r.events.map((e) => e.kind), []); // native records nothing
+  // Not reviewed (no outcome event), but the native degrade leaves a content-free
+  // breadcrumb task event so it isn't silent.
+  assert.deepEqual(r.events.map((e) => e.kind), ['task']);
+  assert.equal((r.events[0]!.event as { status?: string }).status, 'native');
 });
 
 // --- F2-S4c: the reader execution path ---------------------------------------

@@ -52,6 +52,13 @@ export interface SummaryInput {
    * 'current' ⇒ no hint.
    */
   laneReview?: 'first-review' | 'changed' | 'current';
+  /**
+   * Host CLI per-model token usage (real, transcript-derived) to FOLD into per-lane
+   * counts so the lanes show the main-session model's own usage, not just routed
+   * work. Keyed by resolved model id; each model's usage is attributed to AT MOST
+   * one lane (the first whose model matches). Optional — absent ⇒ routed-only counts.
+   */
+  cliUsageByModel?: Record<string, { in: number; out: number }>;
 }
 
 /** A stale-model finding for one lane (structural subset of a freshness warning). */
@@ -68,6 +75,8 @@ export interface SummaryWindow {
   meteredAvoided: number;
   /** Count of routed task events in the window. */
   offloads: number;
+  /** Count of `native` breadcrumbs in the window — delegates that degraded to the host. */
+  nativeFallbacks: number;
 }
 
 export interface LaneSummary {
@@ -115,6 +124,7 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       tokens: core.tokenStats(evs).total.total,
       meteredAvoided: summary.savings.metered_avoided,
       offloads: summary.events,
+      nativeFallbacks: summary.nativeFallbacks,
     };
   };
   const iso = (ms: number) => new Date(ms).toISOString();
@@ -142,15 +152,26 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
   // Lifetime tokens routed per lane (the summary is global ⇒ all events).
   const byLane = core.tokenStats(events).byLane;
+  // Fold the host CLI's own per-model usage into per-lane counts, attributing each
+  // model's tokens to AT MOST ONE lane (the first whose resolved model matches) so a
+  // model shared by two lanes (e.g. a CLI + an API lane) isn't double-counted.
+  const cliUsageByModel = input.cliUsageByModel;
+  const cliConsumed = new Set<string>();
   const laneSummaries: LaneSummary[] = lanes.map((l) => {
     const s = staleByLane.get(l.id);
+    const cu = cliUsageByModel?.[l.model];
+    let cliTokens = 0;
+    if (cu && !cliConsumed.has(l.model)) {
+      cliConsumed.add(l.model);
+      cliTokens = cu.in + cu.out;
+    }
     return {
       id: l.id,
       kind: l.kind,
       model: l.model,
       trustMode: l.trust_mode,
       provenance: l.provenance,
-      tokensRouted: byLane[l.id]?.total ?? 0,
+      tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...(s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}),
@@ -197,9 +218,11 @@ export function formatSummaryBanner(data: SummaryData): string {
     lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
     lines.push('');
     for (const w of data.windows) {
+      const nf =
+        w.nativeFallbacks > 0 ? ` · ${w.nativeFallbacks} native fallback${w.nativeFallbacks === 1 ? '' : 's'}` : '';
       lines.push(
         `   ${w.label.padEnd(9)}${tok(w.tokens).padStart(9)} tok routed · ` +
-          `${usd(w.meteredAvoided)} metered avoided · ${w.offloads} offloads`,
+          `${usd(w.meteredAvoided)} metered avoided · ${w.offloads} offloads${nf}`,
       );
     }
   }
