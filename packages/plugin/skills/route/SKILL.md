@@ -29,17 +29,26 @@ How to offload:
      passing `public`/`normal` lets cheaper worker lanes handle it; omitting them
      leaves the context unknown, and policy (deny-by-default) keeps the work on
      trusted/native lanes. When unsure, do **not** claim public/normal.
+   - **Set `access_need` when you already know the task needs full access.** Leave
+     it unset (or `auto`) for ordinary bounded subtasks — they try a worker, and a
+     worker that turns out to need repo/tool context it can't see will hand the
+     task back automatically (see below). Pass `access_need: "repo-tight"` to skip
+     workers entirely for a task that plainly needs the live repo, shell, tools, or
+     coordinated multi-file edits — it routes straight to a full-access lane. This
+     is about *access*, separate from `repo_class`/`sensitivity` (data egress).
 2. Read the tool's reply:
    - If it returns an **offloaded result**, use that result (review it as you
      would your own work before applying).
    - If it says **handle it yourself (native)** — because routing is disabled,
-     policy blocked it, no cheaper lane qualified, or a lane failed — just do the
-     task yourself on the main model.
+     policy blocked it, no cheaper lane qualified, a lane failed, or **a worker
+     handed the task back for insufficient context** — just do the task yourself on
+     the main model. On a give-back the reply's `reason`/result text names what the
+     worker said it needed; use that as a hint for what to pull into context.
 
 Good candidates: generating a boilerplate file, writing a pure function from a
 clear spec, drafting docs, a localized refactor. Poor candidates: tasks needing
 broad repo context, cross-file reasoning, or judgement about the whole change —
-keep those on the main model.
+keep those on the main model (or mark them `access_need: "repo-tight"`).
 
 Respect the toggle: if the user ran `/tokenmaxed:off`, do not offload. The user
 can check state with `/tokenmaxed:status` and re-enable with `/tokenmaxed:on`.
