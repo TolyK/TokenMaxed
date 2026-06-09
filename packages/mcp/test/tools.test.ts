@@ -21,7 +21,7 @@ import {
   summarize,
   tokenStats,
 } from '../../core/src/index.ts';
-import type { Lane, LedgerEvent, Policy } from '../../core/src/index.ts';
+import type { Lane, LedgerEvent, Policy, RouteDecision } from '../../core/src/index.ts';
 
 import { createTools, dispatch } from '../src/tools.ts';
 import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, SetupReport, ToolDeps } from '../src/tools.ts';
@@ -370,6 +370,74 @@ test('delegate keeps the reader taint on a native give-back (escalation reject)'
   assert.equal(r.structuredContent!.native as boolean, true);
   assert.equal(r.structuredContent!.readerDerived as boolean, true);
   assert.match(r.content[0]!.text, /reader-derived/);
+});
+
+test('delegate forwards access_need to the delegate dep', async () => {
+  let captured: DelegateRequest | undefined;
+  const r = await call(
+    'router_delegate',
+    deps({
+      delegate: async (req: DelegateRequest) => {
+        captured = req;
+        return { laneId: 'native', status: 'ok' as const, native: true };
+      },
+    }),
+    { category: 'feature', instruction: 'wire the new endpoint', access_need: 'repo-tight' },
+  );
+  assert.notEqual(r.isError, true);
+  assert.equal(captured?.access_need, 'repo-tight');
+});
+
+test('delegate rejects an unknown access_need value', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'x', status: 'ok' as const }) }),
+    { category: 'codegen', instruction: 'x', access_need: 'whenever' },
+  );
+  assert.equal(r.isError, true);
+});
+
+test('delegate renders an insufficient_context give-back as a native hand-back carrying the stated need', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({
+      delegate: async () => ({
+        laneId: 'minimax-api',
+        model: 'MiniMax-M3',
+        status: 'fallback' as const,
+        native: true,
+        failureKind: 'insufficient_context',
+        resultText: 'the auth middleware and its tests',
+        reason: 'worker handed back (insufficient context): the auth middleware and its tests — host should complete',
+      }),
+    }),
+    { category: 'bugfix', instruction: 'fix the 401 on refresh' },
+  );
+  assert.equal(r.structuredContent!.native as boolean, true);
+  assert.match(r.content[0]!.text, /Handle this task yourself \(native\)/);
+  assert.match(r.content[0]!.text, /insufficient context.*auth middleware/i);
+});
+
+// --- router_preview: tandem access gate ----------------------------------------
+
+test('preview repo-tight skips the worker and routes to the live (native) lane', async () => {
+  // A capable worker that WOULD win on worker-ok, plus the native host lane.
+  const lanes = [
+    lane({ id: 'mm-worker', kind: 'api', trust_mode: 'worker', model: 'MiniMax-M3', capability: { codegen: 0.95 } }),
+    lane({ id: 'host', native: true, capability: { codegen: 0.6 } }),
+  ];
+  const d = deps({ candidateLanes: () => lanes, gateReady: true });
+  // worker-ok (default): the cheaper-yet-stronger worker is eligible and wins.
+  const open = await call('router_preview', d, { category: 'codegen', repo_class: 'public', sensitivity: 'normal' });
+  assert.equal((open.structuredContent!.decision as RouteDecision).laneId, 'mm-worker');
+  // repo-tight: the worker is filtered out; only the native live-access lane remains.
+  const tight = await call('router_preview', d, {
+    category: 'codegen',
+    repo_class: 'public',
+    sensitivity: 'normal',
+    access_need: 'repo-tight',
+  });
+  assert.equal((tight.structuredContent!.decision as RouteDecision).laneId, 'host');
 });
 
 test('delegate still returns the result when recording failed (no lost work)', async () => {

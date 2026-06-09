@@ -13,6 +13,8 @@
  */
 
 import type {
+  AccessNeed,
+  AccessNeedInput,
   LedgerEvent,
   LedgerSummary,
   Lane,
@@ -219,6 +221,14 @@ export interface DelegateRequest {
    * its egress opt-in). Files that can't be safely read are dropped + surfaced.
    */
   files?: string[];
+  /**
+   * OPTIONAL access requirement (tandem routing). `repo-tight` means the task needs
+   * full repo/tool/shell access, so it routes straight to a full-access lane (worker
+   * and reader lanes are skipped). `worker-ok` permits a worker. `auto` (default) is
+   * resolved by the server — today always to `worker-ok`, with the worker give-back
+   * as the safety net for a repo-tight miss. Orthogonal to the data-egress policy.
+   */
+  access_need?: AccessNeedInput;
 }
 
 /** The outcome of an offload (content-free; the host decides what to do with it). */
@@ -355,6 +365,7 @@ function pct(alreadyPercent: number): string {
 
 const REPO_CLASSES: readonly RepoClass[] = ['public', 'private', 'unknown'];
 const SENSITIVITIES: readonly Sensitivity[] = ['normal', 'sensitive', 'unknown'];
+const ACCESS_NEEDS: readonly AccessNeedInput[] = ['worker-ok', 'repo-tight', 'auto'];
 
 // --- render helpers ------------------------------------------------------------
 
@@ -473,6 +484,12 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'Whether the minimization/policy gate is ready. Defaults to the server\'s current gate posture (the same state router_delegate routes with). Override to preview a different gate state.',
         },
+        access_need: {
+          type: 'string',
+          enum: [...ACCESS_NEEDS],
+          description:
+            'OPTIONAL access requirement to preview. "repo-tight" filters worker/reader lanes out (only full-access lanes survive); "worker-ok"/"auto" (default) impose no access restriction — matching what router_delegate would route with.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -481,6 +498,12 @@ export function createTools(core: CorePort): ToolDef[] {
         if (category === undefined) throw new ToolInputError('"category" is required.');
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
+        const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
+        // Mirror inferAccessNeed for the instruction-less preview case: an explicit
+        // `repo-tight` is honored; `auto`/`worker-ok`/unset ⇒ `worker-ok` (no
+        // restriction). Preview has no instruction/files, so a future heuristic that
+        // reads them would need them threaded here to keep exact delegate parity.
+        const resolvedAccessNeed: AccessNeed = access_need === 'repo-tight' ? 'repo-tight' : 'worker-ok';
 
         // When routing is off for the project, router_delegate degrades to native;
         // the preview must say the same so /tokenmaxed:why never advertises a lane
@@ -518,6 +541,7 @@ export function createTools(core: CorePort): ToolDef[] {
             gateReady,
             readerEgress: deps.readerEgress,
             policyContext,
+            access_need: resolvedAccessNeed,
             ...(observedCapability ? { observedCapability } : {}),
           };
           const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
@@ -540,6 +564,7 @@ export function createTools(core: CorePort): ToolDef[] {
           gateReady,
           readerEgress: deps.readerEgress,
           policyContext,
+          access_need: resolvedAccessNeed,
           ...(observedCapability ? { observedCapability } : {}),
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
@@ -689,6 +714,12 @@ export function createTools(core: CorePort): ToolDef[] {
         },
         repo_class: { type: 'string', enum: [...REPO_CLASSES], description: 'Repository class for policy (default unknown).' },
         sensitivity: { type: 'string', enum: [...SENSITIVITIES], description: 'Content sensitivity for policy (default unknown).' },
+        access_need: {
+          type: 'string',
+          enum: [...ACCESS_NEEDS],
+          description:
+            'OPTIONAL access requirement. "repo-tight" ⇒ the task needs full repo/tool/shell access, so it routes straight to a full-access lane (workers skipped). "worker-ok" ⇒ a worker may handle it. "auto" (default) lets the server decide (today: worker-ok, with worker give-back as the safety net). Orthogonal to repo_class/sensitivity policy.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -700,6 +731,7 @@ export function createTools(core: CorePort): ToolDef[] {
         const files = optStringArray(args, 'files');
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
+        const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
 
         // Respect the per-project toggle: when off, never offload — tell the host
         // to do it itself (no config load, no execution).
@@ -719,6 +751,7 @@ export function createTools(core: CorePort): ToolDef[] {
           instruction,
           ...(Object.keys(policyContext).length ? { policyContext } : {}),
           ...(files && files.length ? { files } : {}),
+          ...(access_need ? { access_need } : {}),
         });
         return renderDelegate(outcome);
       }),

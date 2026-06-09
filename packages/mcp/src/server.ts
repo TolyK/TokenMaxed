@@ -35,7 +35,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -122,11 +122,22 @@ function escToOutcome(esc: EscalationResult, modelOf: (laneId: string) => string
     ...(r.resultText !== undefined ? { resultText: r.resultText } : {}),
     ...(model ? { model } : {}),
     ...(r.failureKind ? { failureKind: r.failureKind } : {}),
+    // A worker give-back surfaces here as a non-reviewable result ⇒ final_action
+    // 'accept'. Carry the give-back reason (same as the non-escalation path) so the
+    // host sees the worker's stated need, not the generic native fallback text. The
+    // review-driven switch cases below override this with their own reason.
+    ...(r.failureKind === 'insufficient_context'
+      ? { reason: `worker handed back (insufficient context): ${r.resultText ?? 'needs repo/tool access'} — host should complete` }
+      : {}),
     ...(r.readerDerived ? { readerDerived: true } : {}),
     ...(recordingFailed ? { recordingFailed: true } : {}),
   };
   switch (esc.final_action) {
     case 'give_back':
+      // A re-run (rework/escalation) leg can itself fire an insufficient_context
+      // give-back. Keep the worker's stated need (already on base.reason) rather
+      // than overwriting it with generic manager-review text.
+      if (r.failureKind === 'insufficient_context' && base.reason) return { ...base, native: true };
       return { ...base, native: true, reason: `manager review (${esc.verdict ?? 'fail'})${esc.notes ? ` — ${esc.notes}` : ''}` };
     case 'review_unavailable':
       return { ...base, reviewUnavailable: true, ...(esc.reason ? { reason: esc.reason } : {}) };
@@ -333,6 +344,12 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       gateReady,
       readerEgress,
       policyContext: request.policyContext ?? {},
+      // Tandem access gate: resolve the caller's access_need (`auto`/unset ⇒
+      // `worker-ok` today) BEFORE routing. `repo-tight` filters worker/reader lanes
+      // out in eligibleLanes so only full-access lanes survive; `worker-ok` is a
+      // no-op. Resolved here (not in core) because the heuristic needs the
+      // instruction/files, which the pure router never sees.
+      access_need: inferAccessNeed(request.access_need, request.instruction, request.files),
       ...(observedCapability ? { observedCapability } : {}),
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...(tieredStrategy === 'tiered'
@@ -444,7 +461,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         ...(result.resultText !== undefined ? { resultText: result.resultText } : {}),
         ...(resultModel ? { model: resultModel } : {}),
         ...(result.failureKind ? { failureKind: result.failureKind } : {}),
-        ...(result.decision?.reason ? { reason: result.decision.reason } : {}),
+        ...(result.failureKind === 'insufficient_context'
+          ? { reason: `worker handed back (insufficient context): ${result.resultText ?? 'needs repo/tool access'} — host should complete` }
+          : result.decision?.reason
+            ? { reason: result.decision.reason }
+            : {}),
         ...(result.readerDerived ? { readerDerived: true } : {}),
         ...(recordingFailed ? { recordingFailed: true } : {}),
       },
