@@ -46,6 +46,19 @@ test('canReassign: up the ladder + policy-allowed only', () => {
   assert.equal(canReassign(worker, reader, task, safeCtx, noPolicy), false); // reader not yet selectable (F-2)
 });
 
+test('canReassign respects access_need=repo-tight: only live-access targets (native / agentic CLI)', () => {
+  const repoTightCtx: RouteContext = { ...safeCtx, access_need: 'repo-tight' };
+  const host = lane({ id: 'host', native: true, capability: { bugfix: 0.9 } });
+  const agenticCli = lane({ id: 'agentic', execution_mode: 'agentic', capability: { bugfix: 0.9 } });
+  // A full but answer-only lane can't act on the repo ⇒ never an escalation target here…
+  assert.equal(canReassign(worker, fullA, task, repoTightCtx, noPolicy), false);
+  // …but the native host and an agentic CLI lane can.
+  assert.equal(canReassign(worker, host, task, repoTightCtx, noPolicy), true);
+  assert.equal(canReassign(worker, agenticCli, task, repoTightCtx, noPolicy), true);
+  // Without the repo-tight restriction the answer-only full lane is fine again.
+  assert.equal(canReassign(worker, fullA, task, safeCtx, noPolicy), true);
+});
+
 test('canReassign fails closed on an unrankable (legacy/unknown) trust mode', () => {
   // A direct JS caller bypassing config normalization passes a legacy `monitored`
   // source: undefined rank must NOT silently allow a down-ladder reassignment.

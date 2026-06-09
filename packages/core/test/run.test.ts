@@ -94,6 +94,34 @@ test('worker lane: minimizes, executes untrusted, records ok with reported usage
   assert.equal(r.events[0]?.trust_mode, 'worker');
 });
 
+test('worker give-back: an INSUFFICIENT_CONTEXT reply hands back to native, records fallback (no savings), no quality failure', async () => {
+  const r = await runTask(
+    { category: 'bugfix', instruction: 'reverse a string' },
+    workerCtx,
+    noPolicy,
+    deps({
+      executeUntrusted: async () => ({
+        ok: true,
+        resultText: 'INSUFFICIENT_CONTEXT: need the String util module and the test runner',
+        reported: { tokens_in: 100, tokens_out: 8 },
+      }),
+    }),
+  );
+  assert.equal(r.laneId, 'deepseek-api');
+  assert.equal(r.status, 'fallback');
+  assert.equal(r.native, true); // host completes it
+  assert.equal(r.failureKind, 'insufficient_context');
+  // The worker's stated need is surfaced to the host, not a wrong guess.
+  assert.equal(r.resultText, 'need the String util module and the test runner');
+  // The give-back is recorded honestly: the worker's real spend counts, status is
+  // `fallback` (never `ok`, so summarize claims no savings for it).
+  assert.equal(r.events.length, 1);
+  assert.equal(r.events[0]?.status, 'fallback');
+  assert.equal(r.events[0]?.tokens_in, 100);
+  assert.equal(r.events[0]?.tokens_out, 8);
+  assert.equal(r.events[0]?.trust_mode, 'worker');
+});
+
 test('worker lane: a blocked minimize degrades to native and records blocked', async () => {
   // Scanner unavailable ⇒ minimize blocks ⇒ degrade.
   const r = await runTask(

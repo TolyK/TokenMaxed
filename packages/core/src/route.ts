@@ -133,6 +133,21 @@ export function executionModeOf(lane: Lane): ExecutionMode {
   return lane.execution_mode ?? 'answer-only';
 }
 
+/**
+ * Whether a lane can actually perform `repo-tight` work — i.e. has live repo/tool/
+ * shell access. `trust_mode: 'full'` is necessary but NOT sufficient, and neither is
+ * `execution_mode: 'agentic'` on its own: a full API or local lane only ever receives
+ * prompt + attachments over its executor (no shell/tools/live repo), so it would
+ * blind-guess repo-tight work exactly like a worker even if flagged agentic. The only
+ * lanes that genuinely act on the repo are the native host lane (Claude Code itself)
+ * and an agentic CLI lane (a spawned provider CLI allowed to edit files / run
+ * commands locally).
+ */
+export function canDoRepoTight(lane: Lane): boolean {
+  if (lane.trust_mode !== 'full') return false;
+  return lane.native === true || (lane.kind === 'cli' && executionModeOf(lane) === 'agentic');
+}
+
 /** Clamp a number into [0, 1]. */
 function clamp01(n: number): number {
   if (Number.isNaN(n)) return 0;
@@ -294,9 +309,18 @@ export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): El
   const policyContext = ctx.policyContext ?? {};
   const gateReady = ctx.gateReady ?? false;
   const readerEgress = ctx.readerEgress ?? false;
+  // Tandem access gate: a `repo-tight` task needs LIVE repo/tool/shell access, so
+  // only a lane that can actually act on the repo survives — the native host or an
+  // agentic full lane (see canDoRepoTight). Worker/reader lanes AND full-but-answer-
+  // only/remote lanes are filtered out, because they would only receive prompt +
+  // attachments and blind-guess. When none qualify, eligibleLanes returns [] and
+  // routeDecide throws ⇒ runTask degrades to native (the host does it). Orthogonal to
+  // the data-egress policy below — this is about capability/access, not data trust.
+  const repoTight = ctx.access_need === 'repo-tight';
   const out: EligibleLane[] = [];
   for (const lane of ctx.lanes) {
     if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) continue;
+    if (repoTight && !canDoRepoTight(lane)) continue;
     const { verdict } = evaluate(task, lane, policyContext, policy);
     if (!laneAllowedByVerdict(lane, verdict)) continue;
     out.push({ lane, verdict });

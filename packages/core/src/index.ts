@@ -7,6 +7,7 @@ export {
   isSelectablePreGate,
   isManagerEligible,
   executionModeOf,
+  canDoRepoTight,
   capabilityFor,
   declaredCapabilityFor,
   effectiveCapability,
@@ -76,7 +77,9 @@ export type {
 export { evaluate, laneAllowedByVerdict, parsePolicyConfig, PolicyConfigError } from './policy.ts';
 export type { PolicyDecision } from './policy.ts';
 export { minimize, minimizeForReader, isMinimizedPayload, isReaderPayload, scrubText, LIMITS } from './minimize.ts';
-export { buildUntrustedRequestBody, isExecutorCertified, buildReaderRequestBody, isReaderExecutorCertified, READER_SYSTEM_FRAMING } from './boundary.ts';
+export { buildUntrustedRequestBody, isExecutorCertified, buildReaderRequestBody, isReaderExecutorCertified, READER_SYSTEM_FRAMING, WORKER_SYSTEM_FRAMING } from './boundary.ts';
+export { inferAccessNeed, parseGiveBackSignal, INSUFFICIENT_CONTEXT_SENTINEL } from './access.ts';
+export type { GiveBackSignal } from './access.ts';
 export type { UntrustedLaneDTO, SafeUntrustedEnvelope, UntrustedRequestBody, SafeReaderEnvelope, ReaderRequestBody } from './boundary.ts';
 export { canReassign, reassignmentTarget, shouldReassign, TRUST_RANK } from './reassign.ts';
 export type { ReassignOptions } from './reassign.ts';

@@ -11,6 +11,13 @@ test('isTransient: capacity/timeout/5xx are transient; auth/bad-request/policy a
   assert.equal(isTransient('auth_failed'), false);
   assert.equal(isTransient('bad_request'), false);
   assert.equal(isTransient('policy_blocked'), false);
+  // A worker give-back is permanent: retrying the same blind input cannot help.
+  assert.equal(isTransient('insufficient_context'), false);
+});
+
+test('insufficient_context is a known kind and never triggers cooldown', () => {
+  assert.ok(FAILURE_KINDS.includes('insufficient_context'));
+  assert.equal(shouldCooldown('insufficient_context'), false);
 });
 
 test('every failure kind has a defined transient classification', () => {

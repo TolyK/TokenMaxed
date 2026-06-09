@@ -155,6 +155,16 @@ export interface Task {
   category: TaskCategory;
 }
 
+/** Caller-supplied access need for a task; `auto` defers the decision to `inferAccessNeed`. */
+export type AccessNeedInput = 'worker-ok' | 'repo-tight' | 'auto';
+
+/**
+ * Resolved access requirement the router gates on (never `auto`). `repo-tight`
+ * restricts a task to full-access lanes; `worker-ok` imposes no access restriction
+ * (the data-egress policy still applies independently).
+ */
+export type AccessNeed = 'worker-ok' | 'repo-tight';
+
 /**
  * Token usage for a single executed task. Both counts are non-negative
  * integers. Any provider cache-read/cache-write tokens are folded into
@@ -262,6 +272,16 @@ export interface RouteContext {
    * the user can flip "use lane X for now" on and off easily without a relaunch.
    */
   preferLaneId?: string;
+  /**
+   * Resolved access requirement of the task (tandem routing). `repo-tight` means
+   * the work needs full repo/tool/shell access, so worker AND reader lanes are
+   * filtered out before scoring and only `full` lanes survive — independent of the
+   * data-egress policy (which stays about repo_class/sensitivity/secrets). Always
+   * the RESOLVED value (`worker-ok` | `repo-tight`), never `auto`: the host adapter
+   * collapses `auto`/unset via `inferAccessNeed` before routing. Absent ⇒
+   * `worker-ok` (no access restriction), identical to before this feature.
+   */
+  access_need?: AccessNeed;
 }
 
 /**

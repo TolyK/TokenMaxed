@@ -19,7 +19,7 @@ import type { PriceTable } from './price.ts';
 import { PolicyConfigError, parsePolicyConfig } from './policy.ts';
 import { isMinimizedPayload, isReaderPayload } from './minimize.ts';
 import type { SecretScanner } from './minimize.ts';
-import { READER_SYSTEM_FRAMING, RECOVERY_MAX_COMPLETION_TOKENS, buildReaderRequestBody, buildUntrustedRequestBody } from './boundary.ts';
+import { READER_SYSTEM_FRAMING, RECOVERY_MAX_COMPLETION_TOKENS, WORKER_SYSTEM_FRAMING, buildReaderRequestBody, buildUntrustedRequestBody } from './boundary.ts';
 import type { SafeReaderEnvelope, SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
 import { estimateTokens } from './usage.ts';
 import type { RawUsage } from './usage.ts';
@@ -368,7 +368,10 @@ export async function executeUntrusted(
           // transient so it never blocks fallback; carry the first call's usage.
           return { ok: false, error: `untrusted lane recovery retry returned status ${retry.status}`, failureKind: recoveryRetryFailureKind(retry.status), ...(reported ? { reported } : {}) };
         }
-        const promptText = [env.payload.instruction, ...env.payload.attachments.map((a) => a.content)].join('\n\n');
+        // Worker requests prepend WORKER_SYSTEM_FRAMING (buildUntrustedRequestBody), so
+        // the estimate's prompt MUST include it too or worker input tokens are
+        // undercounted (mirrors the reader recovery path below).
+        const promptText = [WORKER_SYSTEM_FRAMING, env.payload.instruction, ...env.payload.attachments.map((a) => a.content)].join('\n\n');
         result = retry.data;
         text = extractText(result);
         // Complete best-effort total: each call's reported usage where present, a text

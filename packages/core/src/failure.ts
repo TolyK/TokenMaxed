@@ -15,7 +15,8 @@ export type FailureKind =
   | 'auth_failed'
   | 'bad_request'
   | 'provider_error'
-  | 'policy_blocked';
+  | 'policy_blocked'
+  | 'insufficient_context';
 
 /** All failure kinds, canonical order. */
 export const FAILURE_KINDS: readonly FailureKind[] = [
@@ -26,14 +27,17 @@ export const FAILURE_KINDS: readonly FailureKind[] = [
   'bad_request',
   'provider_error',
   'policy_blocked',
+  'insufficient_context',
 ];
 
 /**
  * Whether a failure is transient — eligible for fallback to another lane.
  * Transient: timeout, rate_limited, quota_exhausted (lane temporarily out of
  * credits), provider_error (5xx). Permanent: auth_failed, bad_request (retrying
- * the same input won't help) and policy_blocked (a deliberate gate decision —
- * never "fall back" around the policy).
+ * the same input won't help), policy_blocked (a deliberate gate decision — never
+ * "fall back" around the policy), and insufficient_context (a worker declared it
+ * lacks repo/tool access; retrying the same blind input cannot help — it is handed
+ * to a full lane, not retried on another worker).
  */
 export function isTransient(kind: FailureKind): boolean {
   switch (kind) {
@@ -45,6 +49,7 @@ export function isTransient(kind: FailureKind): boolean {
     case 'auth_failed':
     case 'bad_request':
     case 'policy_blocked':
+    case 'insufficient_context':
       return false;
   }
 }

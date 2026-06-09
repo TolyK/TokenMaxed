@@ -18,8 +18,9 @@ import type { MinimizedAttachment, SecretScanner } from './minimize.ts';
 import { routeDecide } from './route.ts';
 import { resolveUsage, usageFromReported } from './usage.ts';
 import type { RawUsage, ResolvedUsage } from './usage.ts';
-import { READER_SYSTEM_FRAMING } from './boundary.ts';
+import { READER_SYSTEM_FRAMING, WORKER_SYSTEM_FRAMING } from './boundary.ts';
 import type { SafeReaderEnvelope, SafeUntrustedEnvelope, UntrustedLaneDTO } from './boundary.ts';
+import { parseGiveBackSignal } from './access.ts';
 import { isTransient, LaneFailure, shouldCooldown } from './failure.ts';
 import type { FailureKind } from './failure.ts';
 import { escalationDecision, selectEscalationTarget, TRUST_RANK } from './reassign.ts';
@@ -304,7 +305,10 @@ export async function runTask(
 
   try {
     const env: SafeUntrustedEnvelope = { payload: min.payload, lane: deps.untrustedLaneDTO(lane) };
-    const promptText = combinedText(min.payload.instruction, min.payload.attachments);
+    // Estimate from the SAME text the worker receives — including the answer-only
+    // WORKER_SYSTEM_FRAMING buildUntrustedRequestBody prepends — so a non-reporting
+    // endpoint's input tokens aren't undercounted.
+    const promptText = combinedText([WORKER_SYSTEM_FRAMING, min.payload.instruction].join('\n\n'), min.payload.attachments);
     const r = await deps.executeUntrusted(env);
     if (!r.ok) {
       // Preserve any spend the lane reported before failing (even partial), rather
@@ -320,6 +324,24 @@ export async function runTask(
       };
     }
     const usage = resolveUsageMaybeEstimated({ reported: r.reported, promptText, resultText: r.resultText }, r.reportedEstimated);
+    // Tandem give-back: a worker that can't finish without repo/tool context it was
+    // never given emits the INSUFFICIENT_CONTEXT sentinel. That is NOT a quality
+    // failure — the worker correctly recognized a boundary — so we record the spend
+    // honestly as a `fallback` (never claims savings) and hand the task to the host
+    // (native), surfacing the worker's stated need as the result text. No review is
+    // run, so this never feeds the F-1 capability overlay.
+    const giveBack = parseGiveBackSignal(r.resultText ?? '');
+    if (giveBack.insufficient) {
+      return {
+        decision,
+        laneId: lane.id,
+        status: 'fallback',
+        native: true,
+        failureKind: 'insufficient_context',
+        resultText: giveBack.needed || 'worker lacked required repository/tool context',
+        events: [event('fallback', usage)],
+      };
+    }
     return { decision, laneId: lane.id, status: 'ok', resultText: r.resultText, events: [event('ok', usage)] };
   } catch {
     return { decision, laneId: lane.id, status: 'failed', native: true, failureKind: 'provider_error', events: [event('failed', ZERO_USAGE)] };

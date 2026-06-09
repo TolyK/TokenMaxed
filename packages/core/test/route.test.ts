@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { executionModeOf, isManagerEligible, isSelectablePreGate, routeDecide } from '../src/route.ts';
+import { eligibleLanes, executionModeOf, isManagerEligible, isSelectablePreGate, routeDecide } from '../src/route.ts';
 import { capHeadroom } from '../src/usage.ts';
 import type { Lane, Policy, RouteContext, Task } from '../src/types.ts';
 
@@ -460,6 +460,49 @@ test('preferLaneId never resurrects a capability-0 (hard opt-out) lane', () => {
   const optedOut: Lane = { ...codex, capability: { codegen: 0 } };
   const d = routeDecide({ category: 'codegen' }, { lanes: [claude, optedOut], preferLaneId: 'codex-cli' }, noPolicy);
   assert.equal(d.laneId, 'claude-native'); // opted-out preferred lane is not picked
+});
+
+test('access_need repo-tight keeps ONLY live-access lanes (native or agentic full); filters workers, readers, and answer-only/remote full lanes', () => {
+  const host: Lane = { ...claude, id: 'host', native: true, capability: { codegen: 0.9 } }; // the host (native) — has live access
+  const agenticFull: Lane = { ...claude, id: 'agentic-cli', native: false, execution_mode: 'agentic', capability: { codegen: 0.9 } };
+  const answerOnlyFull: Lane = { ...claude, id: 'answer-only-cli', native: false, execution_mode: 'answer-only', capability: { codegen: 0.9 } };
+  const remoteFull: Lane = { ...claude, id: 'remote-api', kind: 'api', native: false, capability: { codegen: 0.9 } }; // full but remote/answer-only
+  const worker: Lane = { ...ollama, id: 'mm-worker', kind: 'api', trust_mode: 'worker', capability: { codegen: 0.9 } };
+  const reader: Lane = { ...ollama, id: 'mm-reader', kind: 'api', trust_mode: 'reader', repo_read_attestation: true, capability: { codegen: 0.9 } };
+  const publicNormal: Policy = {};
+  const ctxBase: RouteContext = {
+    lanes: [host, agenticFull, answerOnlyFull, remoteFull, worker, reader],
+    gateReady: true,
+    readerEgress: true,
+    policyContext: { repo_class: 'public', sensitivity: 'normal' },
+  };
+  // worker-ok: no access restriction — workers/readers eligible alongside the full lanes.
+  const open = eligibleLanes({ category: 'codegen' }, { ...ctxBase, access_need: 'worker-ok' }, publicNormal).map((e) => e.lane.id);
+  assert.ok(open.includes('mm-worker'));
+  assert.ok(open.includes('mm-reader'));
+  assert.ok(open.includes('answer-only-cli'));
+  // repo-tight: only the native host + the agentic full lane can actually act on the repo.
+  const tight = eligibleLanes({ category: 'codegen' }, { ...ctxBase, access_need: 'repo-tight' }, publicNormal).map((e) => e.lane.id).sort();
+  assert.deepEqual(tight, ['agentic-cli', 'host']);
+});
+
+test('access_need repo-tight with only answer-only/remote full lanes ⇒ routeDecide throws (caller degrades to native)', () => {
+  const answerOnlyFull: Lane = { ...claude, id: 'answer-only-cli', native: false, execution_mode: 'answer-only', capability: { codegen: 0.9 } };
+  const remoteFull: Lane = { ...claude, id: 'remote-api', kind: 'api', native: false, capability: { codegen: 0.9 } };
+  const worker: Lane = { ...ollama, id: 'mm-worker', kind: 'api', trust_mode: 'worker', capability: { codegen: 0.9 } };
+  // No native and no agentic lane ⇒ nothing can do repo-tight work ⇒ degrade to native.
+  assert.throws(() =>
+    routeDecide(
+      { category: 'codegen' },
+      {
+        lanes: [answerOnlyFull, remoteFull, worker],
+        gateReady: true,
+        policyContext: { repo_class: 'public', sensitivity: 'normal' },
+        access_need: 'repo-tight',
+      },
+      noPolicy,
+    ),
+  );
 });
 
 test('preferLaneId respects availability (an unavailable preferred lane falls back)', () => {

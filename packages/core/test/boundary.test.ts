@@ -7,7 +7,9 @@ import {
   isExecutorCertified,
   isReaderExecutorCertified,
   READER_SYSTEM_FRAMING,
+  WORKER_SYSTEM_FRAMING,
 } from '../src/boundary.ts';
+import { INSUFFICIENT_CONTEXT_SENTINEL } from '../src/access.ts';
 import { minimize, minimizeForReader } from '../src/minimize.ts';
 import type { SecretScanner } from '../src/minimize.ts';
 import { executeReader, executeUntrusted } from '../src/node.ts';
@@ -44,6 +46,24 @@ test('buildUntrustedRequestBody allowlists model + minimized content only', asyn
   assert.ok(!json.includes('LANEID_SENT'));
   assert.ok(!json.includes('AUTH_SENT'));
   assert.ok(json.includes('reverse a string'));
+});
+
+test('buildUntrustedRequestBody prepends the worker framing carrying the give-back protocol', () => {
+  // The framing is a constant system message ahead of the user content; it defines
+  // the INSUFFICIENT_CONTEXT give-back so a blind worker can hand repo-tight work back.
+  assert.ok(WORKER_SYSTEM_FRAMING.includes(INSUFFICIENT_CONTEXT_SENTINEL));
+});
+
+test('buildUntrustedRequestBody: system framing first, user content second; top-level keys unchanged', async () => {
+  const payload = await genuinePayload();
+  const env = { payload, lane: { id: 'L', model: 'gpt-x', endpoint: 'https://fake.invalid', authHandle: 'A' } };
+  const body = buildUntrustedRequestBody(env);
+  // The egress allowlist invariant holds: still only model + messages at the top level.
+  assert.deepEqual(Object.keys(body), ['model', 'messages']);
+  assert.equal(body.messages[0]!.role, 'system');
+  assert.equal(body.messages[0]!.content, WORKER_SYSTEM_FRAMING);
+  assert.equal(body.messages[1]!.role, 'user');
+  assert.ok(body.messages[1]!.content.includes('reverse a string'));
 });
 
 test('egress-envelope CI: only model+content + resolved token leave; ids/handles never leak', async () => {

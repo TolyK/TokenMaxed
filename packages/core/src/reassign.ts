@@ -11,7 +11,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { effectiveCapabilityFor, isSelectablePreGate } from './route.ts';
+import { canDoRepoTight, effectiveCapabilityFor, isSelectablePreGate } from './route.ts';
 import type { ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, Task, TrustMode } from './types.ts';
 
@@ -49,6 +49,10 @@ export function canReassign(from: Lane, to: Lane, task: Task, ctx: RouteContext,
   const toRank = TRUST_RANK[to.trust_mode] as number | undefined;
   if (fromRank === undefined || toRank === undefined) return false;
   if (toRank < fromRank) return false; // never move down
+  // Tandem access gate (same as routing's eligibleLanes): for a repo-tight task,
+  // only a lane with live repo/tool access may be a target — never escalate to a
+  // full-but-prompt-only lane that would just blind-guess and re-fail the gate.
+  if (ctx.access_need === 'repo-tight' && !canDoRepoTight(to)) return false;
   // Same structural gate as routing (worker needs gate+cert; reader needs the
   // egress opt-in + cert + attestation; blocked never; pre-gate API excluded).
   if (!isSelectablePreGate(to, ctx.gateReady ?? false, ctx.readerEgress ?? false)) return false;
