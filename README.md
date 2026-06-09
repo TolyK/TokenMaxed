@@ -146,6 +146,25 @@ files only reach a **reader**-trust lane with reader egress enabled; otherwise
 they're dropped and the reply says which and why. Still review offloaded output —
 visibility fixes facts, not logic.
 
+**Tandem routing (worker-first, full-access lane steps in for repo-tight work).**
+Some subtasks genuinely need live repo/tool/shell access — running the test suite,
+coordinated multi-file edits, broad cross-file reasoning — and no amount of
+attached `files` makes a blind worker able to do them. Two mechanisms keep those
+on a capable lane without giving up worker offload everywhere else:
+
+- **`access_need`** on `router_delegate` (`worker-ok` | `repo-tight` | `auto`,
+  default `auto`). `repo-tight` routes straight to a lane that can actually act on
+  the repo — the **native host or an agentic CLI lane** (a full *answer-only* or
+  remote-API lane is excluded; it would only get prompt + attachments) — and when
+  none is available the task simply runs on the host. This is an *access* axis,
+  orthogonal to the `repo_class`/`sensitivity` *data-egress* policy below.
+- **Give-back.** Left on `auto`, every untagged subtask still tries a worker; a
+  worker that finds it can't finish without context it was never given replies with
+  a sentinel, and TokenMaxed hands the task back to the host (recorded honestly as a
+  fallback — real spend counted, no savings claimed, and it never skews the learned
+  capability scores). So the cheap path is tried first and the host steps in only
+  when a worker actually hits a wall.
+
 The optional features are opt-in **environment flags you set when you launch
 Claude Code**. In the shell they go *before* `claude` (they're environment
 variables, not CLI arguments):
