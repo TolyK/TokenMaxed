@@ -21,6 +21,7 @@ const MANUAL_SKILLS: ReadonlyArray<{ name: string; tool: string }> = [
   { name: 'why', tool: `${P}router_preview` },
   { name: 'off', tool: `${P}router_set_enabled` },
   { name: 'on', tool: `${P}router_set_enabled` },
+  { name: 'yolo', tool: `${P}router_set_yolo` },
   { name: 'status', tool: `${P}router_status` },
   { name: 'review', tool: `${P}router_review` },
   { name: 'setup', tool: `${P}router_setup` },

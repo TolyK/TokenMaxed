@@ -7553,7 +7553,13 @@ function parsePolicyConfig(text) {
 
 // ../core/src/route.ts
 var DEFAULT_CAPABILITY = 0.5;
-function isSelectablePreGate(lane, gateReady = false, readerEgress = false) {
+function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false) {
+  if (yolo) {
+    if (lane.trust_mode === "full") return true;
+    if (lane.trust_mode === "worker") return isExecutorCertified(lane);
+    if (lane.trust_mode === "reader") return isReaderExecutorCertified(lane);
+    return false;
+  }
   if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
   if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
   if (lane.trust_mode === "reader") {

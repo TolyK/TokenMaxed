@@ -66,6 +66,7 @@ import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
 import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
+import { readYolo, writeYolo } from './yolo.ts';
 import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
 
 // User-owned (NOT repo-controlled) — see the SECURITY note above. HOME_TM and the
@@ -265,6 +266,16 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || undefined;
   const readPreferredLane = (): string | undefined => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
+  // YOLO mode (--dangerously-skip-permissions analogue): forces every trust/egress
+  // gate open so all worker/reader lanes are selectable (see RouteContext.yolo).
+  // Persisted in its OWN boolean file (per-project), with TOKENMAXED_YOLO as the
+  // headless/CI default. OFF by default; the per-project state wins when set, and the
+  // global kill-switch (TOKENMAXED_DISABLE) always forces it back off. A YoloStore is
+  // structurally a ToggleStore (boolean map), so the same file-backed store is reused.
+  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join(dirname(statePath), 'yolo.json');
+  const yoloStore = fileToggleStore(yoloStatePath);
+  const yoloEnvDefault = (env.TOKENMAXED_YOLO === 'true' || env.TOKENMAXED_YOLO === '1') && !globallyDisabled;
+  const readYoloState = (): boolean => (globallyDisabled ? false : readYolo(yoloStore, projectKey, yoloEnvDefault));
   // Namespaced BYOK auth (see config.ts): a repo-supplied lanes.yaml can't name an
   // arbitrary secret env var; unknown ⇒ '' ⇒ the executor fails closed.
   const resolveAuth = makeResolveAuth(env);
@@ -350,6 +361,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // no-op. Resolved here (not in core) because the heuristic needs the
       // instruction/files, which the pure router never sees.
       access_need: inferAccessNeed(request.access_need, request.instruction, request.files),
+      // YOLO: when on, eligibleLanes/routeDecide force every trust+egress gate open
+      // (the --dangerously-skip-permissions analogue). Read per call so the toggle
+      // takes effect without a relaunch; the kill-switch still forces it off.
+      ...(readYoloState() ? { yolo: true } : {}),
       ...(observedCapability ? { observedCapability } : {}),
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...(tieredStrategy === 'tiered'
@@ -508,6 +523,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Universal preferred-lane override (per-project state + env fallback).
     preferredLane: readPreferredLane,
     setPreferredLane: (laneId) => writePreferred(preferStore, projectKey, laneId),
+    // YOLO mode (per-project state + TOKENMAXED_YOLO fallback; forced off by the
+    // kill-switch). router_preview/router_status read getYolo; router_set_yolo writes it.
+    getYolo: readYoloState,
+    setYolo: (on) => writeYolo(yoloStore, projectKey, on),
     // Session summary (router_summary / /tokenmaxed:summary), composed from the same
     // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
     // one source of truth. Read-only.

@@ -513,3 +513,68 @@ test('preferLaneId respects availability (an unavailable preferred lane falls ba
   );
   assert.equal(d.laneId, 'claude-native');
 });
+
+// --- YOLO mode (--dangerously-skip-permissions analogue) ----------------------
+
+test('isSelectablePreGate(yolo): waives gate/egress/attestation for every tier except blocked, but keeps executor certification', () => {
+  // full: always selectable, even a (normally gate-requiring) API lane.
+  assert.equal(isSelectablePreGate({ ...claude, kind: 'api' }, false, false, true), true);
+  // worker: selectable iff a certified (API) executor exists — a local worker has none.
+  const apiWorker: Lane = { ...ollama, id: 'wa', kind: 'api', trust_mode: 'worker' };
+  const localWorker: Lane = { ...ollama, id: 'wl', trust_mode: 'worker' };
+  assert.equal(isSelectablePreGate(apiWorker, false, false, true), true); // gate/egress off, yolo on ⇒ yes
+  assert.equal(isSelectablePreGate(localWorker, false, false, true), false); // no certified executor ⇒ no
+  // reader: selectable with NO readerEgress, NO gate, and NO attestation — but only API (v1 cert).
+  const apiReader: Lane = { ...ollama, id: 'rd', kind: 'api', trust_mode: 'reader', repo_read_attestation: false };
+  assert.equal(isSelectablePreGate(apiReader, false, false, true), true);
+  assert.equal(isSelectablePreGate({ ...apiReader, kind: 'cli', command: 'x' }, false, false, true), false);
+  // blocked: never, even under yolo.
+  assert.equal(isSelectablePreGate({ ...apiWorker, trust_mode: 'blocked' }, false, false, true), false);
+});
+
+test('eligibleLanes(yolo): a worker/reader on a private+sensitive context (normally force-trusted away) becomes eligible', () => {
+  const worker: Lane = { ...ollama, id: 'mm-worker', kind: 'api', trust_mode: 'worker', capability: { codegen: 0.9 } };
+  const reader: Lane = { ...ollama, id: 'mm-reader', kind: 'api', trust_mode: 'reader', repo_read_attestation: true, capability: { codegen: 0.9 } };
+  // A maximally hostile context: private repo, sensitive, no gate, no egress opt-in.
+  const hostile = { repo_class: 'private', sensitivity: 'sensitive' } as const;
+  // Without yolo: workers/readers are gated out (only the full host could survive, and
+  // there's none here) ⇒ no eligible lanes.
+  const gated = eligibleLanes(
+    { category: 'codegen' },
+    { lanes: [worker, reader], policyContext: hostile },
+    noPolicy,
+  ).map((e) => e.lane.id);
+  assert.deepEqual(gated, []);
+  // With yolo: both are eligible despite the hostile context (force-trusted waived).
+  const open = eligibleLanes(
+    { category: 'codegen' },
+    { lanes: [worker, reader], policyContext: hostile, yolo: true },
+    noPolicy,
+  ).map((e) => e.lane.id).sort();
+  assert.deepEqual(open, ['mm-reader', 'mm-worker']);
+});
+
+test('routeDecide(yolo): a cheap worker wins where it would otherwise be gated to native', () => {
+  const worker: Lane = { ...ollama, id: 'mm-worker', kind: 'api', trust_mode: 'worker', capability: { codegen: 0.9 } };
+  const d = routeDecide(
+    { category: 'codegen' },
+    { lanes: [claude, worker], policyContext: { repo_class: 'unknown', sensitivity: 'unknown' }, yolo: true },
+    noPolicy,
+  );
+  assert.equal(d.laneId, 'mm-worker');
+});
+
+test('yolo still honors an explicit policy `block` rule and disabledLaneIds (deliberate kill-switches)', () => {
+  const worker: Lane = { ...ollama, id: 'mm-worker', kind: 'api', trust_mode: 'worker', capability: { codegen: 0.9 } };
+  const blockPolicy: Policy = { rules: [{ trust_mode: ['worker'], verdict: 'block', reason: 'no workers' }] };
+  // Explicit block: excluded even under yolo.
+  assert.deepEqual(
+    eligibleLanes({ category: 'codegen' }, { lanes: [worker], yolo: true }, blockPolicy).map((e) => e.lane.id),
+    [],
+  );
+  // disabledLaneIds: excluded even under yolo.
+  assert.deepEqual(
+    eligibleLanes({ category: 'codegen' }, { lanes: [worker], yolo: true }, { disabledLaneIds: ['mm-worker'] }).map((e) => e.lane.id),
+    [],
+  );
+});

@@ -104,6 +104,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       learnCapability: false,
       readerEgress: false,
       tiered: false,
+      yolo: false,
       lanes: [],
       laneReview: 'current',
     }),
@@ -129,6 +130,7 @@ test('builds the expected tool set with object input schemas', () => {
       'router_savings',
       'router_set_enabled',
       'router_set_prefer',
+      'router_set_yolo',
       'router_setup',
       'router_status',
       'router_summary',
@@ -293,6 +295,41 @@ test('set_enabled requires a boolean enabled and rejects other types', async () 
   assert.match(missing.content[0]!.text, /required/);
 
   const wrong = await call('router_set_enabled', deps(), { enabled: 'yes' });
+  assert.equal(wrong.isError, true);
+  assert.match(wrong.content[0]!.text, /must be a boolean/);
+});
+
+// --- router_set_yolo / YOLO surfacing (--dangerously-skip-permissions analogue) ---
+
+test('status surfaces a loud warning when YOLO is on, and nothing when off', async () => {
+  const on = await call('router_status', deps({ getEnabled: () => true, getYolo: () => true }));
+  assert.equal(on.structuredContent!.yolo as boolean, true);
+  assert.match(on.content[0]!.text, /YOLO mode is ON/);
+
+  const off = await call('router_status', deps({ getEnabled: () => true, getYolo: () => false }));
+  assert.equal(off.structuredContent!.yolo as boolean, false);
+  assert.doesNotMatch(off.content[0]!.text, /YOLO/);
+});
+
+test('set_yolo persists the requested state with a warning when enabling', async () => {
+  const calls: boolean[] = [];
+  const on = await call('router_set_yolo', deps({ setYolo: (v) => calls.push(v) }), { enabled: true });
+  assert.notEqual(on.isError, true);
+  assert.equal(on.structuredContent!.yolo as boolean, true);
+  assert.match(on.content[0]!.text, /YOLO mode ENABLED/);
+
+  const off = await call('router_set_yolo', deps({ setYolo: (v) => calls.push(v) }), { enabled: false });
+  assert.equal(off.structuredContent!.yolo as boolean, false);
+  assert.match(off.content[0]!.text, /YOLO mode DISABLED/);
+  assert.deepEqual(calls, [true, false]);
+});
+
+test('set_yolo requires a boolean enabled and rejects other types', async () => {
+  const missing = await call('router_set_yolo', deps(), {});
+  assert.equal(missing.isError, true);
+  assert.match(missing.content[0]!.text, /required/);
+
+  const wrong = await call('router_set_yolo', deps(), { enabled: 'yes' });
   assert.equal(wrong.isError, true);
   assert.match(wrong.content[0]!.text, /must be a boolean/);
 });
@@ -587,6 +624,7 @@ test('setup reports the manager + open gate when present', async () => {
         learnCapability: true,
         readerEgress: true,
         tiered: true,
+        yolo: true,
         lanes: [
           { id: 'codex-cli', kind: 'cli', model: 'gpt-5.5', trustMode: 'full', costBasis: 'subscription', executionMode: 'answer-only', role: 'active-reviewer', available: true },
           { id: 'minimax-api', kind: 'api', model: 'minimax-m3', rawModel: 'minimax@latest', trustMode: 'worker', costBasis: 'subscription', executionMode: 'answer-only', role: 'none', available: false },

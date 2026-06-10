@@ -124,6 +124,12 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
     tiered:
       env.TOKENMAXED_TIERED === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
+    // YOLO mode env default (--dangerously-skip-permissions analogue); also forced
+    // off by the global kill-switch. Per-project state (router_set_yolo) overrides
+    // this default at runtime; setup reports only the env-derived default.
+    yolo:
+      (env.TOKENMAXED_YOLO === 'true' || env.TOKENMAXED_YOLO === '1') &&
+      !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
     lanes: laneRows,
     laneReview,
   };

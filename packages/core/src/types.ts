@@ -282,6 +282,21 @@ export interface RouteContext {
    * `worker-ok` (no access restriction), identical to before this feature.
    */
   access_need?: AccessNeed;
+  /**
+   * YOLO — the `--dangerously-skip-permissions` analogue. When `true`, the
+   * structural trust gate and the data-egress policy gate are forced OPEN so EVERY
+   * configured worker/reader lane is selectable: `gateReady`/`readerEgress` are
+   * treated as `true`, the per-lane `repo_read_attestation` and reader hard cap are
+   * waived, and a `force-trusted` verdict (deny-by-default, sensitive/private repo,
+   * secret-on-allow) no longer restricts a lane to `full`. It does NOT relax two
+   * things: an explicit `disabledLaneIds` entry or an explicit policy `block` rule
+   * (deliberate operator kill-switches, honored like a permission deny-rule), and a
+   * lane whose tier has no egress-certified executor (a code-capability fact, not a
+   * permission). Orthogonal protections — the secret scanner and the user-owned
+   * config / RCE guard — live outside routing and are unaffected. Absent/`false` ⇒
+   * normal gated routing, identical to before this feature.
+   */
+  yolo?: boolean;
 }
 
 /**

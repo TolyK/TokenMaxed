@@ -23191,7 +23191,13 @@ function capPenaltyFor(headroom) {
   if (headroom <= CAP_CRITICAL_HEADROOM + CAP_EPSILON) return CAP_CRITICAL_PENALTY;
   return CAP_WARN_PENALTY;
 }
-function isSelectablePreGate(lane, gateReady = false, readerEgress = false) {
+function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false) {
+  if (yolo) {
+    if (lane.trust_mode === "full") return true;
+    if (lane.trust_mode === "worker") return isExecutorCertified(lane);
+    if (lane.trust_mode === "reader") return isReaderExecutorCertified(lane);
+    return false;
+  }
   if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
   if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
   if (lane.trust_mode === "reader") {
@@ -23267,15 +23273,16 @@ function describe2(lane, best, task, tiered = false, preferred = false) {
 function eligibleLanes(task, ctx, policy) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
-  const gateReady = ctx.gateReady ?? false;
-  const readerEgress = ctx.readerEgress ?? false;
+  const yolo = ctx.yolo ?? false;
+  const gateReady = yolo ? true : ctx.gateReady ?? false;
+  const readerEgress = yolo ? true : ctx.readerEgress ?? false;
   const repoTight = ctx.access_need === "repo-tight";
   const out = [];
   for (const lane of ctx.lanes) {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) continue;
+    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
     if (repoTight && !canDoRepoTight(lane)) continue;
     const { verdict } = evaluate(task, lane, policyContext, policy);
-    if (!laneAllowedByVerdict(lane, verdict)) continue;
+    if (yolo ? verdict === "block" : !laneAllowedByVerdict(lane, verdict)) continue;
     out.push({ lane, verdict });
   }
   return out;
@@ -26204,6 +26211,10 @@ async function runSetup(env) {
     readerEgress: env.TOKENMAXED_READER_EGRESS === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
     tiered: env.TOKENMAXED_TIERED === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
+    // YOLO mode env default (--dangerously-skip-permissions analogue); also forced
+    // off by the global kill-switch. Per-project state (router_set_yolo) overrides
+    // this default at runtime; setup reports only the env-derived default.
+    yolo: (env.TOKENMAXED_YOLO === "true" || env.TOKENMAXED_YOLO === "1") && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     lanes: laneRows,
     laneReview
   };
@@ -26439,6 +26450,7 @@ function createTools(core) {
         );
       }
       const gateReady = optBool(args, "gate_ready") ?? deps.gateReady;
+      const yolo = deps.getYolo?.() ?? false;
       const policyContext = {
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
@@ -26454,6 +26466,7 @@ function createTools(core) {
           readerEgress: deps.readerEgress,
           policyContext,
           access_need: resolvedAccessNeed,
+          ...yolo ? { yolo: true } : {},
           ...observedCapability ? { observedCapability } : {}
         };
         const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
@@ -26471,6 +26484,7 @@ function createTools(core) {
         readerEgress: deps.readerEgress,
         policyContext,
         access_need: resolvedAccessNeed,
+        ...yolo ? { yolo: true } : {},
         ...observedCapability ? { observedCapability } : {},
         ...availableIds ? { availableLaneIds: availableIds } : {},
         ...tieredCtx,
@@ -26488,14 +26502,16 @@ function createTools(core) {
       const lane = lanes.find((l) => l.id === decision.laneId);
       const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy).verdict : decision.policyVerdict;
       const preferNote = preferLaneId && decision.laneId !== preferLaneId ? `  note: preferred lane "${preferLaneId}" was not used \u2014 it isn't eligible, available, or capable for this category (fell back to normal routing).` : void 0;
+      const yoloNote = yolo ? `  \u26A0\uFE0F YOLO mode ON: trust/egress gates are bypassed \u2014 workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.` : void 0;
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
         `  why: ${decision.reason}`,
+        ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, ...preferLaneId ? { preferLaneId } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...preferLaneId ? { preferLaneId } : {} });
     })
   };
   const statusTool = {
@@ -26507,7 +26523,13 @@ function createTools(core) {
       const warnings = enabled && deps.freshness ? await deps.freshness() : [];
       const mismatches = enabled && deps.idMismatch ? await deps.idMismatch() : [];
       const preferred = deps.preferredLane?.();
+      const yolo = deps.getYolo?.() ?? false;
       const lines = [`TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`];
+      if (yolo) {
+        lines.push(
+          "\u26A0\uFE0F YOLO mode is ON \u2014 every trust/egress gate is bypassed: ALL configured worker/reader lanes are selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner still runs. Disable with /tokenmaxed:yolo off."
+        );
+      }
       if (preferred) {
         lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
       }
@@ -26521,6 +26543,7 @@ function createTools(core) {
       }
       return ok(lines.join("\n"), {
         enabled,
+        yolo,
         ...preferred ? { preferLaneId: preferred } : {},
         staleness: warnings,
         idMismatch: mismatches
@@ -26571,6 +26594,29 @@ function createTools(core) {
         `Preferred lane set to "${lane}" for this project \u2014 routing will favor it when it is eligible, available, and capable for the task (else it falls back to normal routing). Run /tokenmaxed:prefer off to clear.`,
         { preferLaneId: lane }
       );
+    })
+  };
+  const setYoloTool = {
+    name: "router_set_yolo",
+    description: "Turn YOLO mode ON or OFF for this project \u2014 the TokenMaxed analogue of Claude's --dangerously-skip-permissions. When ON, the router forces every trust/egress gate OPEN: ALL configured worker/reader lanes become selectable regardless of repo_class, sensitivity, the gate-ready/reader-egress opt-ins, or per-lane attestation, and a 'force-trusted' policy verdict no longer restricts a task to a full lane. This means (possibly private) repository code may be sent to ANY configured vendor lane. It does NOT disable the secret scanner, an explicit policy 'block' rule, the disabledLaneIds list, or the user-owned-config / RCE guard. The setting is persisted per project and survives restarts; the TOKENMAXED_DISABLE kill-switch always overrides it back off. Powers /tokenmaxed:yolo. Only enable on code you are comfortable sending to every lane you have configured.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["enabled"],
+      properties: {
+        enabled: {
+          type: "boolean",
+          description: "true to turn YOLO mode ON (bypass all trust/egress gates), false to turn it OFF (normal gated routing)."
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const enabled = optBool(args, "enabled");
+      if (enabled === void 0) throw new ToolInputError('"enabled" is required (boolean).');
+      if (!deps.setYolo) throw new ToolInputError("YOLO mode is not supported by this server build.");
+      deps.setYolo(enabled);
+      const text = enabled ? "\u26A0\uFE0F YOLO mode ENABLED for this project \u2014 every trust/egress gate is bypassed: ALL configured worker/reader lanes are now selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner, explicit policy `block` rules, and disabledLaneIds still apply. Run /tokenmaxed:yolo off to restore normal gated routing." : "YOLO mode DISABLED for this project \u2014 routing is back to normal gated behavior (trust/egress gates enforced).";
+      return ok(text, { yolo: enabled });
     })
   };
   const delegateTool = {
@@ -26667,6 +26713,7 @@ ${r.notes}` : "";
         `  learned capability: ${r.learnCapability ? "on" : "off"} (enable with TOKENMAXED_LEARN_CAPABILITY=true \u2014 review outcomes adjust routing over time)`,
         `  reader egress: ${r.readerEgress ? "on" : "off"} (enable with TOKENMAXED_READER_EGRESS=true \u2014 lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
         `  tiered routing: ${r.tiered ? "on" : "off"} (enable with TOKENMAXED_TIERED=true \u2014 start on the cheapest lane clearing the capability floor, step up on review failure)`,
+        `  YOLO mode: ${r.yolo ? "\u26A0\uFE0F ON (env default)" : "off"} (the --dangerously-skip-permissions analogue: TOKENMAXED_YOLO=true or /tokenmaxed:yolo on \u2014 bypasses ALL trust/egress gates so every worker/reader lane is selectable; secret scanner still applies)`,
         "",
         ...r.laneReview === "changed" ? ["\u26A0 Your lanes changed since you last reviewed them \u2014 confirm the summary below."] : r.laneReview === "first-review" ? ["\u2139 Lane review: confirm what each lane may see/do below (recorded so you're reminded if it changes)."] : [],
         ...formatLaneSetup(r.lanes),
@@ -26676,7 +26723,7 @@ ${r.notes}` : "";
       return ok(lines.join("\n"), { ...r });
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, delegateTool, reviewTool, setupTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool];
 }
 function renderDelegate(o) {
   if (o.native || o.status !== "ok") {
@@ -26761,6 +26808,25 @@ function writePreferred(store, projectKey, laneId) {
   } else {
     delete map[projectKey];
   }
+  store.write(map);
+}
+
+// ../mcp/src/yolo.ts
+function asMap3(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "boolean") out[k] = v;
+  }
+  return out;
+}
+function readYolo(store, projectKey, fallback = false) {
+  const map = asMap3(store.read());
+  return Object.hasOwn(map, projectKey) ? map[projectKey] : fallback;
+}
+function writeYolo(store, projectKey, on) {
+  const map = asMap3(store.read());
+  map[projectKey] = on;
   store.write(map);
 }
 
@@ -26883,6 +26949,10 @@ function makeServerDeps(env = process.env) {
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
   const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
+  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join7(dirname7(statePath), "yolo.json");
+  const yoloStore = fileToggleStore(yoloStatePath);
+  const yoloEnvDefault = (env.TOKENMAXED_YOLO === "true" || env.TOKENMAXED_YOLO === "1") && !globallyDisabled;
+  const readYoloState = () => globallyDisabled ? false : readYolo(yoloStore, projectKey, yoloEnvDefault);
   const resolveAuth = makeResolveAuth(env);
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
@@ -26922,6 +26992,10 @@ function makeServerDeps(env = process.env) {
       // no-op. Resolved here (not in core) because the heuristic needs the
       // instruction/files, which the pure router never sees.
       access_need: inferAccessNeed(request.access_need, request.instruction, request.files),
+      // YOLO: when on, eligibleLanes/routeDecide force every trust+egress gate open
+      // (the --dangerously-skip-permissions analogue). Read per call so the toggle
+      // takes effect without a relaunch; the kill-switch still forces it off.
+      ...readYoloState() ? { yolo: true } : {},
       ...observedCapability ? { observedCapability } : {},
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(lanes, priceTable) } : {},
@@ -27040,6 +27114,10 @@ function makeServerDeps(env = process.env) {
     // Universal preferred-lane override (per-project state + env fallback).
     preferredLane: readPreferredLane,
     setPreferredLane: (laneId) => writePreferred(preferStore, projectKey, laneId),
+    // YOLO mode (per-project state + TOKENMAXED_YOLO fallback; forced off by the
+    // kill-switch). router_preview/router_status read getYolo; router_set_yolo writes it.
+    getYolo: readYoloState,
+    setYolo: (on) => writeYolo(yoloStore, projectKey, on),
     // Session summary (router_summary / /tokenmaxed:summary), composed from the same
     // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
     // one source of truth. Read-only.

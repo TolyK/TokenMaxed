@@ -88,7 +88,19 @@ function capPenaltyFor(headroom: number | undefined): number {
  *   restriction for full (trusted) lanes; worker admission lands with the policy
  *   engine + egress certification.
  */
-export function isSelectablePreGate(lane: Lane, gateReady = false, readerEgress = false): boolean {
+export function isSelectablePreGate(lane: Lane, gateReady = false, readerEgress = false, yolo = false): boolean {
+  // YOLO (--dangerously-skip-permissions analogue): the trust-tier structural gate
+  // (gate-ready, reader-egress opt-in, per-lane repo_read_attestation) is WAIVED, so
+  // every tier is selectable EXCEPT `blocked`. The executor-certification checks
+  // STAY: an egress-certified executor for the tier is a CODE-capability fact (a lane
+  // without one would error at send), not a user permission. The secret scanner and
+  // the user-owned-config / RCE guard live outside routing and are likewise unaffected.
+  if (yolo) {
+    if (lane.trust_mode === 'full') return true;
+    if (lane.trust_mode === 'worker') return isExecutorCertified(lane);
+    if (lane.trust_mode === 'reader') return isReaderExecutorCertified(lane);
+    return false; // `blocked` (never) and any unknown/legacy value.
+  }
   // ALLOWLIST + fail-closed: only `full`/`worker`/`reader` have selectable logic.
   // Full (trusted, user-approved) lanes: CLI/local always selectable; an API lane
   // only once the gate is ready (the blanket pre-gate "no API lane" guard relaxes).
@@ -307,8 +319,11 @@ export interface EligibleLane {
 export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): EligibleLane[] {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
-  const gateReady = ctx.gateReady ?? false;
-  const readerEgress = ctx.readerEgress ?? false;
+  // YOLO forces both safety opt-ins open (the `--dangerously-skip-permissions`
+  // analogue); see RouteContext.yolo and the per-lane / per-verdict handling below.
+  const yolo = ctx.yolo ?? false;
+  const gateReady = yolo ? true : (ctx.gateReady ?? false);
+  const readerEgress = yolo ? true : (ctx.readerEgress ?? false);
   // Tandem access gate: a `repo-tight` task needs LIVE repo/tool/shell access, so
   // only a lane that can actually act on the repo survives — the native host or an
   // agentic full lane (see canDoRepoTight). Worker/reader lanes AND full-but-answer-
@@ -319,10 +334,15 @@ export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): El
   const repoTight = ctx.access_need === 'repo-tight';
   const out: EligibleLane[] = [];
   for (const lane of ctx.lanes) {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress)) continue;
+    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
     if (repoTight && !canDoRepoTight(lane)) continue;
     const { verdict } = evaluate(task, lane, policyContext, policy);
-    if (!laneAllowedByVerdict(lane, verdict)) continue;
+    // Normal: drop `block` AND `force-trusted`-on-non-full. YOLO: waive the egress
+    // policy (deny-by-default, sensitive/private, reader hard cap — all surface as
+    // `force-trusted`, never `block`) but still honor an explicit `block` rule — the
+    // ONLY way `evaluate` yields `block` — as a deliberate operator kill-switch, like
+    // `disabledLaneIds` and a permission deny-rule under --dangerously-skip-permissions.
+    if (yolo ? verdict === 'block' : !laneAllowedByVerdict(lane, verdict)) continue;
     out.push({ lane, verdict });
   }
   return out;

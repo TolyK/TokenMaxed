@@ -121,6 +121,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:review` | manager review of your current working-tree changes |
 | `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
 | `/tokenmaxed:prefer <lane>` · `/tokenmaxed:prefer off` | temporarily favor one configured lane (any vendor, CLI or API) over normal routing — e.g. to push a sprint's work to a cheaper subscription while another's credits run low; clears with `off`. Honored only when that lane is eligible, available, and capable for the task (else it falls back to normal routing). Persisted per project; no relaunch. |
+| `/tokenmaxed:yolo` · `/tokenmaxed:yolo off` | **⚠️ dangerous** — turn YOLO mode on/off for this project (the `--dangerously-skip-permissions` analogue); see **YOLO mode** under optional features below. |
 
 ### Launch it (and turn on optional features)
 
@@ -325,8 +326,26 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     that clears. A `capability: 0` lane is never selected; if nothing clears the floor,
     routing falls back to maximize so it never fails. `/tokenmaxed:why` shows the
     tiered pick. Family grouping uses each lane's `model_family`.
+  - **⚠️ YOLO mode (the `--dangerously-skip-permissions` analogue)** — turns off
+    the routing **permission gates** so EVERY configured worker/reader lane is
+    selectable. Launch with `TOKENMAXED_YOLO=true` (session default), or flip it
+    per project at runtime with `/tokenmaxed:yolo` (on) / `/tokenmaxed:yolo off`
+    (the per-project setting overrides the env default and is persisted). When on,
+    the router forces `TOKENMAXED_GATE_READY` and `TOKENMAXED_READER_EGRESS` open
+    and **waives** the per-lane `repo_read_attestation`, the reader hard cap, and a
+    `force-trusted` policy verdict — so a task routes to a worker/reader even on a
+    private/sensitive/unknown repo. **This means (possibly private) repo code may
+    be sent to any configured vendor lane.** Like `--dangerously-skip-permissions`
+    still honoring deny rules, YOLO does **not** override two deliberate
+    kill-switches — an explicit policy `block` rule and `disabledLaneIds` — and it
+    does **not** disable the orthogonal protections that aren't routing permissions:
+    the **secret scanner** still gates every payload (fail-closed), the lane/policy
+    config is still read only from the user-owned `~/.tokenmaxed` (the RCE guard),
+    and executor certification still applies. `/tokenmaxed:status` and
+    `/tokenmaxed:why` show a loud warning while it's on. Only enable it on code you
+    are comfortable sending to every lane you've configured.
   - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
-    regardless of the flags above.
+    regardless of the flags above (including YOLO mode).
 
 ### Model freshness (never silently run a stale model)
 
