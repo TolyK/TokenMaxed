@@ -8437,13 +8437,22 @@ function combinedPrompt(instruction, attachments) {
   return attachments && attachments.length > 0 ? [instruction, ...attachments.map((a) => a.content)].join("\n\n") : instruction;
 }
 var numOrUndef = (v) => typeof v === "number" ? v : void 0;
+var MAX_PROMPT_ARG_BYTES = 128 * 1024;
 function makeCliExecutor(spawnImpl) {
   const spawn = spawnImpl ?? ((cmd, args, opts) => spawnSync(cmd, [...args], opts));
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model));
-    const res = spawn(lane.command, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const usesPromptArg = (lane.args ?? []).some((a) => a.includes("{prompt}"));
+    if (usesPromptArg && Buffer.byteLength(input, "utf8") > MAX_PROMPT_ARG_BYTES) {
+      throw new LaneFailure(
+        "provider_error",
+        `cli lane "${lane.id}" prompt is too large to pass as a command-line argument (> ${MAX_PROMPT_ARG_BYTES} bytes) \u2014 use a stdin-based CLI lane for large inputs`
+      );
+    }
+    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model).replaceAll("{prompt}", input));
+    const stdinInput = usesPromptArg ? "" : input;
+    const res = spawn(lane.command, args, { input: stdinInput, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (res.error) {
       const code = res.error.code;
       if (code === "ENOBUFS") throw new LaneFailure("provider_error", `cli lane "${lane.id}" produced too much output (exceeded the buffer limit)`);
@@ -8631,6 +8640,22 @@ function commandOnPath(command, path) {
   const dirs = (path ?? "").split(":").filter(Boolean);
   return dirs.some((dir) => isExecutableFile(join3(dir, command)));
 }
+function regularFileExists(candidate) {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+function nodeScriptArgPresent(lane) {
+  const base = (lane.command ?? "").split("/").pop();
+  if (base !== "node") return true;
+  const scriptArg = (lane.args ?? []).find(
+    (a) => !a.startsWith("-") && (a.endsWith(".mjs") || a.endsWith(".js"))
+  );
+  if (scriptArg === void 0) return true;
+  return regularFileExists(scriptArg);
+}
 async function localReachable(base, fetchImpl) {
   if (!fetchImpl) return false;
   const controller = new AbortController();
@@ -8646,7 +8671,7 @@ async function localReachable(base, fetchImpl) {
 }
 async function isLaneAvailable(lane, deps) {
   if (lane.native) return true;
-  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path) && nodeScriptArgPresent(lane);
   if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
   if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
   return false;

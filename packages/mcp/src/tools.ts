@@ -207,6 +207,11 @@ export interface SetupReport {
    * or 'current'. Setup marks the set as reviewed when it runs.
    */
   laneReview: 'first-review' | 'changed' | 'current';
+  /**
+   * If an ENABLED api/BYOK lane belongs to a vendor that also ships a Claude Code CLI
+   * plugin (subscription, $0 metered), a nudge to use the plugin instead of the key.
+   */
+  pluginSuggestions?: { laneId: string; vendor: string; plugin: string; url: string }[];
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -865,6 +870,17 @@ export function createTools(core: CorePort): ToolDef[] {
               ? ['ℹ Lane review: confirm what each lane may see/do below (recorded so you\'re reminded if it changes).']
               : []),
           ...formatLaneSetup(r.lanes),
+          ...(r.pluginSuggestions && r.pluginSuggestions.length > 0
+            ? [
+                '',
+                '💡 These enabled lanes authenticate with a BYOK API key. The vendor also ships a Claude',
+                '   Code CLI plugin you can route on your flat-rate subscription instead — no key to manage',
+                '   (and no metered spend for a pay-per-token key):',
+                ...r.pluginSuggestions.map(
+                  (s) => `   • ${s.laneId} (${s.vendor}) → ${s.plugin}: ${s.url}`,
+                ),
+              ]
+            : []),
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
         ];

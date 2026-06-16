@@ -91,6 +91,68 @@ lanes:
       feature: 0.85
       refactor: 0.82
 
+  # --- Plugin-backed CLI lanes (grok + antigravity) ---------------------------
+  # Installed as Claude Code plugins (grok-plugin-cc, antigravity-plugin-cc), these
+  # make xAI Grok and Google Antigravity callable like codex — routing can hand them
+  # bounded subtasks (and antigravity can also review). Both are subscription CLI lanes,
+  # so they cost $0 metered. Token usage is ESTIMATED (CLIs don't report exact tokens),
+  # exactly like the codex-cli lane above.
+
+  - id: grok-cli                # xAI Grok Build CLI. Worker-only offload.
+    kind: cli
+    model: grok-code-fast-1     # label for a SUBSCRIPTION lane (xAI flat-rate); not sent to a vendor pricing API
+    trust_mode: full            # → blocked to disable. Trusts xAI with repo + tools. Availability-gated:
+                                # routing skips it unless the `grok` CLI is installed (so `full` is safe here).
+    costBasis: subscription
+    provenance: xai
+    jurisdiction: US
+    execution_mode: answer-only
+    command: grok               # bare CLI (the plugin installs it). If it "failed to spawn", the hook/server
+                                # PATH likely omits ~/.grok/bin — set an ABSOLUTE path here
+                                # (e.g. /Users/you/.grok/bin/grok), like the codex note above.
+    # grok reads the prompt as an ARGV arg (not stdin) ⇒ pass it via the {prompt} placeholder.
+    # read-only sandbox + auto-approve: a headless worker never blocks on a confirmation and never
+    # edits files (answer-only — it RETURNS the code/text and the host applies it).
+    args: ["-p", "{prompt}", "--output-format", "plain", "--sandbox", "read-only", "--always-approve"]
+    # Worker only: no roles/manager_allowed ⇒ grok never reviews (xai isn't trusted-by-origin, so it
+    # could only be a manager via `attestation: true` anyway).
+    capability:
+      codegen: 0.86
+      bugfix: 0.84
+      feature: 0.80
+      refactor: 0.80
+
+  - id: antigravity-cli         # Google Antigravity CLI (Gemini engine). Worker + reviewer.
+    kind: cli
+    model: gemini-3-pro         # label for a SUBSCRIPTION lane (Antigravity/Gemini); not sent to a vendor pricing API
+    trust_mode: blocked         # → full to enable — but SET THE COMPANION PATH below FIRST, else it
+                                # spawns `node <placeholder>` and fails. (Blocked, not full, because a
+                                # generic template can't know your machine's companion path.)
+    costBasis: subscription
+    provenance: google
+    jurisdiction: US
+    execution_mode: answer-only
+    # `agy` needs a PTY for headless output, so it MUST run through the plugin's companion script
+    # (it wraps agy under `script`). The companion reads the prompt from STDIN via `--stdin`, which
+    # the lane executor already pipes in (no {prompt} placeholder needed). Set `command` to your node
+    # binary (absolute if the hook PATH is stripped) and the FIRST arg to the companion's ABSOLUTE
+    # path — it lives at (VERSIONED; update after a plugin upgrade):
+    #   ~/.claude/plugins/cache/antigravity-cc/antigravity/<version>/scripts/agy-companion.mjs
+    command: node
+    args: ["<ABSOLUTE-PATH-TO>/agy-companion.mjs", "ask", "--stdin"]
+    # Worker AND reviewer: listed AFTER codex-cli ⇒ codex stays the default reviewer and antigravity
+    # is a fallback / independent reviewer (google is trusted-by-origin ⇒ no attestation needed).
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      codegen: 0.85
+      refactor: 0.84
+      bugfix: 0.83
+      feature: 0.82
+      boilerplate: 0.84
+      explain: 0.84
+      docs: 0.84
+
   - id: ollama-llama3            # Local Ollama model. OPT-IN: a local server is the
     kind: local                  # least likely thing to be present, so it is NOT an
     model: llama3.1:8b           # enabled default — you choose it deliberately.
@@ -182,6 +244,11 @@ lanes:
   #              TOKENMAXED_GATE_READY=true (the pre-gate guard blocks api lanes until the
   #              safety gate is open); full CLI/local lanes need no flag.
   # BYOK api lanes: put the key in env TOKENMAXED_KEY_<authHandle> (never in this file).
+  # TIP: before adding a metered API key, check whether the vendor has a Claude Code CLI
+  #   plugin — OpenAI/Codex, xAI/Grok (github.com/TolyK/grok-plugin-cc), Google/Antigravity
+  #   (github.com/TolyK/antigravity-plugin-cc), Anthropic/Claude Code. A CLI plugin routes
+  #   on the flat-rate SUBSCRIPTION ($0 metered) with no key to manage, so it's usually the
+  #   better lane. /tokenmaxed:setup reminds you whenever an enabled api lane has one.
   # api lanes speak the OpenAI /chat/completions schema — point `endpoint` at your
   # provider's OpenAI-COMPATIBLE chat-completions URL (not a vendor-proprietary one).
   # COST: `costBasis` is YOUR billing model — NOT implied by `api`. Many vendors (e.g.

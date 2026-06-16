@@ -245,6 +245,46 @@ test('makeCliExecutor substitutes the {model} placeholder with the resolved lane
   assert.deepEqual(seen, ['-p', '--model', 'claude-sonnet-4-6']); // {model} ⇒ lane.model
 });
 
+test('makeCliExecutor substitutes the {prompt} placeholder with the full instruction (argv-prompt CLIs)', async () => {
+  // For a CLI that takes the prompt as an ARGV argument (e.g. `grok -p {prompt}`) rather
+  // than on stdin. The full instruction+attachments are substituted into the arg.
+  let seen: readonly string[] = [];
+  let input = '';
+  const exec = makeCliExecutor((_cmd, args, opts) => {
+    seen = args;
+    input = opts.input;
+    return { status: 0, stdout: 'ok' };
+  });
+  const grok: Lane = {
+    id: 'grok-cli', kind: 'cli', model: 'grok-code', trust_mode: 'full',
+    costBasis: 'subscription', provenance: 'xai', jurisdiction: 'US',
+    command: 'grok', args: ['-p', '{prompt}', '--output-format', 'plain'], capability: { codegen: 0.85 },
+  };
+  await exec(grok, 'fix the bug', [{ content: 'ATTACHED' }]);
+  assert.equal(seen[0], '-p');
+  assert.match(seen[1] ?? '', /fix the bug/); // {prompt} ⇒ full instruction
+  assert.match(seen[1] ?? '', /ATTACHED/); // attachments included in the argv prompt
+  assert.deepEqual(seen.slice(2), ['--output-format', 'plain']); // other args untouched
+  assert.equal(input, ''); // NOT duplicated on stdin (argv carries it) — no double-prompt
+});
+
+test('makeCliExecutor: a {prompt} lane keeps stdin for the prompt OFF even with attachments, and rejects an oversized argv prompt', async () => {
+  let spawned = false;
+  const exec = makeCliExecutor(() => {
+    spawned = true;
+    return { status: 0, stdout: 'ok' };
+  });
+  const grok: Lane = {
+    id: 'grok-cli', kind: 'cli', model: 'grok-code', trust_mode: 'full',
+    costBasis: 'subscription', provenance: 'xai', jurisdiction: 'US',
+    command: 'grok', args: ['-p', '{prompt}'], capability: { codegen: 0.85 },
+  };
+  // > 128 KiB ⇒ fail fast with a typed provider_error (clean fallback), never an E2BIG spawn.
+  const huge = 'x'.repeat(129 * 1024);
+  await assert.rejects(() => exec(grok, huge), /too large to pass as a command-line argument/);
+  assert.equal(spawned, false); // guarded BEFORE the spawn
+});
+
 test('makeOllamaExecutor posts to /api/generate and maps eval counts to usage', async () => {
   let url: string | undefined;
   const exec = makeOllamaExecutor(async (u) => {

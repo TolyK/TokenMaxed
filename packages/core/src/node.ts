@@ -677,19 +677,49 @@ function combinedPrompt(instruction: string, attachments?: readonly { content: s
 
 const numOrUndef = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
 
+/**
+ * Conservative cap on a prompt passed via the `{prompt}` ARGV placeholder. The OS limits a
+ * single argument / total argv (ARG_MAX — ~256 KB per arg on macOS, higher on Linux), and a
+ * prompt approaching that is better sent to a stdin-based lane. 128 KB is comfortably under
+ * every platform's limit and far larger than any bounded worker subtask.
+ */
+const MAX_PROMPT_ARG_BYTES = 128 * 1024;
+
 export function makeCliExecutor(spawnImpl?: SpawnLike): TrustedExecFn {
   const spawn: SpawnLike =
     spawnImpl ?? ((cmd, args, opts) => spawnSync(cmd, [...args], opts) as ReturnType<SpawnLike>);
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    // `{model}` placeholder substitution: a CLI lane can pass `--model {model}` in its
-    // args instead of hard-pinning a version, so the spawn always uses the lane's
-    // CURRENT model. By the time a lane reaches the executor its `model` is already the
-    // concrete, price-table-resolved id (a `<family>@latest` alias has been resolved on
-    // the routing path), so this keeps CLI lanes self-updating with no stale literal.
-    const args = (lane.args ?? []).map((a) => a.replaceAll('{model}', lane.model));
-    const res = spawn(lane.command, args, { input, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    // Arg placeholder substitution:
+    //   `{model}`  — a CLI lane can pass `--model {model}` instead of hard-pinning a
+    //                version, so the spawn always uses the lane's CURRENT model. By the
+    //                time a lane reaches the executor its `model` is already the concrete,
+    //                price-table-resolved id (a `<family>@latest` alias has been resolved
+    //                on the routing path), so CLI lanes stay self-updating with no stale
+    //                literal.
+    //   `{prompt}` — for a CLI that takes the prompt as an ARGV argument rather than on
+    //                stdin (e.g. `grok -p {prompt}`). Most CLIs (codex exec, the agy
+    //                companion's `--stdin`) read the instruction from stdin instead.
+    const usesPromptArg = (lane.args ?? []).some((a) => a.includes('{prompt}'));
+    // A `{prompt}` lane puts the whole prompt on the command line, which the OS caps
+    // (ARG_MAX). Fail fast with a typed error (⇒ clean fallback / degrade) rather than a
+    // cryptic E2BIG spawn failure when a delegated prompt is too large for argv.
+    if (usesPromptArg && Buffer.byteLength(input, 'utf8') > MAX_PROMPT_ARG_BYTES) {
+      throw new LaneFailure(
+        'provider_error',
+        `cli lane "${lane.id}" prompt is too large to pass as a command-line argument (> ${MAX_PROMPT_ARG_BYTES} bytes) — use a stdin-based CLI lane for large inputs`,
+      );
+    }
+    const args = (lane.args ?? []).map((a) => a.replaceAll('{model}', lane.model).replaceAll('{prompt}', input));
+    // Transport: an argv-prompt lane already carries the prompt in `args`, so do NOT also
+    // pipe it on stdin — that would DUPLICATE it for any CLI that reads both, and shove a
+    // large payload into a pipe the CLI never drains. stdin carries the prompt only for the
+    // (default) lanes that read it there. NOTE: a `{prompt}` lane's prompt is visible in the
+    // process argv (e.g. `ps`), inherent to argv-prompt CLIs like `grok -p` — prefer a
+    // stdin lane when the prompt may be sensitive.
+    const stdinInput = usesPromptArg ? '' : input;
+    const res = spawn(lane.command, args, { input: stdinInput, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     if (res.error) {
       // Distinguish a TIMEOUT (the common "review took too long" case — spawnSync sets
       // ETIMEDOUT + a SIGTERM signal) from a real spawn failure, so the surfaced error

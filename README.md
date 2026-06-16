@@ -315,6 +315,18 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     constraint: **CLI** lanes can only be `full` (or `blocked`); `worker`/`reader`
     are **API/BYOK-only** (the certified executors are HTTP). So a CLI vendor is
     full-or-nothing, while an API vendor can be `worker`/`reader`/`full`.
+  - **Plugin-backed CLI lanes (Grok, Antigravity)** — installed as Claude Code
+    plugins (`grok-plugin-cc`, `antigravity-plugin-cc`), xAI Grok and Google
+    Antigravity (Gemini) route like Codex: full-trust subscription CLI lanes, with
+    token usage *estimated* (CLIs don't report exact counts). **Grok** ships enabled
+    as a worker-only offload — availability-gated on the `grok` CLI, so `full` is safe
+    by default; it never reviews. **Antigravity** is a worker *and* reviewer (a
+    fallback after Codex in file order) but ships `blocked` in the templates because it
+    must run through the plugin's companion script (it needs a PTY for headless output)
+    at a machine-specific path — set `command`/`args` to that companion and flip to
+    `full` to enable (see the `lanes.example.yaml` comments). Grok takes its prompt as
+    an argv arg via the `{prompt}` placeholder; the Antigravity companion reads it from
+    stdin via `--stdin`.
   - **Tiered routing (start cheap, step up)** — enable with `TOKENMAXED_TIERED=true`.
     Instead of maximizing capability, routing picks the **cheapest lane whose
     *effective* capability clears a floor** (`TOKENMAXED_TIER_FLOOR`, default 0.6;

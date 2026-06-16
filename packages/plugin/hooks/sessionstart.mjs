@@ -8414,6 +8414,7 @@ var JsonlLedger = class {
     return event;
   }
 };
+var MAX_PROMPT_ARG_BYTES = 128 * 1024;
 
 // ../mcp/src/availability.ts
 import { accessSync, constants, statSync } from "node:fs";
@@ -8467,6 +8468,22 @@ function commandOnPath(command, path) {
   const dirs = (path ?? "").split(":").filter(Boolean);
   return dirs.some((dir) => isExecutableFile(join3(dir, command)));
 }
+function regularFileExists(candidate) {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+function nodeScriptArgPresent(lane) {
+  const base = (lane.command ?? "").split("/").pop();
+  if (base !== "node") return true;
+  const scriptArg = (lane.args ?? []).find(
+    (a) => !a.startsWith("-") && (a.endsWith(".mjs") || a.endsWith(".js"))
+  );
+  if (scriptArg === void 0) return true;
+  return regularFileExists(scriptArg);
+}
 async function localReachable(base, fetchImpl) {
   if (!fetchImpl) return false;
   const controller = new AbortController();
@@ -8482,7 +8499,7 @@ async function localReachable(base, fetchImpl) {
 }
 async function isLaneAvailable(lane, deps) {
   if (lane.native) return true;
-  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path) && nodeScriptArgPresent(lane);
   if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
   if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
   return false;

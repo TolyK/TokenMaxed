@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import { LaneConfigError, LaneRegistry, parseLaneConfig } from '../src/registry.ts';
 import { loadLaneConfig } from '../src/node.ts';
+import { isManagerEligible } from '../src/route.ts';
 
 const VALID = `
 lanes:
@@ -338,7 +339,7 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   // Pass the file: URL directly; loadLaneConfig handles URL→path (and spaces).
   const examplePath = new URL('../../../config/lanes.example.yaml', import.meta.url);
   const reg = loadLaneConfig(examplePath);
-  assert.equal(reg.lanes.length, 10);
+  assert.equal(reg.lanes.length, 12);
   assert.ok(reg.byId('claude-native'));
   // MODEL-FRESHNESS: the host lane self-updates via @latest instead of a hard pin.
   assert.equal(reg.byId('claude-native')?.model, 'claude-opus@latest');
@@ -366,6 +367,18 @@ test('loadLaneConfig reads and validates the shipped example file', () => {
   for (const id of ['ollama-llama3', 'gemini-cli', 'kimi-cli', 'glm-api', 'minimax-api', 'claude-sonnet-api']) {
     assert.equal(reg.byId(id)?.trust_mode, 'blocked', `${id} must ship blocked`);
   }
+  // PLUGIN LANES: grok ships full but WORKER-ONLY (availability-gated on the `grok` CLI),
+  // so it's safe to enable by default; it must never be manager-eligible (no roles/attestation).
+  const grok = reg.byId('grok-cli');
+  assert.ok(grok);
+  assert.equal(grok!.trust_mode, 'full', 'grok-cli ships enabled (availability-gated)');
+  assert.equal(grok!.command, 'grok');
+  assert.equal(isManagerEligible(grok!), false, 'grok-cli is worker-only — never a manager');
+  // antigravity needs a machine-specific companion path, so the generic template ships it
+  // blocked (full would spawn a placeholder path and fail). google is trusted-by-origin, so
+  // once enabled + path set it is manager-eligible (a fallback reviewer after codex).
+  assert.equal(reg.byId('antigravity-cli')?.trust_mode, 'blocked', 'antigravity-cli template ships blocked (needs companion path)');
+  assert.equal(reg.byId('antigravity-cli')?.provenance, 'google');
   // MODEL-FRESHNESS: api vendor templates default to <family>@latest so enabling one
   // tracks the newest priced model rather than silently pinning a stale id.
   assert.equal(reg.byId('minimax-api')?.model, 'minimax@latest');

@@ -15,6 +15,7 @@ import { isManagerEligible, resolveLaneModel } from '@tokenmaxed/core';
 import { loadLaneConfig, loadPolicyConfig, loadPriceTable, makeGitleaksScanner } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
+import { pluginSuggestionsFor } from './cli-plugins.ts';
 import { homeFile } from './config.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
 import { laneSetFingerprint, markLanesSeen, readLaneReviewState, writeLaneReviewState } from './lane-state.ts';
@@ -132,5 +133,8 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
       !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
     lanes: laneRows,
     laneReview,
+    // If a user enabled a metered BYOK api lane for a vendor that ALSO ships a Claude Code
+    // CLI plugin (subscription, $0 metered), nudge them toward the plugin with a link.
+    pluginSuggestions: pluginSuggestionsFor(registry.lanes),
   };
 }

@@ -105,6 +105,20 @@ test('availableLaneIds returns only the runnable ids', async () => {
   assert.deepEqual(ids.sort(), ['codex', 'glm', 'host']);
 });
 
+test('a node-runner CLI lane is available only when its script arg exists (companion path / placeholder guard)', async () => {
+  const nodeDir = dirname(process.execPath); // `node` resolves here
+  const dir = mkdtempSync(join(tmpdir(), 'tm-companion-'));
+  const script = join(dir, 'agy-companion.mjs');
+  writeFileSync(script, '// companion\n');
+  const path = `${nodeDir}:${dir}`;
+  const present: Lane = { ...base, id: 'agy', kind: 'cli', command: 'node', args: [script, 'ask', '--stdin'] };
+  const missing: Lane = { ...base, id: 'agy-missing', kind: 'cli', command: 'node', args: [join(dir, 'gone.mjs'), 'ask'] };
+  const placeholder: Lane = { ...base, id: 'agy-tmpl', kind: 'cli', command: 'node', args: ['<ABSOLUTE-PATH-TO>/agy-companion.mjs', 'ask', '--stdin'] };
+  assert.equal(await isLaneAvailable(present, { path, resolveAuth: noAuth }), true);
+  assert.equal(await isLaneAvailable(missing, { path, resolveAuth: noAuth }), false);
+  assert.equal(await isLaneAvailable(placeholder, { path, resolveAuth: noAuth }), false); // template placeholder ⇒ unavailable
+});
+
 test('makeAvailabilityProbe finds a CLI installed beside Node even when the host PATH omits it', async () => {
   // Regression: under a stripped host/hook PATH a bare-command CLI lane was marked
   // unavailable, so it never reached the spawn that augments PATH. The probe must

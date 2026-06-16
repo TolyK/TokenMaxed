@@ -25038,13 +25038,22 @@ function combinedPrompt(instruction, attachments) {
   return attachments && attachments.length > 0 ? [instruction, ...attachments.map((a) => a.content)].join("\n\n") : instruction;
 }
 var numOrUndef = (v) => typeof v === "number" ? v : void 0;
+var MAX_PROMPT_ARG_BYTES = 128 * 1024;
 function makeCliExecutor(spawnImpl) {
   const spawn = spawnImpl ?? ((cmd, args, opts) => spawnSync(cmd, [...args], opts));
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model));
-    const res = spawn(lane.command, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const usesPromptArg = (lane.args ?? []).some((a) => a.includes("{prompt}"));
+    if (usesPromptArg && Buffer.byteLength(input, "utf8") > MAX_PROMPT_ARG_BYTES) {
+      throw new LaneFailure(
+        "provider_error",
+        `cli lane "${lane.id}" prompt is too large to pass as a command-line argument (> ${MAX_PROMPT_ARG_BYTES} bytes) \u2014 use a stdin-based CLI lane for large inputs`
+      );
+    }
+    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model).replaceAll("{prompt}", input));
+    const stdinInput = usesPromptArg ? "" : input;
+    const res = spawn(lane.command, args, { input: stdinInput, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (res.error) {
       const code = res.error.code;
       if (code === "ENOBUFS") throw new LaneFailure("provider_error", `cli lane "${lane.id}" produced too much output (exceeded the buffer limit)`);
@@ -25240,6 +25249,22 @@ function commandOnPath(command, path) {
   const dirs = (path ?? "").split(":").filter(Boolean);
   return dirs.some((dir) => isExecutableFile(join3(dir, command)));
 }
+function regularFileExists(candidate) {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+function nodeScriptArgPresent(lane) {
+  const base = (lane.command ?? "").split("/").pop();
+  if (base !== "node") return true;
+  const scriptArg = (lane.args ?? []).find(
+    (a) => !a.startsWith("-") && (a.endsWith(".mjs") || a.endsWith(".js"))
+  );
+  if (scriptArg === void 0) return true;
+  return regularFileExists(scriptArg);
+}
 async function localReachable(base, fetchImpl) {
   if (!fetchImpl) return false;
   const controller = new AbortController();
@@ -25255,7 +25280,7 @@ async function localReachable(base, fetchImpl) {
 }
 async function isLaneAvailable(lane, deps) {
   if (lane.native) return true;
-  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path) && nodeScriptArgPresent(lane);
   if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
   if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
   return false;
@@ -26137,6 +26162,34 @@ async function runReviewWithBudget(runner, newId, opts) {
 import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
 import { dirname as dirname6, join as join6 } from "node:path";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
+
+// ../mcp/src/cli-plugins.ts
+var CLI_PLUGINS = Object.freeze({
+  openai: { vendor: "OpenAI", cli: "codex", plugin: "codex", url: "https://github.com/openai/codex" },
+  xai: { vendor: "xAI", cli: "grok", plugin: "grok-plugin-cc", url: "https://github.com/TolyK/grok-plugin-cc" },
+  google: {
+    vendor: "Google",
+    cli: "agy",
+    plugin: "antigravity-plugin-cc",
+    url: "https://github.com/TolyK/antigravity-plugin-cc"
+  },
+  anthropic: { vendor: "Anthropic", cli: "claude", plugin: "Claude Code", url: "https://claude.com/claude-code" }
+});
+function cliPluginForProvenance(provenance) {
+  return CLI_PLUGINS[provenance.trim().toLowerCase()];
+}
+function pluginSuggestionsFor(lanes) {
+  const out = [];
+  for (const lane of lanes) {
+    if (lane.kind !== "api" || lane.trust_mode === "blocked" || !lane.authHandle) continue;
+    const plugin = cliPluginForProvenance(lane.provenance);
+    if (!plugin) continue;
+    out.push({ laneId: lane.id, vendor: plugin.vendor, plugin: plugin.plugin, url: plugin.url });
+  }
+  return out;
+}
+
+// ../mcp/src/setup.ts
 var LANES_STARTER = fileURLToPath4(new URL("../lanes.starter.yaml", import.meta.url));
 var POLICY_STARTER = fileURLToPath4(new URL("../policy.starter.yaml", import.meta.url));
 var DEFAULT_PRICES = fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
@@ -26216,7 +26269,10 @@ async function runSetup(env) {
     // this default at runtime; setup reports only the env-derived default.
     yolo: (env.TOKENMAXED_YOLO === "true" || env.TOKENMAXED_YOLO === "1") && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     lanes: laneRows,
-    laneReview
+    laneReview,
+    // If a user enabled a metered BYOK api lane for a vendor that ALSO ships a Claude Code
+    // CLI plugin (subscription, $0 metered), nudge them toward the plugin with a link.
+    pluginSuggestions: pluginSuggestionsFor(registry2.lanes)
   };
 }
 
@@ -26717,6 +26773,15 @@ ${r.notes}` : "";
         "",
         ...r.laneReview === "changed" ? ["\u26A0 Your lanes changed since you last reviewed them \u2014 confirm the summary below."] : r.laneReview === "first-review" ? ["\u2139 Lane review: confirm what each lane may see/do below (recorded so you're reminded if it changes)."] : [],
         ...formatLaneSetup(r.lanes),
+        ...r.pluginSuggestions && r.pluginSuggestions.length > 0 ? [
+          "",
+          "\u{1F4A1} These enabled lanes authenticate with a BYOK API key. The vendor also ships a Claude",
+          "   Code CLI plugin you can route on your flat-rate subscription instead \u2014 no key to manage",
+          "   (and no metered spend for a pay-per-token key):",
+          ...r.pluginSuggestions.map(
+            (s) => `   \u2022 ${s.laneId} (${s.vendor}) \u2192 ${s.plugin}: ${s.url}`
+          )
+        ] : [],
         "",
         `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
       ];
