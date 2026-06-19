@@ -12,10 +12,30 @@ export {
   declaredCapabilityFor,
   effectiveCapability,
   effectiveCapabilityFor,
+  effectiveCapabilityOptsFromContext,
   DEFAULT_CAPABILITY,
   DEFAULT_PRIOR_STRENGTH,
   DEFAULT_TIER_FLOOR,
 } from './route.ts';
+export {
+  MAX_PRIOR_DELTA,
+  PRIOR_STRENGTH_BY_CONFIDENCE,
+  priorStrengthFromConfidence,
+  resolvedPriorFor,
+  clampOverlayPrior,
+  validateSnapshot,
+  computeSnapshotHash,
+  overlayFromSnapshot,
+  priorOptsFromContext,
+} from './capability-prior.ts';
+export type {
+  ResolvedPriorOptions,
+  CapabilitySnapshot,
+  CapabilitySnapshotEntry,
+  ValidateSnapshotResult,
+  OverlayFromSnapshotOptions,
+  OverlayBuildResult,
+} from './capability-prior.ts';
 export type { EffectiveCapabilityOptions, EligibleLane } from './route.ts';
 export { outcomeCapability, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
 export type { OutcomeCapabilityOptions } from './feedback.ts';

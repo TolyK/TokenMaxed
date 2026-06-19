@@ -141,10 +141,64 @@ export interface Lane {
   repo_read_attestation?: boolean;
   /**
    * Per-category capability in [0, 1]. A missing category falls back to
-   * {@link DEFAULT_CAPABILITY}. This is the lane's competence at a category,
-   * later overlaid by the registry feed's `capability_scores`.
+   * {@link DEFAULT_CAPABILITY}. This is the lane's offline/unranked floor when
+   * the rankings prior overlay has no entry; set `capability_source: pinned` to
+   * ignore the overlay and trust this number instead.
    */
   capability?: Partial<Record<TaskCategory, number>>;
+  /**
+   * When `pinned`, the hand-set {@link capability} wins over the rankings prior
+   * overlay for this lane. Absent ⇒ overlay prior applies when present.
+   */
+  capability_source?: CapabilitySource;
+}
+
+/**
+ * How a lane's hand-set {@link Lane.capability} interacts with the rankings prior
+ * overlay. Only `pinned` is defined in v1.
+ */
+export type CapabilitySource = 'pinned';
+
+/**
+ * Raw rankings evidence for one lane × category prior entry. Carried through to
+ * `/why` for honesty — never treated as ground truth.
+ */
+export interface CapabilityPriorEvidence {
+  /** Normalized prior value in [0, 1] (coarse bucket / calibrated score). */
+  value: number;
+  /** Rankings source id, e.g. `mercor-apex-v1`. */
+  source: string;
+  /** Chart id within the source. */
+  chart: string;
+  rank?: number;
+  score?: number;
+  /** ISO date of the chart snapshot used. */
+  date: string;
+  /** Chart size when known. */
+  n?: number;
+  confidence: 'low' | 'moderate' | 'high';
+}
+
+/**
+ * Rankings-sourced capability PRIOR overlay, keyed by lane id then category.
+ * Feeds ONLY the declared-prior slot of {@link effectiveCapability}; separate
+ * from the F-1 observed overlay. Never mutates {@link Lane.capability}.
+ */
+export type CapabilityPriorOverlay = Record<string, Partial<Record<TaskCategory, CapabilityPriorEvidence>>>;
+
+/** Provenance of a resolved rankings prior for `/why` and debugging. */
+export type PriorProvenance = 'opt-out' | 'pinned' | 'overlay' | 'overlay-stale' | 'fallback' | 'default';
+
+/** Result of {@link resolvedPriorFor} — the prior slot before F-1 blending. */
+export interface ResolvedPrior {
+  prior: number;
+  priorStrength: number;
+  provenance: PriorProvenance;
+  evidence?: CapabilityPriorEvidence;
+  /** True when the overlay value was clamped by the ±Δ or stale-upward cap. */
+  clamped?: boolean;
+  /** True when no chart match exists for this lane×category (fallback used). */
+  unranked?: boolean;
 }
 
 /** Provenances treated as trusted-by-origin (locally executed or first-party). */
@@ -215,6 +269,26 @@ export interface RouteContext {
    * opt-out always stay on the DECLARED score regardless of this overlay.
    */
   observedCapability?: ObservedCapabilityByLane;
+  /**
+   * Optional rankings-sourced capability PRIOR overlay (separate from F-1
+   * {@link observedCapability}). When present, routing and escalation read the
+   * resolved rankings prior instead of the raw declared score for the prior
+   * slot; F-1 observed evidence still blends on top unchanged. Absent ⇒
+   * byte-identical to declared capability. Reviewer eligibility and the
+   * `capability: 0` opt-out always stay on the DECLARED score.
+   */
+  capabilityPrior?: CapabilityPriorOverlay;
+  /**
+   * When true, cached rankings priors may decrease but MUST NOT increase any
+   * previously-accepted prior (stale-feed integrity rule).
+   */
+  capabilityPriorStale?: boolean;
+  /**
+   * Previously-accepted overlay prior values per lane×category, used for the
+   * per-refresh ±Δ movement cap. Absent for a slot ⇒ first-acceptance baseline
+   * is the resolved local fallback after opt-out/pinned handling.
+   */
+  capabilityPriorAccepted?: Record<string, Partial<Record<TaskCategory, number>>>;
   /**
    * Whether the minimization/policy gate is built and CI-green. Defaults to
    * `false`. While false, only `full`, non-API lanes are selectable (non-`full`

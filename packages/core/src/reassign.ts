@@ -11,7 +11,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { canDoRepoTight, effectiveCapabilityFor, isSelectablePreGate } from './route.ts';
+import { canDoRepoTight, effectiveCapabilityFor, effectiveCapabilityOptsFromContext, isSelectablePreGate } from './route.ts';
 import type { ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, Task, TrustMode } from './types.ts';
 
@@ -89,7 +89,8 @@ export function reassignmentTarget(
   if (attempts >= max) return null;
 
   // Use EFFECTIVE capability so an empirically-degrading lane isn't preferred.
-  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability);
+  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, effectiveOpts);
   const fromRank = TRUST_RANK[from.trust_mode];
   const fromCap = cap(from);
   const eligible = candidates.filter((c) => {
@@ -190,7 +191,8 @@ export function selectEscalationTarget(
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
   // Use EFFECTIVE capability: don't escalate to an empirically-failing lane.
-  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability);
+  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, effectiveOpts);
   const fromCap = cap(subject);
   const eligible = candidates.filter(
     (c) =>

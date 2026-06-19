@@ -13,9 +13,11 @@
  */
 
 import { isExecutorCertified, isReaderExecutorCertified } from './boundary.ts';
+import { priorOptsFromContext, resolvedPriorFor, type ResolvedPriorOptions } from './capability-prior.ts';
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
 import { TRUSTED_PROVENANCES } from './types.ts';
 import type {
+  CapabilityPriorOverlay,
   ExecutionMode,
   Lane,
   LaneScore,
@@ -189,7 +191,7 @@ export function declaredCapabilityFor(lane: Lane, category: Task['category']): n
  */
 export const capabilityFor = declaredCapabilityFor;
 
-/** Options for {@link effectiveCapability}. */
+/** Options for {@link effectiveCapability} and {@link effectiveCapabilityFor}. */
 export interface EffectiveCapabilityOptions {
   /**
    * Shrinkage prior strength (pseudo-count). Higher ⇒ more evidence required to
@@ -197,6 +199,22 @@ export interface EffectiveCapabilityOptions {
    * {@link DEFAULT_PRIOR_STRENGTH} is used.
    */
   priorStrength?: number;
+  /**
+   * Rankings prior overlay. When set, the prior slot uses {@link resolvedPriorFor}
+   * instead of {@link declaredCapabilityFor}; absent ⇒ declared prior (unchanged).
+   */
+  priorOverlay?: CapabilityPriorOverlay;
+  /** Staleness + accepted-prior state for rankings prior resolution. */
+  priorOpts?: ResolvedPriorOptions;
+}
+
+/** Build effective-capability options from a route context when a prior overlay is present. */
+export function effectiveCapabilityOptsFromContext(ctx: RouteContext): EffectiveCapabilityOptions | undefined {
+  if (!ctx.capabilityPrior) return undefined;
+  return {
+    priorOverlay: ctx.capabilityPrior,
+    priorOpts: priorOptsFromContext(ctx),
+  };
 }
 
 /**
@@ -246,6 +264,12 @@ export function effectiveCapabilityFor(
   overlay?: ObservedCapabilityByLane,
   opts?: EffectiveCapabilityOptions,
 ): number {
+  if (opts?.priorOverlay) {
+    const resolved = resolvedPriorFor(lane, category, opts.priorOverlay, opts.priorOpts);
+    return effectiveCapability(resolved.prior, overlay?.[lane.id]?.[category], {
+      priorStrength: opts.priorStrength ?? resolved.priorStrength,
+    });
+  }
   const declared = declaredCapabilityFor(lane, category);
   return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
 }
@@ -255,10 +279,13 @@ function scoreLane(
   task: Task,
   capHeadroom?: Record<string, number>,
   observedCapability?: ObservedCapabilityByLane,
+  effectiveOpts?: EffectiveCapabilityOptions,
 ): LaneScore {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedCapability?.[lane.id]?.[task.category];
-  const capability = effectiveCapability(declared, observed);
+  const capability = effectiveOpts?.priorOverlay
+    ? effectiveCapabilityFor(lane, task.category, observedCapability, effectiveOpts)
+    : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
@@ -380,7 +407,10 @@ export function routeDecide(
     );
   }
 
-  const scored = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability));
+  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  const scored = candidates.map((lane) =>
+    scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, effectiveOpts),
+  );
   const strategy = ctx.strategy ?? 'maximize';
   const tiered = strategy === 'tiered';
   // `maximize` (default): most capable wins. `tiered`: cheapest lane clearing the

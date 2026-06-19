@@ -52,6 +52,7 @@ const ALLOWED_LANE_KEYS = new Set([
   'authHandle',
   'native',
   'capability',
+  'capability_source',
 ]);
 
 /** Raised for any malformed or invalid lane configuration, with a clear message. */
@@ -209,6 +210,12 @@ function parseLane(entry: unknown, index: number): Lane {
 
   const capability = parseCapability(entry.capability, at('capability'));
   if (capability) lane.capability = capability;
+  if (entry.capability_source !== undefined) {
+    if (entry.capability_source !== 'pinned') {
+      throw new LaneConfigError(`${at('capability_source')} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
+    }
+    lane.capability_source = 'pinned';
+  }
 
   // A SELECTABLE (full/worker/reader), non-native lane must be executable: cli
   // needs a command, api needs an endpoint (local defaults to localhost). Reject
