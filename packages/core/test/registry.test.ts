@@ -175,6 +175,41 @@ lanes:
   assert.throws(() => parseLaneConfig(cfg), { message: /unknown field "capabilty"/ });
 });
 
+test('parses optional requests_per_window (positive finite)', () => {
+  const cfg = `
+lanes:
+  - id: max-cli
+    kind: cli
+    model: claude-opus-4-7
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    command: claude
+    requests_per_window: 45
+`;
+  const lane = parseLaneConfig(cfg).byId('max-cli');
+  assert.ok(lane);
+  assert.equal(lane.requests_per_window, 45);
+});
+
+test('rejects invalid requests_per_window', () => {
+  const base = `
+lanes:
+  - id: x
+    kind: cli
+    model: m
+    trust_mode: full
+    costBasis: subscription
+    provenance: p
+    jurisdiction: US
+    command: c
+`;
+  assert.throws(() => parseLaneConfig(`${base}    requests_per_window: 0`), { message: /positive finite/ });
+  assert.throws(() => parseLaneConfig(`${base}    requests_per_window: -1`), { message: /positive finite/ });
+  assert.throws(() => parseLaneConfig(`${base}    requests_per_window: "45"`), { message: /positive finite/ });
+});
+
 test('parses the new trust/role/execution fields', () => {
   const cfg = `
 lanes:

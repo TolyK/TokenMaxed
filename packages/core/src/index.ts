@@ -158,6 +158,17 @@ export {
   CAP_CRITICAL_USED,
 } from './usage.ts';
 export type { RawUsage, ResolvedUsage, CapLevel } from './usage.ts';
+export {
+  FIVE_HOUR_MS,
+  WINDOW_WARN_USED,
+  WINDOW_CRITICAL_USED,
+  requestsInWindow,
+  windowUsedFraction,
+  windowHeadroom,
+  windowLevel,
+  msUntilWindowFrees,
+} from './window-quota.ts';
+export type { WindowLevel } from './window-quota.ts';
 // File I/O (loadLaneConfig, loadPriceTable, JsonlLedger) lives in the Node
 // adapter: import from "@tokenmaxed/core/node" so the core barrel stays free
 // of node:fs.

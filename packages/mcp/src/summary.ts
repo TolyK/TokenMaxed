@@ -12,16 +12,22 @@
  * spend — computed only from existing content-free ledger primitives.
  */
 
-import type { LedgerEvent, LedgerSummary, Lane, Policy, TokenStats } from '@tokenmaxed/core';
+import type { LedgerEvent, LedgerSummary, Lane, Policy, TokenStats, WindowLevel } from '@tokenmaxed/core';
 import type { ManagerSelectPort } from './manager-select.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** Mirrors {@link FIVE_HOUR_MS} in core — kept local so this module stays runtime-core-free. */
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
 /** Core aggregate functions, injected so this module needs no runtime core import. */
 export interface SummaryCorePort {
   summarize: (events: readonly LedgerEvent[]) => LedgerSummary;
   tokenStats: (events: readonly LedgerEvent[]) => TokenStats;
   filterEventsSince: <E extends { ts: string }>(events: readonly E[], sinceIso?: string) => E[];
+  /** Rolling-window request count (injected — core stays out of this module at runtime). */
+  requestsInWindow: (timestampsMs: readonly number[], now: number, windowMs?: number) => number;
+  windowUsedFraction: (count: number, limit: number) => number;
+  windowLevel: (usedFraction: number) => WindowLevel;
 }
 
 /** Everything the builder needs; all I/O is resolved by the caller. */
@@ -89,6 +95,12 @@ export interface LaneSummary {
   provenance: Lane['provenance'];
   /** Lifetime tokens routed to THIS lane (from tokenStats().byLane); 0 if none yet. */
   tokensRouted: number;
+  /** Routed task events in the trailing 5h window (ledger-only; not total subscription usage). */
+  requestsIn5h: number;
+  /** Configured per-5h request limit, when set on the lane. */
+  requestsPerWindow?: number;
+  /** Quota level vs {@link requestsPerWindow}, when configured. */
+  requestWindowLevel?: WindowLevel;
   /** True for the lane the review path would actually use right now. */
   isActiveReviewer: boolean;
   available: boolean;
@@ -154,6 +166,20 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
   // Lifetime tokens routed per lane (the summary is global ⇒ all events).
   const byLane = core.tokenStats(events).byLane;
+  // Per-lane routed-task timestamps for the 5h request window (excludes native
+  // breadcrumbs — those never ran on a lane and are not "routed" work).
+  const routedTsByLane = new Map<string, number[]>();
+  for (const e of events) {
+    if (e.event_type !== 'task' || e.status === 'native') continue;
+    const ms = Date.parse(e.ts);
+    if (!Number.isFinite(ms)) continue;
+    let arr = routedTsByLane.get(e.laneId);
+    if (!arr) {
+      arr = [];
+      routedTsByLane.set(e.laneId, arr);
+    }
+    arr.push(ms);
+  }
   // Fold the host CLI's own per-model usage into per-lane counts, attributing each
   // model's tokens to AT MOST ONE lane (the first whose resolved model matches) so a
   // model shared by two lanes (e.g. a CLI + an API lane) isn't double-counted.
@@ -167,6 +193,10 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, FIVE_HOUR_MS);
+    const limit = l.requests_per_window;
+    const requestWindowLevel =
+      limit !== undefined ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : undefined;
     return {
       id: l.id,
       kind: l.kind,
@@ -174,6 +204,8 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       trustMode: l.trust_mode,
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
+      requestsIn5h,
+      ...(limit !== undefined ? { requestsPerWindow: limit, requestWindowLevel } : {}),
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...(s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}),
@@ -254,8 +286,11 @@ export function formatSummaryBanner(data: SummaryData): string {
     const width = Math.max(...visible.map((l) => vendorName(l).length));
     // Per-lane counts are often small, so show the EXACT count (grouped) rather than
     // tok()'s thousands-rounding, which would render e.g. 150 tokens as a misleading "0k".
-    const laneLine = (l: LaneSummary): string =>
-      `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` · ${l.tokensRouted.toLocaleString('en-US')} tok` : ''}${l.stale ? ' ⚠ stale' : ''}`;
+    const laneLine = (l: LaneSummary): string => {
+      const routed5h =
+        l.requestsIn5h > 0 || l.requestsPerWindow !== undefined ? ` · routed 5h: ${l.requestsIn5h}` : '';
+      return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` · ${l.tokensRouted.toLocaleString('en-US')} tok` : ''}${routed5h}${l.stale ? ' ⚠ stale' : ''}`;
+    };
     const groups: Array<{ title: string; mode: Lane['trust_mode'] }> = [
       { title: 'Full access', mode: 'full' },
       { title: 'Workers', mode: 'worker' },
@@ -282,6 +317,15 @@ export function formatSummaryBanner(data: SummaryData): string {
     lines.push('   ⚠ your lanes changed since you last reviewed them — run /tokenmaxed:setup to review');
   } else if (data.lanes.length > 0 && data.laneReview === 'first-review') {
     lines.push('   ℹ run /tokenmaxed:setup to review what each lane may see/do');
+  }
+  // Routed 5h quota warnings (ledger-only counts — NOT total subscription usage).
+  for (const l of visible.filter(
+    (x) => x.requestsPerWindow !== undefined && (x.requestWindowLevel === 'warn' || x.requestWindowLevel === 'critical'),
+  )) {
+    const tag = l.requestWindowLevel === 'critical' ? 'near limit' : 'filling up';
+    lines.push(
+      `   ⚠ ${vendorName(l)} routed 5h: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} — ledger count only, not your full session)`,
+    );
   }
   // Spell out stale models, but only for the VISIBLE (capped) lanes — so the spell-out
   // count is bounded by MAX_LANES, never the full set. Offline/blocked lanes are

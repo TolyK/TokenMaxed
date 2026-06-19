@@ -151,6 +151,12 @@ export interface Lane {
    * overlay for this lane. Absent ⇒ overlay prior applies when present.
    */
   capability_source?: CapabilitySource;
+  /**
+   * Optional per-5h rolling-window request limit for subscription plans that gate
+   * on request count (e.g. Claude Max). Absent ⇒ no limit configured; the summary
+   * still shows routed request counts but does not emit quota warnings.
+   */
+  requests_per_window?: number;
 }
 
 /**

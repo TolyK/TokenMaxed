@@ -6,7 +6,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { filterEventsSince, summarize, tokenStats } from '../../core/src/index.ts';
+import {
+  filterEventsSince,
+  requestsInWindow,
+  summarize,
+  tokenStats,
+  windowLevel,
+  windowUsedFraction,
+} from '../../core/src/index.ts';
 import type { LedgerEvent, Lane } from '../../core/src/index.ts';
 
 import { selectManagerLane } from '../src/manager-select.ts';
@@ -14,7 +21,7 @@ import { buildSummaryData, clampBanner, formatSummaryBanner, METERED_KEY_WARNING
 import { makeSummaryFromEnv } from '../src/summary-deps.ts';
 
 const NOW = Date.parse('2026-06-04T12:00:00.000Z');
-const core = { summarize, tokenStats, filterEventsSince };
+const core = { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel };
 
 function taskEvent(over: Partial<LedgerEvent> & { ts: string; laneId: string }): LedgerEvent {
   return {
@@ -109,6 +116,50 @@ test('an unavailable lane is flagged offline', () => {
   const d = build();
   assert.equal(d.lanes.find((l) => l.id === 'ollama-llama3')!.available, false);
   assert.equal(d.lanes.find((l) => l.id === 'codex-cli')!.available, true);
+});
+
+test('per-lane requestsIn5h counts routed task events in the trailing 5h window', () => {
+  const d = build();
+  assert.equal(d.lanes.find((l) => l.id === 'codex-cli')!.requestsIn5h, 1); // 1h ago
+  assert.equal(d.lanes.find((l) => l.id === 'minimax-api')!.requestsIn5h, 0); // 72h ago
+  assert.equal(d.lanes.find((l) => l.id === 'claude-haiku')!.requestsIn5h, 0);
+});
+
+test('banner shows routed 5h count per lane; quota warning only when limit set and near/over', () => {
+  const nearLimit = build({
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 1 })],
+    availableLaneIds: ['codex-cli'],
+  });
+  const bannerWarn = formatSummaryBanner(nearLimit);
+  assert.match(bannerWarn, /routed 5h: 1/);
+  assert.match(bannerWarn, /routed 5h: 1\/1 \(near limit/);
+  assert.match(bannerWarn, /ledger count only/);
+
+  const noLimit = build({ availableLaneIds: ['codex-cli', 'claude-haiku'] });
+  const bannerOk = formatSummaryBanner(noLimit);
+  assert.match(bannerOk, /Codex.*routed 5h: 1/);
+  assert.doesNotMatch(bannerOk, /Claude.*routed 5h/); // idle lane, no limit ⇒ no suffix
+  assert.doesNotMatch(bannerOk, /near limit|filling up/);
+});
+
+test('requestsIn5h excludes native breadcrumb events (only routed task events count)', () => {
+  const withNative = build({
+    events: [
+      ...events,
+      taskEvent({ ts: hoursAgo(2), laneId: 'codex-cli', status: 'native', tokens_in: 0, tokens_out: 0 }),
+    ],
+  });
+  assert.equal(withNative.lanes.find((l) => l.id === 'codex-cli')!.requestsIn5h, 1); // still 1 routed, not 2
+});
+
+test('banner shows routed 5h count when limit is configured below warn threshold, without a warning line', () => {
+  const belowWarn = build({
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 100 })],
+    availableLaneIds: ['codex-cli'],
+  });
+  const banner = formatSummaryBanner(belowWarn);
+  assert.match(banner, /Codex.*routed 5h: 1/); // limit configured ⇒ suffix shown even at low count
+  assert.doesNotMatch(banner, /near limit|filling up|ledger count only/); // below warn ⇒ no warning line
 });
 
 test('per-lane tokensRouted is attributed from the ledger (byLane), 0 for a lane with no events', () => {

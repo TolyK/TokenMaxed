@@ -115,3 +115,46 @@ and reviewer eligibility left untouched.
 **Note:** Phase-1 core is landed but DORMANT — the snapshot isn't loaded into
 `RouteContext.capabilityPrior` by any adapter yet, and `/why`+`/status` source
 surfacing is deferred. Zero runtime impact until that follow-up wiring lands.
+
+---
+
+## P4 — 5-hour rolling-window request-count quota
+
+**Goal:** Add the real subscription mechanic (requests-per-5h-window, not tokens):
+a pure `window-quota.ts` core + lane `requests_per_window` config + honest banner
+surfacing of routed 5h request counts. (Routing-penalty activation deferred — the
+existing weekly-token cap is itself dormant/unwired.)
+
+### MiniMax experiment (router_delegate, prefer=minimax-api) — FAILED
+- Delegated the self-contained pure-math module to MiniMax via the product's own
+  `router_delegate`. The router ran MiniMax, the **manager (Codex) reviewed its
+  output and FAILED it** (emitted `<think>` prose, truncated, didn't return clean
+  files, and a real bug: negative count → negative fraction), so it gave back to
+  native. Honest dogfooding result: **MiniMax is unsuitable even for a pure-math
+  slice** — confirms the [[minimax-worker-profile]] caveat. Routed to Grok instead
+  (planned worker 1 for P4 anyway).
+
+### Worker — Grok (grok-code-fast-1), 3 passes (~26k tok)
+- Core module + config + registry parse + banner surfacing (injected into
+  SummaryCorePort to keep summary.ts runtime-pure). Honest labeling: "routed 5h",
+  "ledger count only, not your full session".
+- Fix pass: non-finite `limit` guard (`!(limit > 0)`), conditional banner suffix,
+  + test gaps.
+- Typecheck-fix pass (see below).
+
+### Review — Codex (gpt-5.5), 3 rounds
+- R1: FAIL — `windowUsedFraction`/`windowHeadroom` returned NaN for NaN limit;
+  always-on banner suffix noise; 3 test gaps. Fixed.
+- R2: FAIL — **caught type errors `node --test` + `npm run build` both MISS**:
+  the new required `requestsIn5h` field broke a `tools.test.ts` fixture, AND P2's
+  already-committed `capability-prior.test.ts` had latent literal-widening errors.
+  Only `npm run typecheck` (tsc over tests) catches these.
+- R3: PASS — typecheck clean, 640/640 tests.
+
+**Final P4 verdict: PASS.**
+
+### PROCESS LESSON (important)
+The commit gate must be `npm run typecheck` (whole repo incl. tests), NOT just
+`npm run build` (tsconfig.build.json excludes tests) + `npm test` (Node strips
+types without checking). P2 shipped with type-erroring tests because of this gap;
+fixed forward. Workers now instructed to run `npm run typecheck`.

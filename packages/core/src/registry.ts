@@ -53,6 +53,7 @@ const ALLOWED_LANE_KEYS = new Set([
   'native',
   'capability',
   'capability_source',
+  'requests_per_window',
 ]);
 
 /** Raised for any malformed or invalid lane configuration, with a clear message. */
@@ -215,6 +216,15 @@ function parseLane(entry: unknown, index: number): Lane {
       throw new LaneConfigError(`${at('capability_source')} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
     }
     lane.capability_source = 'pinned';
+  }
+  if (entry.requests_per_window !== undefined) {
+    const n = entry.requests_per_window;
+    if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) {
+      throw new LaneConfigError(
+        `${at('requests_per_window')} must be a positive finite number (got ${JSON.stringify(n)}).`,
+      );
+    }
+    lane.requests_per_window = n;
   }
 
   // A SELECTABLE (full/worker/reader), non-native lane must be executable: cli

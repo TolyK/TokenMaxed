@@ -13,7 +13,16 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { filterEventsSince, resolveLaneModel, staleAgainstPriceTable, summarize, tokenStats } from '@tokenmaxed/core';
+import {
+  filterEventsSince,
+  requestsInWindow,
+  resolveLaneModel,
+  staleAgainstPriceTable,
+  summarize,
+  tokenStats,
+  windowLevel,
+  windowUsedFraction,
+} from '@tokenmaxed/core';
 import type { PriceTable } from '@tokenmaxed/core';
 import { JsonlLedger, loadLaneConfig, loadPriceTable, readCliUsageByModel } from '@tokenmaxed/core/node';
 
@@ -136,7 +145,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
-      core: { summarize, tokenStats, filterEventsSince },
+      core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel },
       selectManager: selectManagerLane,
       staleness,
       laneReview,
