@@ -7397,6 +7397,96 @@ function isReaderExecutorCertified(lane) {
   return lane.kind === "api";
 }
 
+// ../core/src/model-freshness.ts
+function parseModelAlias(model) {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
+  return { latest: false, id: model };
+}
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function releasedMs(table, id) {
+  const r = table.models[id]?.released;
+  return r === void 0 ? void 0 : Date.parse(r);
+}
+function compareNewestFirst(table, a, b) {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
+  return compareModelVersion(b, a);
+}
+function pricedIdsInFamily(table, family) {
+  return Object.keys(table.models).filter((id) => table.models[id].family === family);
+}
+function newestPricedInFamily(table, family) {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return void 0;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}
+function resolveLaneModel(lane, table) {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
+function staleAgainstPriceTable(lanes, table) {
+  const out = [];
+  for (const lane of lanes) {
+    const spec = parseModelAlias(lane.model);
+    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
+    if (!pinned) continue;
+    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
+    if (!family) continue;
+    const newest = newestPricedInFamily(table, family);
+    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
+      out.push({ laneId: lane.id, family, pinned, newest });
+    }
+  }
+  return out;
+}
+function sameFamily(id, family) {
+  const i = id.toLowerCase();
+  const f = family.toLowerCase();
+  if (i === f) return true;
+  if (!i.startsWith(f)) return false;
+  const next = i.charAt(f.length);
+  return next !== "" && !/[a-z0-9]/.test(next);
+}
+function assessStaleness(pinnedId, family, remote, table) {
+  const fam = remote.filter((m) => sameFamily(m.id, family));
+  if (fam.length === 0) return { status: "unknown" };
+  const newest = [...fam].sort(
+    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
+  )[0];
+  if (newest.id === pinnedId) return { status: "fresh" };
+  const pinned = fam.find((m) => m.id === pinnedId);
+  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
+  if (!newer) return { status: "fresh" };
+  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
+}
+
+// ../core/src/capability-prior.ts
+var CATEGORIES = new Set(TASK_CATEGORIES);
+
 // ../core/src/policy.ts
 var import_yaml = __toESM(require_dist(), 1);
 var REPO_CLASSES = ["public", "private", "unknown"];
@@ -7577,100 +7667,11 @@ function declaredCapabilityFor(lane, category) {
 
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist(), 1);
-
-// ../core/src/model-freshness.ts
-function parseModelAlias(model) {
-  const m = /^(.+)@latest$/.exec(model.trim());
-  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
-  return { latest: false, id: model };
-}
-function compareModelVersion(a, b) {
-  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
-  const ra = runs(a);
-  const rb = runs(b);
-  const n = Math.max(ra.length, rb.length);
-  for (let i = 0; i < n; i++) {
-    const xa = ra[i];
-    const xb = rb[i];
-    if (xa === void 0) return -1;
-    if (xb === void 0) return 1;
-    const na = /^\d+$/.test(xa);
-    const nb = /^\d+$/.test(xb);
-    if (na && nb) {
-      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
-      if (d !== 0) return d < 0 ? -1 : 1;
-    } else if (xa !== xb) {
-      return xa < xb ? -1 : 1;
-    }
-  }
-  return 0;
-}
-function releasedMs(table, id) {
-  const r = table.models[id]?.released;
-  return r === void 0 ? void 0 : Date.parse(r);
-}
-function compareNewestFirst(table, a, b) {
-  const ta = releasedMs(table, a);
-  const tb = releasedMs(table, b);
-  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
-  return compareModelVersion(b, a);
-}
-function pricedIdsInFamily(table, family) {
-  return Object.keys(table.models).filter((id) => table.models[id].family === family);
-}
-function newestPricedInFamily(table, family) {
-  const ids = pricedIdsInFamily(table, family);
-  if (ids.length === 0) return void 0;
-  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
-}
-function resolveLaneModel(lane, table) {
-  const spec = parseModelAlias(lane.model);
-  if (!spec.latest) return lane;
-  const concrete = newestPricedInFamily(table, spec.family);
-  return concrete ? { ...lane, model: concrete } : lane;
-}
-function staleAgainstPriceTable(lanes, table) {
-  const out = [];
-  for (const lane of lanes) {
-    const spec = parseModelAlias(lane.model);
-    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
-    if (!pinned) continue;
-    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
-    if (!family) continue;
-    const newest = newestPricedInFamily(table, family);
-    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
-      out.push({ laneId: lane.id, family, pinned, newest });
-    }
-  }
-  return out;
-}
-function sameFamily(id, family) {
-  const i = id.toLowerCase();
-  const f = family.toLowerCase();
-  if (i === f) return true;
-  if (!i.startsWith(f)) return false;
-  const next = i.charAt(f.length);
-  return next !== "" && !/[a-z0-9]/.test(next);
-}
-function assessStaleness(pinnedId, family, remote, table) {
-  const fam = remote.filter((m) => sameFamily(m.id, family));
-  if (fam.length === 0) return { status: "unknown" };
-  const newest = [...fam].sort(
-    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
-  )[0];
-  if (newest.id === pinnedId) return { status: "fresh" };
-  const pinned = fam.find((m) => m.id === pinnedId);
-  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
-  if (!newer) return { status: "fresh" };
-  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
-}
-
-// ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
 var EXECUTION_MODES = ["answer-only", "agentic"];
-var CATEGORIES = new Set(TASK_CATEGORIES);
+var CATEGORIES2 = new Set(TASK_CATEGORIES);
 var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
@@ -7690,7 +7691,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "endpoint",
   "authHandle",
   "native",
-  "capability"
+  "capability",
+  "capability_source"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7722,7 +7724,7 @@ function parseCapability(value, where) {
   }
   const out = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES.has(category)) {
+    if (!CATEGORIES2.has(category)) {
       throw new LaneConfigError(
         `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(", ")}.`
       );
@@ -7819,6 +7821,12 @@ function parseLane(entry, index) {
   }
   const capability = parseCapability(entry.capability, at("capability"));
   if (capability) lane.capability = capability;
+  if (entry.capability_source !== void 0) {
+    if (entry.capability_source !== "pinned") {
+      throw new LaneConfigError(`${at("capability_source")} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
+    }
+    lane.capability_source = "pinned";
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -8734,9 +8742,11 @@ function buildSummaryData(input) {
     lanes: laneSummaries,
     ...reviewer ? { activeReviewerId: reviewer.id } : {},
     ...input.laneReview ? { laneReview: input.laneReview } : {},
+    ...input.meteredKeyWarning ? { meteredKeyWarning: true } : {},
     empty: lifetime.offloads === 0
   };
 }
+var METERED_KEY_WARNING = "   \u26A0 ANTHROPIC_API_KEY is set \u2014 Claude Code bills per-token (metered) even on a Max/Pro plan. Unset it to use your subscription quota.";
 var usd = (n) => `$${n.toFixed(2)}`;
 var pct = (share) => `${Math.round(share * 100)}%`;
 function tok(n) {
@@ -8745,17 +8755,21 @@ function tok(n) {
 }
 function formatSummaryBanner(data) {
   if (!data.enabled) {
-    return "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    const off = "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    return data.meteredKeyWarning ? `${off}
+${METERED_KEY_WARNING}` : off;
   }
   const lines = [];
   if (data.empty) {
     lines.push("\u{1F7E2} TokenMaxed \u2014 ready. No routed work yet; your savings will show here.");
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
   } else {
     lines.push("\u{1F7E2} TokenMaxed \u2014 maximizing your flat-rate capacity");
     lines.push(
       `   Saved ${usd(data.meteredAvoidedLifetime)} in metered API spend (lifetime) \xB7 ${usd(data.meteredAvoided7d)} last 7d`
     );
     lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
     lines.push("");
     for (const w of data.windows) {
       const nf = w.nativeFallbacks > 0 ? ` \xB7 ${w.nativeFallbacks} native fallback${w.nativeFallbacks === 1 ? "" : "s"}` : "";
@@ -8849,8 +8863,12 @@ function clampBanner(banner, opts = {}) {
   lines.push(CLAMP_POINTER);
   let out = lines.join("\n");
   if (out.length > maxChars) {
-    let idx = 0;
-    for (let k = 1; k < lines.length; k++) if (lines[k].length > lines[idx].length) idx = k;
+    let candidates = lines.map((line, i) => ({ line, i })).filter(({ line }) => line !== METERED_KEY_WARNING || lines.length === 1);
+    if (candidates.length === 0) candidates = lines.map((line, i) => ({ line, i }));
+    let idx = candidates[0].i;
+    for (let k = 1; k < candidates.length; k++) {
+      if (lines[candidates[k].i].length > lines[idx].length) idx = candidates[k].i;
+    }
     const overBy = out.length - maxChars;
     const target = Math.max(0, lines[idx].length - overBy - 1);
     lines[idx] = `${lines[idx].slice(0, target)}\u2026`;
@@ -8904,6 +8922,7 @@ function makeSummaryFromEnv(env) {
   const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname3(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
   const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname3(statePath), "lane-review.json");
+  const meteredKeyWarning = !!(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
   return async () => {
     const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
@@ -8964,7 +8983,8 @@ function makeSummaryFromEnv(env) {
       // Fold the host CLI's own per-model usage (real, transcript-derived) into the
       // per-lane counts. Best-effort: readCliUsageByModel fails open to {} so the
       // summary never breaks if transcripts are unreadable.
-      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR)
+      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR),
+      meteredKeyWarning
     });
   };
 }

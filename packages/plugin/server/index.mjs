@@ -23023,6 +23023,196 @@ function isReaderExecutorCertified(lane) {
   return lane.kind === "api";
 }
 
+// ../core/src/model-freshness.ts
+function parseModelAlias(model) {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
+  return { latest: false, id: model };
+}
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function releasedMs(table, id) {
+  const r = table.models[id]?.released;
+  return r === void 0 ? void 0 : Date.parse(r);
+}
+function compareNewestFirst(table, a, b) {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
+  return compareModelVersion(b, a);
+}
+function pricedIdsInFamily(table, family) {
+  return Object.keys(table.models).filter((id) => table.models[id].family === family);
+}
+function newestPricedInFamily(table, family) {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return void 0;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}
+function resolveLaneModel(lane, table) {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
+function staleAgainstPriceTable(lanes, table) {
+  const out = [];
+  for (const lane of lanes) {
+    const spec = parseModelAlias(lane.model);
+    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
+    if (!pinned) continue;
+    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
+    if (!family) continue;
+    const newest = newestPricedInFamily(table, family);
+    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
+      out.push({ laneId: lane.id, family, pinned, newest });
+    }
+  }
+  return out;
+}
+function detectModelIdMismatch(sentId, remote) {
+  if (remote.length === 0) return null;
+  for (const m of remote) {
+    if (m.id === sentId) return null;
+  }
+  const sentLower = sentId.toLowerCase();
+  for (const m of remote) {
+    if (m.id.toLowerCase() === sentLower) return { sent: sentId, vendorId: m.id };
+  }
+  return { sent: sentId };
+}
+function sameFamily(id, family) {
+  const i = id.toLowerCase();
+  const f = family.toLowerCase();
+  if (i === f) return true;
+  if (!i.startsWith(f)) return false;
+  const next = i.charAt(f.length);
+  return next !== "" && !/[a-z0-9]/.test(next);
+}
+function assessStaleness(pinnedId, family, remote, table) {
+  const fam = remote.filter((m) => sameFamily(m.id, family));
+  if (fam.length === 0) return { status: "unknown" };
+  const newest = [...fam].sort(
+    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
+  )[0];
+  if (newest.id === pinnedId) return { status: "fresh" };
+  const pinned = fam.find((m) => m.id === pinnedId);
+  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
+  if (!newer) return { status: "fresh" };
+  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
+}
+
+// ../core/src/capability-prior.ts
+var DEFAULT_CAPABILITY = 0.5;
+var DEFAULT_PRIOR_STRENGTH = 8;
+var MAX_PRIOR_DELTA = 0.2;
+var PRIOR_STRENGTH_BY_CONFIDENCE = {
+  low: 4,
+  moderate: 6,
+  high: DEFAULT_PRIOR_STRENGTH
+};
+function priorStrengthFromConfidence(confidence) {
+  return PRIOR_STRENGTH_BY_CONFIDENCE[confidence];
+}
+function clamp01(n) {
+  if (Number.isNaN(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+function localFallbackCapability(lane, category) {
+  const declared = lane.capability?.[category];
+  return clamp01(declared ?? DEFAULT_CAPABILITY);
+}
+function isOptOut(lane, category) {
+  return lane.capability?.[category] === 0;
+}
+function clampOverlayPrior(proposed, reference, stale) {
+  const raw = clamp01(proposed);
+  const ref = clamp01(reference);
+  let value = raw;
+  let clamped = false;
+  if (stale && value > ref) {
+    value = ref;
+    clamped = true;
+  }
+  const minAllowed = ref - MAX_PRIOR_DELTA;
+  const maxAllowed = stale ? ref : ref + MAX_PRIOR_DELTA;
+  if (value < minAllowed) {
+    value = Math.max(0, minAllowed);
+    clamped = true;
+  } else if (value > maxAllowed) {
+    value = maxAllowed;
+    clamped = true;
+  }
+  return { value: clamp01(value), clamped };
+}
+function resolvedPriorFor(lane, category, priorOverlay, opts = {}) {
+  if (isOptOut(lane, category)) {
+    return { prior: 0, priorStrength: DEFAULT_PRIOR_STRENGTH, provenance: "opt-out" };
+  }
+  if (lane.capability_source === "pinned") {
+    return {
+      prior: localFallbackCapability(lane, category),
+      priorStrength: DEFAULT_PRIOR_STRENGTH,
+      provenance: "pinned"
+    };
+  }
+  const entry = priorOverlay?.[lane.id]?.[category];
+  const baseline = localFallbackCapability(lane, category);
+  if (entry) {
+    const reference = opts.accepted?.[lane.id]?.[category] ?? baseline;
+    const { value, clamped } = clampOverlayPrior(entry.value, reference, opts.stale ?? false);
+    return {
+      prior: value,
+      priorStrength: priorStrengthFromConfidence(entry.confidence),
+      provenance: opts.stale ? "overlay-stale" : "overlay",
+      evidence: entry,
+      clamped: clamped || void 0
+    };
+  }
+  if (lane.capability?.[category] !== void 0) {
+    return {
+      prior: clamp01(lane.capability[category]),
+      priorStrength: DEFAULT_PRIOR_STRENGTH,
+      provenance: "fallback",
+      unranked: priorOverlay !== void 0 ? true : void 0
+    };
+  }
+  return {
+    prior: DEFAULT_CAPABILITY,
+    priorStrength: DEFAULT_PRIOR_STRENGTH,
+    provenance: "default",
+    unranked: priorOverlay !== void 0 ? true : void 0
+  };
+}
+var CATEGORIES = new Set(TASK_CATEGORIES);
+function priorOptsFromContext(ctx) {
+  return {
+    stale: ctx.capabilityPriorStale,
+    accepted: ctx.capabilityPriorAccepted
+  };
+}
+
 // ../core/src/policy.ts
 var import_yaml = __toESM(require_dist2(), 1);
 var REPO_CLASSES = ["public", "private", "unknown"];
@@ -23170,8 +23360,8 @@ function parsePolicyConfig(text) {
 }
 
 // ../core/src/route.ts
-var DEFAULT_CAPABILITY = 0.5;
-var DEFAULT_PRIOR_STRENGTH = 8;
+var DEFAULT_CAPABILITY2 = 0.5;
+var DEFAULT_PRIOR_STRENGTH2 = 8;
 var COST_PENALTY = {
   local: 0,
   subscription: 0.05,
@@ -23217,7 +23407,7 @@ function canDoRepoTight(lane) {
   if (lane.trust_mode !== "full") return false;
   return lane.native === true || lane.kind === "cli" && executionModeOf(lane) === "agentic";
 }
-function clamp01(n) {
+function clamp012(n) {
   if (Number.isNaN(n)) return 0;
   if (n < 0) return 0;
   if (n > 1) return 1;
@@ -23225,26 +23415,39 @@ function clamp01(n) {
 }
 function declaredCapabilityFor(lane, category) {
   const declared = lane.capability?.[category];
-  return clamp01(declared ?? DEFAULT_CAPABILITY);
+  return clamp012(declared ?? DEFAULT_CAPABILITY2);
+}
+function effectiveCapabilityOptsFromContext(ctx) {
+  if (!ctx.capabilityPrior) return void 0;
+  return {
+    priorOverlay: ctx.capabilityPrior,
+    priorOpts: priorOptsFromContext(ctx)
+  };
 }
 function effectiveCapability(declared, observed, opts = {}) {
-  const prior = clamp01(declared);
+  const prior = clamp012(declared);
   if (prior === 0) return 0;
   if (!observed) return prior;
   const n = Number.isFinite(observed.n) && observed.n > 0 ? observed.n : 0;
   if (n === 0) return prior;
-  const rate = clamp01(observed.rate);
-  const k = Number.isFinite(opts.priorStrength) && opts.priorStrength > 0 ? opts.priorStrength : DEFAULT_PRIOR_STRENGTH;
-  return clamp01((k * prior + n * rate) / (k + n));
+  const rate = clamp012(observed.rate);
+  const k = Number.isFinite(opts.priorStrength) && opts.priorStrength > 0 ? opts.priorStrength : DEFAULT_PRIOR_STRENGTH2;
+  return clamp012((k * prior + n * rate) / (k + n));
 }
 function effectiveCapabilityFor(lane, category, overlay, opts) {
+  if (opts?.priorOverlay) {
+    const resolved = resolvedPriorFor(lane, category, opts.priorOverlay, opts.priorOpts);
+    return effectiveCapability(resolved.prior, overlay?.[lane.id]?.[category], {
+      priorStrength: opts.priorStrength ?? resolved.priorStrength
+    });
+  }
   const declared = declaredCapabilityFor(lane, category);
   return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
 }
-function scoreLane(lane, task, capHeadroom2, observedCapability) {
+function scoreLane(lane, task, capHeadroom2, observedCapability, effectiveOpts) {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedCapability?.[lane.id]?.[task.category];
-  const capability = effectiveCapability(declared, observed);
+  const capability = effectiveOpts?.priorOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effectiveOpts) : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
@@ -23299,7 +23502,10 @@ function routeDecide(task, ctx, policy) {
       "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, unavailable to run, or blocked/forced-trusted away by policy)."
     );
   }
-  const scored = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability));
+  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  const scored = candidates.map(
+    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, effectiveOpts)
+  );
   const strategy = ctx.strategy ?? "maximize";
   const tiered = strategy === "tiered";
   const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
@@ -23399,111 +23605,11 @@ function outcomeCapability(events, now, opts = {}) {
 
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist2(), 1);
-
-// ../core/src/model-freshness.ts
-function parseModelAlias(model) {
-  const m = /^(.+)@latest$/.exec(model.trim());
-  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
-  return { latest: false, id: model };
-}
-function compareModelVersion(a, b) {
-  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
-  const ra = runs(a);
-  const rb = runs(b);
-  const n = Math.max(ra.length, rb.length);
-  for (let i = 0; i < n; i++) {
-    const xa = ra[i];
-    const xb = rb[i];
-    if (xa === void 0) return -1;
-    if (xb === void 0) return 1;
-    const na = /^\d+$/.test(xa);
-    const nb = /^\d+$/.test(xb);
-    if (na && nb) {
-      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
-      if (d !== 0) return d < 0 ? -1 : 1;
-    } else if (xa !== xb) {
-      return xa < xb ? -1 : 1;
-    }
-  }
-  return 0;
-}
-function releasedMs(table, id) {
-  const r = table.models[id]?.released;
-  return r === void 0 ? void 0 : Date.parse(r);
-}
-function compareNewestFirst(table, a, b) {
-  const ta = releasedMs(table, a);
-  const tb = releasedMs(table, b);
-  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
-  return compareModelVersion(b, a);
-}
-function pricedIdsInFamily(table, family) {
-  return Object.keys(table.models).filter((id) => table.models[id].family === family);
-}
-function newestPricedInFamily(table, family) {
-  const ids = pricedIdsInFamily(table, family);
-  if (ids.length === 0) return void 0;
-  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
-}
-function resolveLaneModel(lane, table) {
-  const spec = parseModelAlias(lane.model);
-  if (!spec.latest) return lane;
-  const concrete = newestPricedInFamily(table, spec.family);
-  return concrete ? { ...lane, model: concrete } : lane;
-}
-function staleAgainstPriceTable(lanes, table) {
-  const out = [];
-  for (const lane of lanes) {
-    const spec = parseModelAlias(lane.model);
-    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
-    if (!pinned) continue;
-    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
-    if (!family) continue;
-    const newest = newestPricedInFamily(table, family);
-    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
-      out.push({ laneId: lane.id, family, pinned, newest });
-    }
-  }
-  return out;
-}
-function detectModelIdMismatch(sentId, remote) {
-  if (remote.length === 0) return null;
-  for (const m of remote) {
-    if (m.id === sentId) return null;
-  }
-  const sentLower = sentId.toLowerCase();
-  for (const m of remote) {
-    if (m.id.toLowerCase() === sentLower) return { sent: sentId, vendorId: m.id };
-  }
-  return { sent: sentId };
-}
-function sameFamily(id, family) {
-  const i = id.toLowerCase();
-  const f = family.toLowerCase();
-  if (i === f) return true;
-  if (!i.startsWith(f)) return false;
-  const next = i.charAt(f.length);
-  return next !== "" && !/[a-z0-9]/.test(next);
-}
-function assessStaleness(pinnedId, family, remote, table) {
-  const fam = remote.filter((m) => sameFamily(m.id, family));
-  if (fam.length === 0) return { status: "unknown" };
-  const newest = [...fam].sort(
-    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
-  )[0];
-  if (newest.id === pinnedId) return { status: "fresh" };
-  const pinned = fam.find((m) => m.id === pinnedId);
-  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
-  if (!newer) return { status: "fresh" };
-  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
-}
-
-// ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
 var EXECUTION_MODES = ["answer-only", "agentic"];
-var CATEGORIES = new Set(TASK_CATEGORIES);
+var CATEGORIES2 = new Set(TASK_CATEGORIES);
 var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
@@ -23523,7 +23629,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "endpoint",
   "authHandle",
   "native",
-  "capability"
+  "capability",
+  "capability_source"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -23555,7 +23662,7 @@ function parseCapability(value, where) {
   }
   const out = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES.has(category)) {
+    if (!CATEGORIES2.has(category)) {
       throw new LaneConfigError(
         `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(", ")}.`
       );
@@ -23652,6 +23759,12 @@ function parseLane(entry, index) {
   }
   const capability = parseCapability(entry.capability, at("capability"));
   if (capability) lane.capability = capability;
+  if (entry.capability_source !== void 0) {
+    if (entry.capability_source !== "pinned") {
+      throw new LaneConfigError(`${at("capability_source")} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
+    }
+    lane.capability_source = "pinned";
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -24141,7 +24254,8 @@ function escalationDecision(verdict, counters, caps = {}) {
 function selectEscalationTarget(subject, candidates, task, ctx, policy, opts = {}) {
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
-  const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability);
+  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, effectiveOpts);
   const fromCap = cap(subject);
   const eligible = candidates.filter(
     (c) => !exclude.has(c.id) && !c.native && (c.costBasis === "subscription" || c.costBasis === "local") && canReassign(subject, c, task, ctx, policy) && cap(c) >= fromCap + minDelta
@@ -25727,9 +25841,11 @@ function buildSummaryData(input) {
     lanes: laneSummaries,
     ...reviewer ? { activeReviewerId: reviewer.id } : {},
     ...input.laneReview ? { laneReview: input.laneReview } : {},
+    ...input.meteredKeyWarning ? { meteredKeyWarning: true } : {},
     empty: lifetime.offloads === 0
   };
 }
+var METERED_KEY_WARNING = "   \u26A0 ANTHROPIC_API_KEY is set \u2014 Claude Code bills per-token (metered) even on a Max/Pro plan. Unset it to use your subscription quota.";
 var usd = (n) => `$${n.toFixed(2)}`;
 var pct = (share) => `${Math.round(share * 100)}%`;
 function tok(n) {
@@ -25738,17 +25854,21 @@ function tok(n) {
 }
 function formatSummaryBanner(data) {
   if (!data.enabled) {
-    return "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    const off = "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    return data.meteredKeyWarning ? `${off}
+${METERED_KEY_WARNING}` : off;
   }
   const lines = [];
   if (data.empty) {
     lines.push("\u{1F7E2} TokenMaxed \u2014 ready. No routed work yet; your savings will show here.");
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
   } else {
     lines.push("\u{1F7E2} TokenMaxed \u2014 maximizing your flat-rate capacity");
     lines.push(
       `   Saved ${usd(data.meteredAvoidedLifetime)} in metered API spend (lifetime) \xB7 ${usd(data.meteredAvoided7d)} last 7d`
     );
     lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
     lines.push("");
     for (const w of data.windows) {
       const nf = w.nativeFallbacks > 0 ? ` \xB7 ${w.nativeFallbacks} native fallback${w.nativeFallbacks === 1 ? "" : "s"}` : "";
@@ -25865,6 +25985,7 @@ function makeSummaryFromEnv(env) {
   const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname5(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
   const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname5(statePath), "lane-review.json");
+  const meteredKeyWarning = !!(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
   return async () => {
     const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
@@ -25925,7 +26046,8 @@ function makeSummaryFromEnv(env) {
       // Fold the host CLI's own per-model usage (real, transcript-derived) into the
       // per-lane counts. Best-effort: readCliUsageByModel fails open to {} so the
       // summary never breaks if transcripts are unreadable.
-      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR)
+      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR),
+      meteredKeyWarning
     });
   };
 }
