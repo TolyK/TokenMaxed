@@ -7692,7 +7692,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "authHandle",
   "native",
   "capability",
-  "capability_source"
+  "capability_source",
+  "requests_per_window"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7826,6 +7827,15 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at("capability_source")} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
     }
     lane.capability_source = "pinned";
+  }
+  if (entry.requests_per_window !== void 0) {
+    const n = entry.requests_per_window;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new LaneConfigError(
+        `${at("requests_per_window")} must be a positive finite number (got ${JSON.stringify(n)}).`
+      );
+    }
+    lane.requests_per_window = n;
   }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
@@ -8255,6 +8265,38 @@ function tokenStats(events) {
   return { total, byModel, byLane };
 }
 
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
+var WINDOW_WARN_USED = 0.7;
+var WINDOW_CRITICAL_USED = 0.9;
+function effectiveWindowMs(windowMs) {
+  return windowMs > 0 && Number.isFinite(windowMs) ? windowMs : FIVE_HOUR_MS;
+}
+function saneCount(count) {
+  if (!Number.isFinite(count) || count < 0) return 0;
+  return count;
+}
+function requestsInWindow(timestampsMs, now, windowMs = FIVE_HOUR_MS) {
+  const w = effectiveWindowMs(windowMs);
+  if (!Number.isFinite(now)) return 0;
+  const cutoff = now - w;
+  let n = 0;
+  for (const t of timestampsMs) {
+    if (!Number.isFinite(t)) continue;
+    if (t > cutoff && t <= now) n += 1;
+  }
+  return n;
+}
+function windowUsedFraction(count, limit) {
+  if (!(limit > 0)) return 0;
+  return saneCount(count) / limit;
+}
+function windowLevel(usedFraction) {
+  if (usedFraction >= WINDOW_CRITICAL_USED) return "critical";
+  if (usedFraction >= WINDOW_WARN_USED) return "warn";
+  return "ok";
+}
+
 // ../core/src/node.ts
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -8677,6 +8719,7 @@ function selectManagerLane(lanes, policy, gateReady, available = null) {
 
 // ../mcp/src/summary.ts
 var DAY_MS = 24 * 60 * 60 * 1e3;
+var FIVE_HOUR_MS2 = 5 * 60 * 60 * 1e3;
 function buildSummaryData(input) {
   const { events, lanes, policy, availableLaneIds: availableLaneIds2, gateReady, enabled, now, core, selectManager } = input;
   const availableSet = new Set(availableLaneIds2);
@@ -8711,6 +8754,18 @@ function buildSummaryData(input) {
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
   const byLane = core.tokenStats(events).byLane;
+  const routedTsByLane = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (e.event_type !== "task" || e.status === "native") continue;
+    const ms = Date.parse(e.ts);
+    if (!Number.isFinite(ms)) continue;
+    let arr = routedTsByLane.get(e.laneId);
+    if (!arr) {
+      arr = [];
+      routedTsByLane.set(e.laneId, arr);
+    }
+    arr.push(ms);
+  }
   const cliUsageByModel = input.cliUsageByModel;
   const cliConsumed = /* @__PURE__ */ new Set();
   const laneSummaries = lanes.map((l) => {
@@ -8721,6 +8776,9 @@ function buildSummaryData(input) {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, FIVE_HOUR_MS2);
+    const limit = l.requests_per_window;
+    const requestWindowLevel = limit !== void 0 ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : void 0;
     return {
       id: l.id,
       kind: l.kind,
@@ -8728,6 +8786,8 @@ function buildSummaryData(input) {
       trustMode: l.trust_mode,
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
+      requestsIn5h,
+      ...limit !== void 0 ? { requestsPerWindow: limit, requestWindowLevel } : {},
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
@@ -8787,7 +8847,10 @@ ${METERED_KEY_WARNING}` : off;
   } else {
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
-    const laneLine = (l) => `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${l.stale ? " \u26A0 stale" : ""}`;
+    const laneLine = (l) => {
+      const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed 5h: ${l.requestsIn5h}` : "";
+      return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${routed5h}${l.stale ? " \u26A0 stale" : ""}`;
+    };
     const groups = [
       { title: "Full access", mode: "full" },
       { title: "Workers", mode: "worker" },
@@ -8812,6 +8875,14 @@ ${METERED_KEY_WARNING}` : off;
     lines.push("   \u26A0 your lanes changed since you last reviewed them \u2014 run /tokenmaxed:setup to review");
   } else if (data.lanes.length > 0 && data.laneReview === "first-review") {
     lines.push("   \u2139 run /tokenmaxed:setup to review what each lane may see/do");
+  }
+  for (const l of visible.filter(
+    (x) => x.requestsPerWindow !== void 0 && (x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
+  )) {
+    const tag = l.requestWindowLevel === "critical" ? "near limit" : "filling up";
+    lines.push(
+      `   \u26A0 ${vendorName(l)} routed 5h: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)`
+    );
   }
   for (const l of visible.filter((l2) => l2.stale)) {
     lines.push(
@@ -8976,7 +9047,7 @@ function makeSummaryFromEnv(env) {
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
-      core: { summarize, tokenStats, filterEventsSince },
+      core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel },
       selectManager: selectManagerLane,
       staleness,
       laneReview,

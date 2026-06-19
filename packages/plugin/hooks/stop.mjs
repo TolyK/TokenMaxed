@@ -7665,7 +7665,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "authHandle",
   "native",
   "capability",
-  "capability_source"
+  "capability_source",
+  "requests_per_window"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7799,6 +7800,15 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at("capability_source")} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
     }
     lane.capability_source = "pinned";
+  }
+  if (entry.requests_per_window !== void 0) {
+    const n = entry.requests_per_window;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new LaneConfigError(
+        `${at("requests_per_window")} must be a positive finite number (got ${JSON.stringify(n)}).`
+      );
+    }
+    lane.requests_per_window = n;
   }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
@@ -8241,6 +8251,9 @@ function estimateTokens(text) {
   if (text.length === 0) return 0;
   return Math.ceil(text.length / 4);
 }
+
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
 
 // ../core/src/node.ts
 import { spawnSync } from "node:child_process";
