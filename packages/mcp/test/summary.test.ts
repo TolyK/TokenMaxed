@@ -10,7 +10,8 @@ import { filterEventsSince, summarize, tokenStats } from '../../core/src/index.t
 import type { LedgerEvent, Lane } from '../../core/src/index.ts';
 
 import { selectManagerLane } from '../src/manager-select.ts';
-import { buildSummaryData, clampBanner, formatSummaryBanner } from '../src/summary.ts';
+import { buildSummaryData, clampBanner, formatSummaryBanner, METERED_KEY_WARNING } from '../src/summary.ts';
+import { makeSummaryFromEnv } from '../src/summary-deps.ts';
 
 const NOW = Date.parse('2026-06-04T12:00:00.000Z');
 const core = { summarize, tokenStats, filterEventsSince };
@@ -261,4 +262,76 @@ test('clampBanner GUARANTEES maxChars as a true postcondition even for a patholo
   assert.equal(clampBanner('abcdef', { maxChars: 0.5 }), ''); // fractional < 1 → 0
   // A fractional budget >= 1 floors down, and the result still fits the floored budget.
   assert.ok(clampBanner(banner, { maxChars: 80.9 }).length <= 80);
+});
+
+// --- meteredKeyWarning (ANTHROPIC_API_KEY trap) ------------------------------
+
+test('banner includes the metered warning line when meteredKeyWarning is true', async () => {
+  const b1 = formatSummaryBanner(build({ meteredKeyWarning: true }));
+  assert.match(b1, /   ⚠ ANTHROPIC_API_KEY is set — Claude Code bills per-token \(metered\) even on a Max\/Pro plan\. Unset it to use your subscription quota\./);
+  // also via detection in makeSummaryFromEnv (minimal env for empty path)
+  const envWith = { TOKENMAXED_LANES: '/no', TOKENMAXED_LEDGER: '/no', TOKENMAXED_STATE: '/no', ANTHROPIC_API_KEY: 'present' };
+  const d = await makeSummaryFromEnv(envWith)();
+  assert.equal(d.meteredKeyWarning, true);
+  assert.match(formatSummaryBanner(d), /ANTHROPIC_API_KEY is set/);
+});
+
+test('banner omits the metered warning when meteredKeyWarning false or undefined', () => {
+  assert.doesNotMatch(formatSummaryBanner(build({})), /ANTHROPIC_API_KEY/);
+  assert.doesNotMatch(formatSummaryBanner(build({ meteredKeyWarning: false })), /ANTHROPIC_API_KEY/);
+  assert.doesNotMatch(formatSummaryBanner(build({ meteredKeyWarning: undefined })), /ANTHROPIC_API_KEY/);
+});
+
+test('clampBanner does NOT drop the metered warning even under a tight maxLines budget', () => {
+  const banner = formatSummaryBanner(build({
+    meteredKeyWarning: true,
+    availableLaneIds: ['codex-cli', 'claude-haiku', 'minimax-api'],
+    staleness: [{ laneId: 'minimax-api', newest: 'minimax-m3', newestPriced: true }],
+    laneReview: 'first-review',
+  }));
+  const n = banner.split('\n').length;
+  // tight budget that drops lower-rank trailing (tips, stale, hint)
+  const out = clampBanner(banner, { maxLines: Math.max(3, n - 3), maxChars: 999999 });
+  assert.match(out, /ANTHROPIC_API_KEY is set — Claude Code bills per-token/); // warning (rank 0) never dropped
+  assert.doesNotMatch(out, /\/tokenmaxed:summary anytime/); // tips dropped
+  // required skeleton still present
+  assert.match(out, /🟢 TokenMaxed/);
+  assert.match(out, /24h|7d|lifetime/);
+});
+
+test('banner includes the metered warning when routing is OFF and meteredKeyWarning is true', () => {
+  const banner = formatSummaryBanner(build({ enabled: false, meteredKeyWarning: true }));
+  assert.match(banner, /routing is OFF/i);
+  assert.match(banner, /ANTHROPIC_API_KEY is set — Claude Code bills per-token/);
+  assert.doesNotMatch(formatSummaryBanner(build({ enabled: false })), /ANTHROPIC_API_KEY/);
+});
+
+test('clampBanner stays robust (no throw, within maxChars) when the banner is dominated by the metered warning line', () => {
+  const banner = formatSummaryBanner(build({ enabled: false, meteredKeyWarning: true }));
+  assert.match(banner, /ANTHROPIC_API_KEY is set — Claude Code bills per-token/);
+
+  const maxChars = 50;
+  let out = '';
+  assert.doesNotThrow(() => {
+    out = clampBanner(banner, { maxChars });
+  });
+  assert.equal(typeof out, 'string');
+  assert.ok(out.length <= maxChars);
+
+  const generous = clampBanner(banner, { maxChars: 2000 });
+  assert.ok(generous.includes(METERED_KEY_WARNING), 'full warning line survives under a generous budget');
+});
+
+test('clampBanner keeps the FULL metered warning intact under a tight maxChars budget', () => {
+  const banner = formatSummaryBanner(build({
+    meteredKeyWarning: true,
+    availableLaneIds: ['codex-cli', 'claude-haiku', 'minimax-api'],
+    staleness: [{ laneId: 'minimax-api', newest: 'minimax-m3', newestPriced: true }],
+    laneReview: 'first-review',
+  }));
+  // Force the longest-line ellipsize step: budget tight enough to trim, loose enough
+  // that the hard backstop does not slice the warning.
+  const out = clampBanner(banner, { maxLines: 999, maxChars: banner.length - 20 });
+  assert.ok(out.includes(METERED_KEY_WARNING), 'warning line must survive ellipsize intact');
+  assert.doesNotMatch(out, new RegExp(`${METERED_KEY_WARNING.slice(0, -1)}…`)); // not ellipsized
 });

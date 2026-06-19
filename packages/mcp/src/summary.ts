@@ -59,6 +59,7 @@ export interface SummaryInput {
    * one lane (the first whose model matches). Optional — absent ⇒ routed-only counts.
    */
   cliUsageByModel?: Record<string, { in: number; out: number }>;
+  meteredKeyWarning?: boolean;
 }
 
 /** A stale-model finding for one lane (structural subset of a freshness warning). */
@@ -107,6 +108,7 @@ export interface SummaryData {
   activeReviewerId?: string;
   /** SETUP-1 B: lane-review status (drives a read-only "run /tokenmaxed:setup" hint). */
   laneReview?: 'first-review' | 'changed' | 'current';
+  meteredKeyWarning?: boolean;
   /** True when there are no routed task events yet (new user). */
   empty: boolean;
 }
@@ -187,11 +189,15 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
     lanes: laneSummaries,
     ...(reviewer ? { activeReviewerId: reviewer.id } : {}),
     ...(input.laneReview ? { laneReview: input.laneReview } : {}),
+    ...(input.meteredKeyWarning ? { meteredKeyWarning: true } : {}),
     empty: lifetime.offloads === 0,
   };
 }
 
 // --- rendering (dependency-free: pure data → string) ---------------------------
+
+export const METERED_KEY_WARNING =
+  '   ⚠ ANTHROPIC_API_KEY is set — Claude Code bills per-token (metered) even on a Max/Pro plan. Unset it to use your subscription quota.';
 
 const usd = (n: number): string => `$${n.toFixed(2)}`;
 const pct = (share: number): string => `${Math.round(share * 100)}%`;
@@ -204,11 +210,13 @@ function tok(n: number): string {
 /** Render the banner. Dependency-free; safe to call from any caller. */
 export function formatSummaryBanner(data: SummaryData): string {
   if (!data.enabled) {
-    return '⏸  TokenMaxed routing is OFF for this project — run /tokenmaxed:on to re-enable.';
+    const off = '⏸  TokenMaxed routing is OFF for this project — run /tokenmaxed:on to re-enable.';
+    return data.meteredKeyWarning ? `${off}\n${METERED_KEY_WARNING}` : off;
   }
   const lines: string[] = [];
   if (data.empty) {
     lines.push('🟢 TokenMaxed — ready. No routed work yet; your savings will show here.');
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
   } else {
     lines.push('🟢 TokenMaxed — maximizing your flat-rate capacity');
     lines.push(
@@ -216,6 +224,7 @@ export function formatSummaryBanner(data: SummaryData): string {
         `${usd(data.meteredAvoided7d)} last 7d`,
     );
     lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
     lines.push('');
     for (const w of data.windows) {
       const nf =
@@ -377,8 +386,18 @@ export function clampBanner(banner: string, opts: { maxLines?: number; maxChars?
   // (a big lane set) lands here with the skeleton intact.
   let out = lines.join('\n');
   if (out.length > maxChars) {
-    let idx = 0;
-    for (let k = 1; k < lines.length; k++) if (lines[k]!.length > lines[idx]!.length) idx = k;
+    // Never ellipsize the metered-key warning unless it is the only line left.
+    let candidates = lines
+      .map((line, i) => ({ line, i }))
+      .filter(({ line }) => line !== METERED_KEY_WARNING || lines.length === 1);
+    // Defensive: CLAMP_POINTER is always appended above and is never the warning, so at
+    // least one non-warning candidate always exists; this guard only protects against future
+    // changes that might remove that invariant.
+    if (candidates.length === 0) candidates = lines.map((line, i) => ({ line, i }));
+    let idx = candidates[0]!.i;
+    for (let k = 1; k < candidates.length; k++) {
+      if (lines[candidates[k]!.i]!.length > lines[idx]!.length) idx = candidates[k]!.i;
+    }
     const overBy = out.length - maxChars;
     const target = Math.max(0, lines[idx]!.length - overBy - 1); // -1 for the ellipsis char
     lines[idx] = `${lines[idx]!.slice(0, target)}…`;

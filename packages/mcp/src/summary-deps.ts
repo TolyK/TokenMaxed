@@ -65,6 +65,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
   // SETUP-1 B: lane-review state — same key + path setup uses, so the hint matches.
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? 'default';
   const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join(dirname(statePath), 'lane-review.json');
+  const meteredKeyWarning = !!(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
 
   return async () => {
     const lanes = existsSync(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
@@ -143,6 +144,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
       // per-lane counts. Best-effort: readCliUsageByModel fails open to {} so the
       // summary never breaks if transcripts are unreadable.
       cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR),
+      meteredKeyWarning,
     });
   };
 }
