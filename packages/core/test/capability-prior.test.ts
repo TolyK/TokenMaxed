@@ -19,6 +19,8 @@ import {
   resolvedPriorFor,
   validateSnapshot,
 } from '../src/capability-prior.ts';
+import type { CapabilitySnapshot } from '../src/capability-prior.ts';
+import type { TaskCategory } from '../src/types.ts';
 import { parseLaneConfig } from '../src/registry.ts';
 import {
   DEFAULT_CAPABILITY,
@@ -214,7 +216,7 @@ test('confidence maps to smaller k for low confidence', () => {
 });
 
 test('unmatched model ⇒ unranked fallback via overlayFromSnapshot', () => {
-  const snapshot = {
+  const snapshot: CapabilitySnapshot = {
     version: 1,
     generated: '2026-06-01',
     sources: ['mercor-apex-v1'],
@@ -261,8 +263,9 @@ test('validateSnapshot passes the shipped seed file and rejects bad schema/hash'
       docs: 'mercor-apex-v1',
       explain: 'mercor-apex-v1',
     });
+    const mapping: Partial<Record<TaskCategory, string>> = ok.snapshot.mapping;
     for (const category of ['boilerplate', 'bugfix', 'refactor', 'feature', 'codegen'] as const) {
-      assert.equal(ok.snapshot.mapping[category], undefined, `${category} must not map to APEX`);
+      assert.equal(mapping[category], undefined, `${category} must not map to APEX`);
     }
     assert.ok(ok.snapshot.entries.length > 0);
     for (const entry of ok.snapshot.entries) {
