@@ -23932,7 +23932,8 @@ function computeCostPrimitives(table, lane, usage) {
 }
 
 // ../core/src/ledger.ts
-var SCHEMA_VERSION = 1;
+var SCHEMA_VERSION = 2;
+var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
 var NATIVE_REASONS = ["no_route", "host_native"];
 var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
@@ -23981,6 +23982,9 @@ var OUTCOME_EVENT_FIELDS = [
   "category",
   "subject_lane_id",
   "subject_provenance",
+  "subject_model",
+  "subject_model_resolved",
+  "difficulty",
   "reviewer_lane_id",
   "reviewer_model",
   "reviewer_trust_mode",
@@ -24095,6 +24099,13 @@ function validateOutcomeInput(input) {
   if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
   const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
   if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
+  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
+  if (subject_model !== void 0) out.subject_model = subject_model;
+  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
+  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
+  if (input.difficulty !== void 0) {
+    out.difficulty = requireEnum2(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
+  }
   if (input.action_taken !== void 0) {
     out.action_taken = requireEnum2(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
   }
