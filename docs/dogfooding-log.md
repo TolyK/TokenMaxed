@@ -204,3 +204,19 @@ cheap-lane downgrade. Explicit category ⇒ byte-identical behavior.
 - **Codex (reviewer)**: the highest-value lane — caught a real should-fix/bug every
   round across all four features (incl. two stale-bundle catches and the
   typecheck-gap that build+test missed). Worth the spend.
+
+---
+
+## P5 — Local proxy: DEV PLAN ONLY (deferred per operator decision)
+
+P5 (the universal base_url proxy) was deferred as a decision gate. Instead of code,
+a development plan was produced and reviewed:
+- **Opus plan agent** (141,891 + 74,971 tok over 2 passes) wrote + revised
+  `docs/P5-proxy-plan.md`.
+- **Codex plan review**, 2 rounds: R1 REVISE (3 blockers — ToS/eligibility
+  contradiction, overstated ~85% core-reuse, "subscription-first isn't free"); R2
+  confirmed all 3 blockers RESOLVED, leaving 2 partial should-fixes + 2 nits.
+- Claude closed the remaining items directly (YOLO-must-not-relax-proxy-eligibility,
+  no-eligible-lane-pre-route guard, availability.ts location, stray fence).
+- Result: an APPROVE-READY plan with 10 operator decision-gates flagged (biggest:
+  §8-H, ToS of proxying subscription OAuth to arbitrary clients). **No P5 code.**
