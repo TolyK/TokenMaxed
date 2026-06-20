@@ -25,7 +25,7 @@ import { isTransient, LaneFailure, shouldCooldown } from './failure.ts';
 import type { FailureKind } from './failure.ts';
 import { escalationDecision, selectEscalationTarget, TRUST_RANK } from './reassign.ts';
 import { buildOutputReviewPrompt, parseManagerVerdictStrict, review, selectReviewManager, REVIEW_OUTPUT_MAX_CHARS } from './review.ts';
-import type { OutcomeEventInput, ReviewVerdict, TaskEventInput, TaskStatus } from './ledger.ts';
+import type { DifficultyBucket, OutcomeAction, OutcomeEventInput, ReviewVerdict, TaskEventInput, TaskStatus } from './ledger.ts';
 import type { Lane, Policy, PolicyContext, RouteContext, RouteDecision, Task, TaskCategory } from './types.ts';
 
 /** A unit of work to run (the content the lane needs, beyond the routing category). */
@@ -516,6 +516,16 @@ function complete(result: EscalationResult): EscalationResult {
 }
 
 /**
+ * P6 §4: escalation-depth difficulty from the review stage + structural action.
+ * TODO(P6-1b): token-length fallback when stage is 0 — wire tokens_in from the task leg.
+ */
+export function deriveOutcomeDifficulty(stage: number, action: OutcomeAction): DifficultyBucket {
+  if (action === 'escalate' || action === 'give_back') return 'hard';
+  if (action === 'rework') return 'moderate';
+  return stage === 0 ? 'easy' : 'moderate';
+}
+
+/**
  * Run a task with quality-driven escalation. See the module banner. Pure over its
  * injected deps; bounded by maxReworks (default 1) + maxEscalations (default 1).
  */
@@ -609,7 +619,11 @@ export async function runWithEscalation(
       { task_id, attempt: reviewedAttempt, category: request.category, content: output, subjectLane },
       { managerLane: manager, runManagerReview: async () => (notes ? { verdict, notes } : { verdict }), newId: deps.newId },
     );
-    const outcome: OutcomeEventInput = { ...reviewRes.event, action_taken: action };
+    const outcome: OutcomeEventInput = {
+      ...reviewRes.event,
+      action_taken: action,
+      difficulty: deriveOutcomeDifficulty(stage, action),
+    };
     if (target) outcome.target_lane_id = target.id;
     events.push({ kind: 'outcome', event: outcome });
 
