@@ -8206,6 +8206,11 @@ function classifyHttpStatus(status) {
 }
 
 // ../core/src/review.ts
+function canonicalizeModelKey(model) {
+  const spec = parseModelAlias(model);
+  if (spec.latest) return model.trim();
+  return spec.id;
+}
 var ReviewError = class extends Error {
   constructor(message) {
     super(message);
@@ -8250,6 +8255,8 @@ async function review(request, deps) {
   if (request.subjectLane) {
     event.subject_lane_id = request.subjectLane.id;
     event.subject_provenance = request.subjectLane.provenance;
+    event.subject_model = request.subjectLane.model;
+    event.subject_model_resolved = canonicalizeModelKey(request.subjectLane.model);
   }
   const result = { verdict: out.verdict, event };
   if (out.notes !== void 0) result.notes = out.notes;

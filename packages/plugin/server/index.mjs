@@ -24337,6 +24337,11 @@ function classifyHttpStatus(status) {
 }
 
 // ../core/src/review.ts
+function canonicalizeModelKey(model) {
+  const spec = parseModelAlias(model);
+  if (spec.latest) return model.trim();
+  return spec.id;
+}
 var ReviewError = class extends Error {
   constructor(message) {
     super(message);
@@ -24381,6 +24386,8 @@ async function review(request, deps) {
   if (request.subjectLane) {
     event.subject_lane_id = request.subjectLane.id;
     event.subject_provenance = request.subjectLane.provenance;
+    event.subject_model = request.subjectLane.model;
+    event.subject_model_resolved = canonicalizeModelKey(request.subjectLane.model);
   }
   const result = { verdict: out.verdict, event };
   if (out.notes !== void 0) result.notes = out.notes;
@@ -24703,6 +24710,11 @@ function complete(result) {
   markSupersededLegs(result.events, result.final_action);
   return result;
 }
+function deriveOutcomeDifficulty(stage, action) {
+  if (action === "escalate" || action === "give_back") return "hard";
+  if (action === "rework") return "moderate";
+  return stage === 0 ? "easy" : "moderate";
+}
 async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
   const maxReworks = opts.maxReworks ?? 1;
   const maxEscalations = opts.maxEscalations ?? 1;
@@ -24756,7 +24768,11 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
       { task_id, attempt: reviewedAttempt, category: request.category, content: output, subjectLane },
       { managerLane: manager, runManagerReview: async () => notes ? { verdict, notes } : { verdict }, newId: deps.newId }
     );
-    const outcome = { ...reviewRes.event, action_taken: action };
+    const outcome = {
+      ...reviewRes.event,
+      action_taken: action,
+      difficulty: deriveOutcomeDifficulty(stage, action)
+    };
     if (target) outcome.target_lane_id = target.id;
     events.push({ kind: "outcome", event: outcome });
     if (action === "accept") {
