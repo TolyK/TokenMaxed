@@ -6,6 +6,7 @@ import type { LedgerSummary, OutcomeStats, TokenStats } from '@tokenmaxed/core';
 import {
   CliArgError,
   formatLanes,
+  formatLeaderboard,
   formatOutcomes,
   formatSavings,
   formatTokens,
@@ -13,10 +14,17 @@ import {
   periodLabel,
   resolvePeriodSince,
 } from '../src/render.ts';
+import type { LeaderboardRow } from '@tokenmaxed/core';
 import type { LaneView } from '../src/render.ts';
 
 test('parseArgs defaults to help with no args', () => {
-  assert.deepEqual(parseArgs([]), { command: 'help', period: 'all', by: 'model' });
+  assert.deepEqual(parseArgs([]), {
+    command: 'help',
+    period: 'all',
+    by: 'model',
+    leaderboardBy: 'performance',
+    json: false,
+  });
 });
 
 test('parseArgs reads command, period, by, and ledger', () => {
@@ -24,6 +32,8 @@ test('parseArgs reads command, period, by, and ledger', () => {
     command: 'tokens',
     period: '7d',
     by: 'lane',
+    leaderboardBy: 'performance',
+    json: false,
     ledgerPath: '/tmp/l.jsonl',
   });
 });
@@ -34,8 +44,21 @@ test('parseArgs accepts the outcomes and lanes commands (+ --lanes)', () => {
     command: 'lanes',
     period: 'all',
     by: 'model',
+    leaderboardBy: 'performance',
+    json: false,
     lanesPath: '/tmp/lanes.yaml',
   });
+});
+
+test('parseArgs accepts leaderboard sort axis and --json', () => {
+  assert.deepEqual(parseArgs(['leaderboard', '--by', 'tokens', '--json']), {
+    command: 'leaderboard',
+    period: 'all',
+    by: 'model',
+    leaderboardBy: 'tokens',
+    json: true,
+  });
+  assert.throws(() => parseArgs(['leaderboard', '--by', 'lane']), { message: /--by must be/ });
 });
 
 test('parseArgs rejects bad input', () => {
@@ -165,6 +188,51 @@ test('formatOutcomes handles no reviews', () => {
     escalation: { offloadsReviewed: 0, escalated: 0, rate: 0 },
   };
   assert.match(formatOutcomes({ outcomes: empty, periodLabel: 'all time' }), /No reviews recorded yet/);
+});
+
+function leaderboardRow(over: Partial<LeaderboardRow> = {}): LeaderboardRow {
+  return {
+    model: 'gpt-5-codex',
+    category: 'bugfix',
+    difficulty: 'easy',
+    pass: 2,
+    needs_rework: 1,
+    fail: 1,
+    total: 4,
+    passRate: 0.625,
+    tokens_in: 300,
+    tokens_out: 120,
+    users: 1,
+    ...over,
+  };
+}
+
+test('formatLeaderboard renders the table with caveat and columns', () => {
+  const out = formatLeaderboard({
+    rows: [leaderboardRow()],
+    periodLabel: 'all time',
+    sortBy: 'performance',
+  });
+  assert.match(out, /leaderboard \(all time, by performance\)/);
+  assert.match(out, /gpt-5-codex/);
+  assert.match(out, /62\.5%/);
+  assert.match(out, /2\/1\/1/);
+  assert.match(out, /300/);
+  assert.match(out, /not ground-truth capability/);
+  assert.match(out, /N = contributing users/);
+});
+
+test('formatLeaderboard --json emits rows as JSON', () => {
+  const rows = [leaderboardRow({ model: 'claude-opus-4-8' })];
+  const out = formatLeaderboard({ rows, periodLabel: 'all time', sortBy: 'tokens', json: true });
+  assert.deepEqual(JSON.parse(out.trim()), rows);
+});
+
+test('formatLeaderboard handles no rows', () => {
+  assert.match(
+    formatLeaderboard({ rows: [], periodLabel: 'all time', sortBy: 'performance' }),
+    /No attributable reviews recorded yet/,
+  );
 });
 
 test('formatLanes shows trust mode, exec mode, roles, and manager eligibility', () => {

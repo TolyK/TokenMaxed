@@ -4,15 +4,20 @@
  * have no runtime dependency on the built core package.
  */
 
-import type { LedgerSummary, OutcomeStats, TokenGroup, TokenStats } from '@tokenmaxed/core';
+import type { LeaderboardRow, LedgerSummary, OutcomeStats, TokenGroup, TokenStats } from '@tokenmaxed/core';
 
 export type GroupBy = 'model' | 'lane';
+export type LeaderboardSortBy = 'performance' | 'tokens' | 'difficulty';
 
 export interface CliArgs {
-  command: 'savings' | 'tokens' | 'outcomes' | 'lanes' | 'help';
+  command: 'savings' | 'tokens' | 'outcomes' | 'lanes' | 'leaderboard' | 'help';
   /** 'all' or a relative window like '7d' / '24h'. */
   period: string;
   by: GroupBy;
+  /** Sort axis for the `leaderboard` command. */
+  leaderboardBy: LeaderboardSortBy;
+  /** Emit JSON instead of a text table (leaderboard only). */
+  json: boolean;
   /** Optional explicit ledger path (else the core default is used). */
   ledgerPath?: string;
   /** Lane config path for the `lanes` command (default config/lanes.yaml). */
@@ -48,10 +53,13 @@ function takeValue(argv: readonly string[], i: number, flag: string): string {
 
 /** Parse argv (already sliced past `node script`). */
 export function parseArgs(argv: readonly string[]): CliArgs {
-  const COMMANDS = ['savings', 'tokens', 'outcomes', 'lanes', 'help'] as const;
+  const COMMANDS = ['savings', 'tokens', 'outcomes', 'lanes', 'leaderboard', 'help'] as const;
   let command: CliArgs['command'] | undefined;
   let period = 'all';
   let by: GroupBy = 'model';
+  let leaderboardBy: LeaderboardSortBy = 'performance';
+  let json = false;
+  let byRaw: string | undefined;
   let ledgerPath: string | undefined;
   let lanesPath: string | undefined;
 
@@ -60,20 +68,18 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     switch (arg) {
       case '-h':
       case '--help':
-        return { command: 'help', period, by };
+        return { command: 'help', period, by, leaderboardBy, json };
       case '--period':
         period = takeValue(argv, i, '--period');
         i++;
         break;
-      case '--by': {
-        const v = takeValue(argv, i, '--by');
-        if (v !== 'model' && v !== 'lane') {
-          throw new CliArgError(`--by must be "model" or "lane" (got "${v}").`);
-        }
-        by = v;
+      case '--by':
+        byRaw = takeValue(argv, i, '--by');
         i++;
         break;
-      }
+      case '--json':
+        json = true;
+        break;
       case '--ledger':
         ledgerPath = takeValue(argv, i, '--ledger');
         i++;
@@ -95,10 +101,30 @@ export function parseArgs(argv: readonly string[]): CliArgs {
         command = arg as CliArgs['command'];
     }
   }
+
+  const resolved = command ?? 'help';
+  if (byRaw !== undefined) {
+    if (resolved === 'leaderboard') {
+      if (byRaw !== 'performance' && byRaw !== 'tokens' && byRaw !== 'difficulty') {
+        throw new CliArgError(`--by must be "performance", "tokens", or "difficulty" (got "${byRaw}").`);
+      }
+      leaderboardBy = byRaw;
+    } else if (resolved === 'tokens') {
+      if (byRaw !== 'model' && byRaw !== 'lane') {
+        throw new CliArgError(`--by must be "model" or "lane" (got "${byRaw}").`);
+      }
+      by = byRaw;
+    } else if (byRaw !== 'model' && byRaw !== 'lane') {
+      throw new CliArgError(`--by is only valid for "tokens" or "leaderboard" (got "${byRaw}").`);
+    }
+  }
+
   return {
-    command: command ?? 'help',
+    command: resolved,
     period,
     by,
+    leaderboardBy,
+    json,
     ...(ledgerPath ? { ledgerPath } : {}),
     ...(lanesPath ? { lanesPath } : {}),
   };
@@ -251,6 +277,47 @@ export function formatOutcomes(args: { outcomes: OutcomeStats; periodLabel: stri
   rows.push(['total', `${t.pass}`, `${t.needs_rework}`, `${t.fail}`, `${t.total}`, pct(t.success_rate * 100)]);
   lines.push(...table(rows));
   lines.push('', '  (success = (pass + ½·needs-rework) / total; reviewer + user votes)');
+  return lines.join('\n');
+}
+
+const pctRate = (n: number): string => `${(n * 100).toFixed(1)}%`;
+
+/** Real-usage leaderboard table (or JSON rows when json=true). */
+export function formatLeaderboard(args: {
+  rows: readonly LeaderboardRow[];
+  periodLabel: string;
+  sortBy: LeaderboardSortBy;
+  json?: boolean;
+}): string {
+  const { rows, periodLabel: label, sortBy, json = false } = args;
+  if (json) return JSON.stringify(rows) + '\n';
+
+  const lines = [`TokenMaxed — leaderboard (${label}, by ${sortBy})`, ''];
+  if (rows.length === 0) {
+    lines.push('  No attributable reviews recorded yet.');
+    return lines.join('\n');
+  }
+
+  const tableRows: string[][] = [
+    ['model', 'category', 'difficulty', 'N', 'pass%', 'pass/rew/fail', 'tok-in', 'tok-out'],
+  ];
+  for (const r of rows) {
+    tableRows.push([
+      r.model,
+      r.category,
+      r.difficulty,
+      `${r.users}`,
+      pctRate(r.passRate),
+      `${r.pass}/${r.needs_rework}/${r.fail}`,
+      int(r.tokens_in),
+      int(r.tokens_out),
+    ]);
+  }
+  lines.push(...table(tableRows));
+  lines.push(
+    '',
+    '  Measures who passes real reviews at difficulty D — not ground-truth capability. N = contributing users.',
+  );
   return lines.join('\n');
 }
 

@@ -6,10 +6,12 @@
  */
 
 import {
+  buildLeaderboard,
   executionModeOf,
   filterEventsSince,
   isManagerEligible,
   outcomeStats,
+  sortLeaderboard,
   summarize,
   tokenStats,
 } from '@tokenmaxed/core';
@@ -18,6 +20,7 @@ import { JsonlLedger, loadLaneConfig } from '@tokenmaxed/core/node';
 import {
   CliArgError,
   formatLanes,
+  formatLeaderboard,
   formatOutcomes,
   formatSavings,
   formatTokens,
@@ -32,13 +35,16 @@ const HELP = `TokenMaxed — route coding tasks to the cheapest capable lane.
 Usage:
   tokenmaxed savings  [--period <p>] [--ledger <path>]
   tokenmaxed tokens   [--period <p>] [--by model|lane] [--ledger <path>]
-  tokenmaxed outcomes [--period <p>] [--ledger <path>]
-  tokenmaxed lanes    [--lanes <path>]
+  tokenmaxed outcomes    [--period <p>] [--ledger <path>]
+  tokenmaxed leaderboard [--period <p>] [--by performance|tokens|difficulty] [--json] [--ledger <path>]
+  tokenmaxed lanes       [--lanes <path>]
   tokenmaxed help
 
 Options:
   --period <p>   all (default) or a window like 7d / 24h
-  --by <g>       group tokens by "model" (default) or "lane"
+  --by <g>       tokens: group by "model" (default) or "lane"
+                 leaderboard: sort by "performance" (default), "tokens", or "difficulty"
+  --json         leaderboard: emit rows as JSON (for external chart rendering)
   --ledger <p>   ledger file path (default: ~/.tokenmaxed/ledger.jsonl)
   --lanes <p>    lane config path for "lanes" (default: config/lanes.yaml)
   -h, --help     show this help`;
@@ -89,6 +95,11 @@ function main(): void {
       );
     } else if (args.command === 'tokens') {
       process.stdout.write(formatTokens({ tokens: tokenStats(events), by: args.by, periodLabel: label }) + '\n');
+    } else if (args.command === 'leaderboard') {
+      const rows = sortLeaderboard(buildLeaderboard(events), args.leaderboardBy);
+      process.stdout.write(
+        formatLeaderboard({ rows, periodLabel: label, sortBy: args.leaderboardBy, json: args.json }),
+      );
     } else {
       // outcomes
       process.stdout.write(formatOutcomes({ outcomes: outcomeStats(events), periodLabel: label }) + '\n');
