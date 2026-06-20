@@ -12,8 +12,10 @@ import {
   declaredCapabilityFor,
   effectiveCapability,
   effectiveCapabilityFor,
+  routeDecide,
 } from '../src/route.ts';
-import type { Lane, ObservedCapabilityByLane } from '../src/types.ts';
+import { selectReviewManager } from '../src/review.ts';
+import type { Lane, ObservedCapabilityByLane, ObservedCapabilityByModel, Policy, RouteContext } from '../src/types.ts';
 
 /** Assert two floats are equal within a small tolerance. */
 function near(actual: number, expected: number, eps = 1e-9): void {
@@ -95,3 +97,131 @@ test('effectiveCapabilityFor blends only the matching lane×category entry', () 
   const other: Lane = { ...lane, id: 'other-lane' };
   near(effectiveCapabilityFor(other, 'feature', overlay), 0.6);
 });
+
+// --- P6 Phase 1c: model-keyed overlay lookup ----------------------------------
+
+test('effectiveCapabilityFor with model overlay resolves lane.model to the model key', () => {
+  const modelOverlay: ObservedCapabilityByModel = {
+    'kimi-k2': { feature: { rate: 1.0, n: DEFAULT_PRIOR_STRENGTH } },
+  };
+  near(
+    effectiveCapabilityFor(lane, 'feature', undefined, { modelOverlay }),
+    (0.6 + 1.0) / 2,
+  );
+  // a different model id is unaffected
+  const otherModel: Lane = { ...lane, model: 'other-model' };
+  near(effectiveCapabilityFor(otherModel, 'feature', undefined, { modelOverlay }), 0.6);
+});
+
+test('lane-with-changed-model: old-model verdicts do not contaminate the new model', () => {
+  const oldModelOverlay: ObservedCapabilityByModel = {
+    'old-model': { bugfix: { rate: 1.0, n: 100_000 } },
+  };
+  const newLane: Lane = {
+    id: 'repinned-lane',
+    kind: 'cli',
+    model: 'new-model',
+    trust_mode: 'full',
+    costBasis: 'subscription',
+    provenance: 'moonshot',
+    jurisdiction: 'CN',
+    capability: { bugfix: 0.5 },
+  };
+  // The lane now runs new-model; old-model evidence must not lift its score.
+  near(effectiveCapabilityFor(newLane, 'bugfix', undefined, { modelOverlay: oldModelOverlay }), 0.5);
+  const newModelOverlay: ObservedCapabilityByModel = {
+    'new-model': { bugfix: { rate: 1.0, n: 100_000 } },
+  };
+  near(effectiveCapabilityFor(newLane, 'bugfix', undefined, { modelOverlay: newModelOverlay }), 0.99996, 1e-3);
+});
+
+test('capability:0 opt-out survives the model overlay', () => {
+  const optout: Lane = { ...lane, capability: { feature: 0 } };
+  const modelOverlay: ObservedCapabilityByModel = {
+    'kimi-k2': { feature: { rate: 1.0, n: 100_000 } },
+  };
+  assert.equal(effectiveCapabilityFor(optout, 'feature', undefined, { modelOverlay }), 0);
+});
+
+test('zero-change-when-absent: no model overlay equals declared capability', () => {
+  const modelOverlay: ObservedCapabilityByModel = {
+    'kimi-k2': { feature: { rate: 1.0, n: 100_000 } },
+  };
+  near(effectiveCapabilityFor(lane, 'feature'), declaredCapabilityFor(lane, 'feature'));
+  near(effectiveCapabilityFor(lane, 'feature', undefined, {}), declaredCapabilityFor(lane, 'feature'));
+  // model overlay only applies when passed
+  near(effectiveCapabilityFor(lane, 'refactor', undefined, { modelOverlay }), 0.5);
+});
+
+test('reviewer eligibility is unaffected by the model overlay', () => {
+  const subject: Lane = {
+    id: 'subj',
+    kind: 'cli',
+    model: 'subj-m',
+    trust_mode: 'full',
+    costBasis: 'subscription',
+    provenance: 'moonshot',
+    jurisdiction: 'CN',
+    manager_allowed: false,
+    capability: { bugfix: 0.6 },
+  };
+  const mgr: Lane = {
+    id: 'mgr',
+    kind: 'cli',
+    model: 'mgr-m',
+    trust_mode: 'full',
+    costBasis: 'subscription',
+    provenance: 'anthropic',
+    jurisdiction: 'US',
+    manager_allowed: true,
+    capability: { bugfix: 0.7 },
+  };
+  const modelOverlay: ObservedCapabilityByModel = {
+    'subj-m': { bugfix: { rate: 1.0, n: 100_000 } },
+  };
+  const ctx: RouteContext = {
+    lanes: [subject, mgr],
+    policyContext: { repo_class: 'public', sensitivity: 'normal' },
+    observedCapabilityByModel: modelOverlay,
+  };
+  const noPolicy: Policy = {};
+  assert.equal(selectReviewManager([subject, mgr], subject, 'bugfix', ctx, noPolicy)?.id, 'mgr');
+});
+
+test('routeDecide: model overlay lifts a cheap lane when its model earns evidence', () => {
+  const strong = makeLane({
+    id: 'strong',
+    model: 'strong-m',
+    costBasis: 'subscription',
+    capability: { bugfix: 0.85 },
+  });
+  const cheap = makeLane({
+    id: 'cheap',
+    model: 'cheap-m',
+    costBasis: 'local',
+    capability: { bugfix: 0.6 },
+  });
+  const task = { category: 'bugfix' as const };
+  const base: RouteContext = {
+    lanes: [strong, cheap],
+    policyContext: { repo_class: 'public', sensitivity: 'normal' },
+  };
+  const noPolicy: Policy = {};
+  assert.equal(routeDecide(task, base, noPolicy).laneId, 'strong');
+  const modelOverlay: ObservedCapabilityByModel = {
+    'cheap-m': { bugfix: { rate: 1.0, n: 100_000 } },
+  };
+  assert.equal(routeDecide(task, { ...base, observedCapabilityByModel: modelOverlay }, noPolicy).laneId, 'cheap');
+});
+
+function makeLane(over: Partial<Lane> & { id: string }): Lane {
+  return {
+    kind: 'cli',
+    model: 'm',
+    trust_mode: 'full',
+    costBasis: 'subscription',
+    provenance: 'anthropic',
+    jurisdiction: 'US',
+    ...over,
+  };
+}

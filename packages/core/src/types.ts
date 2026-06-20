@@ -256,6 +256,14 @@ export interface ObservedCapability {
  */
 export type ObservedCapabilityByLane = Record<string, Partial<Record<TaskCategory, ObservedCapability>>>;
 
+/**
+ * Observed capability evidence keyed by resolved model id then task category (P6).
+ * A learned overlay on top of the declared config prior; absent entries fall back
+ * to declared capability. Sparse by construction (only models/categories with
+ * evidence appear).
+ */
+export type ObservedCapabilityByModel = Record<string, Partial<Record<TaskCategory, ObservedCapability>>>;
+
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];
@@ -275,6 +283,16 @@ export interface RouteContext {
    * opt-out always stay on the DECLARED score regardless of this overlay.
    */
   observedCapability?: ObservedCapabilityByLane;
+  /**
+   * Optional model-keyed learned capability overlay (P6 F-1). When present,
+   * routing, reassignment, and escalation-target selection resolve each lane to
+   * its canonical model key and blend observed review evidence from that model's
+   * cell. Takes precedence over {@link observedCapability} when both are set.
+   * Absent ⇒ falls back to lane-keyed overlay, then declared capability.
+   * Reviewer-manager selection and the `capability: 0` opt-out always stay on
+   * the DECLARED score regardless of this overlay.
+   */
+  observedCapabilityByModel?: ObservedCapabilityByModel;
   /**
    * Optional rankings-sourced capability PRIOR overlay (separate from F-1
    * {@link observedCapability}). When present, routing and escalation read the

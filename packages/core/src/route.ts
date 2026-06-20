@@ -14,6 +14,7 @@
 
 import { isExecutorCertified, isReaderExecutorCertified } from './boundary.ts';
 import { priorOptsFromContext, resolvedPriorFor, type ResolvedPriorOptions } from './capability-prior.ts';
+import { parseModelAlias } from './model-freshness.ts';
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
 import { TRUSTED_PROVENANCES } from './types.ts';
 import type {
@@ -23,6 +24,7 @@ import type {
   LaneScore,
   ObservedCapability,
   ObservedCapabilityByLane,
+  ObservedCapabilityByModel,
   Policy,
   PolicyVerdict,
   RouteContext,
@@ -206,6 +208,34 @@ export interface EffectiveCapabilityOptions {
   priorOverlay?: CapabilityPriorOverlay;
   /** Staleness + accepted-prior state for rankings prior resolution. */
   priorOpts?: ResolvedPriorOptions;
+  /**
+   * Model-keyed observed overlay (P6). When set, observed evidence is read by
+   * resolving the lane to its canonical model key via {@link resolveLaneModelKey}.
+   */
+  modelOverlay?: ObservedCapabilityByModel;
+}
+
+/**
+ * Resolve a lane's canonical model key for overlay lookup. Mirrors
+ * {@link resolveLaneModelId} without a price table — the adapter pre-resolves
+ * `@latest` before scoring, so unresolved aliases pass through unchanged.
+ */
+export function resolveLaneModelKey(lane: Lane): string {
+  const spec = parseModelAlias(lane.model);
+  return spec.latest ? lane.model : spec.id;
+}
+
+/** Observed evidence for a lane×category from model- or lane-keyed overlays. */
+function observedForLane(
+  lane: Lane,
+  category: Task['category'],
+  laneOverlay?: ObservedCapabilityByLane,
+  modelOverlay?: ObservedCapabilityByModel,
+): ObservedCapability | undefined {
+  if (modelOverlay) {
+    return modelOverlay[resolveLaneModelKey(lane)]?.[category];
+  }
+  return laneOverlay?.[lane.id]?.[category];
 }
 
 /** Build effective-capability options from a route context when a prior overlay is present. */
@@ -264,14 +294,15 @@ export function effectiveCapabilityFor(
   overlay?: ObservedCapabilityByLane,
   opts?: EffectiveCapabilityOptions,
 ): number {
+  const observed = observedForLane(lane, category, overlay, opts?.modelOverlay);
   if (opts?.priorOverlay) {
     const resolved = resolvedPriorFor(lane, category, opts.priorOverlay, opts.priorOpts);
-    return effectiveCapability(resolved.prior, overlay?.[lane.id]?.[category], {
+    return effectiveCapability(resolved.prior, observed, {
       priorStrength: opts.priorStrength ?? resolved.priorStrength,
     });
   }
   const declared = declaredCapabilityFor(lane, category);
-  return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
+  return effectiveCapability(declared, observed, opts);
 }
 
 function scoreLane(
@@ -279,12 +310,16 @@ function scoreLane(
   task: Task,
   capHeadroom?: Record<string, number>,
   observedCapability?: ObservedCapabilityByLane,
+  observedCapabilityByModel?: ObservedCapabilityByModel,
   effectiveOpts?: EffectiveCapabilityOptions,
 ): LaneScore {
   const declared = declaredCapabilityFor(lane, task.category);
-  const observed = observedCapability?.[lane.id]?.[task.category];
-  const capability = effectiveOpts?.priorOverlay
-    ? effectiveCapabilityFor(lane, task.category, observedCapability, effectiveOpts)
+  const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
+  const effOpts: EffectiveCapabilityOptions | undefined = observedCapabilityByModel
+    ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel }
+    : effectiveOpts;
+  const capability = effOpts?.priorOverlay
+    ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts)
     : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom?.[lane.id]);
@@ -409,7 +444,7 @@ export function routeDecide(
 
   const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
   const scored = candidates.map((lane) =>
-    scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, effectiveOpts),
+    scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts),
   );
   const strategy = ctx.strategy ?? 'maximize';
   const tiered = strategy === 'tiered';

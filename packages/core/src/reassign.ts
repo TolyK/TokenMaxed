@@ -90,7 +90,11 @@ export function reassignmentTarget(
 
   // Use EFFECTIVE capability so an empirically-degrading lane isn't preferred.
   const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
-  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, effectiveOpts);
+  const cap = (l: Lane) =>
+    effectiveCapabilityFor(l, task.category, ctx.observedCapability, {
+      ...effectiveOpts,
+      modelOverlay: ctx.observedCapabilityByModel,
+    });
   const fromRank = TRUST_RANK[from.trust_mode];
   const fromCap = cap(from);
   const eligible = candidates.filter((c) => {
@@ -192,7 +196,11 @@ export function selectEscalationTarget(
   const exclude = new Set(opts.excludeIds ?? []);
   // Use EFFECTIVE capability: don't escalate to an empirically-failing lane.
   const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
-  const cap = (l: Lane) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, effectiveOpts);
+  const cap = (l: Lane) =>
+    effectiveCapabilityFor(l, task.category, ctx.observedCapability, {
+      ...effectiveOpts,
+      modelOverlay: ctx.observedCapabilityByModel,
+    });
   const fromCap = cap(subject);
   const eligible = candidates.filter(
     (c) =>

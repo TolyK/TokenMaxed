@@ -36,7 +36,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -239,7 +239,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // learned adjustment (no /why-vs-run divergence). Built from the ledger + clock
   // the adapter owns; undefined when learning is off. Lazy per call (cheap: local
   // JSONL, opt-in).
-  const buildObserved = (): ObservedCapabilityByLane | undefined => {
+  const buildObservedByModel = (): ObservedCapabilityByModel | undefined => {
     if (!learnEnabled) return undefined;
     // Fail OPEN: a malformed/unreadable ledger must never block routing (mirrors
     // the best-effort recording path). On any read/parse error, fall back to
@@ -341,10 +341,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // the resolved lane set wins; fall back to the registry for ids not in it (native).
     const modelOf = (laneId: string): string | undefined =>
       lanes.find((l) => l.id === laneId)?.model ?? registry.byId(laneId)?.model;
-    // F-1: apply the learned overlay (undefined when off ⇒ declared scores). The
-    // core selectors read ctx.observedCapability; runWithEscalation preserves it
-    // through its effective-context spread, so escalation/reassign also benefit.
-    const observedCapability = buildObserved();
+    // F-1/P6: apply the model-keyed learned overlay (undefined when off ⇒ declared
+    // scores). Core selectors read ctx.observedCapabilityByModel; runWithEscalation
+    // preserves it through its effective-context spread, so escalation/reassign benefit.
+    const observedCapabilityByModel = buildObservedByModel();
     // Exclude lanes that can't run now (e.g. Ollama down) so routing never picks an
     // unavailable lane on cost; threads through runTask/runWithEscalation to
     // routeDecide + canReassign. Empty ⇒ no candidate ⇒ runTask degrades to native.
@@ -365,7 +365,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // (the --dangerously-skip-permissions analogue). Read per call so the toggle
       // takes effect without a relaunch; the kill-switch still forces it off.
       ...(readYoloState() ? { yolo: true } : {}),
-      ...(observedCapability ? { observedCapability } : {}),
+      ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...(tieredStrategy === 'tiered'
         ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(lanes, priceTable) }
@@ -501,9 +501,12 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Same availability probe delegate routes with, so /tokenmaxed:why never
     // advertises a lane that can't run (e.g. a free local lane whose server is down).
     availableLaneIds: probeAvailable,
-    // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
-    // /tokenmaxed:why reflects the effective capability, not the stale prior.
-    observedCapability: buildObserved,
+    // Legacy lane-keyed hook (unused — model overlay is authoritative). Kept so
+    // router_preview callers/tests can still inject a lane-keyed overlay.
+    observedCapability: () => undefined,
+    // F-1/P6: same model-keyed learned overlay delegate routes with (undefined ⇒
+    // declared), so /tokenmaxed:why reflects the effective capability, not the stale prior.
+    observedCapabilityByModel: buildObservedByModel,
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.

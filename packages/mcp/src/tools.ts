@@ -19,6 +19,7 @@ import type {
   LedgerSummary,
   Lane,
   ObservedCapabilityByLane,
+  ObservedCapabilityByModel,
   Policy,
   PolicyContext,
   PolicyDecision,
@@ -91,6 +92,12 @@ export interface ToolDeps {
    * real run path).
    */
   observedCapability: () => ObservedCapabilityByLane | undefined;
+  /**
+   * Model-keyed learned capability overlay (P6 F-1), or `undefined` when learning
+   * is off. Takes precedence over {@link ServerDeps.observedCapability} when both
+   * are set. Built server-side from the ledger + clock.
+   */
+  observedCapabilityByModel?: () => ObservedCapabilityByModel | undefined;
   /** The active routing policy (from policy.yaml via core/node). */
   loadPolicy: () => Policy;
   /**
@@ -556,6 +563,7 @@ export function createTools(core: CorePort): ToolDef[] {
         // Apply the learned overlay (F-1) so /tokenmaxed:why reflects the same
         // effective capability router_delegate routes with. Undefined ⇒ declared.
         const observedCapability = deps.observedCapability();
+        const observedCapabilityByModel = deps.observedCapabilityByModel?.();
         // Same availability filter delegate routes with (when the host provides it),
         // so /tokenmaxed:why never advertises a lane that can't actually run. Probe
         // ONLY the gate+policy-eligible lanes — never a disabled/blocked/gated lane
@@ -570,6 +578,7 @@ export function createTools(core: CorePort): ToolDef[] {
             access_need: resolvedAccessNeed,
             ...(yolo ? { yolo: true } : {}),
             ...(observedCapability ? { observedCapability } : {}),
+            ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
           };
           const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
           availableIds = await deps.availableLaneIds(eligible);
@@ -594,6 +603,7 @@ export function createTools(core: CorePort): ToolDef[] {
           access_need: resolvedAccessNeed,
           ...(yolo ? { yolo: true } : {}),
           ...(observedCapability ? { observedCapability } : {}),
+          ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
           ...(preferLaneId ? { preferLaneId } : {}),

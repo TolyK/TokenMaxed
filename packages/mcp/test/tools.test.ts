@@ -822,6 +822,31 @@ test('preview applies the learned overlay (F-1); flag-off is identical to declar
   assert.match(on.content[0]!.text, /learned/);
 });
 
+test('preview applies the model-keyed overlay (P6 F-1); absent overlay is identical to declared', async () => {
+  const strong = lane({ id: 'strong', model: 'strong-m', costBasis: 'subscription', capability: { bugfix: 0.85 } });
+  const cheap = lane({ id: 'cheap', model: 'cheap-m', costBasis: 'local', capability: { bugfix: 0.6 } });
+  const lanes = [strong, cheap];
+  const off = await call('router_preview', deps({ candidateLanes: () => lanes }), { category: 'bugfix' });
+  assert.equal((off.structuredContent!.decision as { laneId: string }).laneId, 'strong');
+  assert.doesNotMatch(off.content[0]!.text, /learned/);
+  const overlay = { 'cheap-m': { bugfix: { rate: 1.0, n: 100_000 } } };
+  let consulted = 0;
+  const on = await call(
+    'router_preview',
+    deps({
+      candidateLanes: () => lanes,
+      observedCapabilityByModel: () => {
+        consulted++;
+        return overlay;
+      },
+    }),
+    { category: 'bugfix' },
+  );
+  assert.equal(consulted, 1);
+  assert.equal((on.structuredContent!.decision as { laneId: string }).laneId, 'cheap');
+  assert.match(on.content[0]!.text, /learned/);
+});
+
 test('preview applies the availability filter (skips a lane that cannot run)', async () => {
   // A free local lane ties on capability and would win on cost — but it's not
   // available, so preview must pick the available subscription lane instead.
