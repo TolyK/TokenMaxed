@@ -17,7 +17,11 @@ import { POLICY_VERDICTS, TASK_CATEGORIES, TRUST_MODES } from './types.ts';
 import type { PolicyVerdict, TaskCategory, TrustMode } from './types.ts';
 
 /** Current ledger schema version (stamped on every event). */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
+
+/** Bounded difficulty bucket for model-keyed learning (content-free enum). */
+export type DifficultyBucket = 'easy' | 'moderate' | 'hard';
+export const DIFFICULTY_BUCKETS: readonly DifficultyBucket[] = ['easy', 'moderate', 'hard'];
 
 /**
  * Status of an executed/attempted task. Only `ok` feeds savings claims. `native` is
@@ -111,6 +115,12 @@ export interface OutcomeEventInput {
   category: TaskCategory;
   subject_lane_id?: string;
   subject_provenance?: string;
+  /** Concrete model the subject lane ran (optional: host-turn + legacy events lack it). */
+  subject_model?: string;
+  /** Canonical model key after @latest/alias resolution (optional). */
+  subject_model_resolved?: string;
+  /** Escalation-depth difficulty bucket (optional). */
+  difficulty?: DifficultyBucket;
   reviewer_lane_id: string;
   reviewer_model: string;
   reviewer_trust_mode: TrustMode;
@@ -147,6 +157,7 @@ export const OUTCOME_EVENT_FIELDS = [
   'event_type', 'schema_version', 'id', 'seq', 'ts',
   'subject_id', 'subject_type', 'task_id', 'turn_id', 'review_id', 'attempt', 'category',
   'subject_lane_id', 'subject_provenance',
+  'subject_model', 'subject_model_resolved', 'difficulty',
   'reviewer_lane_id', 'reviewer_model', 'reviewer_trust_mode', 'reviewer_provenance',
   'verdict', 'voter', 'policy_verdict', 'action_taken', 'target_lane_id',
 ] as const satisfies readonly (keyof OutcomeEvent)[];
@@ -273,6 +284,13 @@ export function validateOutcomeInput(input: OutcomeEventInput): OutcomeEventInpu
   if (subject_lane_id !== undefined) out.subject_lane_id = subject_lane_id;
   const subject_provenance = optionalString(input.subject_provenance, 'outcome.subject_provenance');
   if (subject_provenance !== undefined) out.subject_provenance = subject_provenance;
+  const subject_model = optionalString(input.subject_model, 'outcome.subject_model');
+  if (subject_model !== undefined) out.subject_model = subject_model;
+  const subject_model_resolved = optionalString(input.subject_model_resolved, 'outcome.subject_model_resolved');
+  if (subject_model_resolved !== undefined) out.subject_model_resolved = subject_model_resolved;
+  if (input.difficulty !== undefined) {
+    out.difficulty = requireEnum(input.difficulty, DIFFICULTY_BUCKETS, 'outcome.difficulty');
+  }
   // C-13 escalation telemetry (optional, content-free).
   if (input.action_taken !== undefined) {
     out.action_taken = requireEnum(input.action_taken, OUTCOME_ACTIONS, 'outcome.action_taken');
