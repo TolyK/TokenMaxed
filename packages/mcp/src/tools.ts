@@ -52,6 +52,9 @@ export interface CorePort {
   evaluate: (task: Task, lane: Lane, ctx: PolicyContext, policy: Policy) => PolicyDecision;
   /** Canonical task categories (core's TASK_CATEGORIES). */
   taskCategories: readonly TaskCategory[];
+  classifyTask: (text: string) => { category: TaskCategory; confidence: number; scores: Partial<Record<TaskCategory, number>> };
+  MIN_CLASSIFY_CONFIDENCE: number;
+  CLASSIFY_FALLBACK_CATEGORY: TaskCategory;
 }
 
 /** A single text block in an MCP tool result. */
@@ -271,6 +274,9 @@ export interface DelegateOutcome {
    * pasted into untrusted contexts.
    */
   readerDerived?: boolean;
+  categoryInferred?: boolean;
+  inferredConfidence?: number;
+  hint?: string;
 }
 
 /** A declarative tool: advertised by the server, invoked via its handler. */
@@ -762,9 +768,13 @@ export function createTools(core: CorePort): ToolDef[] {
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['category', 'instruction'],
+      required: ['instruction'],
       properties: {
-        category: { type: 'string', enum: [...core.taskCategories], description: 'Task category (drives lane choice).' },
+        category: {
+          type: 'string',
+          enum: [...core.taskCategories],
+          description: 'OPTIONAL task category (drives lane choice). If omitted, it is inferred from the instruction.',
+        },
         instruction: {
           type: 'string',
           description:
@@ -774,7 +784,7 @@ export function createTools(core: CorePort): ToolDef[] {
           type: 'array',
           items: { type: 'string' },
           description:
-            'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing — kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounded + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.',
+            'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing — kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounds + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.',
         },
         repo_class: { type: 'string', enum: [...REPO_CLASSES], description: 'Repository class for policy (default unknown).' },
         sensitivity: { type: 'string', enum: [...SENSITIVITIES], description: 'Content sensitivity for policy (default unknown).' },
@@ -788,8 +798,7 @@ export function createTools(core: CorePort): ToolDef[] {
     },
     handler: (deps, args) =>
       guardedAsync(async () => {
-        const category = optEnum(args, 'category', core.taskCategories);
-        if (category === undefined) throw new ToolInputError('"category" is required.');
+        const passedCategory = optEnum(args, 'category', core.taskCategories);
         const instruction = optString(args, 'instruction');
         if (!instruction || instruction.trim() === '') throw new ToolInputError('"instruction" is required (non-empty).');
         const files = optStringArray(args, 'files');
@@ -806,18 +815,30 @@ export function createTools(core: CorePort): ToolDef[] {
           );
         }
 
+        const resolution = resolveCategory(core, passedCategory, instruction);
+
         const policyContext: PolicyContext = {
           ...(repo_class ? { repo_class } : {}),
           ...(sensitivity ? { sensitivity } : {}),
         };
         const outcome = await deps.delegate({
-          category,
+          category: resolution.category,
           instruction,
           ...(Object.keys(policyContext).length ? { policyContext } : {}),
           ...(files && files.length ? { files } : {}),
           ...(access_need ? { access_need } : {}),
         });
-        return renderDelegate(outcome);
+
+        const finalOutcome = resolution.categoryInferred
+          ? {
+              ...outcome,
+              categoryInferred: true,
+              inferredConfidence: resolution.inferredConfidence,
+              hint: resolution.hint,
+            }
+          : outcome;
+
+        return renderDelegate(finalOutcome);
       }),
   };
 
@@ -893,6 +914,15 @@ export function createTools(core: CorePort): ToolDef[] {
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */
 function renderDelegate(o: DelegateOutcome): ToolResult {
+  const inferenceFields = o.categoryInferred
+    ? {
+        categoryInferred: true,
+        inferredConfidence: o.inferredConfidence,
+        hint: o.hint,
+      }
+    : {};
+  const inferenceText = o.categoryInferred && o.hint ? `\n\n${o.hint}` : '';
+
   // Anything that isn't a clean execution by another lane ⇒ the host does it.
   if (o.native || o.status !== 'ok') {
     const why =
@@ -914,7 +944,7 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     const taint = o.readerDerived
       ? '\n\n⚠️ reader-derived: any quoted reader output above may include private repo code — do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts.'
       : '';
-    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note}${taint}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note}${taint}${inferenceText}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
@@ -922,6 +952,7 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
       ...(o.failureKind ? { failureKind: o.failureKind } : {}),
       ...(o.readerDerived ? { readerDerived: true } : {}),
       ...(o.recordingFailed ? { recordingFailed: true } : {}),
+      ...inferenceFields,
     });
   }
   const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
@@ -937,13 +968,13 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
   // result is UNREVIEWED, so do NOT tell the host to "use it"; flag it for review.
   if (o.reviewUnavailable) {
     return ok(
-      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.reason ? { reason: o.reason } : {}), ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}) },
+      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}${inferenceText}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.reason ? { reason: o.reason } : {}), ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}), ...inferenceFields },
     );
   }
   // C-13: `reason` may carry "escalated to X" / "reworked on X" (accept_after_*).
   const how = o.reason ? ` (${o.reason})` : '';
-  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${taint}${note}`, {
+  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${taint}${note}${inferenceText}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
@@ -951,7 +982,40 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     ...(o.reason ? { reason: o.reason } : {}),
     ...taintFlag,
     ...(o.recordingFailed ? { recordingFailed: true } : {}),
+    ...inferenceFields,
   });
+}
+
+export interface CategoryResolution {
+  category: TaskCategory;
+  categoryInferred: boolean;
+  inferredConfidence?: number;
+  hint?: string;
+}
+
+export function resolveCategory(
+  core: {
+    classifyTask: (text: string) => { category: TaskCategory; confidence: number };
+    MIN_CLASSIFY_CONFIDENCE: number;
+    CLASSIFY_FALLBACK_CATEGORY: TaskCategory;
+  },
+  passedCategory?: TaskCategory,
+  instruction?: string,
+): CategoryResolution {
+  if (passedCategory !== undefined) {
+    return {
+      category: passedCategory,
+      categoryInferred: false,
+    };
+  }
+  const c = core.classifyTask(instruction ?? '');
+  const resolvedCategory = c.confidence >= core.MIN_CLASSIFY_CONFIDENCE ? c.category : core.CLASSIFY_FALLBACK_CATEGORY;
+  return {
+    category: resolvedCategory,
+    categoryInferred: true,
+    inferredConfidence: c.confidence,
+    hint: `category inferred as '${resolvedCategory}' (confidence ${c.confidence.toFixed(2)}) — pass an explicit category for precise routing.`,
+  };
 }
 
 // --- dispatch (pure; testable without the SDK or a build) ----------------------

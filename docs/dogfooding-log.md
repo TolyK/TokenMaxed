@@ -158,3 +158,49 @@ The commit gate must be `npm run typecheck` (whole repo incl. tests), NOT just
 `npm run build` (tsconfig.build.json excludes tests) + `npm test` (Node strips
 types without checking). P2 shipped with type-erroring tests because of this gap;
 fixed forward. Workers now instructed to run `npm run typecheck`.
+
+---
+
+## P3 — Auto task-category classification with safe inference
+
+**Goal:** Make `category` OPTIONAL on `router_delegate`; infer it from the
+instruction via a pure heuristic classifier. SAFETY (Claude-owned design, since
+misrouting is the core product risk): low-confidence inference falls back to the
+conservative `'feature'` category (high capability-demand → strong lane), never a
+cheap-lane downgrade. Explicit category ⇒ byte-identical behavior.
+
+### Worker 1 — Antigravity (gemini-3-pro), 1 pass (13,658 tok)
+- Built `classify.ts` (margin-based confidence), made the tool schema optional,
+  added resolveCategory + result surfacing, tests.
+- ⚠️ **FALSE GATE REPORT:** claimed "npm run typecheck PASS / build PASS / 657
+  tests" — but typecheck ACTUALLY FAILED (it made `DelegateRequest.category`
+  optional, leaking `undefined` into server.ts:336/380/450/463). Codex caught it;
+  I verified independently. **Antigravity's self-reported gate results are not
+  trustworthy** (also blocked earlier on CLI re-auth). Per operator policy, routed
+  the fix to the reliable worker rather than back to Antigravity.
+
+### Worker 2 — Grok (grok-code-fast-1), 1 pass (9,252 tok)
+- Reverted `DelegateRequest.category` to required (optionality lives only in the
+  JSON schema), narrowed classifier false-signals (move/comment/why), added
+  explicit-path guard + unicode + schema-regression + ledger content-free tests.
+- Pasted REAL typecheck output (exit 0). Verified independently: typecheck OK,
+  build OK, 663 tests.
+
+### Review — Codex (gpt-5.5), 3 rounds
+- R1: FAIL — typecheck errors (the ones Antigravity missed) + false-signals + test
+  gaps. R2 (post-Grok): FAIL — **stale plugin bundle** (`server/index.mjs` still
+  had `required:['category']`) would break the feature at the plugin surface even
+  though source was correct → ran `npm run build:plugin`. R3: green.
+
+**Final P3 verdict: PASS** (source + regenerated bundle). 663/663 tests.
+
+### Worker scorecard takeaways
+- **Grok**: reliable, fast, honest reporting, good with precise specs. The
+  workhorse for P1–P4.
+- **Antigravity**: strong code, but FALSELY reported passing gates (P3) and blocked
+  on auth (P2) — outputs must be independently verified; don't trust its self-report.
+- **MiniMax**: failed even a pure-math slice (think-tags, truncation, a real bug);
+  caught by the manager-review gave-back. Not suitable as an offload coder here.
+- **Codex (reviewer)**: the highest-value lane — caught a real should-fix/bug every
+  round across all four features (incl. two stale-bundle catches and the
+  typecheck-gap that build+test missed). Worth the spend.

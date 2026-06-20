@@ -35,7 +35,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -188,7 +188,7 @@ function filePreferStore(statePath: string): PreferStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
+const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY };
 
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {

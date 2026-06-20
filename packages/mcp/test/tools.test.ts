@@ -20,15 +20,31 @@ import {
   routeDecide,
   summarize,
   tokenStats,
+  classifyTask,
+  MIN_CLASSIFY_CONFIDENCE,
+  CLASSIFY_FALLBACK_CATEGORY,
+  SCHEMA_VERSION,
+  serializeEvent,
 } from '../../core/src/index.ts';
 import type { Lane, LedgerEvent, Policy, RouteDecision } from '../../core/src/index.ts';
 
-import { createTools, dispatch } from '../src/tools.ts';
+import { createTools, dispatch, resolveCategory } from '../src/tools.ts';
 import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, SetupReport, ToolDeps } from '../src/tools.ts';
 
 // --- harness -------------------------------------------------------------------
 
-const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
+const CORE: CorePort = {
+  filterEventsSince,
+  summarize,
+  tokenStats,
+  routeDecide,
+  eligibleLanes,
+  evaluate,
+  taskCategories: TASK_CATEGORIES,
+  classifyTask,
+  MIN_CLASSIFY_CONFIDENCE,
+  CLASSIFY_FALLBACK_CATEGORY,
+};
 const TOOLS = createTools(CORE);
 
 const FIXED_NOW = Date.parse('2026-06-02T12:00:00.000Z');
@@ -141,6 +157,18 @@ test('builds the expected tool set with object input schemas', () => {
     assert.equal((t.inputSchema as { type: string }).type, 'object');
     assert.ok(t.description.length > 0);
   }
+});
+
+test('router_delegate schema omits category from required; router_preview requires it', () => {
+  const delegate = TOOLS.find((t) => t.name === 'router_delegate')!;
+  const preview = TOOLS.find((t) => t.name === 'router_preview')!;
+  assert.deepEqual((delegate.inputSchema as { required?: string[] }).required, ['instruction']);
+  assert.deepEqual((preview.inputSchema as { required?: string[] }).required, ['category']);
+  assert.equal(
+    (delegate.inputSchema as { properties?: Record<string, unknown> }).properties?.category !== undefined,
+    true,
+    'delegate still advertises optional category',
+  );
 });
 
 test('router_summary renders the injected summary data verbatim', async () => {
@@ -551,12 +579,134 @@ test('delegate surfaces a lane failure as a native directive', async () => {
   assert.match(r.content[0]!.text, /lane failed \(rate_limited\)/);
 });
 
-test('delegate requires category and a non-empty instruction', async () => {
-  const noCat = await call('router_delegate', deps(), { instruction: 'x' });
-  assert.equal(noCat.isError, true);
+test('delegate requires a non-empty instruction', async () => {
   const noInstr = await call('router_delegate', deps(), { category: 'bugfix', instruction: '   ' });
   assert.equal(noInstr.isError, true);
   assert.match(noInstr.content[0]!.text, /instruction/);
+});
+
+test('delegate with category OMITTED + clearly-bugfix instruction infers bugfix', async () => {
+  let captured: DelegateRequest | undefined;
+  const r = await call(
+    'router_delegate',
+    deps({
+      delegate: async (req: DelegateRequest) => {
+        captured = req;
+        return { laneId: 'codex-cli', status: 'ok', resultText: 'fixed' };
+      },
+    }),
+    { instruction: 'fix this crash and exception' },
+  );
+  assert.notEqual(r.isError, true);
+  assert.equal(captured?.category, 'bugfix');
+  assert.equal(r.structuredContent!.categoryInferred as boolean, true);
+  assert.equal(r.structuredContent!.inferredConfidence as number > 0.5, true);
+  assert.match(r.content[0]!.text, /category inferred as 'bugfix'/);
+});
+
+test('delegate with category omitted + ambiguous instruction infers feature', async () => {
+  let captured: DelegateRequest | undefined;
+  const r = await call(
+    'router_delegate',
+    deps({
+      delegate: async (req: DelegateRequest) => {
+        captured = req;
+        return { laneId: 'codex-cli', status: 'ok', resultText: 'done' };
+      },
+    }),
+    { instruction: 'xyz abc qrs' },
+  );
+  assert.notEqual(r.isError, true);
+  assert.equal(captured?.category, 'feature');
+  assert.equal(r.structuredContent!.categoryInferred as boolean, true);
+  assert.equal(r.structuredContent!.inferredConfidence, 0);
+  assert.match(r.content[0]!.text, /category inferred as 'feature'/);
+});
+
+test('delegate WITH explicit category routes verbatim and has no inference fields', async () => {
+  let captured: DelegateRequest | undefined;
+  const r = await call(
+    'router_delegate',
+    deps({
+      delegate: async (req: DelegateRequest) => {
+        captured = req;
+        return { laneId: 'codex-cli', status: 'ok', resultText: 'done' };
+      },
+    }),
+    { category: 'refactor', instruction: 'fix this crash and exception' },
+  );
+  assert.notEqual(r.isError, true);
+  assert.equal(captured?.category, 'refactor');
+  assert.equal(r.structuredContent!.categoryInferred, undefined);
+  assert.equal(r.structuredContent!.inferredConfidence, undefined);
+  assert.equal(r.structuredContent!.hint, undefined);
+  assert.doesNotMatch(r.content[0]!.text, /category inferred/);
+});
+
+test('inferred delegate path records content-free ledger task event', () => {
+  const instruction = 'fix this crash and exception';
+  const resolution = resolveCategory(CORE, undefined, instruction);
+  assert.equal(resolution.category, 'bugfix');
+  assert.equal(resolution.categoryInferred, true);
+  assert.ok((resolution.inferredConfidence ?? 0) > MIN_CLASSIFY_CONFIDENCE);
+
+  const taskEvent = {
+    event_type: 'task' as const,
+    schema_version: SCHEMA_VERSION,
+    id: 'ledger-id',
+    seq: 0,
+    ts: '2026-06-02T12:00:00.000Z',
+    task_id: 'ledger-id',
+    attempt: 0,
+    category: resolution.category,
+    laneId: 'codex-cli',
+    model: 'gpt-5.5',
+    trust_mode: 'full' as const,
+    provenance: 'openai',
+    status: 'ok' as const,
+    tokens_in: 100,
+    tokens_out: 50,
+    tokens_estimated: false,
+    actual_cost: 0.001,
+    frontier_cost: 0.01,
+    metered_spent: 0,
+    frontier_avoided: 0.009,
+    metered_avoided: 0.009,
+    policy_verdict: 'allow' as const,
+  };
+  const serialized = serializeEvent(taskEvent);
+  const parsed = JSON.parse(serialized) as Record<string, unknown>;
+
+  assert.equal(parsed.category, 'bugfix');
+  assert.equal(typeof resolution.inferredConfidence, 'number');
+  assert.ok(!serialized.includes(instruction));
+  for (const key of Object.keys(parsed)) {
+    assert.doesNotMatch(key, /instruction|prompt|content|code|payload|snippet|text|path|repo|diff|secret/i);
+  }
+});
+
+test('resolveCategory helper: explicit category is honored verbatim', () => {
+  const r = resolveCategory(CORE, 'docs', 'fix this error');
+  assert.equal(r.category, 'docs');
+  assert.equal(r.categoryInferred, false);
+  assert.equal(r.inferredConfidence, undefined);
+  assert.equal(r.hint, undefined);
+});
+
+test('resolveCategory helper: clearly bugfix is inferred', () => {
+  const r = resolveCategory(CORE, undefined, 'fix error crash exception');
+  assert.equal(r.category, 'bugfix');
+  assert.equal(r.categoryInferred, true);
+  assert.ok(r.inferredConfidence! >= 0.5);
+  assert.match(r.hint!, /category inferred as 'bugfix'/);
+});
+
+test('resolveCategory helper: ambiguous is fallback feature', () => {
+  const r = resolveCategory(CORE, undefined, 'fix documentation');
+  assert.equal(r.category, 'feature');
+  assert.equal(r.categoryInferred, true);
+  assert.ok(r.inferredConfidence! < 0.5);
+  assert.match(r.hint!, /category inferred as 'feature'/);
 });
 
 test('delegate forwards repo_class/sensitivity as policy context', async () => {

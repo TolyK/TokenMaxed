@@ -169,6 +169,12 @@ export {
   msUntilWindowFrees,
 } from './window-quota.ts';
 export type { WindowLevel } from './window-quota.ts';
+export {
+  MIN_CLASSIFY_CONFIDENCE,
+  CLASSIFY_FALLBACK_CATEGORY,
+  classifyTask,
+} from './classify.ts';
+export type { Classification } from './classify.ts';
 // File I/O (loadLaneConfig, loadPriceTable, JsonlLedger) lives in the Node
 // adapter: import from "@tokenmaxed/core/node" so the core barrel stays free
 // of node:fs.
