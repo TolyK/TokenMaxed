@@ -24813,6 +24813,165 @@ function windowLevel(usedFraction) {
   return "ok";
 }
 
+// ../core/src/classify.ts
+var MIN_CLASSIFY_CONFIDENCE = 0.5;
+var CLASSIFY_FALLBACK_CATEGORY = "feature";
+var CATEGORY_ORDER = [
+  "boilerplate",
+  "bugfix",
+  "refactor",
+  "explain",
+  "feature",
+  "codegen",
+  "docs"
+];
+var SIGNALS = {
+  bugfix: [
+    "fix",
+    "bug",
+    "error",
+    "crash",
+    "broken",
+    "regression",
+    "failing test",
+    "stack trace",
+    "exception",
+    "npe",
+    "off-by-one"
+  ],
+  refactor: [
+    "refactor",
+    "rename",
+    "extract",
+    "inline",
+    "restructure",
+    "clean up",
+    "deduplicate",
+    "simplify code",
+    "simplify",
+    "move function",
+    "move method",
+    "move file",
+    "move code",
+    "move the function",
+    "move the method",
+    "move the file",
+    "move the code"
+  ],
+  docs: [
+    "document",
+    "documentation",
+    "readme",
+    "changelog",
+    "docstring",
+    "jsdoc",
+    "code comment",
+    "write docs"
+  ],
+  explain: [
+    "explain",
+    "how does",
+    "what does",
+    "walk through",
+    "understand",
+    "trace through",
+    "summarize the code"
+  ],
+  codegen: [
+    "generate",
+    "scaffold",
+    "write a function",
+    "write a script",
+    "write a test",
+    "write a component",
+    "write a",
+    "implement a",
+    "create a function",
+    "create a class",
+    "create a"
+  ],
+  boilerplate: [
+    "boilerplate",
+    "stub",
+    "skeleton",
+    "config file",
+    "setup file",
+    "plumbing",
+    "wiring",
+    "repetitive"
+  ],
+  feature: [
+    "add",
+    "implement",
+    "build",
+    "feature",
+    "support for",
+    "new endpoint",
+    "new page",
+    "new command",
+    "new flag",
+    "new"
+  ]
+};
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function classifyTask(text) {
+  const scores = {
+    boilerplate: 0,
+    bugfix: 0,
+    refactor: 0,
+    explain: 0,
+    feature: 0,
+    codegen: 0,
+    docs: 0
+  };
+  const lowerText = text.toLowerCase();
+  for (const category of CATEGORY_ORDER) {
+    const phrases = SIGNALS[category];
+    for (const phrase of phrases) {
+      const escaped = escapeRegExp(phrase);
+      const regex = new RegExp(`\\b${escaped}\\b`, "g");
+      const matches = lowerText.match(regex);
+      if (matches) {
+        scores[category] += matches.length;
+      }
+    }
+  }
+  let topScore = 0;
+  let topCategory = null;
+  for (const category of CATEGORY_ORDER) {
+    const score = scores[category];
+    if (score > topScore) {
+      topScore = score;
+      topCategory = category;
+    }
+  }
+  let secondScore = 0;
+  for (const category of CATEGORY_ORDER) {
+    if (category === topCategory) {
+      continue;
+    }
+    const score = scores[category];
+    if (score > secondScore) {
+      secondScore = score;
+    }
+  }
+  if (topScore === 0) {
+    return {
+      category: CLASSIFY_FALLBACK_CATEGORY,
+      confidence: 0,
+      scores
+    };
+  }
+  const confidence = Math.max(0, Math.min(1, (topScore - secondScore) / topScore));
+  return {
+    category: topCategory,
+    confidence,
+    scores
+  };
+}
+
 // ../core/src/node.ts
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -26874,9 +27033,13 @@ function createTools(core) {
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["category", "instruction"],
+      required: ["instruction"],
       properties: {
-        category: { type: "string", enum: [...core.taskCategories], description: "Task category (drives lane choice)." },
+        category: {
+          type: "string",
+          enum: [...core.taskCategories],
+          description: "OPTIONAL task category (drives lane choice). If omitted, it is inferred from the instruction."
+        },
         instruction: {
           type: "string",
           description: "The self-contained subtask to perform. Include all needed context IN this text. A lane receives nothing else BEYOND any files you pass in `files` \u2014 no repo, no tools."
@@ -26884,7 +27047,7 @@ function createTools(core) {
         files: {
           type: "array",
           items: { type: "string" },
-          description: 'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing \u2014 kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounded + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.'
+          description: 'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing \u2014 kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounds + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.'
         },
         repo_class: { type: "string", enum: [...REPO_CLASSES2], description: "Repository class for policy (default unknown)." },
         sensitivity: { type: "string", enum: [...SENSITIVITIES2], description: "Content sensitivity for policy (default unknown)." },
@@ -26896,8 +27059,7 @@ function createTools(core) {
       }
     },
     handler: (deps, args) => guardedAsync(async () => {
-      const category = optEnum(args, "category", core.taskCategories);
-      if (category === void 0) throw new ToolInputError('"category" is required.');
+      const passedCategory = optEnum(args, "category", core.taskCategories);
       const instruction = optString(args, "instruction");
       if (!instruction || instruction.trim() === "") throw new ToolInputError('"instruction" is required (non-empty).');
       const files = optStringArray(args, "files");
@@ -26910,18 +27072,25 @@ function createTools(core) {
           { native: true, disabled: true }
         );
       }
+      const resolution = resolveCategory(core, passedCategory, instruction);
       const policyContext = {
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
       };
       const outcome = await deps.delegate({
-        category,
+        category: resolution.category,
         instruction,
         ...Object.keys(policyContext).length ? { policyContext } : {},
         ...files && files.length ? { files } : {},
         ...access_need ? { access_need } : {}
       });
-      return renderDelegate(outcome);
+      const finalOutcome = resolution.categoryInferred ? {
+        ...outcome,
+        categoryInferred: true,
+        inferredConfidence: resolution.inferredConfidence,
+        hint: resolution.hint
+      } : outcome;
+      return renderDelegate(finalOutcome);
     })
   };
   const reviewTool = {
@@ -26984,19 +27153,28 @@ ${r.notes}` : "";
   return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool];
 }
 function renderDelegate(o) {
+  const inferenceFields = o.categoryInferred ? {
+    categoryInferred: true,
+    inferredConfidence: o.inferredConfidence,
+    hint: o.hint
+  } : {};
+  const inferenceText = o.categoryInferred && o.hint ? `
+
+${o.hint}` : "";
   if (o.native || o.status !== "ok") {
     const why = o.status === "blocked" ? "blocked by policy/minimization (sensitive content stays on the host)" : o.status === "failed" ? `lane failed (${o.failureKind ?? "error"})` : o.reason ?? "no cheaper capable lane available";
     const reasonNote = (o.status === "blocked" || o.status === "failed") && o.reason ? ` \u2014 ${o.reason}` : "";
     const note2 = o.recordingFailed ? " (note: this attempt could not be recorded to the ledger)" : "";
     const taint2 = o.readerDerived ? "\n\n\u26A0\uFE0F reader-derived: any quoted reader output above may include private repo code \u2014 do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts." : "";
-    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}${inferenceText}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
       ...o.reason ? { reason: o.reason } : {},
       ...o.failureKind ? { failureKind: o.failureKind } : {},
       ...o.readerDerived ? { readerDerived: true } : {},
-      ...o.recordingFailed ? { recordingFailed: true } : {}
+      ...o.recordingFailed ? { recordingFailed: true } : {},
+      ...inferenceFields
     });
   }
   const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
@@ -27007,22 +27185,39 @@ function renderDelegate(o) {
     return ok(
       `Offloaded to ${lane} \u2014 UNREVIEWED (${o.reason ?? "manager review unavailable"}). Inspect it yourself before using:
 
-${o.resultText ?? ""}${taint}${note}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {} }
+${o.resultText ?? ""}${taint}${note}${inferenceText}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {}, ...inferenceFields }
     );
   }
   const how = o.reason ? ` (${o.reason})` : "";
   return ok(`Offloaded to ${lane}${how}. Use this result:
 
-${o.resultText ?? ""}${taint}${note}`, {
+${o.resultText ?? ""}${taint}${note}${inferenceText}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
     status: o.status,
     ...o.reason ? { reason: o.reason } : {},
     ...taintFlag,
-    ...o.recordingFailed ? { recordingFailed: true } : {}
+    ...o.recordingFailed ? { recordingFailed: true } : {},
+    ...inferenceFields
   });
+}
+function resolveCategory(core, passedCategory, instruction) {
+  if (passedCategory !== void 0) {
+    return {
+      category: passedCategory,
+      categoryInferred: false
+    };
+  }
+  const c = core.classifyTask(instruction ?? "");
+  const resolvedCategory = c.confidence >= core.MIN_CLASSIFY_CONFIDENCE ? c.category : core.CLASSIFY_FALLBACK_CATEGORY;
+  return {
+    category: resolvedCategory,
+    categoryInferred: true,
+    inferredConfidence: c.confidence,
+    hint: `category inferred as '${resolvedCategory}' (confidence ${c.confidence.toFixed(2)}) \u2014 pass an explicit category for precise routing.`
+  };
 }
 async function dispatch(tools, deps, name, rawArgs) {
   const tool = tools.find((t) => t.name === name);
@@ -27169,7 +27364,7 @@ function filePreferStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY };
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
   const lanesPathExplicit = env.TOKENMAXED_LANES !== void 0;
