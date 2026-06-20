@@ -23417,6 +23417,16 @@ function declaredCapabilityFor(lane, category) {
   const declared = lane.capability?.[category];
   return clamp012(declared ?? DEFAULT_CAPABILITY2);
 }
+function resolveLaneModelKey(lane) {
+  const spec = parseModelAlias(lane.model);
+  return spec.latest ? lane.model : spec.id;
+}
+function observedForLane(lane, category, laneOverlay, modelOverlay) {
+  if (modelOverlay) {
+    return modelOverlay[resolveLaneModelKey(lane)]?.[category];
+  }
+  return laneOverlay?.[lane.id]?.[category];
+}
 function effectiveCapabilityOptsFromContext(ctx) {
   if (!ctx.capabilityPrior) return void 0;
   return {
@@ -23435,19 +23445,21 @@ function effectiveCapability(declared, observed, opts = {}) {
   return clamp012((k * prior + n * rate) / (k + n));
 }
 function effectiveCapabilityFor(lane, category, overlay, opts) {
+  const observed = observedForLane(lane, category, overlay, opts?.modelOverlay);
   if (opts?.priorOverlay) {
     const resolved = resolvedPriorFor(lane, category, opts.priorOverlay, opts.priorOpts);
-    return effectiveCapability(resolved.prior, overlay?.[lane.id]?.[category], {
+    return effectiveCapability(resolved.prior, observed, {
       priorStrength: opts.priorStrength ?? resolved.priorStrength
     });
   }
   const declared = declaredCapabilityFor(lane, category);
-  return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
+  return effectiveCapability(declared, observed, opts);
 }
-function scoreLane(lane, task, capHeadroom2, observedCapability, effectiveOpts) {
+function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts) {
   const declared = declaredCapabilityFor(lane, task.category);
-  const observed = observedCapability?.[lane.id]?.[task.category];
-  const capability = effectiveOpts?.priorOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effectiveOpts) : effectiveCapability(declared, observed);
+  const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
+  const effOpts = observedCapabilityByModel ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel } : effectiveOpts;
+  const capability = effOpts?.priorOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts) : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
@@ -23504,7 +23516,7 @@ function routeDecide(task, ctx, policy) {
   }
   const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
   const scored = candidates.map(
-    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, effectiveOpts)
+    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts)
   );
   const strategy = ctx.strategy ?? "maximize";
   const tiered = strategy === "tiered";
@@ -23563,8 +23575,15 @@ function verdictValue(verdict) {
 function isLearnableOutcome(e) {
   return e.event_type === "outcome" && e.subject_type === "router_task" && e.voter === "reviewer_model" && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
 }
+function modelKeyFromOutcome(e) {
+  const resolved = e.subject_model_resolved?.trim();
+  if (resolved) return resolved;
+  const raw = e.subject_model?.trim();
+  if (raw) return raw;
+  return void 0;
+}
 function dedupKey(e) {
-  return [e.task_id, e.attempt, e.subject_lane_id, e.category].join(SEP);
+  return [e.task_id, e.attempt, modelKeyFromOutcome(e), e.category].join(SEP);
 }
 function outcomeCapability(events, now, opts = {}) {
   const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
@@ -23572,6 +23591,8 @@ function outcomeCapability(events, now, opts = {}) {
   const latest = /* @__PURE__ */ new Map();
   for (const e of events) {
     if (!isLearnableOutcome(e)) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    if (!modelKey) continue;
     if (!Number.isFinite(Date.parse(e.ts))) continue;
     const key = dedupKey(e);
     const prev = latest.get(key);
@@ -23583,11 +23604,11 @@ function outcomeCapability(events, now, opts = {}) {
     const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
     const weight = Math.pow(0.5, ageDays / halfLife);
     if (!Number.isFinite(weight) || weight <= 0) continue;
-    const laneId = e.subject_lane_id;
-    const accKey = [laneId, e.category].join(SEP);
+    const modelKey = modelKeyFromOutcome(e);
+    const accKey = [modelKey, e.category].join(SEP);
     let a = acc.get(accKey);
     if (!a) {
-      a = { laneId, category: e.category, weightSum: 0, weightedValueSum: 0 };
+      a = { modelKey, category: e.category, weightSum: 0, weightedValueSum: 0 };
       acc.set(accKey, a);
     }
     a.weightSum += weight;
@@ -23597,7 +23618,7 @@ function outcomeCapability(events, now, opts = {}) {
   for (const a of acc.values()) {
     if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
     const observed = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
-    const inner = overlay[a.laneId] ?? (overlay[a.laneId] = /* @__PURE__ */ Object.create(null));
+    const inner = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
     inner[a.category] = observed;
   }
   return overlay;
@@ -24276,7 +24297,10 @@ function selectEscalationTarget(subject, candidates, task, ctx, policy, opts = {
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
   const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
-  const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, effectiveOpts);
+  const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, {
+    ...effectiveOpts,
+    modelOverlay: ctx.observedCapabilityByModel
+  });
   const fromCap = cap(subject);
   const eligible = candidates.filter(
     (c) => !exclude.has(c.id) && !c.native && (c.costBasis === "subscription" || c.costBasis === "local") && canReassign(subject, c, task, ctx, policy) && cap(c) >= fromCap + minDelta
@@ -26893,6 +26917,7 @@ function createTools(core) {
       const lanes = deps.candidateLanes(category);
       const policy = deps.loadPolicy();
       const observedCapability = deps.observedCapability();
+      const observedCapabilityByModel = deps.observedCapabilityByModel?.();
       let availableIds;
       if (deps.availableLaneIds) {
         const baseCtx = {
@@ -26902,7 +26927,8 @@ function createTools(core) {
           policyContext,
           access_need: resolvedAccessNeed,
           ...yolo ? { yolo: true } : {},
-          ...observedCapability ? { observedCapability } : {}
+          ...observedCapability ? { observedCapability } : {},
+          ...observedCapabilityByModel ? { observedCapabilityByModel } : {}
         };
         const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
@@ -26921,6 +26947,7 @@ function createTools(core) {
         access_need: resolvedAccessNeed,
         ...yolo ? { yolo: true } : {},
         ...observedCapability ? { observedCapability } : {},
+        ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
         ...availableIds ? { availableLaneIds: availableIds } : {},
         ...tieredCtx,
         ...preferLaneId ? { preferLaneId } : {}
@@ -27415,7 +27442,7 @@ function makeServerDeps(env = process.env) {
     }
     return out;
   };
-  const buildObserved = () => {
+  const buildObservedByModel = () => {
     if (!learnEnabled) return void 0;
     try {
       return outcomeCapability(new JsonlLedger(ledgerPath).readAll(), Date.now());
@@ -27460,7 +27487,7 @@ function makeServerDeps(env = process.env) {
     const ledger = new JsonlLedger(ledgerPath);
     const lanes = registry2.candidateLanes(request.category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
     const modelOf = (laneId) => lanes.find((l) => l.id === laneId)?.model ?? registry2.byId(laneId)?.model;
-    const observedCapability = buildObserved();
+    const observedCapabilityByModel = buildObservedByModel();
     const baseCtx = {
       lanes,
       gateReady,
@@ -27476,7 +27503,7 @@ function makeServerDeps(env = process.env) {
       // (the --dangerously-skip-permissions analogue). Read per call so the toggle
       // takes effect without a relaunch; the kill-switch still forces it off.
       ...readYoloState() ? { yolo: true } : {},
-      ...observedCapability ? { observedCapability } : {},
+      ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(lanes, priceTable) } : {},
       // Universal preferred-lane override: favor this lane when it is an eligible+
@@ -27572,9 +27599,12 @@ function makeServerDeps(env = process.env) {
     // Same availability probe delegate routes with, so /tokenmaxed:why never
     // advertises a lane that can't run (e.g. a free local lane whose server is down).
     availableLaneIds: probeAvailable,
-    // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
-    // /tokenmaxed:why reflects the effective capability, not the stale prior.
-    observedCapability: buildObserved,
+    // Legacy lane-keyed hook (unused — model overlay is authoritative). Kept so
+    // router_preview callers/tests can still inject a lane-keyed overlay.
+    observedCapability: () => void 0,
+    // F-1/P6: same model-keyed learned overlay delegate routes with (undefined ⇒
+    // declared), so /tokenmaxed:why reflects the effective capability, not the stale prior.
+    observedCapabilityByModel: buildObservedByModel,
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
