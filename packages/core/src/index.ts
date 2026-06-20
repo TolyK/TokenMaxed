@@ -13,6 +13,7 @@ export {
   effectiveCapability,
   effectiveCapabilityFor,
   effectiveCapabilityOptsFromContext,
+  resolveLaneModelKey,
   DEFAULT_CAPABILITY,
   DEFAULT_PRIOR_STRENGTH,
   DEFAULT_TIER_FLOOR,
