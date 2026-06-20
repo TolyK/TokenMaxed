@@ -20,6 +20,11 @@ config/policy.yaml
 *.log
 npm-debug.log*
 
+# Plans, research, scope/design docs, and internal dogfooding logs — LOCAL ONLY,
+# never published. Only code + README (+ standard OSS governance files) belong on
+# GitHub. Kept on disk for local use; untracked from git.
+/docs/
+
 # Editor / OS
 .DS_Store
 .idea/
