@@ -10,7 +10,7 @@ export type GroupBy = 'model' | 'lane';
 export type LeaderboardSortBy = 'performance' | 'tokens' | 'difficulty';
 
 export interface CliArgs {
-  command: 'savings' | 'tokens' | 'outcomes' | 'lanes' | 'leaderboard' | 'help';
+  command: 'savings' | 'tokens' | 'outcomes' | 'lanes' | 'leaderboard' | 'dashboard' | 'help';
   /** 'all' or a relative window like '7d' / '24h'. */
   period: string;
   by: GroupBy;
@@ -22,6 +22,10 @@ export interface CliArgs {
   ledgerPath?: string;
   /** Lane config path for the `lanes` command (default config/lanes.yaml). */
   lanesPath?: string;
+  /** Output file path for the `dashboard` command (default ~/.tokenmaxed/dashboard.html). */
+  outPath?: string;
+  /** dashboard: open the generated file with the platform opener. */
+  open: boolean;
 }
 
 /** A flattened view of a lane's trust config, for the `lanes` command. */
@@ -53,7 +57,7 @@ function takeValue(argv: readonly string[], i: number, flag: string): string {
 
 /** Parse argv (already sliced past `node script`). */
 export function parseArgs(argv: readonly string[]): CliArgs {
-  const COMMANDS = ['savings', 'tokens', 'outcomes', 'lanes', 'leaderboard', 'help'] as const;
+  const COMMANDS = ['savings', 'tokens', 'outcomes', 'lanes', 'leaderboard', 'dashboard', 'help'] as const;
   let command: CliArgs['command'] | undefined;
   let period = 'all';
   let by: GroupBy = 'model';
@@ -62,13 +66,15 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   let byRaw: string | undefined;
   let ledgerPath: string | undefined;
   let lanesPath: string | undefined;
+  let outPath: string | undefined;
+  let open = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     switch (arg) {
       case '-h':
       case '--help':
-        return { command: 'help', period, by, leaderboardBy, json };
+        return { command: 'help', period, by, leaderboardBy, json, open };
       case '--period':
         period = takeValue(argv, i, '--period');
         i++;
@@ -88,6 +94,13 @@ export function parseArgs(argv: readonly string[]): CliArgs {
         lanesPath = takeValue(argv, i, '--lanes');
         i++;
         break;
+      case '--out':
+        outPath = takeValue(argv, i, '--out');
+        i++;
+        break;
+      case '--open':
+        open = true;
+        break;
       default:
         if (arg.startsWith('-')) {
           throw new CliArgError(`Unknown option "${arg}".`);
@@ -103,6 +116,11 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   }
 
   const resolved = command ?? 'help';
+  // Dashboard-only flags stay dashboard-only (an unknown flag elsewhere must
+  // not become silently ignored).
+  if ((open || outPath !== undefined) && resolved !== 'dashboard') {
+    throw new CliArgError(`--open/--out are only valid for "dashboard" (got command "${resolved}").`);
+  }
   if (byRaw !== undefined) {
     if (resolved === 'leaderboard') {
       if (byRaw !== 'performance' && byRaw !== 'tokens' && byRaw !== 'difficulty') {
@@ -125,8 +143,10 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     by,
     leaderboardBy,
     json,
+    open,
     ...(ledgerPath ? { ledgerPath } : {}),
     ...(lanesPath ? { lanesPath } : {}),
+    ...(outPath ? { outPath } : {}),
   };
 }
 

@@ -24,6 +24,7 @@ test('parseArgs defaults to help with no args', () => {
     by: 'model',
     leaderboardBy: 'performance',
     json: false,
+    open: false,
   });
 });
 
@@ -34,6 +35,7 @@ test('parseArgs reads command, period, by, and ledger', () => {
     by: 'lane',
     leaderboardBy: 'performance',
     json: false,
+    open: false,
     ledgerPath: '/tmp/l.jsonl',
   });
 });
@@ -46,6 +48,7 @@ test('parseArgs accepts the outcomes and lanes commands (+ --lanes)', () => {
     by: 'model',
     leaderboardBy: 'performance',
     json: false,
+    open: false,
     lanesPath: '/tmp/lanes.yaml',
   });
 });
@@ -57,6 +60,7 @@ test('parseArgs accepts leaderboard sort axis and --json', () => {
     by: 'model',
     leaderboardBy: 'tokens',
     json: true,
+    open: false,
   });
   assert.throws(() => parseArgs(['leaderboard', '--by', 'lane']), { message: /--by must be/ });
 });
@@ -246,4 +250,13 @@ test('formatLanes shows trust mode, exec mode, roles, and manager eligibility', 
   assert.match(out, /eligible/);
   assert.match(out, /worker/);
   assert.match(out, /\bno\b/);
+});
+
+test('dashboard-only flags are rejected on other commands', () => {
+  assert.throws(() => parseArgs(['savings', '--open']), /only valid for "dashboard"/);
+  assert.throws(() => parseArgs(['tokens', '--out', 'x.html']), /only valid for "dashboard"/);
+  const ok = parseArgs(['dashboard', '--out', 'x.html', '--open']);
+  assert.equal(ok.command, 'dashboard');
+  assert.equal(ok.outPath, 'x.html');
+  assert.equal(ok.open, true);
 });
