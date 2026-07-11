@@ -21,6 +21,7 @@ import { homeFile } from './config.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
 import { laneSetFingerprint, markLanesSeen, readLaneReviewState, writeLaneReviewState } from './lane-state.ts';
 import { selectManagerLane } from './manager-select.ts';
+import { hostFromEnv } from './host-id.ts';
 import { parseMaxRounds, reviewLoopEnabled } from './reviewer.ts';
 import { settingsReport } from './settings.ts';
 import type { SetupReport } from './tools.ts';
@@ -54,7 +55,7 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
   // and would fail the moment review runs.
   const gateReady = env.TOKENMAXED_GATE_READY === 'true';
   const available = new Set(await makeAvailabilityProbe(env)([...registry.lanes]));
-  const manager = selectManagerLane(registry.lanes, policy, gateReady, available);
+  const manager = selectManagerLane(registry.lanes, policy, gateReady, available, hostFromEnv(env));
 
   // SETUP-1: a per-lane confirmation — model (resolved if @latest), trust/permissions,
   // role, availability, declared capability. Role uses the REAL selectors (active
@@ -80,6 +81,7 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
       role,
       available: !!l.native || available.has(l.id),
       ...(l.capability ? { capability: l.capability } : {}),
+      ...(l.hosts ? { hosts: l.hosts } : {}),
     };
   });
 

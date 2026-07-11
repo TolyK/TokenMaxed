@@ -6,6 +6,7 @@ import { dirname as __d } from 'node:path';
 const require = __cr(import.meta.url);
 const __filename = __f(import.meta.url);
 const __dirname = __d(__filename);
+process.env.TOKENMAXED_HOST ??= 'claude-code'; // F: host identity default (hooks don't inherit mcpServers.env)
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -7556,6 +7557,7 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "native",
   "capability",
   "capability_source",
+  "hosts",
   "requests_per_window",
   "window_ms",
   "requests_per_week",
@@ -7711,6 +7713,18 @@ function parseLane(entry, index) {
     }
     lane[field] = v;
   }
+  if (entry.hosts !== void 0) {
+    const v = entry.hosts;
+    if (!Array.isArray(v) || v.length === 0) {
+      throw new LaneConfigError(`${at("hosts")} must be a non-empty array of host ids (e.g. [claude-code, cli]) \u2014 omit the field to allow all hosts.`);
+    }
+    for (const h of v) {
+      if (typeof h !== "string" || !/^[a-z0-9-]+$/.test(h)) {
+        throw new LaneConfigError(`${at("hosts")}: host ids must be lowercase [a-z0-9-]+ strings (got ${JSON.stringify(h)}).`);
+      }
+    }
+    lane.hosts = v;
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -7730,6 +7744,7 @@ function freezeLane(lane) {
   if (clone.capability) clone.capability = Object.freeze({ ...clone.capability });
   if (clone.roles) clone.roles = Object.freeze([...clone.roles]);
   if (clone.args) clone.args = Object.freeze([...clone.args]);
+  if (clone.hosts) clone.hosts = Object.freeze([...clone.hosts]);
   return Object.freeze(clone);
 }
 var LaneRegistry = class {

@@ -10,7 +10,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { declaredCapabilityFor, isManagerEligible, isSelectablePreGate } from './route.ts';
+import { declaredCapabilityFor, hostAllowsLane, isManagerEligible, isSelectablePreGate } from './route.ts';
 import { parseModelAlias } from './model-freshness.ts';
 import type { OutcomeEventInput, ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, TaskCategory } from './types.ts';
@@ -243,6 +243,9 @@ export function selectReviewManager(
       (m.costBasis === 'subscription' || m.costBasis === 'local') &&
       declaredCapabilityFor(m, category) >= subjectCap &&
       !disabled.has(m.id) &&
+      // F: host allowlist — a host-blocked lane can't review here (independent
+      // filter; review.ts rebuilds its own checks). Not YOLO-overridable.
+      hostAllowsLane(m, ctx) &&
       isSelectablePreGate(m, gateReady) &&
       (!available || available.has(m.id)) &&
       laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict),

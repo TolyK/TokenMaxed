@@ -57,6 +57,8 @@ export interface CorePort {
   /** The gate+policy-eligible lanes for a task (no availability/scoring) — the set worth probing. */
   eligibleLanes: (task: Task, ctx: RouteContext, policy: Policy) => { lane: Lane }[];
   evaluate: (task: Task, lane: Lane, ctx: PolicyContext, policy: Policy) => PolicyDecision;
+  /** F: the host-gating predicate (route.ts) — /why uses the SAME predicate to name host-blocked lanes. */
+  hostAllowsLane: (lane: Lane, ctx: Pick<RouteContext, 'host'>) => boolean;
   /** Canonical task categories (core's TASK_CATEGORIES). */
   taskCategories: readonly TaskCategory[];
   classifyTask: (text: string) => { category: TaskCategory; confidence: number; scores: Partial<Record<TaskCategory, number>> };
@@ -155,6 +157,12 @@ export interface ToolDeps {
    * caller can still override per-call with `gate_ready`.
    */
   gateReady: boolean;
+  /**
+   * F: this adapter's host id (TOKENMAXED_HOST), threaded into every preview
+   * RouteContext so lanes with a `hosts:` allowlist filter identically in
+   * preview and delegate. Absent ⇒ unknown host ⇒ restricted lanes fail closed.
+   */
+  host?: string;
   /**
    * F-2: whether the global reader-egress opt-in (`TOKENMAXED_READER_EGRESS`) is on,
    * so router_preview reflects the same reader selectability router_delegate routes
@@ -735,6 +743,7 @@ export function createTools(core: CorePort): ToolDef[] {
             readerEgress: deps.readerEgress,
             policyContext,
             access_need: resolvedAccessNeed,
+            ...(deps.host ? { host: deps.host } : {}),
             ...(yolo ? { yolo: true } : {}),
             ...(observedCapability ? { observedCapability } : {}),
             ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
@@ -763,6 +772,7 @@ export function createTools(core: CorePort): ToolDef[] {
           readerEgress: deps.readerEgress,
           policyContext,
           access_need: resolvedAccessNeed,
+          ...(deps.host ? { host: deps.host } : {}),
           ...(yolo ? { yolo: true } : {}),
           ...(observedCapability ? { observedCapability } : {}),
           ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
@@ -850,6 +860,17 @@ export function createTools(core: CorePort): ToolDef[] {
           priorLines.push(`  capability prior: ERROR — ${capPrior.warning} (routing unaffected; declared capabilities in use)`);
           priorStructured = { state: 'error', warning: capPrior.warning };
         }
+        // F: rejected-lane diagnostics — enumerate configured candidates rejected
+        // specifically by HOST scope, via the SAME predicate routing uses (never
+        // inferred from absence). Reason precedence: disabled beats host scope
+        // (a disabled lane is not reported here), host beats structural/policy/
+        // availability (those filters never saw the lane).
+        const disabledIds = new Set(policy.disabledLaneIds ?? []);
+        const hostBlocked = lanes.filter((l) => !disabledIds.has(l.id) && !core.hostAllowsLane(l, { host: deps.host }));
+        const hostLines = hostBlocked.map(
+          (l) =>
+            `  host-blocked: ${l.id} (its hosts: list does not include '${deps.host ?? 'unknown'}'; adding it is YOUR acknowledgement of that vendor's terms for this host)`,
+        );
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
@@ -862,10 +883,11 @@ export function createTools(core: CorePort): ToolDef[] {
             : []),
           ...quotaLines,
           ...priorLines,
+          ...hostLines,
           ...(yoloNote ? [yoloNote] : []),
           ...(preferNote ? [preferNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}) });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}), ...(hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}) });
       }),
   };
 

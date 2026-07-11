@@ -594,11 +594,53 @@ per host — each host controlling which lanes are even allowed to run inside it
 |---|---|---|
 | **CLI** (`tokenmaxed`) | available | the commands above, after `npm run build` |
 | **Claude Code plugin** | available | `claude --plugin-dir packages/plugin`, then `/tokenmaxed:setup` |
-| **Codex CLI plugin** | in progress | `packages/codex-plugin` — bundled MCP server + skills + hooks (see [Use in Codex CLI](#use-in-codex-cli-plugin)) |
+| **Codex CLI plugin** | available | `packages/codex-plugin` — bundled MCP server + skills + hooks (see [Use in Codex CLI](#use-in-codex-cli-plugin)) |
 | Pi · OpenCode · OpenClaw · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.
+
+### Per-host lane permissions (`hosts:`)
+
+Not every lane is appropriate inside every host framework, so a lane can carry
+an allowlist of the hosts it may be selected under:
+
+```yaml
+- id: claude-haiku          # spawns the genuine `claude` binary
+  command: claude
+  hosts: [claude-code, cli] # only inside Claude Code / the tokenmaxed CLI
+```
+
+The rule is simple and fail-closed: **no `hosts:` field ⇒ the lane runs under
+every host** (nothing changes for existing configs); **with `hosts:`, the lane
+is selected only when the running adapter's host id is listed** — and an
+unknown or missing host identity blocks it rather than bypassing the list.
+Every filter respects it (initial routing, escalation/reassignment targets,
+review-manager selection, reviewer reservation), it is **not** overridable by
+YOLO mode (YOLO opens *your* data-trust gates; host rules encode *third-party*
+terms — a different axis), and `/tokenmaxed:why` names any lane rejected by
+host scope.
+
+Two distinctions the shipped defaults encode:
+
+- **A code license is not a service entitlement.** Codex CLI's code is
+  Apache-2.0, but what makes it routable everywhere is that OpenAI *publicly
+  embraces* ChatGPT-plan Codex use inside third-party tools — the
+  [Codex for Open Source program](https://openai.com/form/codex-open-source-fund/)
+  names OpenCode, Cline, Pi, and OpenClaw, and OpenAI's
+  [help pages](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan)
+  document plan-based CLI use. So `codex-cli` ships with no `hosts:`
+  restriction.
+- **Spawning the genuine `claude` binary inside a non-Anthropic harness is an
+  officially unaddressed gray zone** (the ToS ban covers subscription-token
+  reuse; subprocess use is neither sanctioned nor prohibited). The claude-CLI
+  lanes therefore ship `hosts: [claude-code, cli]`. Adding another host id is
+  *your acknowledgement* of that gray zone — TokenMaxed never auto-adds one,
+  and listing a host is never a claim that the vendor permits it.
+
+Direct subscription-OAuth reuse in third-party tools (banned by Anthropic
+since Feb 2026) is not a lane under any host — that's standing policy, not a
+`hosts:` decision.
 
 ### Development
 

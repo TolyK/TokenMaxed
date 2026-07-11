@@ -4,6 +4,7 @@ export * from './types.ts';
 export {
   routeDecide,
   eligibleLanes,
+  hostAllowsLane,
   isSelectablePreGate,
   isManagerEligible,
   executionModeOf,

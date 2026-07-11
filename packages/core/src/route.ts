@@ -435,6 +435,21 @@ export interface EligibleLane {
  * would never be routed to anyway). routeDecide layers availability + scoring on
  * top of this, so the two can never disagree on what's eligible.
  */
+/**
+ * F — host-aware lane gating (a THIRD-PARTY-terms axis, separate from data
+ * trust; deliberately NOT YOLO-overridable):
+ *   lane.hosts absent  ⇒ allowed everywhere (back-compat, zero-change)
+ *   lane.hosts present ⇒ ctx.host must be present AND listed (FAIL CLOSED —
+ *                        unknown identity never bypasses a configured allowlist)
+ * Used by every independent lane filter: eligibleLanes, canReassign,
+ * selectReviewManager, the adapter's selectManagerLane (host-turn Stop
+ * review), and the adapter's reviewer-reservation.
+ */
+export function hostAllowsLane(lane: Lane, ctx: Pick<RouteContext, 'host'>): boolean {
+  if (!lane.hosts || lane.hosts.length === 0) return true;
+  return typeof ctx.host === 'string' && ctx.host !== '' && lane.hosts.includes(ctx.host);
+}
+
 export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): EligibleLane[] {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
@@ -453,7 +468,9 @@ export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): El
   const repoTight = ctx.access_need === 'repo-tight';
   const out: EligibleLane[] = [];
   for (const lane of ctx.lanes) {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
+    // Order: disabled → host scope → structural gates → access → policy.
+    if (disabled.has(lane.id) || !hostAllowsLane(lane, ctx)) continue;
+    if (!isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
     if (repoTight && !canDoRepoTight(lane)) continue;
     const { verdict } = evaluate(task, lane, policyContext, policy);
     // Normal: drop `block` AND `force-trusted`-on-non-full. YOLO: waive the egress

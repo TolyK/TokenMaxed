@@ -5,6 +5,11 @@
  * logic lives in (and is tested via) ./render.ts.
  */
 
+// F: first-party host identity — the tokenmaxed CLI declares itself so any
+// hosts:-restricted lane listing `cli` stays selectable if routing is ever
+// invoked from here (an explicit TOKENMAXED_HOST still wins).
+process.env.TOKENMAXED_HOST ??= 'cli';
+
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';

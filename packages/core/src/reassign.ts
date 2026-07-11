@@ -11,7 +11,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { canDoRepoTight, effectiveCapabilityFor, effectiveOptsForTask, isSelectablePreGate } from './route.ts';
+import { canDoRepoTight, effectiveCapabilityFor, effectiveOptsForTask, hostAllowsLane, isSelectablePreGate } from './route.ts';
 import type { ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, Task, TrustMode } from './types.ts';
 
@@ -39,6 +39,10 @@ export function shouldReassign(verdict: ReviewVerdict): boolean {
 export function canReassign(from: Lane, to: Lane, task: Task, ctx: RouteContext, policy: Policy): boolean {
   if (to.id === from.id) return false;
   if ((policy.disabledLaneIds ?? []).includes(to.id)) return false; // admin-disabled never selectable
+  // F: host allowlist — same gate as routing; a host-blocked lane is never a
+  // reassignment/escalation target (independent filter; does not share
+  // eligibleLanes). Not YOLO-overridable.
+  if (!hostAllowsLane(to, ctx)) return false;
   // Never escalate/reassign to a lane that can't run now (same availability filter
   // as routing; native is always runnable). Absent set ⇒ availability not checked.
   if (ctx.availableLaneIds && !to.native && !new Set(ctx.availableLaneIds).has(to.id)) return false;

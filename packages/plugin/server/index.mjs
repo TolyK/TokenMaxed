@@ -6,6 +6,7 @@ import { dirname as __d } from 'node:path';
 const require = __cr(import.meta.url);
 const __filename = __f(import.meta.url);
 const __dirname = __d(__filename);
+process.env.TOKENMAXED_HOST ??= 'claude-code'; // F: host identity default (hooks don't inherit mcpServers.env)
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -23673,6 +23674,10 @@ function describe2(lane, best, task, tiered = false, preferred = false) {
   }
   return reason;
 }
+function hostAllowsLane(lane, ctx) {
+  if (!lane.hosts || lane.hosts.length === 0) return true;
+  return typeof ctx.host === "string" && ctx.host !== "" && lane.hosts.includes(ctx.host);
+}
 function eligibleLanes(task, ctx, policy) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
@@ -23682,7 +23687,8 @@ function eligibleLanes(task, ctx, policy) {
   const repoTight = ctx.access_need === "repo-tight";
   const out = [];
   for (const lane of ctx.lanes) {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
+    if (disabled.has(lane.id) || !hostAllowsLane(lane, ctx)) continue;
+    if (!isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
     if (repoTight && !canDoRepoTight(lane)) continue;
     const { verdict } = evaluate(task, lane, policyContext, policy);
     if (yolo ? verdict === "block" : !laneAllowedByVerdict(lane, verdict)) continue;
@@ -24043,6 +24049,7 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "native",
   "capability",
   "capability_source",
+  "hosts",
   "requests_per_window",
   "window_ms",
   "requests_per_week",
@@ -24198,6 +24205,18 @@ function parseLane(entry, index) {
     }
     lane[field] = v;
   }
+  if (entry.hosts !== void 0) {
+    const v = entry.hosts;
+    if (!Array.isArray(v) || v.length === 0) {
+      throw new LaneConfigError(`${at("hosts")} must be a non-empty array of host ids (e.g. [claude-code, cli]) \u2014 omit the field to allow all hosts.`);
+    }
+    for (const h of v) {
+      if (typeof h !== "string" || !/^[a-z0-9-]+$/.test(h)) {
+        throw new LaneConfigError(`${at("hosts")}: host ids must be lowercase [a-z0-9-]+ strings (got ${JSON.stringify(h)}).`);
+      }
+    }
+    lane.hosts = v;
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -24217,6 +24236,7 @@ function freezeLane(lane) {
   if (clone2.capability) clone2.capability = Object.freeze({ ...clone2.capability });
   if (clone2.roles) clone2.roles = Object.freeze([...clone2.roles]);
   if (clone2.args) clone2.args = Object.freeze([...clone2.args]);
+  if (clone2.hosts) clone2.hosts = Object.freeze([...clone2.hosts]);
   return Object.freeze(clone2);
 }
 var LaneRegistry = class {
@@ -24674,6 +24694,7 @@ var TRUST_RANK = {
 function canReassign(from, to, task, ctx, policy) {
   if (to.id === from.id) return false;
   if ((policy.disabledLaneIds ?? []).includes(to.id)) return false;
+  if (!hostAllowsLane(to, ctx)) return false;
   if (ctx.availableLaneIds && !to.native && !new Set(ctx.availableLaneIds).has(to.id)) return false;
   const fromRank = TRUST_RANK[from.trust_mode];
   const toRank = TRUST_RANK[to.trust_mode];
@@ -24874,7 +24895,9 @@ function selectReviewManager(lanes, subject, category, ctx, policy) {
   const policyContext = ctx.policyContext ?? {};
   const available = ctx.availableLaneIds ? new Set(ctx.availableLaneIds) : null;
   const eligible = lanes.filter(
-    (m) => m.id !== subject.id && !m.native && isManagerEligible(m) && (m.costBasis === "subscription" || m.costBasis === "local") && declaredCapabilityFor(m, category) >= subjectCap && !disabled.has(m.id) && isSelectablePreGate(m, gateReady) && (!available || available.has(m.id)) && laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict)
+    (m) => m.id !== subject.id && !m.native && isManagerEligible(m) && (m.costBasis === "subscription" || m.costBasis === "local") && declaredCapabilityFor(m, category) >= subjectCap && !disabled.has(m.id) && // F: host allowlist — a host-blocked lane can't review here (independent
+    // filter; review.ts rebuilds its own checks). Not YOLO-overridable.
+    hostAllowsLane(m, ctx) && isSelectablePreGate(m, gateReady) && (!available || available.has(m.id)) && laneAllowedByVerdict(m, evaluate({ category }, m, policyContext, policy).verdict)
   );
   if (eligible.length === 0) return null;
   eligible.sort((a, b) => {
@@ -26196,6 +26219,12 @@ function writeSetting(env, key, value) {
   writeFileSync2(path, JSON.stringify(obj, null, 2) + "\n", "utf8");
 }
 
+// ../mcp/src/host-id.ts
+function hostFromEnv(env) {
+  const raw = env.TOKENMAXED_HOST?.trim().toLowerCase();
+  return raw ? raw : void 0;
+}
+
 // ../mcp/src/model-cache.ts
 import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
 import { dirname as dirname4 } from "node:path";
@@ -26552,11 +26581,14 @@ function markLanesSeen(state, projectKey, fingerprint) {
 }
 
 // ../mcp/src/manager-select.ts
-function selectManagerLane(lanes, policy, gateReady, available = null) {
+function selectManagerLane(lanes, policy, gateReady, available = null, host) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
   return lanes.find(
-    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+    (l) => isManagerEligible(l) && !l.native && // F: a lane with a hosts: allowlist may only review under a listed host
+    // (independent filter — the review path must not spawn e.g. the claude
+    // binary inside a host framework the user hasn't opted in). Fail closed.
+    hostAllowsLane(l, { host }) && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
   );
 }
 
@@ -26894,7 +26926,10 @@ function makeSummaryFromEnv(env) {
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
       core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel, laneDepletionForecast, laneQuotaState },
-      selectManager: selectManagerLane,
+      // F: bind the host identity so the summary reports the SAME reviewer the
+      // review path would select under this host (a hosts:-restricted manager
+      // fails closed on an unknown host).
+      selectManager: (l, pol, gr, avail) => selectManagerLane(l, pol, gr, avail, hostFromEnv(env)),
       staleness,
       laneReview,
       // Fold the host CLI's own per-model usage (real, transcript-derived) into the
@@ -26963,7 +26998,7 @@ async function runHostTurnReview(turnId, deps) {
   const lanes = deps.loadLanes();
   if (!lanes) return { reviewed: false, reason: "no lanes configured yet \u2014 run /tokenmaxed:setup" };
   const available = new Set(await deps.availableLaneIds(lanes));
-  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady, available);
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady, available, deps.host);
   if (!manager) {
     return {
       reviewed: false,
@@ -27093,6 +27128,10 @@ function makeHostReviewDeps(env) {
       new JsonlLedger(ledgerPath).appendOutcome(event);
     },
     gateReady: env.TOKENMAXED_GATE_READY === "true",
+    ...(() => {
+      const h = hostFromEnv(env);
+      return h ? { host: h } : {};
+    })(),
     newId: () => randomUUID2()
   };
 }
@@ -27186,7 +27225,7 @@ async function runSetup(env) {
   const policy = loadPolicyConfig(policyPath);
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
   const available = new Set(await makeAvailabilityProbe(env)([...registry2.lanes]));
-  const manager = selectManagerLane(registry2.lanes, policy, gateReady, available);
+  const manager = selectManagerLane(registry2.lanes, policy, gateReady, available, hostFromEnv(env));
   let priceTable;
   try {
     priceTable = loadPriceTable(env.TOKENMAXED_PRICES ?? DEFAULT_PRICES);
@@ -27206,7 +27245,8 @@ async function runSetup(env) {
       executionMode: l.execution_mode ?? "answer-only",
       role,
       available: !!l.native || available.has(l.id),
-      ...l.capability ? { capability: l.capability } : {}
+      ...l.capability ? { capability: l.capability } : {},
+      ...l.hosts ? { hosts: l.hosts } : {}
     };
   });
   const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
@@ -27299,11 +27339,12 @@ function formatLaneSetup(rows) {
   let anyApi = false;
   for (const r of rows) {
     const model = r.rawModel && r.rawModel !== r.model ? `${r.rawModel} \u2192 ${r.model}` : r.model;
+    const hostScope = r.hosts && r.hosts.length > 0 ? ` \xB7 hosts=${r.hosts.join(",")}` : "";
     const caps = r.capability && Object.keys(r.capability).length > 0 ? " \xB7 caps " + Object.entries(r.capability).map(([c, v]) => `${c}=${v}`).join(",") : "";
     const billing = r.kind === "api" ? ` \xB7 billing=${r.costBasis} (confirm: subscription vs metered)` : ` \xB7 billing=${r.costBasis}`;
     if (r.kind === "api") anyApi = true;
     lines.push(
-      `  \u2022 ${r.id} [${r.kind}] ${model} \xB7 trust=${r.trustMode} \u2192 ${permissionFor(r.trustMode, r.executionMode)}${billing} \xB7 role=${ROLE_LABEL[r.role]} \xB7 ${r.available ? "available" : "unavailable now"}${caps}`
+      `  \u2022 ${r.id} [${r.kind}] ${model} \xB7 trust=${r.trustMode} \u2192 ${permissionFor(r.trustMode, r.executionMode)}${billing} \xB7 role=${ROLE_LABEL[r.role]} \xB7 ${r.available ? "available" : "unavailable now"}${hostScope}${caps}`
     );
   }
   if (anyApi) {
@@ -27549,6 +27590,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           readerEgress: deps.readerEgress,
           policyContext,
           access_need: resolvedAccessNeed,
+          ...deps.host ? { host: deps.host } : {},
           ...yolo ? { yolo: true } : {},
           ...observedCapability ? { observedCapability } : {},
           ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
@@ -27571,6 +27613,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         readerEgress: deps.readerEgress,
         policyContext,
         access_need: resolvedAccessNeed,
+        ...deps.host ? { host: deps.host } : {},
         ...yolo ? { yolo: true } : {},
         ...observedCapability ? { observedCapability } : {},
         ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
@@ -27632,6 +27675,11 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         priorLines.push(`  capability prior: ERROR \u2014 ${capPrior.warning} (routing unaffected; declared capabilities in use)`);
         priorStructured = { state: "error", warning: capPrior.warning };
       }
+      const disabledIds = new Set(policy.disabledLaneIds ?? []);
+      const hostBlocked = lanes.filter((l) => !disabledIds.has(l.id) && !core.hostAllowsLane(l, { host: deps.host }));
+      const hostLines = hostBlocked.map(
+        (l) => `  host-blocked: ${l.id} (its hosts: list does not include '${deps.host ?? "unknown"}'; adding it is YOUR acknowledgement of that vendor's terms for this host)`
+      );
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
@@ -27642,10 +27690,11 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ] : [],
         ...quotaLines,
         ...priorLines,
+        ...hostLines,
         ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {} });
     })
   };
   const statusTool = {
@@ -28181,7 +28230,7 @@ function filePreferStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
 function receiptFromEvents(events) {
   const legs = events.filter((e) => e.status !== "native");
   if (legs.length === 0) return void 0;
@@ -28259,7 +28308,8 @@ function makeServerDeps(env = process.env) {
       return void 0;
     }
   };
-  const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
+  const hostId = hostFromEnv(env);
+  const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local") && hostAllowsLane(lane, { host: hostId });
   const store = fileToggleStore(statePath);
   const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname8(statePath), "prefer.json");
   const preferStore = filePreferStore(preferStatePath);
@@ -28310,6 +28360,7 @@ function makeServerDeps(env = process.env) {
           readerEgress,
           policyContext: {},
           access_need: "worker-ok",
+          ...hostId ? { host: hostId } : {},
           ...snapshot.yolo ? { yolo: true } : {},
           ...snapshot.observedByModel ? { observedCapabilityByModel: snapshot.observedByModel } : {},
           ...snapshot.observedByModelDifficulty ? { observedCapabilityByModelDifficulty: snapshot.observedByModelDifficulty } : {},
@@ -28396,6 +28447,9 @@ function makeServerDeps(env = process.env) {
       // no-op. Resolved here (not in core) because the heuristic needs the
       // instruction/files, which the pure router never sees.
       access_need: inferAccessNeed(request.access_need, request.instruction, request.files),
+      // F: host-aware lane gating — every routing/reassignment/review filter
+      // sees the same host identity (parity across delegate/preview/alerts).
+      ...hostId ? { host: hostId } : {},
       // YOLO: when on, eligibleLanes/routeDecide force every trust+egress gate open
       // (the --dangerously-skip-permissions analogue). Read per call so the toggle
       // takes effect without a relaunch; the kill-switch still forces it off.
@@ -28562,6 +28616,9 @@ function makeServerDeps(env = process.env) {
     settings: () => settingsReport(env),
     setSetting: (key, value) => writeSetting(env, key, value),
     loadPolicy: loadPolicySafe,
+    // F: the host identity every routing surface (delegate/preview/alerts) runs
+    // under, so /tokenmaxed:why can name lanes rejected by host scope.
+    ...hostId ? { host: hostId } : {},
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
     gateReady,

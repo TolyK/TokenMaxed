@@ -14,6 +14,7 @@ import { test } from 'node:test';
 import {
   eligibleLanes,
   evaluate,
+  hostAllowsLane,
   filterEventsSince,
   routeDecide,
   summarize,
@@ -36,6 +37,7 @@ const CORE: CorePort = {
   routeDecide,
   eligibleLanes,
   evaluate,
+  hostAllowsLane,
   taskCategories: TASK_CATEGORIES,
   classifyTask,
   MIN_CLASSIFY_CONFIDENCE,

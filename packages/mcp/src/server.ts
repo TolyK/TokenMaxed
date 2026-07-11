@@ -36,7 +36,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
+  hostAllowsLane, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -55,6 +56,7 @@ import {
 import { makeAvailabilityProbe } from './availability.ts';
 import { loadCapabilityPriorState, loadCapabilitySnapshotState, priorStateFromSnapshot } from './capability-prior-load.ts';
 import { effectiveEnv, settingsReport, writeSetting } from './settings.ts';
+import { hostFromEnv } from './host-id.ts';
 import { reportFreshness, reportModelIdMismatches } from './freshness-report.ts';
 import { readRepoFiles } from './read-files.ts';
 import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
@@ -192,7 +194,7 @@ function filePreferStore(statePath: string): PreferStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -323,12 +325,17 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       return undefined;
     }
   };
+  // F: this process's host identity (set by each adapter's launch config /
+  // bundle default). Threaded into EVERY RouteContext below; lanes with a
+  // `hosts:` allowlist fail closed when it is absent.
+  const hostId = hostFromEnv(env);
   // A lane is reserved from the initial offload only if it can ACTUALLY serve as
   // the auto-review manager: manager-eligible AND marginal-free (the reviewer
-  // restriction in selectReviewManager). A metered manager-eligible lane can't
-  // auto-review, so it stays a normal offload candidate (never stranded).
+  // restriction in selectReviewManager) AND allowed under THIS host — a
+  // host-blocked lane can't review here, so reserving it would only shrink the
+  // candidate set for nothing.
   const reservedForReview = (lane: Lane): boolean =>
-    isManagerEligible(lane) && (lane.costBasis === 'subscription' || lane.costBasis === 'local');
+    isManagerEligible(lane) && (lane.costBasis === 'subscription' || lane.costBasis === 'local') && hostAllowsLane(lane, { host: hostId });
   const store = fileToggleStore(statePath);
   // Universal "preferred lane" override (per-project, no relaunch): a single lane id
   // routing favors when it is eligible/available/capable. Persisted in its own file
@@ -430,6 +437,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
           readerEgress,
           policyContext: {},
           access_need: 'worker-ok',
+          ...(hostId ? { host: hostId } : {}),
           ...(snapshot.yolo ? { yolo: true } : {}),
           ...(snapshot.observedByModel ? { observedCapabilityByModel: snapshot.observedByModel } : {}),
           ...(snapshot.observedByModelDifficulty ? { observedCapabilityByModelDifficulty: snapshot.observedByModelDifficulty } : {}),
@@ -558,6 +566,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // no-op. Resolved here (not in core) because the heuristic needs the
       // instruction/files, which the pure router never sees.
       access_need: inferAccessNeed(request.access_need, request.instruction, request.files),
+      // F: host-aware lane gating — every routing/reassignment/review filter
+      // sees the same host identity (parity across delegate/preview/alerts).
+      ...(hostId ? { host: hostId } : {}),
       // YOLO: when on, eligibleLanes/routeDecide force every trust+egress gate open
       // (the --dangerously-skip-permissions analogue). Read per call so the toggle
       // takes effect without a relaunch; the kill-switch still forces it off.
@@ -771,6 +782,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     settings: () => settingsReport(env),
     setSetting: (key, value) => writeSetting(env, key, value),
     loadPolicy: loadPolicySafe,
+    // F: the host identity every routing surface (delegate/preview/alerts) runs
+    // under, so /tokenmaxed:why can name lanes rejected by host scope.
+    ...(hostId ? { host: hostId } : {}),
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
     gateReady,

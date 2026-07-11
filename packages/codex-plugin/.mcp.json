@@ -1,6 +1,7 @@
 {
   "tokenmaxed": {
     "command": "node",
-    "args": ["${PLUGIN_ROOT}/server/index.mjs"]
+    "args": ["${PLUGIN_ROOT}/server/index.mjs"],
+    "env": { "TOKENMAXED_HOST": "codex-cli" }
   }
 }
