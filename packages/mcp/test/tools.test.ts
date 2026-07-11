@@ -118,6 +118,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       reviewOnStop: false,
       escalate: false,
       learnCapability: false,
+      capabilityPrior: { state: 'off' },
       readerEgress: false,
       tiered: false,
       yolo: false,
@@ -772,6 +773,14 @@ test('setup reports the manager + open gate when present', async () => {
         reviewOnStop: true,
         escalate: true,
         learnCapability: true,
+        capabilityPrior: {
+          state: 'on',
+          stale: false,
+          source: 'mercor-apex-v1',
+          generated: '2026-06-20',
+          categories: ['docs', 'explain'],
+          unrankedCount: 3,
+        },
         readerEgress: true,
         tiered: true,
         yolo: true,
@@ -793,7 +802,13 @@ test('setup reports the manager + open gate when present', async () => {
   assert.match(r.content[0]!.text, /minimax-api \[api\] minimax@latest → minimax-m3 · trust=worker.*unavailable now/);
   assert.match(r.content[0]!.text, /quality escalation: on/);
   assert.match(r.content[0]!.text, /learned capability: on/);
+  assert.match(r.content[0]!.text, /capability prior: ON — mercor-apex-v1, generated 2026-06-20, categories docs\/explain, 3 lane×category unranked/);
   assert.match(r.content[0]!.text, /already present/);
+});
+
+test('setup: capability prior OFF renders no line (default-off output byte-identical)', async () => {
+  const r = await call('router_setup', deps()); // default fixture: state 'off'
+  assert.doesNotMatch(r.content[0]!.text, /capability prior/i);
 });
 
 // --- router_preview ------------------------------------------------------------

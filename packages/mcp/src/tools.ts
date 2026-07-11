@@ -15,6 +15,7 @@
 import type {
   AccessNeed,
   AccessNeedInput,
+  CapabilityPriorOverlay,
   LedgerEvent,
   LedgerSummary,
   Lane,
@@ -24,6 +25,8 @@ import type {
   PolicyContext,
   PolicyDecision,
   RepoClass,
+  ResolvedPrior,
+  ResolvedPriorOptions,
   RouteContext,
   RouteDecision,
   Sensitivity,
@@ -56,7 +59,36 @@ export interface CorePort {
   classifyTask: (text: string) => { category: TaskCategory; confidence: number; scores: Partial<Record<TaskCategory, number>> };
   MIN_CLASSIFY_CONFIDENCE: number;
   CLASSIFY_FALLBACK_CATEGORY: TaskCategory;
+  /**
+   * P2: resolve a lane×category's rankings prior (provenance + clamping) so
+   * router_preview can explain the winner's prior source. Pure; optional so
+   * fakes/hosts without the prior surface can omit it.
+   */
+  resolvedPriorFor?: (lane: Lane, category: TaskCategory, priorOverlay?: CapabilityPriorOverlay, opts?: ResolvedPriorOptions) => ResolvedPrior;
 }
+
+/** P2: metadata about the active rankings snapshot, for /why + /status + setup. */
+export interface CapabilityPriorMeta {
+  /** Rankings source id(s) from the snapshot (`sources` joined). */
+  source: string;
+  /** Snapshot `generated` date string. */
+  generated: string;
+  /** Task categories the snapshot maps (keys of `mapping`). */
+  categories: string[];
+  /** Lane×category pairs with no chart match (declared fallback applies). */
+  unrankedCount: number;
+}
+
+/**
+ * P2: the adapter's capability-prior posture. `off` ⇒ flag not set (routing on
+ * declared priors, byte-identical to before); `error` ⇒ flag set but the
+ * snapshot failed to load/validate (routing UNAFFECTED — declared priors — with
+ * a warning to surface); `on` ⇒ overlay active (stale ⇒ zero-upward rule).
+ */
+export type CapabilityPriorState =
+  | { state: 'off' }
+  | { state: 'error'; warning: string }
+  | { state: 'on'; overlay: CapabilityPriorOverlay; stale: boolean; meta: CapabilityPriorMeta };
 
 /** A single text block in an MCP tool result. */
 export interface ToolTextContent {
@@ -98,6 +130,14 @@ export interface ToolDeps {
    * are set. Built server-side from the ledger + clock.
    */
   observedCapabilityByModel?: () => ObservedCapabilityByModel | undefined;
+  /**
+   * P2: the rankings capability-prior posture for a (model-resolved) lane set —
+   * `off` / `error` (flag on, snapshot bad; warning to surface) / `on` (overlay +
+   * staleness + snapshot meta). Built server-side from ONE loader so
+   * router_preview and router_delegate apply the SAME prior (no /why-vs-run
+   * divergence). Absent (old hosts/fakes) ⇒ treated as off.
+   */
+  capabilityPrior?: (lanes: readonly Lane[]) => CapabilityPriorState;
   /** The active routing policy (from policy.yaml via core/node). */
   loadPolicy: () => Policy;
   /**
@@ -203,6 +243,14 @@ export interface SetupReport {
   escalate: boolean;
   /** F-1: whether learned capability feedback is enabled (TOKENMAXED_LEARN_CAPABILITY). */
   learnCapability: boolean;
+  /**
+   * P2: rankings capability-prior posture (TOKENMAXED_CAPABILITY_PRIOR) — meta
+   * only, never the overlay itself (setup reports, it doesn't route).
+   */
+  capabilityPrior:
+    | { state: 'off' }
+    | { state: 'error'; warning: string }
+    | { state: 'on'; stale: boolean; source: string; generated: string; categories: string[]; unrankedCount: number };
   /** F-2: whether reader-egress is enabled (TOKENMAXED_READER_EGRESS). */
   readerEgress: boolean;
   /** MODEL-TIERS: whether tiered routing is enabled (TOKENMAXED_TIERED). */
@@ -564,6 +612,18 @@ export function createTools(core: CorePort): ToolDef[] {
         // effective capability router_delegate routes with. Undefined ⇒ declared.
         const observedCapability = deps.observedCapability();
         const observedCapabilityByModel = deps.observedCapabilityByModel?.();
+        // P2: the rankings prior — the SAME loader delegate uses, so /why shows the
+        // same prior-adjusted pick. 'off'/'error' (or an absent dep) ⇒ no ctx fields
+        // ⇒ declared priors, byte-identical to before. NOTE: under escalation the
+        // preview lane set excludes the reserved reviewer lane, so the overlay's
+        // unranked COUNT is scoped to the lanes previewed (per-lane entries are
+        // independent, so shared lanes' prior values — and the pick — still match
+        // the real run; the banner wording scopes the count accordingly).
+        const capPrior = deps.capabilityPrior?.(lanes);
+        const priorCtx: Partial<RouteContext> =
+          capPrior?.state === 'on'
+            ? { capabilityPrior: capPrior.overlay, ...(capPrior.stale ? { capabilityPriorStale: true } : {}) }
+            : {};
         // Same availability filter delegate routes with (when the host provides it),
         // so /tokenmaxed:why never advertises a lane that can't actually run. Probe
         // ONLY the gate+policy-eligible lanes — never a disabled/blocked/gated lane
@@ -579,6 +639,7 @@ export function createTools(core: CorePort): ToolDef[] {
             ...(yolo ? { yolo: true } : {}),
             ...(observedCapability ? { observedCapability } : {}),
             ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+            ...priorCtx,
           };
           const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
           availableIds = await deps.availableLaneIds(eligible);
@@ -604,6 +665,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(yolo ? { yolo: true } : {}),
           ...(observedCapability ? { observedCapability } : {}),
           ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+          ...priorCtx,
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
           ...(preferLaneId ? { preferLaneId } : {}),
@@ -635,15 +697,47 @@ export function createTools(core: CorePort): ToolDef[] {
         const yoloNote = yolo
           ? `  ⚠️ YOLO mode ON: trust/egress gates are bypassed — workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.`
           : undefined;
+        // P2: say where the winner's capability PRIOR came from (rankings overlay vs
+        // declared config), and describe the active snapshot — or its load error —
+        // so an adjusted score is never mistaken for a hand-set one.
+        const priorLines: string[] = [];
+        let priorStructured: Record<string, unknown> | undefined;
+        if (capPrior?.state === 'on') {
+          const m = capPrior.meta;
+          priorLines.push(
+            `  capability prior: ${m.source} (generated ${m.generated}${capPrior.stale ? '; STALE — no upward movement' : ''}) — categories ${m.categories.join('/')}; ${m.unrankedCount} of the previewed lane×category pairs unranked`,
+          );
+          const winnerPrior =
+            lane && core.resolvedPriorFor
+              ? core.resolvedPriorFor(lane, category, capPrior.overlay, { stale: capPrior.stale })
+              : undefined;
+          if (winnerPrior) {
+            priorLines.push(
+              `  prior for "${decision.laneId}": ${winnerPrior.provenance} ${winnerPrior.prior.toFixed(2)}${winnerPrior.clamped ? ' (clamped)' : ''}${winnerPrior.evidence ? ` [${winnerPrior.evidence.chart}, confidence ${winnerPrior.evidence.confidence}]` : ''}`,
+            );
+          }
+          priorStructured = {
+            state: 'on',
+            stale: capPrior.stale,
+            source: m.source,
+            generated: m.generated,
+            unrankedCount: m.unrankedCount,
+            ...(winnerPrior ? { winnerProvenance: winnerPrior.provenance, winnerPrior: winnerPrior.prior, winnerClamped: winnerPrior.clamped ?? false } : {}),
+          };
+        } else if (capPrior?.state === 'error') {
+          priorLines.push(`  capability prior: ERROR — ${capPrior.warning} (routing unaffected; declared capabilities in use)`);
+          priorStructured = { state: 'error', warning: capPrior.warning };
+        }
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
           `  why: ${decision.reason}`,
+          ...priorLines,
           ...(yoloNote ? [yoloNote] : []),
           ...(preferNote ? [preferNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(preferLaneId ? { preferLaneId } : {}) });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}) });
       }),
   };
 
@@ -669,6 +763,20 @@ export function createTools(core: CorePort): ToolDef[] {
         }
         if (preferred) {
           lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
+        }
+        // P2: the rankings-prior posture. Lanes aren't loaded on this read-only
+        // path, so the meta line reports the snapshot itself (per-category lane
+        // detail lives in /tokenmaxed:why). Rendered ONLY when on/error — the
+        // default-off path stays byte-identical to before this feature (the
+        // discovery hint lives in /tokenmaxed:setup, the surface that lists every
+        // opt-in flag's off state).
+        const capPrior = deps.capabilityPrior?.([]);
+        if (capPrior?.state === 'on') {
+          lines.push(
+            `Capability prior: ON — ${capPrior.meta.source}, generated ${capPrior.meta.generated}, categories ${capPrior.meta.categories.join('/')}${capPrior.stale ? ', STALE (no upward movement)' : ''}.`,
+          );
+        } else if (capPrior?.state === 'error') {
+          lines.push(`Capability prior: ERROR — ${capPrior.warning} (routing unaffected; declared capabilities in use).`);
         }
         if (mismatches.length > 0) {
           lines.push('', 'Model ids the vendor will REJECT (fix before offloading):', ...renderModelIdMismatchWarnings(mismatches));
@@ -891,6 +999,16 @@ export function createTools(core: CorePort): ToolDef[] {
           `  review loop: ${r.reviewOnStop ? `ON (default — reviews every finishing turn when a reviewer exists; up to ${r.reviewMaxRounds ?? 5} rework round(s))` : 'off'} (opt out with TOKENMAXED_REVIEW_ON_STOP=false; tune rounds with TOKENMAXED_REVIEW_MAX_ROUNDS)`,
           `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
           `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
+          // P2: rendered ONLY when on/error — the default-off setup output stays
+          // byte-identical to pre-P2 (the A1 gate; discoverability moves to the
+          // A4 settings surface). The report FIELD is always present for hosts.
+          ...(r.capabilityPrior.state === 'on'
+            ? [
+                `  capability prior: ON — ${r.capabilityPrior.source}, generated ${r.capabilityPrior.generated}, categories ${r.capabilityPrior.categories.join('/')}, ${r.capabilityPrior.unrankedCount} lane×category unranked${r.capabilityPrior.stale ? ', STALE (no upward movement)' : ''}`,
+              ]
+            : r.capabilityPrior.state === 'error'
+              ? [`  capability prior: ERROR — ${r.capabilityPrior.warning} (routing unaffected; declared capabilities in use)`]
+              : []),
           `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
           `  tiered routing: ${r.tiered ? 'on' : 'off'} (enable with TOKENMAXED_TIERED=true — start on the cheapest lane clearing the capability floor, step up on review failure)`,
           `  YOLO mode: ${r.yolo ? '⚠️ ON (env default)' : 'off'} (the --dangerously-skip-permissions analogue: TOKENMAXED_YOLO=true or /tokenmaxed:yolo on — bypasses ALL trust/egress gates so every worker/reader lane is selectable; secret scanner still applies)`,

@@ -33,6 +33,7 @@ const sessionOut = resolve(root, 'hooks/sessionstart.mjs');
 // Ship a default price table with the plugin (reference data the delegate path
 // needs to cost routed work). plugin.json points TOKENMAXED_PRICES at it.
 copyFileSync(resolve(root, '../../config/prices.seed.json'), resolve(root, 'prices.seed.json'));
+copyFileSync(resolve(root, '../../config/capability-snapshot.v1.json'), resolve(root, 'capability-snapshot.v1.json'));
 // Ship the starter configs next to the server bundle so /tokenmaxed:setup can
 // create ~/.tokenmaxed/{lanes,policy}.yaml (resolved module-relative, ../).
 copyFileSync(resolve(root, '../mcp/lanes.starter.yaml'), resolve(root, 'lanes.starter.yaml'));

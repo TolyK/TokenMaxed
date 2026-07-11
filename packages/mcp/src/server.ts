@@ -12,6 +12,7 @@
  *   - lanes:  TOKENMAXED_LANES   (default ~/.tokenmaxed/lanes.yaml)
  *   - policy: TOKENMAXED_POLICY  (default ~/.tokenmaxed/policy.yaml)
  *   - prices: TOKENMAXED_PRICES  (default config/prices.seed.json)
+ *   - capability snapshot: TOKENMAXED_CAPABILITY_SNAPSHOT (default capability-snapshot.v1.json)
  *   - ledger: TOKENMAXED_LEDGER  (default ~/.tokenmaxed/ledger.jsonl)
  *   - state:  TOKENMAXED_STATE   (toggle file; default ~/.tokenmaxed/state.json)
  *   - project key: TOKENMAXED_PROJECT (default "default")
@@ -35,8 +36,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, PriceTable, RouteContext, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -52,6 +53,7 @@ import {
 } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
+import { loadCapabilityPriorState } from './capability-prior-load.ts';
 import { reportFreshness, reportModelIdMismatches } from './freshness-report.ts';
 import { readRepoFiles } from './read-files.ts';
 import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
@@ -188,7 +190,7 @@ function filePreferStore(statePath: string): PreferStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY };
+const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
 
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
@@ -239,6 +241,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // learned adjustment (no /why-vs-run divergence). Built from the ledger + clock
   // the adapter owns; undefined when learning is off. Lazy per call (cheap: local
   // JSONL, opt-in).
+  // P2 rankings prior — ONE loader (capability-prior-load.ts) shared by delegate,
+  // preview, and status so every surface reports/routes the same posture. Loaded
+  // per call (like prices) so snapshot edits apply without a restart. Fail-open:
+  // off/error ⇒ no ctx fields ⇒ declared priors, byte-identical scores.
+  const capabilityPriorFor = (lanes: readonly Lane[]) => loadCapabilityPriorState(env, lanes);
   const buildObservedByModel = (): ObservedCapabilityByModel | undefined => {
     if (!learnEnabled) return undefined;
     // Fail OPEN: a malformed/unreadable ledger must never block routing (mirrors
@@ -366,6 +373,16 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // takes effect without a relaunch; the kill-switch still forces it off.
       ...(readYoloState() ? { yolo: true } : {}),
       ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+      // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
+      // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
+      // runWithEscalation preserves these through its effective-context spread, so
+      // escalation-target ranking consumes the same prior.
+      ...((): Partial<RouteContext> => {
+        const p = capabilityPriorFor(lanes);
+        return p.state === 'on'
+          ? { capabilityPrior: p.overlay, ...(p.stale ? { capabilityPriorStale: true } : {}) }
+          : {};
+      })(),
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...(tieredStrategy === 'tiered'
         ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(lanes, priceTable) }
@@ -507,6 +524,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // F-1/P6: same model-keyed learned overlay delegate routes with (undefined ⇒
     // declared), so /tokenmaxed:why reflects the effective capability, not the stale prior.
     observedCapabilityByModel: buildObservedByModel,
+    // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
+    // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
+    capabilityPrior: capabilityPriorFor,
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.

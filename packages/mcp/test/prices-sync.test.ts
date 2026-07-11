@@ -16,3 +16,9 @@ test('packages/mcp/prices.seed.json matches the canonical config/prices.seed.jso
   const canonical = read(new URL('../../../config/prices.seed.json', import.meta.url));
   assert.deepEqual(shipped, canonical, 'run: cp config/prices.seed.json packages/mcp/prices.seed.json');
 });
+
+test('packages/mcp/capability-snapshot.v1.json matches the canonical config/capability-snapshot.v1.json', () => {
+  const shipped = read(new URL('../capability-snapshot.v1.json', import.meta.url));
+  const canonical = read(new URL('../../../config/capability-snapshot.v1.json', import.meta.url));
+  assert.deepEqual(shipped, canonical, 'run: cp config/capability-snapshot.v1.json packages/mcp/capability-snapshot.v1.json');
+});
