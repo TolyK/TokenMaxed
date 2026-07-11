@@ -34,6 +34,8 @@ test('reviews a router task and builds a content-free outcome event', async () =
   assert.equal(r.event.subject_id, 't-1');
   assert.equal(r.event.task_id, 't-1');
   assert.equal(r.event.subject_lane_id, 'deepseek-api');
+  assert.equal(r.event.subject_model, 'deepseek-v3');
+  assert.equal(r.event.subject_model_resolved, 'deepseek-v3');
   assert.equal(r.event.reviewer_lane_id, 'claude-native');
   assert.equal(r.event.reviewer_model, 'claude-opus-4-7');
   assert.equal(r.event.voter, 'reviewer_model');
@@ -52,6 +54,47 @@ test('reviews a host turn (no subject lane) via turn_id', async () => {
   assert.equal(r.event.turn_id, 'turn-9');
   assert.equal(r.event.task_id, undefined);
   assert.equal(r.event.subject_lane_id, undefined);
+  assert.equal(r.event.subject_model, undefined);
+  assert.equal(r.event.subject_model_resolved, undefined);
+  assert.equal(r.event.difficulty, undefined);
+});
+
+// --- P6 Phase 1b: subject_model population ------------------------------------
+
+test('router-task review records subject_model and subject_model_resolved', async () => {
+  const subject: Lane = {
+    id: 'opus-cli', kind: 'cli', model: 'claude-opus-4-8', trust_mode: 'full',
+    costBasis: 'subscription', provenance: 'anthropic', jurisdiction: 'US',
+  };
+  const r = await review(
+    { task_id: 't-model', category: 'bugfix', content: 'diff', subjectLane: subject },
+    deps({ verdict: 'pass' }),
+  );
+  assert.equal(r.event.subject_model, 'claude-opus-4-8');
+  assert.equal(r.event.subject_model_resolved, 'claude-opus-4-8');
+});
+
+test('subject_model_resolved preserves an unresolved @latest alias', async () => {
+  const aliasLane: Lane = {
+    id: 'minimax-api', kind: 'api', model: 'minimax@latest', trust_mode: 'worker',
+    costBasis: 'metered', provenance: 'minimax', jurisdiction: 'CN',
+  };
+  const r = await review(
+    { task_id: 't-alias', category: 'bugfix', content: 'diff', subjectLane: aliasLane },
+    deps({ verdict: 'pass' }),
+  );
+  assert.equal(r.event.subject_model, 'minimax@latest');
+  assert.equal(r.event.subject_model_resolved, 'minimax@latest');
+});
+
+test('subject_model_resolved equals subject_model for a concrete pinned model', async () => {
+  const pinned: Lane = { ...worker, model: 'deepseek-chat-v3' };
+  const r = await review(
+    { task_id: 't-pin', category: 'bugfix', content: 'diff', subjectLane: pinned },
+    deps({ verdict: 'pass' }),
+  );
+  assert.equal(r.event.subject_model, 'deepseek-chat-v3');
+  assert.equal(r.event.subject_model_resolved, 'deepseek-chat-v3');
 });
 
 test('refuses an ineligible manager', async () => {

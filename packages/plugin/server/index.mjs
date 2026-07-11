@@ -14227,9 +14227,9 @@ var require_dist2 = __commonJS({
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync8, mkdirSync as mkdirSync5, readFileSync as readFileSync5, realpathSync, statSync as statSync2, writeFileSync as writeFileSync4 } from "node:fs";
-import { dirname as dirname7, join as join7 } from "node:path";
-import { fileURLToPath as fileURLToPath5 } from "node:url";
+import { existsSync as existsSync9, mkdirSync as mkdirSync6, readFileSync as readFileSync7, realpathSync, statSync as statSync2, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname as dirname8, join as join7 } from "node:path";
+import { fileURLToPath as fileURLToPath6 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
 var _a;
@@ -22804,6 +22804,7 @@ var TASK_CATEGORIES = [
   "docs"
 ];
 var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
+var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
 // ../core/src/minimize.ts
@@ -23023,382 +23024,8 @@ function isReaderExecutorCertified(lane) {
   return lane.kind === "api";
 }
 
-// ../core/src/policy.ts
-var import_yaml = __toESM(require_dist2(), 1);
-var REPO_CLASSES = ["public", "private", "unknown"];
-var SENSITIVITIES = ["normal", "sensitive", "unknown"];
-var PolicyConfigError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "PolicyConfigError";
-  }
-};
-function matchOne(condition, value) {
-  if (condition === void 0) return true;
-  return Array.isArray(condition) ? condition.includes(value) : condition === value;
-}
-function ruleMatches(rule, task, lane, repoClass, sensitivity) {
-  return matchOne(rule.repo_class, repoClass) && matchOne(rule.sensitivity, sensitivity) && matchOne(rule.trust_mode, lane.trust_mode) && matchOne(rule.provenance, lane.provenance) && matchOne(rule.jurisdiction, lane.jurisdiction) && matchOne(rule.category, task.category);
-}
-function evaluate(task, lane, ctx, policy) {
-  const repoClass = ctx.repo_class ?? "unknown";
-  const sensitivity = ctx.sensitivity ?? "unknown";
-  let decision;
-  for (const rule of policy.rules ?? []) {
-    if (ruleMatches(rule, task, lane, repoClass, sensitivity)) {
-      decision = { verdict: rule.verdict, reason: rule.reason ?? "matched policy rule" };
-      break;
-    }
-  }
-  if (!decision) {
-    decision = repoClass === "public" && sensitivity === "normal" ? { verdict: "allow", reason: "public repo, normal sensitivity" } : {
-      verdict: "force-trusted",
-      reason: `deny-by-default (repo_class=${repoClass}, sensitivity=${sensitivity})`
-    };
-  }
-  if (ctx.secretHit === true && decision.verdict === "allow") {
-    decision = { verdict: "force-trusted", reason: "secret detected: trusted/local lanes only" };
-  }
-  if (lane.trust_mode === "reader" && decision.verdict !== "block" && (sensitivity !== "normal" || repoClass === "unknown" || ctx.secretHit === true)) {
-    return {
-      verdict: "force-trusted",
-      reason: "reader hard cap: reader lanes require a known repo + normal sensitivity + no secret"
-    };
-  }
-  return decision;
-}
-function laneAllowedByVerdict(lane, verdict) {
-  if (verdict === "block") return false;
-  if (verdict === "force-trusted") return lane.trust_mode === "full";
-  return true;
-}
-function isPlainObject3(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-var ALLOWED_RULE_KEYS = /* @__PURE__ */ new Set([
-  "repo_class",
-  "sensitivity",
-  "trust_mode",
-  "provenance",
-  "jurisdiction",
-  "category",
-  "verdict",
-  "reason"
-]);
-function validateCondition(value, allowed, where) {
-  if (value === void 0) return void 0;
-  const values = Array.isArray(value) ? value : [value];
-  for (const v of values) {
-    if (typeof v !== "string" || allowed !== null && !allowed.includes(v)) {
-      const suffix = allowed ? ` Valid: ${allowed.join(", ")}.` : "";
-      throw new PolicyConfigError(`${where} has invalid value ${JSON.stringify(v)}.${suffix}`);
-    }
-  }
-  return value;
-}
-function parseRule(entry, index) {
-  const where = `rules[${index}]`;
-  if (!isPlainObject3(entry)) {
-    throw new PolicyConfigError(`${where} must be a mapping.`);
-  }
-  for (const key of Object.keys(entry)) {
-    if (!ALLOWED_RULE_KEYS.has(key)) {
-      throw new PolicyConfigError(
-        `${where} has unknown field "${key}". Allowed: ${[...ALLOWED_RULE_KEYS].join(", ")}.`
-      );
-    }
-  }
-  if (typeof entry.verdict !== "string" || !POLICY_VERDICTS.includes(entry.verdict)) {
-    throw new PolicyConfigError(
-      `${where}.verdict must be one of: ${POLICY_VERDICTS.join(", ")} (got ${JSON.stringify(entry.verdict)}).`
-    );
-  }
-  if (entry.reason !== void 0 && typeof entry.reason !== "string") {
-    throw new PolicyConfigError(`${where}.reason must be a string.`);
-  }
-  const rule = { verdict: entry.verdict };
-  const repo_class = validateCondition(entry.repo_class, REPO_CLASSES, `${where}.repo_class`);
-  const sensitivity = validateCondition(entry.sensitivity, SENSITIVITIES, `${where}.sensitivity`);
-  const aliasTrust = (v) => typeof v === "string" && v in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[v] : v;
-  const rawTrust = Array.isArray(entry.trust_mode) ? entry.trust_mode.map(aliasTrust) : aliasTrust(entry.trust_mode);
-  const trust_mode = validateCondition(rawTrust, TRUST_MODES, `${where}.trust_mode`);
-  const provenance = validateCondition(entry.provenance, null, `${where}.provenance`);
-  const jurisdiction = validateCondition(entry.jurisdiction, null, `${where}.jurisdiction`);
-  const category = validateCondition(entry.category, TASK_CATEGORIES, `${where}.category`);
-  if (repo_class !== void 0) rule.repo_class = repo_class;
-  if (sensitivity !== void 0) rule.sensitivity = sensitivity;
-  if (trust_mode !== void 0) rule.trust_mode = trust_mode;
-  if (provenance !== void 0) rule.provenance = provenance;
-  if (jurisdiction !== void 0) rule.jurisdiction = jurisdiction;
-  if (category !== void 0) rule.category = category;
-  if (typeof entry.reason === "string") rule.reason = entry.reason;
-  return rule;
-}
-function parsePolicyConfig(text) {
-  let doc;
-  try {
-    doc = (0, import_yaml.parse)(text);
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    throw new PolicyConfigError(`Could not parse policy config as YAML: ${detail}`);
-  }
-  if (doc === null || doc === void 0) return { rules: [] };
-  if (!isPlainObject3(doc)) {
-    throw new PolicyConfigError('Policy config must be a mapping with an optional "rules" array.');
-  }
-  for (const key of Object.keys(doc)) {
-    if (key !== "rules" && key !== "disabledLaneIds") {
-      throw new PolicyConfigError(
-        `Policy config has unknown top-level field "${key}". Allowed: rules, disabledLaneIds.`
-      );
-    }
-  }
-  const result = { rules: [] };
-  if (doc.rules !== void 0) {
-    if (!Array.isArray(doc.rules)) {
-      throw new PolicyConfigError('Policy config "rules" must be an array.');
-    }
-    result.rules = doc.rules.map((entry, i) => parseRule(entry, i));
-  }
-  if (doc.disabledLaneIds !== void 0) {
-    if (!Array.isArray(doc.disabledLaneIds) || doc.disabledLaneIds.some((x) => typeof x !== "string")) {
-      throw new PolicyConfigError('Policy config "disabledLaneIds" must be an array of strings.');
-    }
-    result.disabledLaneIds = doc.disabledLaneIds;
-  }
-  return result;
-}
-
-// ../core/src/route.ts
-var DEFAULT_CAPABILITY = 0.5;
-var DEFAULT_PRIOR_STRENGTH = 8;
-var COST_PENALTY = {
-  local: 0,
-  subscription: 0.05,
-  metered: 0.2
-};
-var WEIGHTS = {
-  capability: 1,
-  cost: 1
-};
-var CAP_WARN_HEADROOM = 0.3;
-var CAP_CRITICAL_HEADROOM = 0.1;
-var CAP_WARN_PENALTY = 0.15;
-var CAP_CRITICAL_PENALTY = 1;
-var CAP_EPSILON = 1e-9;
-function capPenaltyFor(headroom) {
-  if (headroom === void 0 || headroom > CAP_WARN_HEADROOM + CAP_EPSILON) return 0;
-  if (headroom <= CAP_CRITICAL_HEADROOM + CAP_EPSILON) return CAP_CRITICAL_PENALTY;
-  return CAP_WARN_PENALTY;
-}
-function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false) {
-  if (yolo) {
-    if (lane.trust_mode === "full") return true;
-    if (lane.trust_mode === "worker") return isExecutorCertified(lane);
-    if (lane.trust_mode === "reader") return isReaderExecutorCertified(lane);
-    return false;
-  }
-  if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
-  if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
-  if (lane.trust_mode === "reader") {
-    return readerEgress && gateReady && isReaderExecutorCertified(lane) && lane.repo_read_attestation === true;
-  }
-  return false;
-}
-function isManagerEligible(lane) {
-  if (lane.trust_mode !== "full" || lane.manager_allowed !== true) return false;
-  const trustedByOrigin = lane.kind === "local" || TRUSTED_PROVENANCES.includes(lane.provenance);
-  return trustedByOrigin || lane.attestation === true;
-}
-function executionModeOf(lane) {
-  return lane.execution_mode ?? "answer-only";
-}
-function canDoRepoTight(lane) {
-  if (lane.trust_mode !== "full") return false;
-  return lane.native === true || lane.kind === "cli" && executionModeOf(lane) === "agentic";
-}
-function clamp01(n) {
-  if (Number.isNaN(n)) return 0;
-  if (n < 0) return 0;
-  if (n > 1) return 1;
-  return n;
-}
-function declaredCapabilityFor(lane, category) {
-  const declared = lane.capability?.[category];
-  return clamp01(declared ?? DEFAULT_CAPABILITY);
-}
-function effectiveCapability(declared, observed, opts = {}) {
-  const prior = clamp01(declared);
-  if (prior === 0) return 0;
-  if (!observed) return prior;
-  const n = Number.isFinite(observed.n) && observed.n > 0 ? observed.n : 0;
-  if (n === 0) return prior;
-  const rate = clamp01(observed.rate);
-  const k = Number.isFinite(opts.priorStrength) && opts.priorStrength > 0 ? opts.priorStrength : DEFAULT_PRIOR_STRENGTH;
-  return clamp01((k * prior + n * rate) / (k + n));
-}
-function effectiveCapabilityFor(lane, category, overlay, opts) {
-  const declared = declaredCapabilityFor(lane, category);
-  return effectiveCapability(declared, overlay?.[lane.id]?.[category], opts);
-}
-function scoreLane(lane, task, capHeadroom2, observedCapability) {
-  const declared = declaredCapabilityFor(lane, task.category);
-  const observed = observedCapability?.[lane.id]?.[task.category];
-  const capability = effectiveCapability(declared, observed);
-  const costPenalty = COST_PENALTY[lane.costBasis];
-  const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
-  const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
-  return {
-    laneId: lane.id,
-    score,
-    factors: { capability, costPenalty, capPenalty, declared, evidenceN: observed?.n ?? 0 }
-  };
-}
-function compareScores(a, b) {
-  const az = a.factors.capability === 0;
-  const bz = b.factors.capability === 0;
-  if (az !== bz) return az ? 1 : -1;
-  if (b.score !== a.score) return b.score - a.score;
-  return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
-}
-function describe2(lane, best, task, tiered = false, preferred = false) {
-  const f = best.factors;
-  const cap = f.capability.toFixed(2);
-  let reason = preferred ? `Selected ${lane.id} (${lane.model}) for ${task.category}: preferred lane (explicit offload), capability ${cap} at ${lane.costBasis} cost.` : tiered ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.` : `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
-  if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
-    reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
-  }
-  return reason;
-}
-function eligibleLanes(task, ctx, policy) {
-  const disabled = new Set(policy.disabledLaneIds ?? []);
-  const policyContext = ctx.policyContext ?? {};
-  const yolo = ctx.yolo ?? false;
-  const gateReady = yolo ? true : ctx.gateReady ?? false;
-  const readerEgress = yolo ? true : ctx.readerEgress ?? false;
-  const repoTight = ctx.access_need === "repo-tight";
-  const out = [];
-  for (const lane of ctx.lanes) {
-    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
-    if (repoTight && !canDoRepoTight(lane)) continue;
-    const { verdict } = evaluate(task, lane, policyContext, policy);
-    if (yolo ? verdict === "block" : !laneAllowedByVerdict(lane, verdict)) continue;
-    out.push({ lane, verdict });
-  }
-  return out;
-}
-function routeDecide(task, ctx, policy) {
-  const available = ctx.availableLaneIds ? new Set(ctx.availableLaneIds) : null;
-  const verdicts = /* @__PURE__ */ new Map();
-  const candidates = eligibleLanes(task, ctx, policy).filter(({ lane }) => !(available && !lane.native && !available.has(lane.id))).map(({ lane, verdict }) => {
-    verdicts.set(lane.id, verdict);
-    return lane;
-  });
-  if (candidates.length === 0) {
-    throw new Error(
-      "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, unavailable to run, or blocked/forced-trusted away by policy)."
-    );
-  }
-  const scored = candidates.map((lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability));
-  const strategy = ctx.strategy ?? "maximize";
-  const tiered = strategy === "tiered";
-  const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
-  let preferred = false;
-  if (ctx.preferLaneId != null) {
-    const idx = scores.findIndex((s) => s.laneId === ctx.preferLaneId && s.factors.capability > 0);
-    if (idx >= 0) {
-      const picked = scores.splice(idx, 1)[0];
-      scores.unshift(picked);
-      preferred = true;
-    }
-  }
-  const winner = scores[0];
-  const winningLane = candidates.find((lane) => lane.id === winner.laneId);
-  const wonByTier = !preferred && tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
-  return {
-    laneId: winner.laneId,
-    reason: describe2(winningLane, winner, task, wonByTier, preferred),
-    scores,
-    policyVerdict: verdicts.get(winner.laneId)
-  };
-}
-function tierFloorFor(task, ctx) {
-  return ctx.tierFloorByCategory?.[task.category] ?? ctx.tierFloor ?? DEFAULT_TIER_FLOOR;
-}
-var DEFAULT_TIER_FLOOR = 0.6;
-function orderTiered(scored, candidates, task, ctx) {
-  const floor = tierFloorFor(task, ctx);
-  const laneById = new Map(candidates.map((l) => [l.id, l]));
-  const costOf = (id) => ctx.laneCost?.[id] ?? COST_PENALTY[laneById.get(id).costBasis];
-  const isClear = (s) => s.factors.capability > 0 && s.factors.capability >= floor;
-  const clears = scored.filter(isClear);
-  if (clears.length === 0) return [...scored].sort(compareScores);
-  const byTier = (a, b) => {
-    if (a.factors.capPenalty !== b.factors.capPenalty) return a.factors.capPenalty - b.factors.capPenalty;
-    const ca = costOf(a.laneId);
-    const cb = costOf(b.laneId);
-    if (ca !== cb) return ca - cb;
-    if (a.factors.capability !== b.factors.capability) return a.factors.capability - b.factors.capability;
-    return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
-  };
-  const rest = scored.filter((s) => !isClear(s)).sort(compareScores);
-  return [...clears.sort(byTier), ...rest];
-}
-
-// ../core/src/feedback.ts
-var MS_PER_DAY = 864e5;
-var SEP = "\0";
-var DEFAULT_HALF_LIFE_DAYS = 30;
-function verdictValue(verdict) {
-  if (verdict === "pass") return 1;
-  if (verdict === "needs-rework") return 0.5;
-  return 0;
-}
-function isLearnableOutcome(e) {
-  return e.event_type === "outcome" && e.subject_type === "router_task" && e.voter === "reviewer_model" && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
-}
-function dedupKey(e) {
-  return [e.task_id, e.attempt, e.subject_lane_id, e.category].join(SEP);
-}
-function outcomeCapability(events, now, opts = {}) {
-  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
-  const nowMs = Number.isFinite(now) ? now : Number.NaN;
-  const latest = /* @__PURE__ */ new Map();
-  for (const e of events) {
-    if (!isLearnableOutcome(e)) continue;
-    if (!Number.isFinite(Date.parse(e.ts))) continue;
-    const key = dedupKey(e);
-    const prev = latest.get(key);
-    if (!prev || e.seq > prev.seq) latest.set(key, e);
-  }
-  const acc = /* @__PURE__ */ new Map();
-  for (const e of latest.values()) {
-    const tsMs = Date.parse(e.ts);
-    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
-    const weight = Math.pow(0.5, ageDays / halfLife);
-    if (!Number.isFinite(weight) || weight <= 0) continue;
-    const laneId = e.subject_lane_id;
-    const accKey = [laneId, e.category].join(SEP);
-    let a = acc.get(accKey);
-    if (!a) {
-      a = { laneId, category: e.category, weightSum: 0, weightedValueSum: 0 };
-      acc.set(accKey, a);
-    }
-    a.weightSum += weight;
-    a.weightedValueSum += weight * verdictValue(e.verdict);
-  }
-  const overlay = /* @__PURE__ */ Object.create(null);
-  for (const a of acc.values()) {
-    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
-    const observed = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
-    const inner = overlay[a.laneId] ?? (overlay[a.laneId] = /* @__PURE__ */ Object.create(null));
-    inner[a.category] = observed;
-  }
-  return overlay;
-}
-
-// ../core/src/registry.ts
-var import_yaml2 = __toESM(require_dist2(), 1);
+// ../core/src/capability-prior.ts
+import { createHash } from "node:crypto";
 
 // ../core/src/model-freshness.ts
 function parseModelAlias(model) {
@@ -23498,12 +23125,903 @@ function assessStaleness(pinnedId, family, remote, table) {
   return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
 }
 
+// ../core/src/capability-prior.ts
+var DEFAULT_CAPABILITY = 0.5;
+var DEFAULT_PRIOR_STRENGTH = 8;
+var MAX_PRIOR_DELTA = 0.2;
+var PRIOR_STRENGTH_BY_CONFIDENCE = {
+  low: 4,
+  moderate: 6,
+  high: DEFAULT_PRIOR_STRENGTH
+};
+function priorStrengthFromConfidence(confidence) {
+  return PRIOR_STRENGTH_BY_CONFIDENCE[confidence];
+}
+function clamp01(n) {
+  if (Number.isNaN(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+function localFallbackCapability(lane, category) {
+  const declared = lane.capability?.[category];
+  return clamp01(declared ?? DEFAULT_CAPABILITY);
+}
+function isOptOut(lane, category) {
+  return lane.capability?.[category] === 0;
+}
+function clampOverlayPrior(proposed, reference, stale) {
+  const raw = clamp01(proposed);
+  const ref = clamp01(reference);
+  let value = raw;
+  let clamped = false;
+  if (stale && value > ref) {
+    value = ref;
+    clamped = true;
+  }
+  const minAllowed = ref - MAX_PRIOR_DELTA;
+  const maxAllowed = stale ? ref : ref + MAX_PRIOR_DELTA;
+  if (value < minAllowed) {
+    value = Math.max(0, minAllowed);
+    clamped = true;
+  } else if (value > maxAllowed) {
+    value = maxAllowed;
+    clamped = true;
+  }
+  return { value: clamp01(value), clamped };
+}
+function resolvedPriorFor(lane, category, priorOverlay, opts = {}) {
+  if (isOptOut(lane, category)) {
+    return { prior: 0, priorStrength: DEFAULT_PRIOR_STRENGTH, provenance: "opt-out" };
+  }
+  if (lane.capability_source === "pinned") {
+    return {
+      prior: localFallbackCapability(lane, category),
+      priorStrength: DEFAULT_PRIOR_STRENGTH,
+      provenance: "pinned"
+    };
+  }
+  const entry = priorOverlay?.[lane.id]?.[category];
+  const baseline = localFallbackCapability(lane, category);
+  if (entry) {
+    const reference = opts.accepted?.[lane.id]?.[category] ?? baseline;
+    const { value, clamped } = clampOverlayPrior(entry.value, reference, opts.stale ?? false);
+    return {
+      prior: value,
+      priorStrength: priorStrengthFromConfidence(entry.confidence),
+      provenance: opts.stale ? "overlay-stale" : "overlay",
+      evidence: entry,
+      clamped: clamped || void 0
+    };
+  }
+  if (lane.capability?.[category] !== void 0) {
+    return {
+      prior: clamp01(lane.capability[category]),
+      priorStrength: DEFAULT_PRIOR_STRENGTH,
+      provenance: "fallback",
+      unranked: priorOverlay !== void 0 ? true : void 0
+    };
+  }
+  return {
+    prior: DEFAULT_CAPABILITY,
+    priorStrength: DEFAULT_PRIOR_STRENGTH,
+    provenance: "default",
+    unranked: priorOverlay !== void 0 ? true : void 0
+  };
+}
+var CONFIDENCE_LEVELS = /* @__PURE__ */ new Set(["low", "moderate", "high"]);
+var CATEGORIES = new Set(TASK_CATEGORIES);
+function isPlainObject3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function stableStringify(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const obj = value;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
+}
+function computeSnapshotHash(snapshot) {
+  const { hash: _hash, ...content } = snapshot;
+  return createHash("sha256").update(stableStringify(content)).digest("hex");
+}
+function validateSnapshotEntry(raw, index) {
+  if (!isPlainObject3(raw)) return `entries[${index}] must be an object`;
+  const category = raw.category;
+  if (typeof category !== "string" || !CATEGORIES.has(category)) {
+    return `entries[${index}].category is not a known task category`;
+  }
+  const model = raw.model;
+  const chart = raw.chart;
+  const source = raw.source;
+  const date3 = raw.date;
+  const confidence = raw.confidence;
+  const value = raw.value;
+  if (typeof model !== "string" || model === "") return `entries[${index}].model must be a non-empty string`;
+  if (typeof chart !== "string" || chart === "") return `entries[${index}].chart must be a non-empty string`;
+  if (typeof source !== "string" || source === "") return `entries[${index}].source must be a non-empty string`;
+  if (typeof date3 !== "string" || date3 === "") return `entries[${index}].date must be a non-empty string`;
+  if (typeof confidence !== "string" || !CONFIDENCE_LEVELS.has(confidence)) {
+    return `entries[${index}].confidence must be low, moderate, or high`;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    return `entries[${index}].value must be a number in [0, 1]`;
+  }
+  const entry = {
+    model,
+    chart,
+    category,
+    value,
+    source,
+    date: date3,
+    confidence
+  };
+  if (raw.rank !== void 0) {
+    if (typeof raw.rank !== "number" || !Number.isFinite(raw.rank) || raw.rank < 1) {
+      return `entries[${index}].rank must be a positive number when set`;
+    }
+    entry.rank = raw.rank;
+  }
+  if (raw.score !== void 0) {
+    if (typeof raw.score !== "number" || !Number.isFinite(raw.score)) {
+      return `entries[${index}].score must be a finite number when set`;
+    }
+    entry.score = raw.score;
+  }
+  if (raw.n !== void 0) {
+    if (typeof raw.n !== "number" || !Number.isFinite(raw.n) || raw.n < 1) {
+      return `entries[${index}].n must be a positive number when set`;
+    }
+    entry.n = raw.n;
+  }
+  return entry;
+}
+function validateSnapshot(obj) {
+  if (!isPlainObject3(obj)) return { valid: false, reason: "snapshot must be an object" };
+  const version2 = obj.version;
+  const generated = obj.generated;
+  const sources = obj.sources;
+  const mapping = obj.mapping;
+  const aliases = obj.aliases;
+  const entries = obj.entries;
+  const hash = obj.hash;
+  if (typeof version2 !== "number" || !Number.isFinite(version2) || version2 < 1) {
+    return { valid: false, reason: "version must be a positive number" };
+  }
+  if (typeof generated !== "string" || generated === "") {
+    return { valid: false, reason: "generated must be a non-empty string" };
+  }
+  if (!Array.isArray(sources) || sources.some((s) => typeof s !== "string" || s === "")) {
+    return { valid: false, reason: "sources must be an array of non-empty strings" };
+  }
+  if (!isPlainObject3(mapping)) return { valid: false, reason: "mapping must be an object" };
+  const parsedMapping = {};
+  for (const [key, chartId] of Object.entries(mapping)) {
+    if (!CATEGORIES.has(key)) return { valid: false, reason: `mapping.${key} is not a known task category` };
+    if (typeof chartId !== "string" || chartId === "") {
+      return { valid: false, reason: `mapping.${key} must be a non-empty chart id` };
+    }
+    parsedMapping[key] = chartId;
+  }
+  if (!isPlainObject3(aliases)) return { valid: false, reason: "aliases must be an object" };
+  const parsedAliases = {};
+  for (const [modelId, chartEntryId] of Object.entries(aliases)) {
+    if (modelId === "" || typeof chartEntryId !== "string" || chartEntryId === "") {
+      return { valid: false, reason: "aliases must map non-empty model ids to non-empty chart entry ids" };
+    }
+    parsedAliases[modelId] = chartEntryId;
+  }
+  if (!Array.isArray(entries)) return { valid: false, reason: "entries must be an array" };
+  const parsedEntries = [];
+  for (let i = 0; i < entries.length; i++) {
+    const result = validateSnapshotEntry(entries[i], i);
+    if (typeof result === "string") return { valid: false, reason: result };
+    parsedEntries.push(result);
+  }
+  if (typeof hash !== "string" || hash === "") return { valid: false, reason: "hash must be a non-empty string" };
+  const snapshot = {
+    version: version2,
+    generated,
+    sources: [...sources],
+    mapping: parsedMapping,
+    aliases: parsedAliases,
+    entries: parsedEntries,
+    hash
+  };
+  if (obj._note !== void 0) {
+    if (typeof obj._note !== "string") return { valid: false, reason: "_note must be a string when set" };
+    snapshot._note = obj._note;
+  }
+  const expected = computeSnapshotHash(snapshot);
+  if (hash !== expected) {
+    return { valid: false, reason: `hash mismatch (expected ${expected}, got ${hash})` };
+  }
+  return { valid: true, snapshot };
+}
+function resolveLaneModelId(lane, priceTable) {
+  if (priceTable) return resolveLaneModel(lane, priceTable).model;
+  const spec = parseModelAlias(lane.model);
+  return spec.latest ? lane.model : spec.id;
+}
+function findSnapshotEntry(snapshot, resolvedModel, category) {
+  const chartId = snapshot.mapping[category];
+  if (!chartId) return void 0;
+  const chartEntryId = snapshot.aliases[resolvedModel];
+  if (!chartEntryId) return void 0;
+  return snapshot.entries.find((e) => e.category === category && e.chart === chartId && e.model === chartEntryId);
+}
+function entryToEvidence(entry) {
+  const evidence = {
+    value: entry.value,
+    source: entry.source,
+    chart: entry.chart,
+    date: entry.date,
+    confidence: entry.confidence
+  };
+  if (entry.rank !== void 0) evidence.rank = entry.rank;
+  if (entry.score !== void 0) evidence.score = entry.score;
+  if (entry.n !== void 0) evidence.n = entry.n;
+  return evidence;
+}
+function overlayFromSnapshot(snapshot, lanes, opts = {}) {
+  const overlay = /* @__PURE__ */ Object.create(null);
+  const unranked = [];
+  for (const lane of lanes) {
+    const resolvedModel = resolveLaneModelId(lane, opts.priceTable);
+    for (const category of TASK_CATEGORIES) {
+      if (!snapshot.mapping[category]) continue;
+      const entry = findSnapshotEntry(snapshot, resolvedModel, category);
+      if (!entry) {
+        unranked.push({ laneId: lane.id, category });
+        continue;
+      }
+      const inner = overlay[lane.id] ?? (overlay[lane.id] = /* @__PURE__ */ Object.create(null));
+      inner[category] = entryToEvidence(entry);
+    }
+  }
+  return { overlay, unranked };
+}
+function priorOptsFromContext(ctx) {
+  return {
+    stale: ctx.capabilityPriorStale,
+    accepted: ctx.capabilityPriorAccepted
+  };
+}
+
+// ../core/src/policy.ts
+var import_yaml = __toESM(require_dist2(), 1);
+var REPO_CLASSES = ["public", "private", "unknown"];
+var SENSITIVITIES = ["normal", "sensitive", "unknown"];
+var PolicyConfigError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PolicyConfigError";
+  }
+};
+function matchOne(condition, value) {
+  if (condition === void 0) return true;
+  return Array.isArray(condition) ? condition.includes(value) : condition === value;
+}
+function ruleMatches(rule, task, lane, repoClass, sensitivity) {
+  return matchOne(rule.repo_class, repoClass) && matchOne(rule.sensitivity, sensitivity) && matchOne(rule.trust_mode, lane.trust_mode) && matchOne(rule.provenance, lane.provenance) && matchOne(rule.jurisdiction, lane.jurisdiction) && matchOne(rule.category, task.category);
+}
+function evaluate(task, lane, ctx, policy) {
+  const repoClass = ctx.repo_class ?? "unknown";
+  const sensitivity = ctx.sensitivity ?? "unknown";
+  let decision;
+  for (const rule of policy.rules ?? []) {
+    if (ruleMatches(rule, task, lane, repoClass, sensitivity)) {
+      decision = { verdict: rule.verdict, reason: rule.reason ?? "matched policy rule" };
+      break;
+    }
+  }
+  if (!decision) {
+    decision = repoClass === "public" && sensitivity === "normal" ? { verdict: "allow", reason: "public repo, normal sensitivity" } : {
+      verdict: "force-trusted",
+      reason: `deny-by-default (repo_class=${repoClass}, sensitivity=${sensitivity})`
+    };
+  }
+  if (ctx.secretHit === true && decision.verdict === "allow") {
+    decision = { verdict: "force-trusted", reason: "secret detected: trusted/local lanes only" };
+  }
+  if (lane.trust_mode === "reader" && decision.verdict !== "block" && (sensitivity !== "normal" || repoClass === "unknown" || ctx.secretHit === true)) {
+    return {
+      verdict: "force-trusted",
+      reason: "reader hard cap: reader lanes require a known repo + normal sensitivity + no secret"
+    };
+  }
+  return decision;
+}
+function laneAllowedByVerdict(lane, verdict) {
+  if (verdict === "block") return false;
+  if (verdict === "force-trusted") return lane.trust_mode === "full";
+  return true;
+}
+function isPlainObject4(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+var ALLOWED_RULE_KEYS = /* @__PURE__ */ new Set([
+  "repo_class",
+  "sensitivity",
+  "trust_mode",
+  "provenance",
+  "jurisdiction",
+  "category",
+  "verdict",
+  "reason"
+]);
+function validateCondition(value, allowed, where) {
+  if (value === void 0) return void 0;
+  const values = Array.isArray(value) ? value : [value];
+  for (const v of values) {
+    if (typeof v !== "string" || allowed !== null && !allowed.includes(v)) {
+      const suffix = allowed ? ` Valid: ${allowed.join(", ")}.` : "";
+      throw new PolicyConfigError(`${where} has invalid value ${JSON.stringify(v)}.${suffix}`);
+    }
+  }
+  return value;
+}
+function parseRule(entry, index) {
+  const where = `rules[${index}]`;
+  if (!isPlainObject4(entry)) {
+    throw new PolicyConfigError(`${where} must be a mapping.`);
+  }
+  for (const key of Object.keys(entry)) {
+    if (!ALLOWED_RULE_KEYS.has(key)) {
+      throw new PolicyConfigError(
+        `${where} has unknown field "${key}". Allowed: ${[...ALLOWED_RULE_KEYS].join(", ")}.`
+      );
+    }
+  }
+  if (typeof entry.verdict !== "string" || !POLICY_VERDICTS.includes(entry.verdict)) {
+    throw new PolicyConfigError(
+      `${where}.verdict must be one of: ${POLICY_VERDICTS.join(", ")} (got ${JSON.stringify(entry.verdict)}).`
+    );
+  }
+  if (entry.reason !== void 0 && typeof entry.reason !== "string") {
+    throw new PolicyConfigError(`${where}.reason must be a string.`);
+  }
+  const rule = { verdict: entry.verdict };
+  const repo_class = validateCondition(entry.repo_class, REPO_CLASSES, `${where}.repo_class`);
+  const sensitivity = validateCondition(entry.sensitivity, SENSITIVITIES, `${where}.sensitivity`);
+  const aliasTrust = (v) => typeof v === "string" && v in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[v] : v;
+  const rawTrust = Array.isArray(entry.trust_mode) ? entry.trust_mode.map(aliasTrust) : aliasTrust(entry.trust_mode);
+  const trust_mode = validateCondition(rawTrust, TRUST_MODES, `${where}.trust_mode`);
+  const provenance = validateCondition(entry.provenance, null, `${where}.provenance`);
+  const jurisdiction = validateCondition(entry.jurisdiction, null, `${where}.jurisdiction`);
+  const category = validateCondition(entry.category, TASK_CATEGORIES, `${where}.category`);
+  if (repo_class !== void 0) rule.repo_class = repo_class;
+  if (sensitivity !== void 0) rule.sensitivity = sensitivity;
+  if (trust_mode !== void 0) rule.trust_mode = trust_mode;
+  if (provenance !== void 0) rule.provenance = provenance;
+  if (jurisdiction !== void 0) rule.jurisdiction = jurisdiction;
+  if (category !== void 0) rule.category = category;
+  if (typeof entry.reason === "string") rule.reason = entry.reason;
+  return rule;
+}
+function parsePolicyConfig(text) {
+  let doc;
+  try {
+    doc = (0, import_yaml.parse)(text);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new PolicyConfigError(`Could not parse policy config as YAML: ${detail}`);
+  }
+  if (doc === null || doc === void 0) return { rules: [] };
+  if (!isPlainObject4(doc)) {
+    throw new PolicyConfigError('Policy config must be a mapping with an optional "rules" array.');
+  }
+  for (const key of Object.keys(doc)) {
+    if (key !== "rules" && key !== "disabledLaneIds") {
+      throw new PolicyConfigError(
+        `Policy config has unknown top-level field "${key}". Allowed: rules, disabledLaneIds.`
+      );
+    }
+  }
+  const result = { rules: [] };
+  if (doc.rules !== void 0) {
+    if (!Array.isArray(doc.rules)) {
+      throw new PolicyConfigError('Policy config "rules" must be an array.');
+    }
+    result.rules = doc.rules.map((entry, i) => parseRule(entry, i));
+  }
+  if (doc.disabledLaneIds !== void 0) {
+    if (!Array.isArray(doc.disabledLaneIds) || doc.disabledLaneIds.some((x) => typeof x !== "string")) {
+      throw new PolicyConfigError('Policy config "disabledLaneIds" must be an array of strings.');
+    }
+    result.disabledLaneIds = doc.disabledLaneIds;
+  }
+  return result;
+}
+
+// ../core/src/route.ts
+var DEFAULT_CAPABILITY2 = 0.5;
+var DEFAULT_PRIOR_STRENGTH2 = 8;
+var COST_PENALTY = {
+  local: 0,
+  subscription: 0.05,
+  metered: 0.2
+};
+var WEIGHTS = {
+  capability: 1,
+  cost: 1
+};
+var CAP_WARN_HEADROOM = 0.3;
+var CAP_CRITICAL_HEADROOM = 0.1;
+var CAP_WARN_PENALTY = 0.15;
+var CAP_CRITICAL_PENALTY = 1;
+var CAP_EPSILON = 1e-9;
+function capPenaltyFor(headroom) {
+  if (headroom === void 0 || headroom > CAP_WARN_HEADROOM + CAP_EPSILON) return 0;
+  if (headroom <= CAP_CRITICAL_HEADROOM + CAP_EPSILON) return CAP_CRITICAL_PENALTY;
+  return CAP_WARN_PENALTY;
+}
+function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false) {
+  if (yolo) {
+    if (lane.trust_mode === "full") return true;
+    if (lane.trust_mode === "worker") return isExecutorCertified(lane);
+    if (lane.trust_mode === "reader") return isReaderExecutorCertified(lane);
+    return false;
+  }
+  if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
+  if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
+  if (lane.trust_mode === "reader") {
+    return readerEgress && gateReady && isReaderExecutorCertified(lane) && lane.repo_read_attestation === true;
+  }
+  return false;
+}
+function isManagerEligible(lane) {
+  if (lane.trust_mode !== "full" || lane.manager_allowed !== true) return false;
+  const trustedByOrigin = lane.kind === "local" || TRUSTED_PROVENANCES.includes(lane.provenance);
+  return trustedByOrigin || lane.attestation === true;
+}
+function executionModeOf(lane) {
+  return lane.execution_mode ?? "answer-only";
+}
+function canDoRepoTight(lane) {
+  if (lane.trust_mode !== "full") return false;
+  return lane.native === true || lane.kind === "cli" && executionModeOf(lane) === "agentic";
+}
+function clamp012(n) {
+  if (Number.isNaN(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+function declaredCapabilityFor(lane, category) {
+  const declared = lane.capability?.[category];
+  return clamp012(declared ?? DEFAULT_CAPABILITY2);
+}
+function resolveLaneModelKey(lane) {
+  const spec = parseModelAlias(lane.model);
+  return spec.latest ? lane.model : spec.id;
+}
+function observedForLane(lane, category, laneOverlay, modelOverlay) {
+  if (modelOverlay) {
+    return modelOverlay[resolveLaneModelKey(lane)]?.[category];
+  }
+  return laneOverlay?.[lane.id]?.[category];
+}
+function effectiveCapabilityOptsFromContext(ctx) {
+  if (!ctx.capabilityPrior) return void 0;
+  return {
+    priorOverlay: ctx.capabilityPrior,
+    priorOpts: priorOptsFromContext(ctx)
+  };
+}
+function effectiveOptsForTask(ctx, task) {
+  const base = effectiveCapabilityOptsFromContext(ctx);
+  const conditioned = task.difficulty && ctx.observedCapabilityByModelDifficulty ? { difficulty: task.difficulty, difficultyOverlay: ctx.observedCapabilityByModelDifficulty } : void 0;
+  if (!base && !conditioned) return void 0;
+  return { ...base, ...conditioned };
+}
+function applyDifficultyCell(categoryLevel, lane, category, opts) {
+  if (!opts?.difficulty || !opts.difficultyOverlay) return categoryLevel;
+  const cell = opts.difficultyOverlay[resolveLaneModelKey(lane)]?.[category]?.[opts.difficulty];
+  if (!cell) return categoryLevel;
+  return effectiveCapability(categoryLevel, cell, { priorStrength: opts.priorStrength });
+}
+function effectiveCapability(declared, observed, opts = {}) {
+  const prior = clamp012(declared);
+  if (prior === 0) return 0;
+  if (!observed) return prior;
+  const n = Number.isFinite(observed.n) && observed.n > 0 ? observed.n : 0;
+  if (n === 0) return prior;
+  const rate = clamp012(observed.rate);
+  const k = Number.isFinite(opts.priorStrength) && opts.priorStrength > 0 ? opts.priorStrength : DEFAULT_PRIOR_STRENGTH2;
+  return clamp012((k * prior + n * rate) / (k + n));
+}
+function effectiveCapabilityFor(lane, category, overlay, opts) {
+  const observed = observedForLane(lane, category, overlay, opts?.modelOverlay);
+  if (opts?.priorOverlay) {
+    const resolved = resolvedPriorFor(lane, category, opts.priorOverlay, opts.priorOpts);
+    const categoryLevel = effectiveCapability(resolved.prior, observed, {
+      priorStrength: opts.priorStrength ?? resolved.priorStrength
+    });
+    return applyDifficultyCell(categoryLevel, lane, category, opts);
+  }
+  const declared = declaredCapabilityFor(lane, category);
+  return applyDifficultyCell(effectiveCapability(declared, observed, opts), lane, category, opts);
+}
+function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts) {
+  const declared = declaredCapabilityFor(lane, task.category);
+  const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
+  const effOpts = observedCapabilityByModel ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel } : effectiveOpts;
+  const capability = effOpts?.priorOverlay || effOpts?.difficulty && effOpts?.difficultyOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts) : effectiveCapability(declared, observed);
+  const costPenalty = COST_PENALTY[lane.costBasis];
+  const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
+  const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
+  return {
+    laneId: lane.id,
+    score,
+    factors: { capability, costPenalty, capPenalty, declared, evidenceN: observed?.n ?? 0 }
+  };
+}
+function compareScores(a, b) {
+  const az = a.factors.capability === 0;
+  const bz = b.factors.capability === 0;
+  if (az !== bz) return az ? 1 : -1;
+  if (b.score !== a.score) return b.score - a.score;
+  return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
+}
+function describe2(lane, best, task, tiered = false, preferred = false) {
+  const f = best.factors;
+  const cap = f.capability.toFixed(2);
+  let reason = preferred ? `Selected ${lane.id} (${lane.model}) for ${task.category}: preferred lane (explicit offload), capability ${cap} at ${lane.costBasis} cost.` : tiered ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.` : `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
+  if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
+    reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
+  }
+  return reason;
+}
+function eligibleLanes(task, ctx, policy) {
+  const disabled = new Set(policy.disabledLaneIds ?? []);
+  const policyContext = ctx.policyContext ?? {};
+  const yolo = ctx.yolo ?? false;
+  const gateReady = yolo ? true : ctx.gateReady ?? false;
+  const readerEgress = yolo ? true : ctx.readerEgress ?? false;
+  const repoTight = ctx.access_need === "repo-tight";
+  const out = [];
+  for (const lane of ctx.lanes) {
+    if (disabled.has(lane.id) || !isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
+    if (repoTight && !canDoRepoTight(lane)) continue;
+    const { verdict } = evaluate(task, lane, policyContext, policy);
+    if (yolo ? verdict === "block" : !laneAllowedByVerdict(lane, verdict)) continue;
+    out.push({ lane, verdict });
+  }
+  return out;
+}
+function routeDecide(task, ctx, policy) {
+  const available = ctx.availableLaneIds ? new Set(ctx.availableLaneIds) : null;
+  const verdicts = /* @__PURE__ */ new Map();
+  const candidates = eligibleLanes(task, ctx, policy).filter(({ lane }) => !(available && !lane.native && !available.has(lane.id))).map(({ lane, verdict }) => {
+    verdicts.set(lane.id, verdict);
+    return lane;
+  });
+  if (candidates.length === 0) {
+    throw new Error(
+      "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, unavailable to run, or blocked/forced-trusted away by policy)."
+    );
+  }
+  const effectiveOpts = effectiveOptsForTask(ctx, task);
+  const scored = candidates.map(
+    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts)
+  );
+  const strategy = ctx.strategy ?? "maximize";
+  const tiered = strategy === "tiered";
+  const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
+  let preferred = false;
+  if (ctx.preferLaneId != null) {
+    const idx = scores.findIndex((s) => s.laneId === ctx.preferLaneId && s.factors.capability > 0);
+    if (idx >= 0) {
+      const picked = scores.splice(idx, 1)[0];
+      scores.unshift(picked);
+      preferred = true;
+    }
+  }
+  const winner = scores[0];
+  const winningLane = candidates.find((lane) => lane.id === winner.laneId);
+  const wonByTier = !preferred && tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
+  return {
+    laneId: winner.laneId,
+    reason: describe2(winningLane, winner, task, wonByTier, preferred),
+    scores,
+    policyVerdict: verdicts.get(winner.laneId)
+  };
+}
+function tierFloorFor(task, ctx) {
+  return ctx.tierFloorByCategory?.[task.category] ?? ctx.tierFloor ?? DEFAULT_TIER_FLOOR;
+}
+var DEFAULT_TIER_FLOOR = 0.6;
+function orderTiered(scored, candidates, task, ctx) {
+  const floor = tierFloorFor(task, ctx);
+  const laneById = new Map(candidates.map((l) => [l.id, l]));
+  const costOf = (id) => ctx.laneCost?.[id] ?? COST_PENALTY[laneById.get(id).costBasis];
+  const isClear = (s) => s.factors.capability > 0 && s.factors.capability >= floor;
+  const clears = scored.filter(isClear);
+  if (clears.length === 0) return [...scored].sort(compareScores);
+  const byTier = (a, b) => {
+    if (a.factors.capPenalty !== b.factors.capPenalty) return a.factors.capPenalty - b.factors.capPenalty;
+    const ca = costOf(a.laneId);
+    const cb = costOf(b.laneId);
+    if (ca !== cb) return ca - cb;
+    if (a.factors.capability !== b.factors.capability) return a.factors.capability - b.factors.capability;
+    return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
+  };
+  const rest = scored.filter((s) => !isClear(s)).sort(compareScores);
+  return [...clears.sort(byTier), ...rest];
+}
+
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
+var WINDOW_WARN_USED = 0.7;
+var WINDOW_CRITICAL_USED = 0.9;
+function effectiveWindowMs(windowMs) {
+  return windowMs > 0 && Number.isFinite(windowMs) ? windowMs : FIVE_HOUR_MS;
+}
+function saneCount(count) {
+  if (!Number.isFinite(count) || count < 0) return 0;
+  return count;
+}
+function requestsInWindow(timestampsMs, now, windowMs = FIVE_HOUR_MS) {
+  const w = effectiveWindowMs(windowMs);
+  if (!Number.isFinite(now)) return 0;
+  const cutoff = now - w;
+  let n = 0;
+  for (const t of timestampsMs) {
+    if (!Number.isFinite(t)) continue;
+    if (t > cutoff && t <= now) n += 1;
+  }
+  return n;
+}
+function windowUsedFraction(count, limit) {
+  if (!(limit > 0)) return 0;
+  return saneCount(count) / limit;
+}
+function windowLevel(usedFraction) {
+  if (usedFraction >= WINDOW_CRITICAL_USED) return "critical";
+  if (usedFraction >= WINDOW_WARN_USED) return "warn";
+  return "ok";
+}
+
+// ../core/src/quota.ts
+var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+function laneObservations(events, laneId, weightTokens) {
+  const out = [];
+  for (const e of events) {
+    if (e.event_type !== "task" || e.laneId !== laneId || e.status === "native") continue;
+    const ts = Date.parse(e.ts);
+    if (!Number.isFinite(ts)) continue;
+    out.push({ ts, amount: weightTokens ? e.tokens_in + e.tokens_out : 1 });
+  }
+  return out;
+}
+function amountInWindow(observations, now, windowMs) {
+  let sum = 0;
+  for (const o of observations) {
+    if (o.ts > now || o.ts <= now - windowMs) continue;
+    if (!(Number.isFinite(o.amount) && o.amount > 0)) continue;
+    sum += o.amount;
+  }
+  return sum;
+}
+function axisState(count, limit) {
+  const used = windowUsedFraction(count, limit);
+  return { count, limit, used, level: windowLevel(used) };
+}
+function laneQuotaState(events, lane, now) {
+  const axes = [];
+  const state = { headroom: 1 };
+  const hasWindow = typeof lane.requests_per_window === "number" && lane.requests_per_window > 0;
+  const hasWeekRequests = typeof lane.requests_per_week === "number" && lane.requests_per_week > 0;
+  const hasWeekTokens = typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
+  if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
+  const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
+  if (hasWindow) {
+    const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+    const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
+    state.window = axisState(count, lane.requests_per_window);
+    axes.push(state.window);
+  }
+  if (hasWeekRequests) {
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week);
+    axes.push(state.weekRequests);
+  }
+  if (hasWeekTokens) {
+    const tokens = laneObservations(events, lane.id, true);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week);
+    axes.push(state.weekTokens);
+  }
+  let headroom = 1;
+  for (const a of axes) headroom = Math.min(headroom, Math.max(0, 1 - a.used));
+  state.headroom = headroom;
+  return state;
+}
+var MIN_SAMPLES = 8;
+var MIN_SPAN_FRACTION = 0.25;
+var MAX_HALF_RATE_RATIO = 3;
+var MODERATE_SPAN_FRACTION = 0.5;
+var MODERATE_HALF_RATE_RATIO = 2;
+function projectOccupancy(observations, limit, windowMs, now) {
+  if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return void 0;
+  const inWindow = observations.filter((o) => Number.isFinite(o.ts) && o.ts > now - windowMs && o.ts <= now && Number.isFinite(o.amount) && o.amount > 0).sort((a, b) => a.ts - b.ts);
+  if (inWindow.length < MIN_SAMPLES) return void 0;
+  const span = inWindow[inWindow.length - 1].ts - inWindow[0].ts;
+  const spanFraction = span / windowMs;
+  if (spanFraction < MIN_SPAN_FRACTION) return void 0;
+  const mid = now - windowMs / 2;
+  let firstHalf = 0;
+  let secondHalf = 0;
+  for (const o of inWindow) {
+    if (o.ts <= mid) firstHalf += o.amount;
+    else secondHalf += o.amount;
+  }
+  if (!(firstHalf > 0) || !(secondHalf > 0)) return void 0;
+  const ratio = Math.max(firstHalf, secondHalf) / Math.min(firstHalf, secondHalf);
+  if (ratio >= MAX_HALF_RATE_RATIO) return void 0;
+  const total = firstHalf + secondHalf;
+  const lambda = total / windowMs;
+  let occupancy = total;
+  if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
+  const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
+  let t = now;
+  let idx = 0;
+  const horizonEnd = now + windowMs;
+  while (t < horizonEnd) {
+    const nextExpiry = idx < expirations.length ? Math.min(expirations[idx].at, horizonEnd) : horizonEnd;
+    if (lambda > 0) {
+      const tCross = t + (limit - occupancy) / lambda;
+      if (tCross < nextExpiry) return { etaMs: tCross - now, confidence: confidenceOf(spanFraction, ratio) };
+    }
+    if (nextExpiry >= horizonEnd) break;
+    occupancy += lambda * (nextExpiry - t) - expirations[idx].amount;
+    t = nextExpiry;
+    idx += 1;
+  }
+  return void 0;
+}
+function confidenceOf(spanFraction, ratio) {
+  return spanFraction >= MODERATE_SPAN_FRACTION && ratio <= MODERATE_HALF_RATE_RATIO ? "moderate" : "low";
+}
+function laneDepletionForecast(events, lane, now) {
+  const axes = [
+    {
+      axis: "window",
+      limit: lane.requests_per_window,
+      windowMs: typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS,
+      weighted: false
+    },
+    { axis: "weekRequests", limit: lane.requests_per_week, windowMs: WEEK_MS, weighted: false },
+    { axis: "weekTokens", limit: lane.tokens_per_week, windowMs: WEEK_MS, weighted: true }
+  ];
+  let best;
+  let requests;
+  let tokens;
+  for (const a of axes) {
+    if (!(typeof a.limit === "number" && a.limit > 0)) continue;
+    const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
+    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
+  }
+  return best;
+}
+function quotaHeadroomMap(events, lanes, now) {
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const lane of lanes) {
+    const hasAny = typeof lane.requests_per_window === "number" && lane.requests_per_window > 0 || typeof lane.requests_per_week === "number" && lane.requests_per_week > 0 || typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
+    if (!hasAny) continue;
+    out[lane.id] = laneQuotaState(events, lane, now).headroom;
+  }
+  return out;
+}
+
+// ../core/src/feedback.ts
+var MS_PER_DAY = 864e5;
+var SEP = "\0";
+var DEFAULT_HALF_LIFE_DAYS = 30;
+function verdictValue(verdict) {
+  if (verdict === "pass") return 1;
+  if (verdict === "needs-rework") return 0.5;
+  return 0;
+}
+function isLearnableOutcome(e) {
+  return e.event_type === "outcome" && e.subject_type === "router_task" && e.voter === "reviewer_model" && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
+}
+function modelKeyFromOutcome(e) {
+  const resolved = e.subject_model_resolved?.trim();
+  if (resolved) return resolved;
+  const raw = e.subject_model?.trim();
+  if (raw) return raw;
+  return void 0;
+}
+function dedupKey(e) {
+  return [e.task_id, e.attempt, modelKeyFromOutcome(e), e.category].join(SEP);
+}
+function outcomeCapability(events, now, opts = {}) {
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const latest = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (!isLearnableOutcome(e)) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    if (!modelKey) continue;
+    if (!Number.isFinite(Date.parse(e.ts))) continue;
+    const key = dedupKey(e);
+    const prev = latest.get(key);
+    if (!prev || e.seq > prev.seq) latest.set(key, e);
+  }
+  const acc = /* @__PURE__ */ new Map();
+  for (const e of latest.values()) {
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    const accKey = [modelKey, e.category].join(SEP);
+    let a = acc.get(accKey);
+    if (!a) {
+      a = { modelKey, category: e.category, weightSum: 0, weightedValueSum: 0 };
+      acc.set(accKey, a);
+    }
+    a.weightSum += weight;
+    a.weightedValueSum += weight * verdictValue(e.verdict);
+  }
+  const overlay = /* @__PURE__ */ Object.create(null);
+  for (const a of acc.values()) {
+    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
+    const observed = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
+    const inner = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
+    inner[a.category] = observed;
+  }
+  return overlay;
+}
+function outcomeCapabilityByDifficulty(events, now, opts = {}) {
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const latest = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (!isLearnableOutcome(e)) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    if (!modelKey) continue;
+    if (!Number.isFinite(Date.parse(e.ts))) continue;
+    const key = dedupKey(e);
+    const prev = latest.get(key);
+    if (!prev || e.seq > prev.seq) latest.set(key, e);
+  }
+  const acc = /* @__PURE__ */ new Map();
+  for (const e of latest.values()) {
+    const difficulty = e.difficulty;
+    if (!difficulty) continue;
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    const accKey = [modelKey, e.category, difficulty].join(SEP);
+    let a = acc.get(accKey);
+    if (!a) {
+      a = { modelKey, category: e.category, difficulty, weightSum: 0, weightedValueSum: 0 };
+      acc.set(accKey, a);
+    }
+    a.weightSum += weight;
+    a.weightedValueSum += weight * verdictValue(e.verdict);
+  }
+  const overlay = /* @__PURE__ */ Object.create(null);
+  for (const a of acc.values()) {
+    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
+    const byCategory = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
+    const byDifficulty = byCategory[a.category] ?? (byCategory[a.category] = /* @__PURE__ */ Object.create(null));
+    byDifficulty[a.difficulty] = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
+  }
+  return overlay;
+}
+
 // ../core/src/registry.ts
+var import_yaml2 = __toESM(require_dist2(), 1);
 var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
 var EXECUTION_MODES = ["answer-only", "agentic"];
-var CATEGORIES = new Set(TASK_CATEGORIES);
+var CATEGORIES2 = new Set(TASK_CATEGORIES);
 var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
@@ -23523,7 +24041,12 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "endpoint",
   "authHandle",
   "native",
-  "capability"
+  "capability",
+  "capability_source",
+  "requests_per_window",
+  "window_ms",
+  "requests_per_week",
+  "tokens_per_week"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -23531,7 +24054,7 @@ var LaneConfigError = class extends Error {
     this.name = "LaneConfigError";
   }
 };
-function isPlainObject4(value) {
+function isPlainObject5(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireString(value, where) {
@@ -23550,12 +24073,12 @@ function requireEnum(value, allowed, where) {
 }
 function parseCapability(value, where) {
   if (value === void 0) return void 0;
-  if (!isPlainObject4(value)) {
+  if (!isPlainObject5(value)) {
     throw new LaneConfigError(`${where} must be a mapping of category to a number in [0, 1].`);
   }
   const out = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES.has(category)) {
+    if (!CATEGORIES2.has(category)) {
       throw new LaneConfigError(
         `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(", ")}.`
       );
@@ -23571,7 +24094,7 @@ function parseCapability(value, where) {
 }
 function parseLane(entry, index) {
   const where = `lanes[${index}]`;
-  if (!isPlainObject4(entry)) {
+  if (!isPlainObject5(entry)) {
     throw new LaneConfigError(`${where} must be a mapping.`);
   }
   for (const key of Object.keys(entry)) {
@@ -23652,6 +24175,29 @@ function parseLane(entry, index) {
   }
   const capability = parseCapability(entry.capability, at("capability"));
   if (capability) lane.capability = capability;
+  if (entry.capability_source !== void 0) {
+    if (entry.capability_source !== "pinned") {
+      throw new LaneConfigError(`${at("capability_source")} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
+    }
+    lane.capability_source = "pinned";
+  }
+  if (entry.requests_per_window !== void 0) {
+    const n = entry.requests_per_window;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new LaneConfigError(
+        `${at("requests_per_window")} must be a positive finite number (got ${JSON.stringify(n)}).`
+      );
+    }
+    lane.requests_per_window = n;
+  }
+  for (const field of ["window_ms", "requests_per_week", "tokens_per_week"]) {
+    const v = entry[field];
+    if (v === void 0) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -23703,7 +24249,7 @@ function parseLaneConfig(text) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new LaneConfigError(`Could not parse lane config as YAML: ${detail}`);
   }
-  if (!isPlainObject4(doc) || !Array.isArray(doc.lanes)) {
+  if (!isPlainObject5(doc) || !Array.isArray(doc.lanes)) {
     throw new LaneConfigError('Lane config must be a mapping with a "lanes" array.');
   }
   if (doc.lanes.length === 0) {
@@ -23727,7 +24273,7 @@ var PriceError = class extends Error {
     this.name = "PriceError";
   }
 };
-function isPlainObject5(value) {
+function isPlainObject6(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireNonNegativeNumber(value, where) {
@@ -23737,7 +24283,7 @@ function requireNonNegativeNumber(value, where) {
   return value;
 }
 function validatePriceTable(data) {
-  if (!isPlainObject5(data)) {
+  if (!isPlainObject6(data)) {
     throw new PriceError("Price table must be a JSON object.");
   }
   if (typeof data.schema_version !== "number") {
@@ -23746,12 +24292,12 @@ function validatePriceTable(data) {
   if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
     throw new PriceError('Price table "frontier_model" must be a non-empty string.');
   }
-  if (!isPlainObject5(data.models)) {
+  if (!isPlainObject6(data.models)) {
     throw new PriceError('Price table "models" must be a mapping of model id to prices.');
   }
   const models = /* @__PURE__ */ Object.create(null);
   for (const [model, raw] of Object.entries(data.models)) {
-    if (!isPlainObject5(raw)) {
+    if (!isPlainObject6(raw)) {
       throw new PriceError(`Price table models["${model}"] must be a mapping.`);
     }
     const entry = {
@@ -23809,7 +24355,7 @@ function computeCostPrimitives(table, lane, usage) {
 }
 
 // ../core/src/ledger.ts
-var SCHEMA_VERSION = 1;
+var SCHEMA_VERSION = 2;
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
 var NATIVE_REASONS = ["no_route", "host_native"];
 var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
@@ -23858,6 +24404,9 @@ var OUTCOME_EVENT_FIELDS = [
   "category",
   "subject_lane_id",
   "subject_provenance",
+  "subject_model",
+  "subject_model_resolved",
+  "difficulty",
   "reviewer_lane_id",
   "reviewer_model",
   "reviewer_trust_mode",
@@ -23874,7 +24423,7 @@ var LedgerError = class extends Error {
     this.name = "LedgerError";
   }
 };
-function isPlainObject6(value) {
+function isPlainObject7(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function requireString2(value, where) {
@@ -23972,6 +24521,13 @@ function validateOutcomeInput(input) {
   if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
   const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
   if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
+  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
+  if (subject_model !== void 0) out.subject_model = subject_model;
+  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
+  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
+  if (input.difficulty !== void 0) {
+    out.difficulty = requireEnum2(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
+  }
   if (input.action_taken !== void 0) {
     out.action_taken = requireEnum2(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
   }
@@ -24014,7 +24570,7 @@ function backfillLegacyTask(obj) {
   };
 }
 function parseEvent(obj) {
-  if (!isPlainObject6(obj)) {
+  if (!isPlainObject7(obj)) {
     throw new LedgerError("Ledger record must be a JSON object.");
   }
   const meta2 = parseMeta(obj);
@@ -24141,7 +24697,11 @@ function escalationDecision(verdict, counters, caps = {}) {
 function selectEscalationTarget(subject, candidates, task, ctx, policy, opts = {}) {
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
-  const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability);
+  const effectiveOpts = effectiveOptsForTask(ctx, task);
+  const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, {
+    ...effectiveOpts,
+    modelOverlay: ctx.observedCapabilityByModel
+  });
   const fromCap = cap(subject);
   const eligible = candidates.filter(
     (c) => !exclude.has(c.id) && !c.native && (c.costBasis === "subscription" || c.costBasis === "local") && canReassign(subject, c, task, ctx, policy) && cap(c) >= fromCap + minDelta
@@ -24202,6 +24762,11 @@ function classifyHttpStatus(status) {
 }
 
 // ../core/src/review.ts
+function canonicalizeModelKey(model) {
+  const spec = parseModelAlias(model);
+  if (spec.latest) return model.trim();
+  return spec.id;
+}
 var ReviewError = class extends Error {
   constructor(message) {
     super(message);
@@ -24246,6 +24811,8 @@ async function review(request, deps) {
   if (request.subjectLane) {
     event.subject_lane_id = request.subjectLane.id;
     event.subject_provenance = request.subjectLane.provenance;
+    event.subject_model = request.subjectLane.model;
+    event.subject_model_resolved = canonicalizeModelKey(request.subjectLane.model);
   }
   const result = { verdict: out.verdict, event };
   if (out.notes !== void 0) result.notes = out.notes;
@@ -24383,7 +24950,11 @@ async function runTask(request, ctx, policy, deps) {
   const policyContext = effectiveCtx.policyContext ?? {};
   let decision;
   try {
-    decision = routeDecide({ category: request.category }, effectiveCtx, policy);
+    decision = routeDecide(
+      { category: request.category, ...request.difficulty ? { difficulty: request.difficulty } : {} },
+      effectiveCtx,
+      policy
+    );
   } catch {
     const breadcrumb = {
       task_id: request.task_id ?? deps.newId(),
@@ -24568,11 +25139,19 @@ function complete(result) {
   markSupersededLegs(result.events, result.final_action);
   return result;
 }
+function deriveOutcomeDifficulty(stage, action) {
+  if (action === "escalate" || action === "give_back") return "hard";
+  if (action === "rework") return "moderate";
+  return stage === 0 ? "easy" : "moderate";
+}
 async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
   const maxReworks = opts.maxReworks ?? 1;
   const maxEscalations = opts.maxEscalations ?? 1;
   const minCapabilityDelta = opts.minCapabilityDelta ?? 0.15;
-  const task = { category: request.category };
+  const task = {
+    category: request.category,
+    ...request.difficulty ? { difficulty: request.difficulty } : {}
+  };
   const events = [];
   const effectiveCtx = request.policyContext ? { ...ctx, policyContext: request.policyContext } : ctx;
   const candidates = opts.candidates ?? effectiveCtx.lanes;
@@ -24610,7 +25189,8 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
     }
     let target = null;
     if (action === "escalate") {
-      target = selectEscalationTarget(subjectLane, candidates, task, effectiveCtx, policy, {
+      const escTask = { ...task, difficulty: deriveOutcomeDifficulty(stage, action) };
+      target = selectEscalationTarget(subjectLane, candidates, escTask, effectiveCtx, policy, {
         minDelta: minCapabilityDelta,
         excludeIds: [manager.id]
       });
@@ -24621,7 +25201,11 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
       { task_id, attempt: reviewedAttempt, category: request.category, content: output, subjectLane },
       { managerLane: manager, runManagerReview: async () => notes ? { verdict, notes } : { verdict }, newId: deps.newId }
     );
-    const outcome = { ...reviewRes.event, action_taken: action };
+    const outcome = {
+      ...reviewRes.event,
+      action_taken: action,
+      difficulty: deriveOutcomeDifficulty(stage, action)
+    };
     if (target) outcome.target_lane_id = target.id;
     events.push({ kind: "outcome", event: outcome });
     if (action === "accept") {
@@ -24655,6 +25239,165 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
     subjectLane = nextLane;
   }
   return complete({ final_action: "give_back", reason: "escalation budget exhausted", subjectLaneId: subjectLane.id, result: current, events });
+}
+
+// ../core/src/classify.ts
+var MIN_CLASSIFY_CONFIDENCE = 0.5;
+var CLASSIFY_FALLBACK_CATEGORY = "feature";
+var CATEGORY_ORDER = [
+  "boilerplate",
+  "bugfix",
+  "refactor",
+  "explain",
+  "feature",
+  "codegen",
+  "docs"
+];
+var SIGNALS = {
+  bugfix: [
+    "fix",
+    "bug",
+    "error",
+    "crash",
+    "broken",
+    "regression",
+    "failing test",
+    "stack trace",
+    "exception",
+    "npe",
+    "off-by-one"
+  ],
+  refactor: [
+    "refactor",
+    "rename",
+    "extract",
+    "inline",
+    "restructure",
+    "clean up",
+    "deduplicate",
+    "simplify code",
+    "simplify",
+    "move function",
+    "move method",
+    "move file",
+    "move code",
+    "move the function",
+    "move the method",
+    "move the file",
+    "move the code"
+  ],
+  docs: [
+    "document",
+    "documentation",
+    "readme",
+    "changelog",
+    "docstring",
+    "jsdoc",
+    "code comment",
+    "write docs"
+  ],
+  explain: [
+    "explain",
+    "how does",
+    "what does",
+    "walk through",
+    "understand",
+    "trace through",
+    "summarize the code"
+  ],
+  codegen: [
+    "generate",
+    "scaffold",
+    "write a function",
+    "write a script",
+    "write a test",
+    "write a component",
+    "write a",
+    "implement a",
+    "create a function",
+    "create a class",
+    "create a"
+  ],
+  boilerplate: [
+    "boilerplate",
+    "stub",
+    "skeleton",
+    "config file",
+    "setup file",
+    "plumbing",
+    "wiring",
+    "repetitive"
+  ],
+  feature: [
+    "add",
+    "implement",
+    "build",
+    "feature",
+    "support for",
+    "new endpoint",
+    "new page",
+    "new command",
+    "new flag",
+    "new"
+  ]
+};
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function classifyTask(text) {
+  const scores = {
+    boilerplate: 0,
+    bugfix: 0,
+    refactor: 0,
+    explain: 0,
+    feature: 0,
+    codegen: 0,
+    docs: 0
+  };
+  const lowerText = text.toLowerCase();
+  for (const category of CATEGORY_ORDER) {
+    const phrases = SIGNALS[category];
+    for (const phrase of phrases) {
+      const escaped = escapeRegExp(phrase);
+      const regex = new RegExp(`\\b${escaped}\\b`, "g");
+      const matches = lowerText.match(regex);
+      if (matches) {
+        scores[category] += matches.length;
+      }
+    }
+  }
+  let topScore = 0;
+  let topCategory = null;
+  for (const category of CATEGORY_ORDER) {
+    const score = scores[category];
+    if (score > topScore) {
+      topScore = score;
+      topCategory = category;
+    }
+  }
+  let secondScore = 0;
+  for (const category of CATEGORY_ORDER) {
+    if (category === topCategory) {
+      continue;
+    }
+    const score = scores[category];
+    if (score > secondScore) {
+      secondScore = score;
+    }
+  }
+  if (topScore === 0) {
+    return {
+      category: CLASSIFY_FALLBACK_CATEGORY,
+      confidence: 0,
+      scores
+    };
+  }
+  const confidence = Math.max(0, Math.min(1, (topScore - secondScore) / topScore));
+  return {
+    category: topCategory,
+    confidence,
+    scores
+  };
 }
 
 // ../core/src/node.ts
@@ -25038,13 +25781,22 @@ function combinedPrompt(instruction, attachments) {
   return attachments && attachments.length > 0 ? [instruction, ...attachments.map((a) => a.content)].join("\n\n") : instruction;
 }
 var numOrUndef = (v) => typeof v === "number" ? v : void 0;
+var MAX_PROMPT_ARG_BYTES = 128 * 1024;
 function makeCliExecutor(spawnImpl) {
   const spawn = spawnImpl ?? ((cmd, args, opts) => spawnSync(cmd, [...args], opts));
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model));
-    const res = spawn(lane.command, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const usesPromptArg = (lane.args ?? []).some((a) => a.includes("{prompt}"));
+    if (usesPromptArg && Buffer.byteLength(input, "utf8") > MAX_PROMPT_ARG_BYTES) {
+      throw new LaneFailure(
+        "provider_error",
+        `cli lane "${lane.id}" prompt is too large to pass as a command-line argument (> ${MAX_PROMPT_ARG_BYTES} bytes) \u2014 use a stdin-based CLI lane for large inputs`
+      );
+    }
+    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model).replaceAll("{prompt}", input));
+    const stdinInput = usesPromptArg ? "" : input;
+    const res = spawn(lane.command, args, { input: stdinInput, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (res.error) {
       const code = res.error.code;
       if (code === "ENOBUFS") throw new LaneFailure("provider_error", `cli lane "${lane.id}" produced too much output (exceeded the buffer limit)`);
@@ -25240,6 +25992,22 @@ function commandOnPath(command, path) {
   const dirs = (path ?? "").split(":").filter(Boolean);
   return dirs.some((dir) => isExecutableFile(join3(dir, command)));
 }
+function regularFileExists(candidate) {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+function nodeScriptArgPresent(lane) {
+  const base = (lane.command ?? "").split("/").pop();
+  if (base !== "node") return true;
+  const scriptArg = (lane.args ?? []).find(
+    (a) => !a.startsWith("-") && (a.endsWith(".mjs") || a.endsWith(".js"))
+  );
+  if (scriptArg === void 0) return true;
+  return regularFileExists(scriptArg);
+}
 async function localReachable(base, fetchImpl) {
   if (!fetchImpl) return false;
   const controller = new AbortController();
@@ -25255,7 +26023,7 @@ async function localReachable(base, fetchImpl) {
 }
 async function isLaneAvailable(lane, deps) {
   if (lane.native) return true;
-  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path) && nodeScriptArgPresent(lane);
   if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
   if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
   return false;
@@ -25271,9 +26039,166 @@ function makeAvailabilityProbe(env) {
   return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
 }
 
-// ../mcp/src/model-cache.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+// ../mcp/src/capability-prior-load.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+var DEFAULT_CAPABILITY_SNAPSHOT = fileURLToPath2(new URL("../capability-snapshot.v1.json", import.meta.url));
+var MAX_SNAPSHOT_AGE_DAYS = 45;
+var MAX_SNAPSHOT_AGE_MS = MAX_SNAPSHOT_AGE_DAYS * 24 * 60 * 60 * 1e3;
+function capabilityPriorEnabled(env) {
+  const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
+  return env.TOKENMAXED_CAPABILITY_PRIOR === "true" && !globallyDisabled;
+}
+function loadCapabilitySnapshotState(env, opts = {}) {
+  if (!capabilityPriorEnabled(env)) return { state: "off" };
+  const path = env.TOKENMAXED_CAPABILITY_SNAPSHOT ?? DEFAULT_CAPABILITY_SNAPSHOT;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync2(path, "utf8"));
+  } catch (err) {
+    return { state: "error", warning: `capability snapshot unreadable (${path}): ${err.message}` };
+  }
+  const validated = validateSnapshot(parsed);
+  if (!validated.valid) {
+    return { state: "error", warning: `capability snapshot invalid (${path}): ${validated.reason}` };
+  }
+  const snapshot = validated.snapshot;
+  const generatedMs = Date.parse(snapshot.generated);
+  const now = opts.now ?? Date.now();
+  const stale = !Number.isFinite(generatedMs) || now - generatedMs > MAX_SNAPSHOT_AGE_MS;
+  return { state: "on", snapshot, stale };
+}
+function priorStateFromSnapshot(loaded, lanes, opts = {}) {
+  if (loaded.state !== "on") return loaded;
+  const { overlay, unranked } = overlayFromSnapshot(loaded.snapshot, lanes, opts.priceTable ? { priceTable: opts.priceTable } : {});
+  return {
+    state: "on",
+    overlay,
+    stale: loaded.stale,
+    meta: {
+      source: loaded.snapshot.sources.join(", "),
+      generated: loaded.snapshot.generated,
+      categories: Object.keys(loaded.snapshot.mapping),
+      unrankedCount: unranked.length
+    }
+  };
+}
+function loadCapabilityPriorState(env, lanes, opts = {}) {
+  return priorStateFromSnapshot(loadCapabilitySnapshotState(env, opts), lanes, opts);
+}
+
+// ../mcp/src/settings.ts
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname3 } from "node:path";
+var SETTING_KEYS = {
+  gate_ready: "TOKENMAXED_GATE_READY",
+  escalate: "TOKENMAXED_ESCALATE",
+  learn_capability: "TOKENMAXED_LEARN_CAPABILITY",
+  capability_prior: "TOKENMAXED_CAPABILITY_PRIOR",
+  reader_egress: "TOKENMAXED_READER_EGRESS",
+  tiered: "TOKENMAXED_TIERED",
+  /** number in [0,1] */
+  tier_floor: "TOKENMAXED_TIER_FLOOR",
+  review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
+  /** positive integer */
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+};
+var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
+var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
+function settingsPath(env) {
+  return env.TOKENMAXED_SETTINGS ?? homeFile("settings.json");
+}
+function validValue(key, raw) {
+  if (NUMERIC_KEYS.has(key)) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return void 0;
+    if (key === "tier_floor" && (raw < 0 || raw > 1)) return void 0;
+    if (key === "review_max_rounds" && (!Number.isInteger(raw) || raw < 1)) return void 0;
+    return raw;
+  }
+  return typeof raw === "boolean" ? raw : void 0;
+}
+function loadSettings(env) {
+  const path = settingsPath(env);
+  if (!existsSync3(path)) return { values: {}, present: false, invalid: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync3(path, "utf8"));
+  } catch (err) {
+    return { values: {}, present: true, invalid: [], warning: `settings unreadable (${path}): ${err.message}` };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { values: {}, present: true, invalid: [], warning: `settings must be a JSON object (${path})` };
+  }
+  const obj = parsed;
+  const values = {};
+  const invalid = [];
+  for (const key of SETTING_KEY_LIST) {
+    if (!(key in obj)) continue;
+    const v = validValue(key, obj[key]);
+    if (v === void 0) invalid.push(key);
+    else values[key] = v;
+  }
+  return { values, present: true, invalid };
+}
+var SEEDED_KEYS = /* @__PURE__ */ new WeakMap();
+function effectiveEnv(env) {
+  const { values } = loadSettings(env);
+  const out = { ...env };
+  const seeded = new Set(SEEDED_KEYS.get(env) ?? []);
+  for (const key of SETTING_KEY_LIST) {
+    const envVar = SETTING_KEYS[key];
+    if (out[envVar] !== void 0) continue;
+    const v = values[key];
+    if (v === void 0) continue;
+    out[envVar] = String(v);
+    seeded.add(key);
+  }
+  if (seeded.size > 0) SEEDED_KEYS.set(out, seeded);
+  return out;
+}
+function settingsReport(env) {
+  const loaded = loadSettings(env);
+  const seeded = SEEDED_KEYS.get(env);
+  const seededByFile = (key, envValue) => seeded !== void 0 && seeded.has(key) && loaded.values[key] !== void 0 && String(loaded.values[key]) === envValue;
+  const rows = SETTING_KEY_LIST.map((key) => {
+    const envVar = SETTING_KEYS[key];
+    if (env[envVar] !== void 0) {
+      return { key, envVar, effective: env[envVar], source: seededByFile(key, env[envVar]) ? "settings" : "env" };
+    }
+    const v = loaded.values[key];
+    if (v !== void 0) return { key, envVar, effective: String(v), source: "settings" };
+    return { key, envVar, effective: "", source: "default" };
+  });
+  return { path: settingsPath(env), present: loaded.present, ...loaded.warning ? { warning: loaded.warning } : {}, invalid: loaded.invalid, rows };
+}
+function writeSetting(env, key, value) {
+  const path = settingsPath(env);
+  let obj = {};
+  if (existsSync3(path)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync3(path, "utf8"));
+    } catch {
+      throw new Error(`refusing to overwrite unreadable settings at ${path} \u2014 fix or delete it first`);
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`refusing to overwrite non-object settings at ${path} \u2014 fix or delete it first`);
+    }
+    obj = parsed;
+  }
+  if (value === null) delete obj[key];
+  else {
+    const valid = validValue(key, value);
+    if (valid === void 0) throw new Error(`invalid value for "${key}": ${JSON.stringify(value)}`);
+    obj[key] = valid;
+  }
+  mkdirSync2(dirname3(path), { recursive: true });
+  writeFileSync2(path, JSON.stringify(obj, null, 2) + "\n", "utf8");
+}
+
+// ../mcp/src/model-cache.ts
+import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname4 } from "node:path";
 var CACHE_VERSION = 1;
 function emptyCache() {
   return { version: CACHE_VERSION, endpoints: /* @__PURE__ */ Object.create(null) };
@@ -25313,15 +26238,15 @@ function putEntry(cache, endpoint, models, now) {
 }
 function readFreshnessCache(path) {
   try {
-    return existsSync3(path) ? coerceCache(JSON.parse(readFileSync2(path, "utf8"))) : emptyCache();
+    return existsSync4(path) ? coerceCache(JSON.parse(readFileSync4(path, "utf8"))) : emptyCache();
   } catch {
     return emptyCache();
   }
 }
 function writeFreshnessCache(path, cache) {
   try {
-    mkdirSync2(dirname3(path), { recursive: true });
-    writeFileSync2(path, JSON.stringify(cache, null, 2) + "\n", "utf8");
+    mkdirSync3(dirname4(path), { recursive: true });
+    writeFileSync3(path, JSON.stringify(cache, null, 2) + "\n", "utf8");
   } catch {
   }
 }
@@ -25546,14 +26471,14 @@ async function fetchModelList(lane, deps) {
 }
 
 // ../mcp/src/summary-deps.ts
-import { existsSync as existsSync5, readFileSync as readFileSync4 } from "node:fs";
-import { dirname as dirname5, join as join5 } from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+import { existsSync as existsSync6, readFileSync as readFileSync6 } from "node:fs";
+import { dirname as dirname6, join as join5 } from "node:path";
+import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // ../mcp/src/lane-state.ts
-import { createHash } from "node:crypto";
-import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname4 } from "node:path";
+import { createHash as createHash2 } from "node:crypto";
+import { existsSync as existsSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync5, writeFileSync as writeFileSync4 } from "node:fs";
+import { dirname as dirname5 } from "node:path";
 var STATE_VERSION = 1;
 function canonicalLane(l) {
   return {
@@ -25589,7 +26514,7 @@ function sortedCapability(cap) {
 }
 function laneSetFingerprint(lanes) {
   const canonical = lanes.map(canonicalLane);
-  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+  return createHash2("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
 function emptyLaneReviewState() {
   return { version: STATE_VERSION, byProject: /* @__PURE__ */ Object.create(null) };
@@ -25607,15 +26532,15 @@ function coerceLaneReviewState(raw) {
 }
 function readLaneReviewState(path) {
   try {
-    return existsSync4(path) ? coerceLaneReviewState(JSON.parse(readFileSync3(path, "utf8"))) : emptyLaneReviewState();
+    return existsSync5(path) ? coerceLaneReviewState(JSON.parse(readFileSync5(path, "utf8"))) : emptyLaneReviewState();
   } catch {
     return emptyLaneReviewState();
   }
 }
 function writeLaneReviewState(path, state) {
   try {
-    mkdirSync3(dirname4(path), { recursive: true });
-    writeFileSync3(path, JSON.stringify(state, null, 2) + "\n", "utf8");
+    mkdirSync4(dirname5(path), { recursive: true });
+    writeFileSync4(path, JSON.stringify(state, null, 2) + "\n", "utf8");
   } catch {
   }
 }
@@ -25637,6 +26562,23 @@ function selectManagerLane(lanes, policy, gateReady, available = null) {
 
 // ../mcp/src/summary.ts
 var DAY_MS = 24 * 60 * 60 * 1e3;
+var FIVE_HOUR_MS2 = 5 * 60 * 60 * 1e3;
+function fmtWindow(ms) {
+  if (ms >= 36e5) {
+    const hours = ms / 36e5;
+    const rounded = Math.round(hours * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded}h`;
+  }
+  return `${Math.max(1, Math.round(ms / 6e4))}m`;
+}
+function fmtEta(ms) {
+  const minutes = ms / 6e4;
+  if (minutes < 0.75) return "now";
+  if (minutes < 90) return `~${Math.max(1, Math.round(minutes))}m`;
+  const hours = minutes / 60;
+  if (hours < 36) return `~${Math.round(hours)}h`;
+  return `~${Math.round(hours / 24)}d`;
+}
 function buildSummaryData(input) {
   const { events, lanes, policy, availableLaneIds: availableLaneIds2, gateReady, enabled, now, core, selectManager } = input;
   const availableSet = new Set(availableLaneIds2);
@@ -25671,6 +26613,18 @@ function buildSummaryData(input) {
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
   const byLane = core.tokenStats(events).byLane;
+  const routedTsByLane = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (e.event_type !== "task" || e.status === "native") continue;
+    const ms = Date.parse(e.ts);
+    if (!Number.isFinite(ms)) continue;
+    let arr = routedTsByLane.get(e.laneId);
+    if (!arr) {
+      arr = [];
+      routedTsByLane.set(e.laneId, arr);
+    }
+    arr.push(ms);
+  }
   const cliUsageByModel = input.cliUsageByModel;
   const cliConsumed = /* @__PURE__ */ new Set();
   const laneSummaries = lanes.map((l) => {
@@ -25681,6 +26635,19 @@ function buildSummaryData(input) {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
+    const windowMs = typeof l.window_ms === "number" && l.window_ms > 0 ? l.window_ms : FIVE_HOUR_MS2;
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, windowMs);
+    const limit = l.requests_per_window;
+    const requestWindowLevel = limit !== void 0 ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : void 0;
+    const weekState = core.laneQuotaState?.(input.events, l, now);
+    const weekLevels = [weekState?.weekRequests?.level, weekState?.weekTokens?.level];
+    const weekLevel = weekLevels.includes("critical") ? "critical" : weekLevels.includes("warn") ? "warn" : void 0;
+    const weekDetail = weekState ? [
+      ...weekState.weekRequests ? [`7d ${weekState.weekRequests.count}/${weekState.weekRequests.limit} req`] : [],
+      ...weekState.weekTokens ? [`7d ${Math.round(weekState.weekTokens.count).toLocaleString("en-US")}/${weekState.weekTokens.limit.toLocaleString("en-US")} tok`] : []
+    ].join(" \xB7 ") : "";
+    const anyPressure = requestWindowLevel === "warn" || requestWindowLevel === "critical" || weekLevel !== void 0;
+    const forecast = core.laneDepletionForecast && anyPressure ? core.laneDepletionForecast(input.events, l, now) : void 0;
     return {
       id: l.id,
       kind: l.kind,
@@ -25688,6 +26655,11 @@ function buildSummaryData(input) {
       trustMode: l.trust_mode,
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
+      requestsIn5h,
+      ...windowMs !== FIVE_HOUR_MS2 ? { windowHours: windowMs / 36e5 } : {},
+      ...limit !== void 0 ? { requestsPerWindow: limit, requestWindowLevel } : {},
+      ...weekLevel && weekDetail ? { weekLevel, weekDetail } : {},
+      ...forecast ? forecast.confidence === "moderate" ? { forecastEtaMs: forecast.etaMs } : { forecastLow: true } : {},
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
@@ -25702,9 +26674,11 @@ function buildSummaryData(input) {
     lanes: laneSummaries,
     ...reviewer ? { activeReviewerId: reviewer.id } : {},
     ...input.laneReview ? { laneReview: input.laneReview } : {},
+    ...input.meteredKeyWarning ? { meteredKeyWarning: true } : {},
     empty: lifetime.offloads === 0
   };
 }
+var METERED_KEY_WARNING = "   \u26A0 ANTHROPIC_API_KEY is set \u2014 Claude Code bills per-token (metered) even on a Max/Pro plan. Unset it to use your subscription quota.";
 var usd = (n) => `$${n.toFixed(2)}`;
 var pct = (share) => `${Math.round(share * 100)}%`;
 function tok(n) {
@@ -25713,17 +26687,21 @@ function tok(n) {
 }
 function formatSummaryBanner(data) {
   if (!data.enabled) {
-    return "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    const off = "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    return data.meteredKeyWarning ? `${off}
+${METERED_KEY_WARNING}` : off;
   }
   const lines = [];
   if (data.empty) {
     lines.push("\u{1F7E2} TokenMaxed \u2014 ready. No routed work yet; your savings will show here.");
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
   } else {
     lines.push("\u{1F7E2} TokenMaxed \u2014 maximizing your flat-rate capacity");
     lines.push(
       `   Saved ${usd(data.meteredAvoidedLifetime)} in metered API spend (lifetime) \xB7 ${usd(data.meteredAvoided7d)} last 7d`
     );
     lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
     lines.push("");
     for (const w of data.windows) {
       const nf = w.nativeFallbacks > 0 ? ` \xB7 ${w.nativeFallbacks} native fallback${w.nativeFallbacks === 1 ? "" : "s"}` : "";
@@ -25741,7 +26719,11 @@ function formatSummaryBanner(data) {
   } else {
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
-    const laneLine = (l) => `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${l.stale ? " \u26A0 stale" : ""}`;
+    const laneLine = (l) => {
+      const windowLabel = l.windowHours !== void 0 ? fmtWindow(l.windowHours * 36e5) : "5h";
+      const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed ${windowLabel}: ${l.requestsIn5h}` : "";
+      return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${routed5h}${l.stale ? " \u26A0 stale" : ""}`;
+    };
     const groups = [
       { title: "Full access", mode: "full" },
       { title: "Workers", mode: "worker" },
@@ -25766,6 +26748,23 @@ function formatSummaryBanner(data) {
     lines.push("   \u26A0 your lanes changed since you last reviewed them \u2014 run /tokenmaxed:setup to review");
   } else if (data.lanes.length > 0 && data.laneReview === "first-review") {
     lines.push("   \u2139 run /tokenmaxed:setup to review what each lane may see/do");
+  }
+  for (const l of visible.filter(
+    (x) => x.requestsPerWindow !== void 0 && (x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
+  )) {
+    const tag = l.requestWindowLevel === "critical" ? "near limit" : "filling up";
+    const windowLabel = l.windowHours !== void 0 ? fmtWindow(l.windowHours * 36e5) : "5h";
+    const forecast = l.forecastEtaMs !== void 0 ? ` \u2014 est. ${fmtEta(l.forecastEtaMs)} at routed pace` : l.forecastLow ? " \u2014 approaching cap (routed)" : "";
+    lines.push(
+      `   \u26A0 ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)${forecast}`
+    );
+  }
+  for (const l of visible.filter(
+    (x) => x.weekLevel !== void 0 && !(x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
+  )) {
+    const tag = l.weekLevel === "critical" ? "near limit" : "filling up";
+    const forecast = l.forecastEtaMs !== void 0 ? ` \u2014 est. ${fmtEta(l.forecastEtaMs)} at routed pace` : l.forecastLow ? " \u2014 approaching cap (routed)" : "";
+    lines.push(`   \u26A0 ${vendorName(l)} routed ${l.weekDetail} (${tag} \u2014 ledger count only, not your full session)${forecast}`);
   }
   for (const l of visible.filter((l2) => l2.stale)) {
     lines.push(
@@ -25816,7 +26815,7 @@ function readOnlyToggleStore(statePath) {
   return {
     read: () => {
       try {
-        return existsSync5(statePath) ? JSON.parse(readFileSync4(statePath, "utf8")) : {};
+        return existsSync6(statePath) ? JSON.parse(readFileSync6(statePath, "utf8")) : {};
       } catch {
         return {};
       }
@@ -25836,16 +26835,17 @@ function makeSummaryFromEnv(env) {
   const loadPolicy = makeLoadPolicy(env);
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
-  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));
-  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname5(statePath), "model-freshness.json");
+  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname6(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname5(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname6(statePath), "lane-review.json");
+  const meteredKeyWarning = !!(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
   return async () => {
-    const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+    const lanes = existsSync6(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     const now = Date.now();
     let priceTable;
-    if (existsSync5(pricesPath)) {
+    if (existsSync6(pricesPath)) {
       try {
         priceTable = loadPriceTable(pricesPath);
       } catch {
@@ -25893,14 +26893,15 @@ function makeSummaryFromEnv(env) {
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
-      core: { summarize, tokenStats, filterEventsSince },
+      core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel, laneDepletionForecast, laneQuotaState },
       selectManager: selectManagerLane,
       staleness,
       laneReview,
       // Fold the host CLI's own per-model usage (real, transcript-derived) into the
       // per-lane counts. Best-effort: readCliUsageByModel fails open to {} so the
       // summary never breaks if transcripts are unreadable.
-      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR)
+      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR),
+      meteredKeyWarning
     });
   };
 }
@@ -25908,8 +26909,8 @@ function makeSummaryFromEnv(env) {
 // ../mcp/src/host-review.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync6 } from "node:fs";
-import { fileURLToPath as fileURLToPath3 } from "node:url";
+import { existsSync as existsSync7 } from "node:fs";
+import { fileURLToPath as fileURLToPath4 } from "node:url";
 
 // ../mcp/src/reviewer.ts
 var VERDICT_RE = /^[ \t>]*VERDICT:\s*(pass|needs-rework|fail)\s*$/gim;
@@ -26041,7 +27042,7 @@ function makeHostReviewDeps(env) {
   const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
-  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
+  const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
   const resolveAuth = makeResolveAuth(env);
   const executor = makeTrustedExecutor({
     cli: makeCliExecutor(makeCliSpawn(REVIEW_CLI_TIMEOUT_MS)),
@@ -26075,7 +27076,7 @@ function makeHostReviewDeps(env) {
       return { diff: out, incomplete, ...incompleteReason ? { incompleteReason } : {} };
     },
     loadLanes: () => {
-      if (!existsSync6(lanesPath)) return null;
+      if (!existsSync7(lanesPath)) return null;
       const raw = [...loadLaneConfig(lanesPath).lanes];
       let table;
       try {
@@ -26134,23 +27135,51 @@ async function runReviewWithBudget(runner, newId, opts) {
 }
 
 // ../mcp/src/setup.ts
-import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
-import { dirname as dirname6, join as join6 } from "node:path";
-import { fileURLToPath as fileURLToPath4 } from "node:url";
-var LANES_STARTER = fileURLToPath4(new URL("../lanes.starter.yaml", import.meta.url));
-var POLICY_STARTER = fileURLToPath4(new URL("../policy.starter.yaml", import.meta.url));
-var DEFAULT_PRICES = fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
+import { copyFileSync, existsSync as existsSync8, mkdirSync as mkdirSync5 } from "node:fs";
+import { dirname as dirname7, join as join6 } from "node:path";
+import { fileURLToPath as fileURLToPath5 } from "node:url";
+
+// ../mcp/src/cli-plugins.ts
+var CLI_PLUGINS = Object.freeze({
+  openai: { vendor: "OpenAI", cli: "codex", plugin: "codex", url: "https://github.com/openai/codex" },
+  xai: { vendor: "xAI", cli: "grok", plugin: "grok-plugin-cc", url: "https://github.com/TolyK/grok-plugin-cc" },
+  google: {
+    vendor: "Google",
+    cli: "agy",
+    plugin: "antigravity-plugin-cc",
+    url: "https://github.com/TolyK/antigravity-plugin-cc"
+  },
+  anthropic: { vendor: "Anthropic", cli: "claude", plugin: "Claude Code", url: "https://claude.com/claude-code" }
+});
+function cliPluginForProvenance(provenance) {
+  return CLI_PLUGINS[provenance.trim().toLowerCase()];
+}
+function pluginSuggestionsFor(lanes) {
+  const out = [];
+  for (const lane of lanes) {
+    if (lane.kind !== "api" || lane.trust_mode === "blocked" || !lane.authHandle) continue;
+    const plugin = cliPluginForProvenance(lane.provenance);
+    if (!plugin) continue;
+    out.push({ laneId: lane.id, vendor: plugin.vendor, plugin: plugin.plugin, url: plugin.url });
+  }
+  return out;
+}
+
+// ../mcp/src/setup.ts
+var LANES_STARTER = fileURLToPath5(new URL("../lanes.starter.yaml", import.meta.url));
+var POLICY_STARTER = fileURLToPath5(new URL("../policy.starter.yaml", import.meta.url));
+var DEFAULT_PRICES = fileURLToPath5(new URL("../prices.seed.json", import.meta.url));
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
-  const lanesExisted = existsSync7(lanesPath);
+  const lanesExisted = existsSync8(lanesPath);
   if (!lanesExisted) {
-    mkdirSync4(dirname6(lanesPath), { recursive: true });
+    mkdirSync5(dirname7(lanesPath), { recursive: true });
     copyFileSync(LANES_STARTER, lanesPath);
   }
-  const policyExisted = existsSync7(policyPath);
+  const policyExisted = existsSync8(policyPath);
   if (!policyExisted) {
-    mkdirSync4(dirname6(policyPath), { recursive: true });
+    mkdirSync5(dirname7(policyPath), { recursive: true });
     copyFileSync(POLICY_STARTER, policyPath);
   }
   const registry2 = loadLaneConfig(lanesPath);
@@ -26182,7 +27211,7 @@ async function runSetup(env) {
   });
   const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
   const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join6(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join6(dirname6(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join6(dirname7(statePath), "lane-review.json");
   const fingerprint = laneSetFingerprint(registry2.lanes);
   const reviewState = readLaneReviewState(laneStatePath);
   const prior = Object.hasOwn(reviewState.byProject, projectKey) ? reviewState.byProject[projectKey].fingerprint : void 0;
@@ -26207,6 +27236,27 @@ async function runSetup(env) {
     escalate: env.TOKENMAXED_ESCALATE === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // F-1 learned capability; also disabled by the global kill-switch.
     learnCapability: env.TOKENMAXED_LEARN_CAPABILITY === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
+    // A4: settings-file state — reported only when the file exists, so a
+    // settings-less setup output stays byte-identical.
+    ...(() => {
+      const rep = settingsReport(env);
+      if (!rep.present) return {};
+      return {
+        settings: {
+          path: rep.path,
+          applied: rep.rows.filter((r) => r.source === "settings").map((r) => r.key),
+          ...rep.warning ? { warning: rep.warning } : {}
+        }
+      };
+    })(),
+    // P2 rankings prior — same loader the routing paths use, run over the RAW
+    // registry lanes with the price table so @latest resolves like everywhere else.
+    // Meta only (the overlay itself never enters the report).
+    capabilityPrior: (() => {
+      const p = loadCapabilityPriorState(env, [...registry2.lanes], priceTable ? { priceTable } : {});
+      if (p.state !== "on") return p;
+      return { state: "on", stale: p.stale, ...p.meta };
+    })(),
     // F-2 reader egress; also disabled by the global kill-switch.
     readerEgress: env.TOKENMAXED_READER_EGRESS === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // MODEL-TIERS tiered routing; also disabled by the global kill-switch.
@@ -26216,7 +27266,10 @@ async function runSetup(env) {
     // this default at runtime; setup reports only the env-derived default.
     yolo: (env.TOKENMAXED_YOLO === "true" || env.TOKENMAXED_YOLO === "1") && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     lanes: laneRows,
-    laneReview
+    laneReview,
+    // If a user enabled a metered BYOK api lane for a vendor that ALSO ships a Claude Code
+    // CLI plugin (subscription, $0 metered), nudge them toward the plugin with a link.
+    pluginSuggestions: pluginSuggestionsFor(registry2.lanes)
   };
 }
 
@@ -26336,6 +27389,19 @@ function pct2(alreadyPercent) {
 var REPO_CLASSES2 = ["public", "private", "unknown"];
 var SENSITIVITIES2 = ["normal", "sensitive", "unknown"];
 var ACCESS_NEEDS = ["worker-ok", "repo-tight", "auto"];
+var DIFFICULTIES = ["easy", "moderate", "hard"];
+var SETTING_KEYS_UI = [
+  "gate_ready",
+  "escalate",
+  "learn_capability",
+  "capability_prior",
+  "reader_egress",
+  "tiered",
+  "tier_floor",
+  "review_on_stop",
+  "review_max_rounds"
+];
+var NUMERIC_SETTING_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
 function renderSavings(summary, tokens, period) {
   const s = summary.savings;
   const scope = period && period !== "all" ? ` (last ${period})` : "";
@@ -26411,7 +27477,11 @@ function createTools(core) {
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
     handler: (deps) => guardedAsync(async () => {
       const data = await deps.summary();
-      return ok(formatSummaryBanner(data), { summary: data });
+      const alerts = deps.quotaAlerts ? await deps.quotaAlerts() : [];
+      const banner = alerts.length > 0 ? `${formatSummaryBanner(data)}
+   Quota (routed share only):
+${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
+      return ok(banner, { summary: data, ...alerts.length ? { quotaAlerts: alerts } : {} });
     })
   };
   const previewTool = {
@@ -26433,6 +27503,11 @@ function createTools(core) {
           type: "string",
           enum: [...ACCESS_NEEDS],
           description: 'OPTIONAL access requirement to preview. "repo-tight" filters worker/reader lanes out (only full-access lanes survive); "worker-ok"/"auto" (default) impose no access restriction \u2014 matching what router_delegate would route with.'
+        },
+        difficulty: {
+          type: "string",
+          enum: [...DIFFICULTIES],
+          description: "OPTIONAL difficulty to preview \u2014 shows the pick a difficulty-tagged delegate would make when learned difficulty evidence exists. Omit for the category-level pick."
         }
       }
     },
@@ -26442,6 +27517,8 @@ function createTools(core) {
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
+      const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
+      const task = { category, ...difficulty ? { difficulty } : {} };
       const resolvedAccessNeed = access_need === "repo-tight" ? "repo-tight" : "worker-ok";
       if (!deps.getEnabled()) {
         return ok(
@@ -26458,6 +27535,12 @@ function createTools(core) {
       const lanes = deps.candidateLanes(category);
       const policy = deps.loadPolicy();
       const observedCapability = deps.observedCapability();
+      const observedCapabilityByModel = deps.observedCapabilityByModel?.();
+      const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
+      const capPrior = deps.capabilityPrior?.(lanes);
+      const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
+      const capHeadroom2 = deps.capHeadroom?.(lanes);
+      const quotaCtx = capHeadroom2 ? { capHeadroom: capHeadroom2 } : {};
       let availableIds;
       if (deps.availableLaneIds) {
         const baseCtx = {
@@ -26467,9 +27550,13 @@ function createTools(core) {
           policyContext,
           access_need: resolvedAccessNeed,
           ...yolo ? { yolo: true } : {},
-          ...observedCapability ? { observedCapability } : {}
+          ...observedCapability ? { observedCapability } : {},
+          ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+          ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+          ...priorCtx,
+          ...quotaCtx
         };
-        const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
+        const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
       }
       const tieredCtx = deps.tieredStrategy === "tiered" ? {
@@ -26486,13 +27573,17 @@ function createTools(core) {
         access_need: resolvedAccessNeed,
         ...yolo ? { yolo: true } : {},
         ...observedCapability ? { observedCapability } : {},
+        ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+        ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+        ...priorCtx,
+        ...quotaCtx,
         ...availableIds ? { availableLaneIds: availableIds } : {},
         ...tieredCtx,
         ...preferLaneId ? { preferLaneId } : {}
       };
       let decision;
       try {
-        decision = core.routeDecide({ category }, ctx, policy);
+        decision = core.routeDecide(task, ctx, policy);
       } catch {
         return ok(
           `category "${category}": no eligible lane (gate_ready=${gateReady}) \u2014 would run on the host (native).`,
@@ -26503,15 +27594,58 @@ function createTools(core) {
       const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy).verdict : decision.policyVerdict;
       const preferNote = preferLaneId && decision.laneId !== preferLaneId ? `  note: preferred lane "${preferLaneId}" was not used \u2014 it isn't eligible, available, or capable for this category (fell back to normal routing).` : void 0;
       const yoloNote = yolo ? `  \u26A0\uFE0F YOLO mode ON: trust/egress gates are bypassed \u2014 workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.` : void 0;
+      const quotaLines = [];
+      const winnerCapPenalty = decision.scores.find((s) => s.laneId === decision.laneId)?.factors.capPenalty ?? 0;
+      if (winnerCapPenalty > 0) {
+        const detail = lane ? deps.quotaDetail?.(lane) : void 0;
+        quotaLines.push(`  quota: ${detail ?? "near cap"} \u2014 pressure applied; it won anyway (no better capable alternative)`);
+        if (preferLaneId === decision.laneId) {
+          quotaLines.push(`  \u26A0 preferred lane overrides quota pressure${detail ? ` (${detail})` : ""} \u2014 /tokenmaxed:prefer off to release it.`);
+        }
+      }
+      const pressuredLosers = decision.scores.filter((s) => s.laneId !== decision.laneId && s.factors.capPenalty > 0).map((s) => s.laneId);
+      if (pressuredLosers.length > 0) {
+        quotaLines.push(`  quota-deprioritized: ${pressuredLosers.join(", ")} (routed-share near cap)`);
+      }
+      const priorLines = [];
+      let priorStructured;
+      if (capPrior?.state === "on") {
+        const m = capPrior.meta;
+        priorLines.push(
+          `  capability prior: ${m.source} (generated ${m.generated}${capPrior.stale ? "; STALE \u2014 no upward movement" : ""}) \u2014 categories ${m.categories.join("/")}; ${m.unrankedCount} of the previewed lane\xD7category pairs unranked`
+        );
+        const winnerPrior = lane && core.resolvedPriorFor ? core.resolvedPriorFor(lane, category, capPrior.overlay, { stale: capPrior.stale }) : void 0;
+        if (winnerPrior) {
+          priorLines.push(
+            `  prior for "${decision.laneId}": ${winnerPrior.provenance} ${winnerPrior.prior.toFixed(2)}${winnerPrior.clamped ? " (clamped)" : ""}${winnerPrior.evidence ? ` [${winnerPrior.evidence.chart}, confidence ${winnerPrior.evidence.confidence}]` : ""}`
+          );
+        }
+        priorStructured = {
+          state: "on",
+          stale: capPrior.stale,
+          source: m.source,
+          generated: m.generated,
+          unrankedCount: m.unrankedCount,
+          ...winnerPrior ? { winnerProvenance: winnerPrior.provenance, winnerPrior: winnerPrior.prior, winnerClamped: winnerPrior.clamped ?? false } : {}
+        };
+      } else if (capPrior?.state === "error") {
+        priorLines.push(`  capability prior: ERROR \u2014 ${capPrior.warning} (routing unaffected; declared capabilities in use)`);
+        priorStructured = { state: "error", warning: capPrior.warning };
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
         `  why: ${decision.reason}`,
+        ...difficulty ? [
+          `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
+        ] : [],
+        ...quotaLines,
+        ...priorLines,
         ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...preferLaneId ? { preferLaneId } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {} });
     })
   };
   const statusTool = {
@@ -26532,6 +27666,18 @@ function createTools(core) {
       }
       if (preferred) {
         lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
+      }
+      const capPrior = deps.capabilityPrior?.([]);
+      if (capPrior?.state === "on") {
+        lines.push(
+          `Capability prior: ON \u2014 ${capPrior.meta.source}, generated ${capPrior.meta.generated}, categories ${capPrior.meta.categories.join("/")}${capPrior.stale ? ", STALE (no upward movement)" : ""}.`
+        );
+      } else if (capPrior?.state === "error") {
+        lines.push(`Capability prior: ERROR \u2014 ${capPrior.warning} (routing unaffected; declared capabilities in use).`);
+      }
+      const quotaAlerts = enabled && deps.quotaAlerts ? await deps.quotaAlerts() : [];
+      if (quotaAlerts.length > 0) {
+        lines.push("", "Quota (routed share only \u2014 not your total subscription usage):", ...quotaAlerts.map((a) => `  ${a}`));
       }
       if (mismatches.length > 0) {
         lines.push("", "Model ids the vendor will REJECT (fix before offloading):", ...renderModelIdMismatchWarnings(mismatches));
@@ -26625,9 +27771,13 @@ function createTools(core) {
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      required: ["category", "instruction"],
+      required: ["instruction"],
       properties: {
-        category: { type: "string", enum: [...core.taskCategories], description: "Task category (drives lane choice)." },
+        category: {
+          type: "string",
+          enum: [...core.taskCategories],
+          description: "OPTIONAL task category (drives lane choice). If omitted, it is inferred from the instruction."
+        },
         instruction: {
           type: "string",
           description: "The self-contained subtask to perform. Include all needed context IN this text. A lane receives nothing else BEYOND any files you pass in `files` \u2014 no repo, no tools."
@@ -26635,7 +27785,7 @@ function createTools(core) {
         files: {
           type: "array",
           items: { type: "string" },
-          description: 'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing \u2014 kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounded + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.'
+          description: 'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing \u2014 kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounds + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.'
         },
         repo_class: { type: "string", enum: [...REPO_CLASSES2], description: "Repository class for policy (default unknown)." },
         sensitivity: { type: "string", enum: [...SENSITIVITIES2], description: "Content sensitivity for policy (default unknown)." },
@@ -26643,36 +27793,49 @@ function createTools(core) {
           type: "string",
           enum: [...ACCESS_NEEDS],
           description: 'OPTIONAL access requirement. "repo-tight" \u21D2 the task needs full repo/tool/shell access, so it routes straight to a full-access lane (workers skipped). "worker-ok" \u21D2 a worker may handle it. "auto" (default) lets the server decide (today: worker-ok, with worker give-back as the safety net). Orthogonal to repo_class/sensitivity policy.'
+        },
+        difficulty: {
+          type: "string",
+          enum: [...DIFFICULTIES],
+          description: `OPTIONAL expected difficulty. When set and learned difficulty-specific evidence exists (TOKENMAXED_LEARN_CAPABILITY), routing conditions capability on that difficulty's real pass record \u2014 e.g. "hard" favors models that keep passing hard reviews. Omit when unsure (category-level routing, unchanged).`
         }
       }
     },
     handler: (deps, args) => guardedAsync(async () => {
-      const category = optEnum(args, "category", core.taskCategories);
-      if (category === void 0) throw new ToolInputError('"category" is required.');
+      const passedCategory = optEnum(args, "category", core.taskCategories);
       const instruction = optString(args, "instruction");
       if (!instruction || instruction.trim() === "") throw new ToolInputError('"instruction" is required (non-empty).');
       const files = optStringArray(args, "files");
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
+      const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       if (!deps.getEnabled()) {
         return ok(
           "TokenMaxed routing is DISABLED for this project \u2014 handle this task yourself (native). Run /tokenmaxed:on to re-enable.",
           { native: true, disabled: true }
         );
       }
+      const resolution = resolveCategory(core, passedCategory, instruction);
       const policyContext = {
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
       };
       const outcome = await deps.delegate({
-        category,
+        category: resolution.category,
         instruction,
         ...Object.keys(policyContext).length ? { policyContext } : {},
         ...files && files.length ? { files } : {},
-        ...access_need ? { access_need } : {}
+        ...access_need ? { access_need } : {},
+        ...difficulty ? { difficulty } : {}
       });
-      return renderDelegate(outcome);
+      const finalOutcome = resolution.categoryInferred ? {
+        ...outcome,
+        categoryInferred: true,
+        inferredConfidence: resolution.inferredConfidence,
+        hint: resolution.hint
+      } : outcome;
+      return renderDelegate(finalOutcome);
     })
   };
   const reviewTool = {
@@ -26711,34 +27874,123 @@ ${r.notes}` : "";
         `  review loop: ${r.reviewOnStop ? `ON (default \u2014 reviews every finishing turn when a reviewer exists; up to ${r.reviewMaxRounds ?? 5} rework round(s))` : "off"} (opt out with TOKENMAXED_REVIEW_ON_STOP=false; tune rounds with TOKENMAXED_REVIEW_MAX_ROUNDS)`,
         `  quality escalation: ${r.escalate ? "on" : "off"} (enable with TOKENMAXED_ESCALATE=true \u2014 offloads a failed cheap result up to a stronger lane)`,
         `  learned capability: ${r.learnCapability ? "on" : "off"} (enable with TOKENMAXED_LEARN_CAPABILITY=true \u2014 review outcomes adjust routing over time)`,
+        // A4: rendered ONLY when the settings file exists (byte-compat when absent).
+        ...r.settings ? [
+          `  settings: ${r.settings.path}${r.settings.warning ? ` \u2014 \u26A0 ${r.settings.warning}` : ` (${r.settings.applied.length ? `applies: ${r.settings.applied.join(", ")}` : "no flags stored"}; /tokenmaxed:config to view/edit)`}`
+        ] : [],
+        // P2: rendered ONLY when on/error — the default-off setup output stays
+        // byte-identical to pre-P2 (the A1 gate; discoverability moves to the
+        // A4 settings surface). The report FIELD is always present for hosts.
+        ...r.capabilityPrior.state === "on" ? [
+          `  capability prior: ON \u2014 ${r.capabilityPrior.source}, generated ${r.capabilityPrior.generated}, categories ${r.capabilityPrior.categories.join("/")}, ${r.capabilityPrior.unrankedCount} lane\xD7category unranked${r.capabilityPrior.stale ? ", STALE (no upward movement)" : ""}`
+        ] : r.capabilityPrior.state === "error" ? [`  capability prior: ERROR \u2014 ${r.capabilityPrior.warning} (routing unaffected; declared capabilities in use)`] : [],
         `  reader egress: ${r.readerEgress ? "on" : "off"} (enable with TOKENMAXED_READER_EGRESS=true \u2014 lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
         `  tiered routing: ${r.tiered ? "on" : "off"} (enable with TOKENMAXED_TIERED=true \u2014 start on the cheapest lane clearing the capability floor, step up on review failure)`,
         `  YOLO mode: ${r.yolo ? "\u26A0\uFE0F ON (env default)" : "off"} (the --dangerously-skip-permissions analogue: TOKENMAXED_YOLO=true or /tokenmaxed:yolo on \u2014 bypasses ALL trust/egress gates so every worker/reader lane is selectable; secret scanner still applies)`,
         "",
         ...r.laneReview === "changed" ? ["\u26A0 Your lanes changed since you last reviewed them \u2014 confirm the summary below."] : r.laneReview === "first-review" ? ["\u2139 Lane review: confirm what each lane may see/do below (recorded so you're reminded if it changes)."] : [],
         ...formatLaneSetup(r.lanes),
+        ...r.pluginSuggestions && r.pluginSuggestions.length > 0 ? [
+          "",
+          "\u{1F4A1} These enabled lanes authenticate with a BYOK API key. The vendor also ships a Claude",
+          "   Code CLI plugin you can route on your flat-rate subscription instead \u2014 no key to manage",
+          "   (and no metered spend for a pay-per-token key):",
+          ...r.pluginSuggestions.map(
+            (s) => `   \u2022 ${s.laneId} (${s.vendor}) \u2192 ${s.plugin}: ${s.url}`
+          )
+        ] : [],
         "",
         `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`
       ];
       return ok(lines.join("\n"), { ...r });
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool];
+  const configTool = {
+    name: "router_config",
+    description: "Show or persist TokenMaxed feature settings (~/.tokenmaxed/settings.json) \u2014 the durable alternative to launch-time env flags. A real environment variable ALWAYS overrides a stored setting. The kill-switch (TOKENMAXED_DISABLE), YOLO mode, and API keys are deliberately NOT settable here. Powers /tokenmaxed:config.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        key: {
+          type: "string",
+          enum: [...SETTING_KEYS_UI],
+          description: "OPTIONAL setting to show or change. Omit to list every setting with its effective value and source."
+        },
+        value: {
+          type: "string",
+          description: 'OPTIONAL new value: "true"/"false" for the boolean flags, a number for tier_floor (0..1) / review_max_rounds (integer \u2265 1), or "clear" to remove the stored key. Omit to just show the key.'
+        }
+      }
+    },
+    handler: (deps, args) => guardedAsync(async () => {
+      if (!deps.settings) throw new ToolInputError("settings are not available on this host.");
+      const key = optEnum(args, "key", SETTING_KEYS_UI);
+      const rawValue = optString(args, "value");
+      if (rawValue !== void 0 && key === void 0) throw new ToolInputError('"value" requires "key".');
+      if (key !== void 0 && rawValue !== void 0) {
+        if (!deps.setSetting) throw new ToolInputError("this host cannot write settings.");
+        let parsed;
+        if (rawValue === "clear") parsed = null;
+        else if (rawValue === "true" || rawValue === "false") parsed = rawValue === "true";
+        else if (NUMERIC_SETTING_KEYS.has(key) && Number.isFinite(Number(rawValue))) parsed = Number(rawValue);
+        else throw new ToolInputError(`invalid value "${rawValue}" for "${key}" \u2014 use true/false${NUMERIC_SETTING_KEYS.has(key) ? ", a number," : ""} or "clear".`);
+        deps.setSetting(key, parsed);
+      }
+      const report = deps.settings();
+      const rows = key !== void 0 && rawValue === void 0 ? report.rows.filter((r) => r.key === key) : report.rows;
+      const renderRow = (r) => {
+        const value = r.source === "default" ? "(default)" : r.effective;
+        const src = r.source === "env" ? ` \u2014 env ${r.envVar} overrides` : r.source === "settings" ? " \u2014 from settings" : "";
+        return `  ${r.key} = ${value}${src}`;
+      };
+      const lines = [
+        `TokenMaxed settings (${report.path}${report.present ? "" : " \u2014 not created yet"}):`,
+        ...report.warning ? [`  \u26A0 ${report.warning}`] : [],
+        ...report.invalid.length ? [`  \u26A0 ignored invalid value(s) for: ${report.invalid.join(", ")}`] : [],
+        ...rows.map(renderRow),
+        "",
+        'Precedence: env var > settings.json > default. Set with /tokenmaxed:config <key> <value>; "clear" removes a stored key. The kill-switch, YOLO, and API keys stay env-only by design. When they apply: hooks and the statusline read settings on every run; the MCP server reads them at session start, so routing flags apply from your NEXT Claude Code session.'
+      ];
+      return ok(lines.join("\n"), { path: report.path, present: report.present, ...report.warning ? { warning: report.warning } : {}, rows });
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
+}
+function receiptLine(r) {
+  const int2 = (n) => Math.round(n).toLocaleString("en-US");
+  const usd2 = (n) => n < 0 ? `-$${Math.abs(n).toFixed(4)}` : `$${n.toFixed(4)}`;
+  const legs = `${r.legs} leg${r.legs === 1 ? "" : "s"}`;
+  return `\u2014 receipt: ${int2(r.tokensIn)} in / ${int2(r.tokensOut)} out tok${r.tokensEstimated ? " (est.)" : ""} \xB7 spent ${usd2(r.spentUsd)} metered \xB7 est. ${usd2(r.meteredAvoidedUsd)} metered avoided \xB7 ${legs}`;
 }
 function renderDelegate(o) {
+  const inferenceFields = o.categoryInferred ? {
+    categoryInferred: true,
+    inferredConfidence: o.inferredConfidence,
+    hint: o.hint
+  } : {};
+  const inferenceText = o.categoryInferred && o.hint ? `
+
+${o.hint}` : "";
+  const receiptText = o.receipt ? `
+
+${receiptLine(o.receipt)}` : "";
+  const receiptFields = o.receipt ? { receipt: o.receipt } : {};
   if (o.native || o.status !== "ok") {
     const why = o.status === "blocked" ? "blocked by policy/minimization (sensitive content stays on the host)" : o.status === "failed" ? `lane failed (${o.failureKind ?? "error"})` : o.reason ?? "no cheaper capable lane available";
     const reasonNote = (o.status === "blocked" || o.status === "failed") && o.reason ? ` \u2014 ${o.reason}` : "";
     const note2 = o.recordingFailed ? " (note: this attempt could not be recorded to the ledger)" : "";
     const taint2 = o.readerDerived ? "\n\n\u26A0\uFE0F reader-derived: any quoted reader output above may include private repo code \u2014 do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts." : "";
-    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}${receiptText}${inferenceText}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
       ...o.reason ? { reason: o.reason } : {},
       ...o.failureKind ? { failureKind: o.failureKind } : {},
       ...o.readerDerived ? { readerDerived: true } : {},
-      ...o.recordingFailed ? { recordingFailed: true } : {}
+      ...o.recordingFailed ? { recordingFailed: true } : {},
+      ...receiptFields,
+      ...inferenceFields
     });
   }
   const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
@@ -26749,22 +28001,40 @@ function renderDelegate(o) {
     return ok(
       `Offloaded to ${lane} \u2014 UNREVIEWED (${o.reason ?? "manager review unavailable"}). Inspect it yourself before using:
 
-${o.resultText ?? ""}${taint}${note}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {} }
+${o.resultText ?? ""}${taint}${note}${receiptText}${inferenceText}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {}, ...receiptFields, ...inferenceFields }
     );
   }
   const how = o.reason ? ` (${o.reason})` : "";
   return ok(`Offloaded to ${lane}${how}. Use this result:
 
-${o.resultText ?? ""}${taint}${note}`, {
+${o.resultText ?? ""}${taint}${note}${receiptText}${inferenceText}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
     status: o.status,
     ...o.reason ? { reason: o.reason } : {},
     ...taintFlag,
-    ...o.recordingFailed ? { recordingFailed: true } : {}
+    ...o.recordingFailed ? { recordingFailed: true } : {},
+    ...receiptFields,
+    ...inferenceFields
   });
+}
+function resolveCategory(core, passedCategory, instruction) {
+  if (passedCategory !== void 0) {
+    return {
+      category: passedCategory,
+      categoryInferred: false
+    };
+  }
+  const c = core.classifyTask(instruction ?? "");
+  const resolvedCategory = c.confidence >= core.MIN_CLASSIFY_CONFIDENCE ? c.category : core.CLASSIFY_FALLBACK_CATEGORY;
+  return {
+    category: resolvedCategory,
+    categoryInferred: true,
+    inferredConfidence: c.confidence,
+    hint: `category inferred as '${resolvedCategory}' (confidence ${c.confidence.toFixed(2)}) \u2014 pass an explicit category for precise routing.`
+  };
 }
 async function dispatch(tools, deps, name, rawArgs) {
   const tool = tools.find((t) => t.name === name);
@@ -26832,7 +28102,7 @@ function writeYolo(store, projectKey, on) {
 
 // ../mcp/src/server.ts
 var DEFAULT_LANES = homeFile("lanes.yaml");
-var DEFAULT_PRICES2 = fileURLToPath5(new URL("../prices.seed.json", import.meta.url));
+var DEFAULT_PRICES2 = fileURLToPath6(new URL("../prices.seed.json", import.meta.url));
 var ID_MISMATCH_TTL_MS = 10 * 6e4;
 function recordableLane(lane, priceTable) {
   if (lane.native || lane.costBasis !== "metered") return true;
@@ -26882,36 +28152,51 @@ function escToOutcome(esc2, modelOf, recordingFailed) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync8(statePath)) return {};
+      if (!existsSync9(statePath)) return {};
       try {
-        return JSON.parse(readFileSync5(statePath, "utf8"));
+        return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
         return {};
       }
     },
     write: (state) => {
-      mkdirSync5(dirname7(statePath), { recursive: true });
-      writeFileSync4(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+      mkdirSync6(dirname8(statePath), { recursive: true });
+      writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
 }
 function filePreferStore(statePath) {
   return {
     read: () => {
-      if (!existsSync8(statePath)) return {};
+      if (!existsSync9(statePath)) return {};
       try {
-        return JSON.parse(readFileSync5(statePath, "utf8"));
+        return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
         return {};
       }
     },
     write: (state) => {
-      mkdirSync5(dirname7(statePath), { recursive: true });
-      writeFileSync4(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+      mkdirSync6(dirname8(statePath), { recursive: true });
+      writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+function receiptFromEvents(events) {
+  const legs = events.filter((e) => e.status !== "native");
+  if (legs.length === 0) return void 0;
+  const receipt = { tokensIn: 0, tokensOut: 0, tokensEstimated: false, spentUsd: 0, meteredAvoidedUsd: 0, legs: legs.length };
+  let deliveredFrontier = 0;
+  for (const e of legs) {
+    receipt.tokensIn += e.tokens_in;
+    receipt.tokensOut += e.tokens_out;
+    receipt.tokensEstimated = receipt.tokensEstimated || e.tokens_estimated;
+    receipt.spentUsd += e.metered_spent;
+    if (e.status === "ok" && e.superseded !== true) deliveredFrontier += e.frontier_cost;
+  }
+  receipt.meteredAvoidedUsd = deliveredFrontier - receipt.spentUsd;
+  return receipt;
+}
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
   const lanesPathExplicit = env.TOKENMAXED_LANES !== void 0;
@@ -26935,7 +28220,30 @@ function makeServerDeps(env = process.env) {
     }
     return out;
   };
-  const buildObserved = () => {
+  const buildCapHeadroom = (lanes) => {
+    try {
+      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanes, Date.now());
+      return Object.keys(map).length > 0 ? map : void 0;
+    } catch {
+      return void 0;
+    }
+  };
+  const quotaDetailFor = (lane) => {
+    try {
+      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), lane, Date.now());
+      const parts = [];
+      const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+      const windowLabel = windowMs === FIVE_HOUR_MS ? "5h" : fmtWindow(windowMs);
+      if (s.window) parts.push(`${windowLabel} ${s.window.count}/${s.window.limit} routed`);
+      if (s.weekRequests) parts.push(`7d ${s.weekRequests.count}/${s.weekRequests.limit} req routed`);
+      if (s.weekTokens) parts.push(`7d ${Math.round(s.weekTokens.count).toLocaleString("en-US")}/${s.weekTokens.limit.toLocaleString("en-US")} tok routed`);
+      return parts.length > 0 ? parts.join(" \xB7 ") : void 0;
+    } catch {
+      return void 0;
+    }
+  };
+  const capabilityPriorFor = (lanes) => loadCapabilityPriorState(env, lanes);
+  const buildObservedByModel = () => {
     if (!learnEnabled) return void 0;
     try {
       return outcomeCapability(new JsonlLedger(ledgerPath).readAll(), Date.now());
@@ -26943,13 +28251,21 @@ function makeServerDeps(env = process.env) {
       return void 0;
     }
   };
+  const buildObservedByModelDifficulty = () => {
+    if (!learnEnabled) return void 0;
+    try {
+      return outcomeCapabilityByDifficulty(new JsonlLedger(ledgerPath).readAll(), Date.now());
+    } catch {
+      return void 0;
+    }
+  };
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
-  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname7(statePath), "prefer.json");
+  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname8(statePath), "prefer.json");
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
   const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
-  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join7(dirname7(statePath), "yolo.json");
+  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join7(dirname8(statePath), "yolo.json");
   const yoloStore = fileToggleStore(yoloStatePath);
   const yoloEnvDefault = (env.TOKENMAXED_YOLO === "true" || env.TOKENMAXED_YOLO === "1") && !globallyDisabled;
   const readYoloState = () => globallyDisabled ? false : readYolo(yoloStore, projectKey, yoloEnvDefault);
@@ -26957,15 +28273,101 @@ function makeServerDeps(env = process.env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync8(lanesPath)) {
+    if (!existsSync9(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
     const priceTable = loadPriceTable(pricesPath);
     return loadLaneConfig(lanesPath).candidateLanes(category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
   };
+  const buildQuotaAlerts = async () => {
+    try {
+      if (!existsSync9(lanesPath)) return [];
+      const registry2 = loadLaneConfig(lanesPath);
+      const events = new JsonlLedger(ledgerPath).readAll();
+      const now = Date.now();
+      const policy = loadPolicySafe();
+      const preferred = readPreferredLane();
+      const alerts = [];
+      for (const cappedLane of registry2.lanes) {
+        const state = laneQuotaState(events, cappedLane, now);
+        const levels = [state.window?.level, state.weekRequests?.level, state.weekTokens?.level];
+        if (!levels.some((l) => l === "warn" || l === "critical")) continue;
+        const detail = quotaDetailFor(cappedLane) ?? "near cap";
+        const forecast = laneDepletionForecast(events, cappedLane, now);
+        const forecastText = forecast ? forecast.confidence === "moderate" ? ` \u2014 est. ${fmtEta(forecast.etaMs)} at routed pace` : " \u2014 approaching cap (routed)" : "";
+        const snapshot = {
+          yolo: readYoloState(),
+          observedByModel: buildObservedByModel(),
+          observedByModelDifficulty: buildObservedByModelDifficulty(),
+          priceTable: loadPriceTable(pricesPath),
+          // The prior snapshot FILE is read once; per-set overlays derive purely.
+          prior: loadCapabilitySnapshotState(env)
+        };
+        const ctxFor = (candidates) => ({
+          lanes: candidates,
+          gateReady,
+          readerEgress,
+          policyContext: {},
+          access_need: "worker-ok",
+          ...snapshot.yolo ? { yolo: true } : {},
+          ...snapshot.observedByModel ? { observedCapabilityByModel: snapshot.observedByModel } : {},
+          ...snapshot.observedByModelDifficulty ? { observedCapabilityByModelDifficulty: snapshot.observedByModelDifficulty } : {},
+          ...(() => {
+            const p = priorStateFromSnapshot(snapshot.prior, candidates);
+            return p.state === "on" ? { capabilityPrior: p.overlay, ...p.stale ? { capabilityPriorStale: true } : {} } : {};
+          })(),
+          ...(() => {
+            const m = quotaHeadroomMap(events, candidates, now);
+            return Object.keys(m).length > 0 ? { capHeadroom: m } : {};
+          })(),
+          ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(candidates, snapshot.priceTable) } : {},
+          ...preferred && preferred !== cappedLane.id ? { preferLaneId: preferred } : {}
+        });
+        const catCounts = /* @__PURE__ */ new Map();
+        for (const e of events) {
+          if (e.event_type === "task" && e.laneId === cappedLane.id && e.status !== "native") {
+            catCounts.set(e.category, (catCounts.get(e.category) ?? 0) + 1);
+          }
+        }
+        const topCats = [...catCounts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([c]) => c).filter((category) => {
+          let full = usableCandidates(category);
+          if (escalateEnabled) full = full.filter((l) => !reservedForReview(l));
+          return full.some((l) => l.id === cappedLane.id) && eligibleLanes({ category }, ctxFor(full), policy).some((e) => e.lane.id === cappedLane.id);
+        }).slice(0, 4);
+        let overflowText = "";
+        if (topCats.length > 0) {
+          const perCat = topCats.map((category) => {
+            let candidates = usableCandidates(category).filter((l) => l.id !== cappedLane.id);
+            if (escalateEnabled) candidates = candidates.filter((l) => !reservedForReview(l));
+            return { category, ctx: ctxFor(candidates) };
+          });
+          const eligibleUnion = /* @__PURE__ */ new Map();
+          for (const { category, ctx } of perCat) {
+            for (const e of eligibleLanes({ category }, ctx, policy)) eligibleUnion.set(e.lane.id, e.lane);
+          }
+          const available = await probeAvailable([...eligibleUnion.values()]);
+          const winnerByCat = /* @__PURE__ */ new Map();
+          for (const { category, ctx } of perCat) {
+            let winner;
+            try {
+              winner = routeDecide({ category }, { ...ctx, availableLaneIds: available }, policy).laneId;
+            } catch {
+              winner = "none (host)";
+            }
+            (winnerByCat.get(winner) ?? winnerByCat.set(winner, []).get(winner)).push(category);
+          }
+          overflowText = ` \xB7 overflow: ${[...winnerByCat.entries()].map(([w, cats]) => `${cats.join("/")} \u2192 ${w}`).join(", ")}`;
+        }
+        alerts.push(`\u26A0 ${cappedLane.id}: ${detail}${forecastText}${overflowText}`);
+      }
+      return alerts;
+    } catch {
+      return [];
+    }
+  };
   const delegate = async (request) => {
-    if (!existsSync8(lanesPath)) {
+    if (!existsSync9(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -26980,7 +28382,9 @@ function makeServerDeps(env = process.env) {
     const ledger = new JsonlLedger(ledgerPath);
     const lanes = registry2.candidateLanes(request.category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
     const modelOf = (laneId) => lanes.find((l) => l.id === laneId)?.model ?? registry2.byId(laneId)?.model;
-    const observedCapability = buildObserved();
+    const observedCapabilityByModel = buildObservedByModel();
+    const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
+    const capHeadroom2 = buildCapHeadroom(lanes);
     const baseCtx = {
       lanes,
       gateReady,
@@ -26996,7 +28400,19 @@ function makeServerDeps(env = process.env) {
       // (the --dangerously-skip-permissions analogue). Read per call so the toggle
       // takes effect without a relaunch; the kill-switch still forces it off.
       ...readYoloState() ? { yolo: true } : {},
-      ...observedCapability ? { observedCapability } : {},
+      ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+      ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+      // B quota pressure: near-cap lanes are deprioritized by scoreLane's
+      // capPenalty; a capped lane can still win when it's the only capable one.
+      ...capHeadroom2 ? { capHeadroom: capHeadroom2 } : {},
+      // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
+      // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
+      // runWithEscalation preserves these through its effective-context spread, so
+      // escalation-target ranking consumes the same prior.
+      ...(() => {
+        const p = capabilityPriorFor(lanes);
+        return p.state === "on" ? { capabilityPrior: p.overlay, ...p.stale ? { capabilityPriorStale: true } : {} } : {};
+      })(),
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(lanes, priceTable) } : {},
       // Universal preferred-lane override: favor this lane when it is an eligible+
@@ -27025,7 +28441,7 @@ function makeServerDeps(env = process.env) {
     const fileResult = request.files?.length ? readRepoFiles(request.files, {
       projectDir: env.CLAUDE_PROJECT_DIR,
       realpath: realpathSync,
-      readFile: (p) => readFileSync5(p, "utf8"),
+      readFile: (p) => readFileSync7(p, "utf8"),
       stat: (p) => {
         const s = statSync2(p);
         return { isFile: s.isFile(), size: s.size };
@@ -27034,10 +28450,24 @@ function makeServerDeps(env = process.env) {
     const taskInput = {
       category: request.category,
       instruction: request.instruction,
+      ...request.difficulty ? { difficulty: request.difficulty } : {},
       ...request.policyContext ? { policyContext: request.policyContext } : {},
       ...fileResult.attachments.length ? { attachments: fileResult.attachments } : {}
     };
     const skippedNote = fileResult.skipped.length > 0 ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join("; ")})` : "";
+    const preferOverrideNoteFor = (laneId, decision) => {
+      if (readPreferredLane() !== laneId) return "";
+      const capPenalty = decision?.scores.find((s) => s.laneId === laneId)?.factors.capPenalty ?? 0;
+      if (!(capPenalty > 0)) return "";
+      const winnerLane = lanes.find((l) => l.id === laneId);
+      const detail = winnerLane ? quotaDetailFor(winnerLane) : void 0;
+      return ` \u26A0 preferred lane overrides quota pressure${detail ? ` (${detail})` : ""}.`;
+    };
+    const withPreferOverrideNote = (outcome, decision) => {
+      const note = preferOverrideNoteFor(outcome.laneId, decision);
+      if (!note) return outcome;
+      return { ...outcome, reason: outcome.reason ? `${outcome.reason}${note}` : note.trim() };
+    };
     if (escalateEnabled) {
       const escDeps = {
         ...runDeps,
@@ -27054,7 +28484,14 @@ function makeServerDeps(env = process.env) {
       } catch {
         escRecordingFailed = true;
       }
-      return withSkippedNote(escToOutcome(esc2, modelOf, escRecordingFailed), skippedNote);
+      const escReceipt = receiptFromEvents(esc2.events.flatMap((e) => e.kind === "task" ? [e.event] : []));
+      return withSkippedNote(
+        withPreferOverrideNote(
+          { ...escToOutcome(esc2, modelOf, escRecordingFailed), ...escReceipt ? { receipt: escReceipt } : {} },
+          esc2.result.decision
+        ),
+        skippedNote
+      );
     }
     const result = await runTask(taskInput, ctx, policy, runDeps);
     let recordingFailed = false;
@@ -27065,17 +28502,24 @@ function makeServerDeps(env = process.env) {
     }
     const resultModel = modelOf(result.laneId);
     return withSkippedNote(
-      {
-        laneId: result.laneId,
-        status: result.status,
-        ...result.native ? { native: true } : {},
-        ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
-        ...resultModel ? { model: resultModel } : {},
-        ...result.failureKind ? { failureKind: result.failureKind } : {},
-        ...result.failureKind === "insufficient_context" ? { reason: `worker handed back (insufficient context): ${result.resultText ?? "needs repo/tool access"} \u2014 host should complete` } : result.decision?.reason ? { reason: result.decision.reason } : {},
-        ...result.readerDerived ? { readerDerived: true } : {},
-        ...recordingFailed ? { recordingFailed: true } : {}
-      },
+      withPreferOverrideNote(
+        {
+          laneId: result.laneId,
+          status: result.status,
+          ...result.native ? { native: true } : {},
+          ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
+          ...resultModel ? { model: resultModel } : {},
+          ...result.failureKind ? { failureKind: result.failureKind } : {},
+          ...result.failureKind === "insufficient_context" ? { reason: `worker handed back (insufficient context): ${result.resultText ?? "needs repo/tool access"} \u2014 host should complete` } : result.decision?.reason ? { reason: result.decision.reason } : {},
+          ...result.readerDerived ? { readerDerived: true } : {},
+          ...recordingFailed ? { recordingFailed: true } : {},
+          ...(() => {
+            const receipt = receiptFromEvents(result.events);
+            return receipt ? { receipt } : {};
+          })()
+        },
+        result.decision
+      ),
       skippedNote
     );
   };
@@ -27092,9 +28536,31 @@ function makeServerDeps(env = process.env) {
     // Same availability probe delegate routes with, so /tokenmaxed:why never
     // advertises a lane that can't run (e.g. a free local lane whose server is down).
     availableLaneIds: probeAvailable,
-    // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
-    // /tokenmaxed:why reflects the effective capability, not the stale prior.
-    observedCapability: buildObserved,
+    // Legacy lane-keyed hook (unused — model overlay is authoritative). Kept so
+    // router_preview callers/tests can still inject a lane-keyed overlay.
+    observedCapability: () => void 0,
+    // F-1/P6: same model-keyed learned overlay delegate routes with (undefined ⇒
+    // declared), so /tokenmaxed:why reflects the effective capability, not the stale prior.
+    observedCapabilityByModel: buildObservedByModel,
+    // P6 §4: same difficulty-conditioned overlay delegate routes with; preview
+    // consults it only when the caller previews a difficulty.
+    observedCapabilityByModelDifficulty: buildObservedByModelDifficulty,
+    // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
+    // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
+    capabilityPrior: capabilityPriorFor,
+    // B: same routed-share headroom map + per-lane detail delegate routes with,
+    // so /tokenmaxed:why shows the identical quota pressure (parity law).
+    capHeadroom: buildCapHeadroom,
+    quotaDetail: quotaDetailFor,
+    // B3/B4: warn/critical alerts + omit-first projection + the overflow plan,
+    // rendered by router_status and appended to router_summary.
+    quotaAlerts: buildQuotaAlerts,
+    // A4: persistent settings (env always wins). NOTE the flag consts above were
+    // captured from the wrapped env at server start, so a /config edit reaches
+    // ROUTING at the next session; hooks/statusline read settings on every run.
+    // The report is honest about that (see the tool's footer text).
+    settings: () => settingsReport(env),
+    setSetting: (key, value) => writeSetting(env, key, value),
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
@@ -27126,12 +28592,12 @@ function makeServerDeps(env = process.env) {
     // Gated egress — only non-blocked, gate-open, keyed api lanes get a /models call
     // (key only, no content); never when routing is globally disabled. Caches results.
     freshness: async () => {
-      if (globallyDisabled || !gateReady || !existsSync8(lanesPath)) return [];
+      if (globallyDisabled || !gateReady || !existsSync9(lanesPath)) return [];
       const registry2 = loadLaneConfig(lanesPath);
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname7(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname8(statePath), "model-freshness.json");
       return reportFreshness(
         eligible,
         {
@@ -27149,12 +28615,12 @@ function makeServerDeps(env = process.env) {
     // (wrong casing / absent) — so a bad id can't silently ship for any provider.
     // CACHE-ONLY (no extra egress); reads the list freshness() just wrote.
     idMismatch: async () => {
-      if (globallyDisabled || !gateReady || !existsSync8(lanesPath)) return [];
+      if (globallyDisabled || !gateReady || !existsSync9(lanesPath)) return [];
       const registry2 = loadLaneConfig(lanesPath);
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname7(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname8(statePath), "model-freshness.json");
       return reportModelIdMismatches(eligible, {
         table: loadPriceTable(pricesPath),
         now: Date.now(),
@@ -27195,7 +28661,7 @@ function createServer(deps) {
   return server;
 }
 async function startStdioServer() {
-  const server = createServer(makeServerDeps());
+  const server = createServer(makeServerDeps(effectiveEnv(process.env)));
   await server.connect(new StdioServerTransport());
 }
 

@@ -20,6 +20,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { preToolUseDecision } from './hook.ts';
+import { effectiveEnv } from './settings.ts';
 import { readEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
 
@@ -31,7 +32,7 @@ function main(): void {
     /* no stdin — fine */
   }
 
-  const env = process.env;
+  const env = effectiveEnv(process.env);
   const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join(env.CLAUDE_PLUGIN_DATA, 'state.json') : '');
   const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? 'default';
   const disabledByEnv = env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true';

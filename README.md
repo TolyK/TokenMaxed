@@ -62,8 +62,8 @@ packages/
 machine to a TokenMaxed-hosted backend. Downstream model lanes receive only
 minimized, policy-gated payloads.* The local event log is content-free by
 construction (integers, enums, model ids — never text), which is also what lets
-an optional web dashboard be added later as a pure forwarder, with zero schema
-changes and nothing new leaving the machine.
+the local dashboard (`tokenmaxed dashboard`) be a pure forwarder — zero schema
+changes and nothing leaving the machine.
 
 ## Requirements
 
@@ -120,6 +120,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:why <category>` | preview which lane would handle a category — nothing runs |
 | `/tokenmaxed:review` | manager review of your current working-tree changes |
 | `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
+| `/tokenmaxed:config [key] [value\|clear]` | show or persist the feature settings (`~/.tokenmaxed/settings.json`) — the durable alternative to launch-time env flags. An env var always overrides a stored setting; the kill-switch, YOLO, and API keys stay env-only. Hooks/statusline apply changes on their next run; routing flags apply at the next session. |
 | `/tokenmaxed:prefer <lane>` · `/tokenmaxed:prefer off` | temporarily favor one configured lane (any vendor, CLI or API) over normal routing — e.g. to push a sprint's work to a cheaper subscription while another's credits run low; clears with `off`. Honored only when that lane is eligible, available, and capable for the task (else it falls back to normal routing). Persisted per project; no relaunch. |
 | `/tokenmaxed:yolo` · `/tokenmaxed:yolo off` | **⚠️ dangerous** — turn YOLO mode on/off for this project (the `--dangerously-skip-permissions` analogue); see **YOLO mode** under optional features below. |
 
@@ -146,6 +147,13 @@ minimizer, so the lane copies real values instead of inventing them. Private-rep
 files only reach a **reader**-trust lane with reader egress enabled; otherwise
 they're dropped and the reply says which and why. Still review offloaded output —
 visibility fixes facts, not logic.
+
+Every delegation that ran one or more lane legs returns an inline **receipt** —
+tokens in/out (estimates labeled), real metered dollars spent, the estimated
+metered dollars avoided, and how many legs ran (rework/escalation legs included;
+a failed offload's spend is never hidden) — so you see what each offload cost
+and saved as it happens, not only in the reports. (A delegation that never ran
+a lane — e.g. routing degraded straight to native — has nothing to receipt.)
 
 **Tandem routing (worker-first, full-access lane steps in for repo-tight work).**
 Some subtasks genuinely need live repo/tool/shell access — running the test suite,
@@ -204,9 +212,12 @@ gate is needed only for API/BYOK egress.
 Typing the env flags and `--plugin-dir` every launch gets old. Two pieces make
 it a one-word command:
 
-**1. Persist the env flags in your Claude Code settings** (`~/.claude/settings.json`)
-so they're always on and never typed. This file is **strict JSON** — no comments —
-so add just the `env` keys:
+**1. Persist the flags.** The simplest way is TokenMaxed's own settings file —
+run `/tokenmaxed:config gate_ready true` (and any other flag) once and it's
+stored in `~/.tokenmaxed/settings.json`; env vars still override per launch.
+Alternatively, persist them as env vars in your Claude Code settings
+(`~/.claude/settings.json`). That file is **strict JSON** — no comments — so
+add just the `env` keys:
 
 ```json
 {
@@ -315,6 +326,18 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     constraint: **CLI** lanes can only be `full` (or `blocked`); `worker`/`reader`
     are **API/BYOK-only** (the certified executors are HTTP). So a CLI vendor is
     full-or-nothing, while an API vendor can be `worker`/`reader`/`full`.
+  - **Plugin-backed CLI lanes (Grok, Antigravity)** — installed as Claude Code
+    plugins (`grok-plugin-cc`, `antigravity-plugin-cc`), xAI Grok and Google
+    Antigravity (Gemini) route like Codex: full-trust subscription CLI lanes, with
+    token usage *estimated* (CLIs don't report exact counts). **Grok** ships enabled
+    as a worker-only offload — availability-gated on the `grok` CLI, so `full` is safe
+    by default; it never reviews. **Antigravity** is a worker *and* reviewer (a
+    fallback after Codex in file order) but ships `blocked` in the templates because it
+    must run through the plugin's companion script (it needs a PTY for headless output)
+    at a machine-specific path — set `command`/`args` to that companion and flip to
+    `full` to enable (see the `lanes.example.yaml` comments). Grok takes its prompt as
+    an argv arg via the `{prompt}` placeholder; the Antigravity companion reads it from
+    stdin via `--stdin`.
   - **Tiered routing (start cheap, step up)** — enable with `TOKENMAXED_TIERED=true`.
     Instead of maximizing capability, routing picks the **cheapest lane whose
     *effective* capability clears a floor** (`TOKENMAXED_TIER_FLOOR`, default 0.6;
@@ -346,6 +369,49 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     are comfortable sending to every lane you've configured.
   - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
     regardless of the flags above (including YOLO mode).
+
+### Quota brain (never hit your weekly cap blind)
+
+Declare what your plans actually enforce on any lane (all optional; see
+`config/lanes.example.yaml`): `requests_per_window` (rolling 5h by default,
+`window_ms` to override), `requests_per_week`, and/or `tokens_per_week`. Then:
+
+- **Routing pressure** — as a lane's ROUTED share of its quota fills, routing
+  deprioritizes it (warn at 70% used, critical at 90%); a capped lane can still
+  win when it's the only capable one, and `/tokenmaxed:why` explains every
+  quota-affected pick. An explicit `/tokenmaxed:prefer` deliberately overrides
+  the pressure — loudly, never silently.
+- **Honest depletion estimates** — a rolling-window-correct projection (it
+  models consumption expiring out of the window, so a stable pace never fakes
+  a depletion) that renders only with enough evidence: `est. ~2d at routed
+  pace`, or just "approaching cap" when confidence is low, `now` when you're
+  there. Never a calendar timestamp.
+- **Overflow plans** — `/tokenmaxed:status` and `/tokenmaxed:summary` show,
+  per near-cap lane, where its top categories would route with it excluded:
+  `near cap: codex-cli — overflow: bugfix/codegen → claude-cli, docs → glm-api`.
+
+Everything is labeled the **routed share**: TokenMaxed only sees what it
+routed, so counts are floors on real usage, never totals — consistent with the
+honest-accounting law.
+
+### Statusline quota gauge (optional)
+
+A one-line, always-visible gauge for Claude Code's status bar: estimated metered
+dollars avoided (last 7 days) plus the tightest routed-5h request window among
+lanes that declare `requests_per_window` (⚠ at 70% used, 🛑 at 90%). It reads
+only the local lanes + content-free ledger — no probes, no network — and fails
+silent, so it can never wedge the status bar. The 5h count is the **routed**
+share of the window (ledger-only), never claimed as your total subscription
+usage. Wire it up in `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node /ABS/PATH/TO/packages/plugin/statusline.mjs"
+  }
+}
+```
 
 ### Model freshness (never silently run a stale model)
 
@@ -429,8 +495,8 @@ console.log(`${decision.laneId} — ${decision.reason}`);
 ```
 
 `routeDecide` is pure and deterministic: the same inputs always pick the same
-lane, and `decision.scores` shows how every candidate ranked (useful for a
-future `why` command).
+lane, and `decision.scores` shows how every candidate ranked — exactly what
+`/tokenmaxed:why` renders.
 
 ### 4. See your savings and token usage (CLI)
 
@@ -441,8 +507,13 @@ ledger (`~/.tokenmaxed/ledger.jsonl` by default) and reports on it:
 npx tokenmaxed savings              # actual spend + metered $ avoided (headline) + baseline context + tokens
 npx tokenmaxed tokens --by lane     # full per-lane token breakdown (--by model is the default)
 npx tokenmaxed outcomes             # manager-review verdicts (pass/needs-rework/fail) + success rate per lane
+npx tokenmaxed leaderboard          # real-usage per-model leaderboard (× category × difficulty), honest N
+npx tokenmaxed leaderboard --html --open  # the same as a self-contained page (local view; nothing uploaded)
+npx tokenmaxed dashboard --open     # the local dashboard: savings tiles, quota meters + forecasts,
+                                    #   leaderboard, outcomes, recent offloads — ONE self-contained HTML
+                                    #   file from your content-free ledger; no server, no network
 npx tokenmaxed lanes                # your configured lanes: trust mode, autonomy, roles, manager eligibility
-npx tokenmaxed savings --period 7d  # any command takes --period all|Nd|Nh
+npx tokenmaxed savings --period 7d  # report commands take --period all|Nd|Nh
 npx tokenmaxed help                 # full usage
 ```
 

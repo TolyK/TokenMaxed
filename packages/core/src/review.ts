@@ -11,8 +11,16 @@
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
 import { declaredCapabilityFor, isManagerEligible, isSelectablePreGate } from './route.ts';
+import { parseModelAlias } from './model-freshness.ts';
 import type { OutcomeEventInput, ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, TaskCategory } from './types.ts';
+
+/** Canonical model key for learning: concrete ids pass through; unresolved `@latest` aliases stay as-is. */
+function canonicalizeModelKey(model: string): string {
+  const spec = parseModelAlias(model);
+  if (spec.latest) return model.trim();
+  return spec.id;
+}
 
 /** What the injected manager model returns after looking at the content. */
 export interface ManagerReviewOutput {
@@ -107,6 +115,8 @@ export async function review(request: ReviewRequest, deps: ReviewDeps): Promise<
   if (request.subjectLane) {
     event.subject_lane_id = request.subjectLane.id;
     event.subject_provenance = request.subjectLane.provenance;
+    event.subject_model = request.subjectLane.model;
+    event.subject_model_resolved = canonicalizeModelKey(request.subjectLane.model);
   }
 
   const result: ReviewResult = { verdict: out.verdict, event };

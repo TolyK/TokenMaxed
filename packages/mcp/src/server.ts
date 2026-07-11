@@ -12,6 +12,7 @@
  *   - lanes:  TOKENMAXED_LANES   (default ~/.tokenmaxed/lanes.yaml)
  *   - policy: TOKENMAXED_POLICY  (default ~/.tokenmaxed/policy.yaml)
  *   - prices: TOKENMAXED_PRICES  (default config/prices.seed.json)
+ *   - capability snapshot: TOKENMAXED_CAPABILITY_SNAPSHOT (default capability-snapshot.v1.json)
  *   - ledger: TOKENMAXED_LEDGER  (default ~/.tokenmaxed/ledger.jsonl)
  *   - state:  TOKENMAXED_STATE   (toggle file; default ~/.tokenmaxed/state.json)
  *   - project key: TOKENMAXED_PROJECT (default "default")
@@ -35,8 +36,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, routeDecide, runTask, runWithEscalation, summarize, tokenStats } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByLane, PriceTable, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -52,6 +53,8 @@ import {
 } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
+import { loadCapabilityPriorState, loadCapabilitySnapshotState, priorStateFromSnapshot } from './capability-prior-load.ts';
+import { effectiveEnv, settingsReport, writeSetting } from './settings.ts';
 import { reportFreshness, reportModelIdMismatches } from './freshness-report.ts';
 import { readRepoFiles } from './read-files.ts';
 import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
@@ -59,6 +62,7 @@ import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { REVIEW_BUDGET_MS, makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
+import { fmtEta, fmtWindow } from './summary.ts';
 import { runReviewWithBudget } from './review-budget.ts';
 import { runSetup } from './setup.ts';
 import { createTools, dispatch } from './tools.ts';
@@ -67,7 +71,7 @@ import type { ToggleStore } from './toggle.ts';
 import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
 import { readYolo, writeYolo } from './yolo.ts';
-import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
+import type { CorePort, DelegateOutcome, DelegateReceipt, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
 
 // User-owned (NOT repo-controlled) — see the SECURITY note above. HOME_TM and the
 // auth/spawn helpers come from config.ts so they have one shared definition.
@@ -188,7 +192,32 @@ function filePreferStore(statePath: string): PreferStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES };
+const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+
+/**
+ * A3: aggregate the recorded task legs into the content-free receipt rendered
+ * with every delegation result. MIRRORS `summarize()`'s honest net exactly
+ * (ledger.ts): `native` breadcrumbs are not legs (nothing ran, zero spend); the
+ * savings baseline counts only DELIVERED (`status: 'ok'`, non-superseded) legs;
+ * metered spend counts over ALL legs (failed/superseded included) — so avoided
+ * can be ≤ 0 when a discarded/failed attempt cost real money, and the receipt
+ * can never disagree with /tokenmaxed:savings over the same events.
+ */
+export function receiptFromEvents(events: readonly TaskEventInput[]): DelegateReceipt | undefined {
+  const legs = events.filter((e) => e.status !== 'native');
+  if (legs.length === 0) return undefined;
+  const receipt: DelegateReceipt = { tokensIn: 0, tokensOut: 0, tokensEstimated: false, spentUsd: 0, meteredAvoidedUsd: 0, legs: legs.length };
+  let deliveredFrontier = 0;
+  for (const e of legs) {
+    receipt.tokensIn += e.tokens_in;
+    receipt.tokensOut += e.tokens_out;
+    receipt.tokensEstimated = receipt.tokensEstimated || e.tokens_estimated;
+    receipt.spentUsd += e.metered_spent;
+    if (e.status === 'ok' && e.superseded !== true) deliveredFrontier += e.frontier_cost;
+  }
+  receipt.meteredAvoidedUsd = deliveredFrontier - receipt.spentUsd;
+  return receipt;
+}
 
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
@@ -239,13 +268,57 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // learned adjustment (no /why-vs-run divergence). Built from the ledger + clock
   // the adapter owns; undefined when learning is off. Lazy per call (cheap: local
   // JSONL, opt-in).
-  const buildObserved = (): ObservedCapabilityByLane | undefined => {
+  // B quota brain: the routed-share headroom map (RouteContext.capHeadroom).
+  // Fail-open; an EMPTY map is returned as undefined so a config with no quota
+  // fields anywhere stays byte-identical (zero-change-when-absent).
+  const buildCapHeadroom = (lanes: readonly Lane[]): Record<string, number> | undefined => {
+    try {
+      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanes, Date.now());
+      return Object.keys(map).length > 0 ? map : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  // B: one compact, content-free detail string per quota-configured lane (counts
+  // are the ROUTED share — the label says so) for /why and the override warning.
+  const quotaDetailFor = (lane: Lane): string | undefined => {
+    try {
+      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), lane, Date.now());
+      const parts: string[] = [];
+      // Honest labeling: say the CONFIGURED window, not "5h", when overridden.
+      const windowMs = typeof lane.window_ms === 'number' && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+      const windowLabel = windowMs === FIVE_HOUR_MS ? '5h' : fmtWindow(windowMs);
+      if (s.window) parts.push(`${windowLabel} ${s.window.count}/${s.window.limit} routed`);
+      if (s.weekRequests) parts.push(`7d ${s.weekRequests.count}/${s.weekRequests.limit} req routed`);
+      if (s.weekTokens) parts.push(`7d ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok routed`);
+      return parts.length > 0 ? parts.join(' · ') : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  // P2 rankings prior — ONE loader (capability-prior-load.ts) shared by delegate,
+  // preview, and status so every surface reports/routes the same posture. Loaded
+  // per call (like prices) so snapshot edits apply without a restart. Fail-open:
+  // off/error ⇒ no ctx fields ⇒ declared priors, byte-identical scores.
+  const capabilityPriorFor = (lanes: readonly Lane[]) => loadCapabilityPriorState(env, lanes);
+  const buildObservedByModel = (): ObservedCapabilityByModel | undefined => {
     if (!learnEnabled) return undefined;
     // Fail OPEN: a malformed/unreadable ledger must never block routing (mirrors
     // the best-effort recording path). On any read/parse error, fall back to
     // declared capability by returning undefined.
     try {
       return outcomeCapability(new JsonlLedger(ledgerPath).readAll(), Date.now());
+    } catch {
+      return undefined;
+    }
+  };
+  // P6 §4: the difficulty-conditioned sibling — same learn gate, same fail-open.
+  // Consulted by core only for a difficulty-tagged task (explicit on the request,
+  // or an escalation leg), so its presence alone never changes routing.
+  const buildObservedByModelDifficulty = (): ObservedCapabilityByModelDifficulty | undefined => {
+    if (!learnEnabled) return undefined;
+    try {
+      return outcomeCapabilityByDifficulty(new JsonlLedger(ledgerPath).readAll(), Date.now());
     } catch {
       return undefined;
     }
@@ -313,6 +386,127 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
   };
 
+  // B3/B4 — quota alerts with an overflow plan (plan §1.5 context contract):
+  // one line per warn/critical lane: routed-share detail, an omit-first
+  // projection, and the per-category overflow winners computed by re-running
+  // routeDecide with the capped lane EXCLUDED under the EXACT preview posture
+  // (same policy/gates/overlays/prior/tiered/headroom; preference dropped only
+  // when it names the excluded lane; ONE availability probe reused across
+  // categories). Pure preview — nothing executes. Fail-open to [].
+  const buildQuotaAlerts = async (): Promise<string[]> => {
+    try {
+      if (!existsSync(lanesPath)) return [];
+      const registry = loadLaneConfig(lanesPath);
+      const events = new JsonlLedger(ledgerPath).readAll();
+      const now = Date.now();
+      const policy = loadPolicySafe();
+      const preferred = readPreferredLane();
+      const alerts: string[] = [];
+      for (const cappedLane of registry.lanes) {
+        const state = laneQuotaState(events, cappedLane, now);
+        const levels = [state.window?.level, state.weekRequests?.level, state.weekTokens?.level];
+        if (!levels.some((l) => l === 'warn' || l === 'critical')) continue;
+        const detail = quotaDetailFor(cappedLane) ?? 'near cap';
+        const forecast = laneDepletionForecast(events, cappedLane, now);
+        const forecastText = forecast
+          ? forecast.confidence === 'moderate'
+            ? ` — est. ${fmtEta(forecast.etaMs)} at routed pace`
+            : ' — approaching cap (routed)'
+          : '';
+        // ONE posture snapshot shared by eligibility, the availability probe, and
+        // every routeDecide (plan §1.5 contract — the probe and the winners must
+        // never be computed under different postures).
+        const snapshot = {
+          yolo: readYoloState(),
+          observedByModel: buildObservedByModel(),
+          observedByModelDifficulty: buildObservedByModelDifficulty(),
+          priceTable: loadPriceTable(pricesPath),
+          // The prior snapshot FILE is read once; per-set overlays derive purely.
+          prior: loadCapabilitySnapshotState(env),
+        };
+        const ctxFor = (candidates: Lane[]): RouteContext => ({
+          lanes: candidates,
+          gateReady,
+          readerEgress,
+          policyContext: {},
+          access_need: 'worker-ok',
+          ...(snapshot.yolo ? { yolo: true } : {}),
+          ...(snapshot.observedByModel ? { observedCapabilityByModel: snapshot.observedByModel } : {}),
+          ...(snapshot.observedByModelDifficulty ? { observedCapabilityByModelDifficulty: snapshot.observedByModelDifficulty } : {}),
+          ...((): Partial<RouteContext> => {
+            const p = priorStateFromSnapshot(snapshot.prior, candidates); // pure over the captured snapshot
+            return p.state === 'on' ? { capabilityPrior: p.overlay, ...(p.stale ? { capabilityPriorStale: true } : {}) } : {};
+          })(),
+          ...((): Partial<RouteContext> => {
+            const m = quotaHeadroomMap(events, candidates, now); // same events snapshot
+            return Object.keys(m).length > 0 ? { capHeadroom: m } : {};
+          })(),
+          ...(tieredStrategy === 'tiered'
+            ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(candidates, snapshot.priceTable) }
+            : {}),
+          ...(preferred && preferred !== cappedLane.id ? { preferLaneId: preferred } : {}),
+        });
+        // Top routed categories for THIS lane (ledger counts; deterministic
+        // tiebreak), then FILTERED to categories where the capped lane is
+        // CURRENTLY eligible under the same posture (plan: "its categories" =
+        // eligible with positive effective capability NOW — candidateLanes
+        // already excludes declared-0, and no overlay can resurrect a 0).
+        const catCounts = new Map<TaskCategory, number>();
+        for (const e of events) {
+          if (e.event_type === 'task' && e.laneId === cappedLane.id && e.status !== 'native') {
+            catCounts.set(e.category, (catCounts.get(e.category) ?? 0) + 1);
+          }
+        }
+        const topCats = [...catCounts.entries()]
+          .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+          .map(([c]) => c)
+          .filter((category) => {
+            // The REAL preview posture, including the escalation reviewer
+            // reservation — a lane reserved as the review manager is not an
+            // initial-routing candidate, so it acquires no overflow categories.
+            let full = usableCandidates(category);
+            if (escalateEnabled) full = full.filter((l) => !reservedForReview(l));
+            return (
+              full.some((l) => l.id === cappedLane.id) &&
+              eligibleLanes({ category }, ctxFor(full), policy).some((e) => e.lane.id === cappedLane.id)
+            );
+          })
+          .slice(0, 4);
+        let overflowText = '';
+        if (topCats.length > 0) {
+          // Build each reduced per-category context ONCE and reuse it for both
+          // the eligibility union and the final decide (contract).
+          const perCat = topCats.map((category) => {
+            let candidates = usableCandidates(category).filter((l) => l.id !== cappedLane.id);
+            if (escalateEnabled) candidates = candidates.filter((l) => !reservedForReview(l));
+            return { category, ctx: ctxFor(candidates) };
+          });
+          // ONE availability probe over the union of eligible lanes (contract).
+          const eligibleUnion = new Map<string, Lane>();
+          for (const { category, ctx } of perCat) {
+            for (const e of eligibleLanes({ category }, ctx, policy)) eligibleUnion.set(e.lane.id, e.lane);
+          }
+          const available = await probeAvailable([...eligibleUnion.values()]);
+          const winnerByCat = new Map<string, TaskCategory[]>();
+          for (const { category, ctx } of perCat) {
+            let winner: string;
+            try {
+              winner = routeDecide({ category }, { ...ctx, availableLaneIds: available }, policy).laneId;
+            } catch {
+              winner = 'none (host)';
+            }
+            (winnerByCat.get(winner) ?? winnerByCat.set(winner, []).get(winner)!).push(category);
+          }
+          overflowText = ` · overflow: ${[...winnerByCat.entries()].map(([w, cats]) => `${cats.join('/')} → ${w}`).join(', ')}`;
+        }
+        alerts.push(`⚠ ${cappedLane.id}: ${detail}${forecastText}${overflowText}`);
+      }
+      return alerts;
+    } catch {
+      return []; // fail open — alerts are advisory, never load-bearing
+    }
+  };
+
   const delegate = async (request: DelegateRequest): Promise<DelegateOutcome> => {
     // No DEFAULT lane config yet ⇒ nothing to route to; do it on the host and tell
     // the user how to set up, rather than erroring. But an EXPLICIT missing path is
@@ -341,10 +535,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // the resolved lane set wins; fall back to the registry for ids not in it (native).
     const modelOf = (laneId: string): string | undefined =>
       lanes.find((l) => l.id === laneId)?.model ?? registry.byId(laneId)?.model;
-    // F-1: apply the learned overlay (undefined when off ⇒ declared scores). The
-    // core selectors read ctx.observedCapability; runWithEscalation preserves it
-    // through its effective-context spread, so escalation/reassign also benefit.
-    const observedCapability = buildObserved();
+    // F-1/P6: apply the model-keyed learned overlay (undefined when off ⇒ declared
+    // scores). Core selectors read ctx.observedCapabilityByModel; runWithEscalation
+    // preserves it through its effective-context spread, so escalation/reassign benefit.
+    const observedCapabilityByModel = buildObservedByModel();
+    const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
+    // B: routed-share quota headroom (undefined when no lane configures quotas).
+    const capHeadroom = buildCapHeadroom(lanes);
     // Exclude lanes that can't run now (e.g. Ollama down) so routing never picks an
     // unavailable lane on cost; threads through runTask/runWithEscalation to
     // routeDecide + canReassign. Empty ⇒ no candidate ⇒ runTask degrades to native.
@@ -365,7 +562,21 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // (the --dangerously-skip-permissions analogue). Read per call so the toggle
       // takes effect without a relaunch; the kill-switch still forces it off.
       ...(readYoloState() ? { yolo: true } : {}),
-      ...(observedCapability ? { observedCapability } : {}),
+      ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+      ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
+      // B quota pressure: near-cap lanes are deprioritized by scoreLane's
+      // capPenalty; a capped lane can still win when it's the only capable one.
+      ...(capHeadroom ? { capHeadroom } : {}),
+      // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
+      // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
+      // runWithEscalation preserves these through its effective-context spread, so
+      // escalation-target ranking consumes the same prior.
+      ...((): Partial<RouteContext> => {
+        const p = capabilityPriorFor(lanes);
+        return p.state === 'on'
+          ? { capabilityPrior: p.overlay, ...(p.stale ? { capabilityPriorStale: true } : {}) }
+          : {};
+      })(),
       // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
       ...(tieredStrategy === 'tiered'
         ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(lanes, priceTable) }
@@ -421,6 +632,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const taskInput = {
       category: request.category,
       instruction: request.instruction,
+      ...(request.difficulty ? { difficulty: request.difficulty } : {}),
       ...(request.policyContext ? { policyContext: request.policyContext } : {}),
       ...(fileResult.attachments.length ? { attachments: fileResult.attachments } : {}),
     };
@@ -430,6 +642,24 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       fileResult.skipped.length > 0
         ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join('; ')})`
         : '';
+
+    // B (plan §1.3): preference deliberately OVERRIDES quota pressure — make the
+    // override loud rather than silent, on BOTH the plain and escalation paths.
+    // Detection mirrors core exactly by reading the decision's ACTUAL capPenalty
+    // factor (no threshold/epsilon duplication).
+    const preferOverrideNoteFor = (laneId: string, decision: { scores: readonly { laneId: string; factors: { capPenalty: number } }[] } | undefined): string => {
+      if (readPreferredLane() !== laneId) return '';
+      const capPenalty = decision?.scores.find((s) => s.laneId === laneId)?.factors.capPenalty ?? 0;
+      if (!(capPenalty > 0)) return '';
+      const winnerLane = lanes.find((l) => l.id === laneId);
+      const detail = winnerLane ? quotaDetailFor(winnerLane) : undefined;
+      return ` ⚠ preferred lane overrides quota pressure${detail ? ` (${detail})` : ''}.`;
+    };
+    const withPreferOverrideNote = (outcome: DelegateOutcome, decision: Parameters<typeof preferOverrideNoteFor>[1]): DelegateOutcome => {
+      const note = preferOverrideNoteFor(outcome.laneId, decision);
+      if (!note) return outcome;
+      return { ...outcome, reason: outcome.reason ? `${outcome.reason}${note}` : note.trim() };
+    };
 
     // C-13 (opt-in): offload → review → escalate/rework/give_back. The manager
     // runs via the same trusted executor (core restricts managers to marginal-free
@@ -457,7 +687,14 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       } catch {
         escRecordingFailed = true;
       }
-      return withSkippedNote(escToOutcome(esc, modelOf, escRecordingFailed), skippedNote);
+      const escReceipt = receiptFromEvents(esc.events.flatMap((e) => (e.kind === 'task' ? [e.event] : [])));
+      return withSkippedNote(
+        withPreferOverrideNote(
+          { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
+          esc.result.decision,
+        ),
+        skippedNote,
+      );
     }
 
     const result = await runTask(taskInput, ctx, policy, runDeps);
@@ -469,7 +706,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     }
     const resultModel = modelOf(result.laneId);
     return withSkippedNote(
-      {
+      withPreferOverrideNote(
+        {
         laneId: result.laneId,
         status: result.status,
         ...(result.native ? { native: true } : {}),
@@ -483,7 +721,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
             : {}),
         ...(result.readerDerived ? { readerDerived: true } : {}),
         ...(recordingFailed ? { recordingFailed: true } : {}),
-      },
+        ...((): { receipt?: DelegateReceipt } => {
+          const receipt = receiptFromEvents(result.events);
+          return receipt ? { receipt } : {};
+        })(),
+        },
+        result.decision,
+      ),
       skippedNote,
     );
   };
@@ -501,9 +745,31 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Same availability probe delegate routes with, so /tokenmaxed:why never
     // advertises a lane that can't run (e.g. a free local lane whose server is down).
     availableLaneIds: probeAvailable,
-    // F-1: same learned overlay delegate routes with (undefined ⇒ declared), so
-    // /tokenmaxed:why reflects the effective capability, not the stale prior.
-    observedCapability: buildObserved,
+    // Legacy lane-keyed hook (unused — model overlay is authoritative). Kept so
+    // router_preview callers/tests can still inject a lane-keyed overlay.
+    observedCapability: () => undefined,
+    // F-1/P6: same model-keyed learned overlay delegate routes with (undefined ⇒
+    // declared), so /tokenmaxed:why reflects the effective capability, not the stale prior.
+    observedCapabilityByModel: buildObservedByModel,
+    // P6 §4: same difficulty-conditioned overlay delegate routes with; preview
+    // consults it only when the caller previews a difficulty.
+    observedCapabilityByModelDifficulty: buildObservedByModelDifficulty,
+    // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
+    // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
+    capabilityPrior: capabilityPriorFor,
+    // B: same routed-share headroom map + per-lane detail delegate routes with,
+    // so /tokenmaxed:why shows the identical quota pressure (parity law).
+    capHeadroom: buildCapHeadroom,
+    quotaDetail: quotaDetailFor,
+    // B3/B4: warn/critical alerts + omit-first projection + the overflow plan,
+    // rendered by router_status and appended to router_summary.
+    quotaAlerts: buildQuotaAlerts,
+    // A4: persistent settings (env always wins). NOTE the flag consts above were
+    // captured from the wrapped env at server start, so a /config edit reaches
+    // ROUTING at the next session; hooks/statusline read settings on every run.
+    // The report is honest about that (see the tool's footer text).
+    settings: () => settingsReport(env),
+    setSetting: (key, value) => writeSetting(env, key, value),
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
@@ -619,6 +885,8 @@ export function createServer(deps: ToolDeps): Server {
 
 /** Start the server over stdio. Called by the bin entry. */
 export async function startStdioServer(): Promise<void> {
-  const server = createServer(makeServerDeps());
+  // A4: settings.json fills unset flag vars at the PROCESS entrypoint only —
+  // an injected test env is never silently mixed with a developer's real file.
+  const server = createServer(makeServerDeps(effectiveEnv(process.env)));
   await server.connect(new StdioServerTransport());
 }

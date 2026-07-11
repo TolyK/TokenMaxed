@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "prices.seed.json",
+    "capability-snapshot.v1.json",
     "lanes.starter.yaml",
     "policy.starter.yaml"
   ],

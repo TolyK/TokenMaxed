@@ -13,7 +13,18 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { filterEventsSince, resolveLaneModel, staleAgainstPriceTable, summarize, tokenStats } from '@tokenmaxed/core';
+import {
+  filterEventsSince,
+  requestsInWindow,
+  resolveLaneModel,
+  laneDepletionForecast,
+  laneQuotaState,
+  staleAgainstPriceTable,
+  summarize,
+  tokenStats,
+  windowLevel,
+  windowUsedFraction,
+} from '@tokenmaxed/core';
 import type { PriceTable } from '@tokenmaxed/core';
 import { JsonlLedger, loadLaneConfig, loadPriceTable, readCliUsageByModel } from '@tokenmaxed/core/node';
 
@@ -65,6 +76,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
   // SETUP-1 B: lane-review state — same key + path setup uses, so the hint matches.
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? 'default';
   const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join(dirname(statePath), 'lane-review.json');
+  const meteredKeyWarning = !!(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
 
   return async () => {
     const lanes = existsSync(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
@@ -135,7 +147,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
-      core: { summarize, tokenStats, filterEventsSince },
+      core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel, laneDepletionForecast, laneQuotaState },
       selectManager: selectManagerLane,
       staleness,
       laneReview,
@@ -143,6 +155,7 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
       // per-lane counts. Best-effort: readCliUsageByModel fails open to {} so the
       // summary never breaks if transcripts are unreadable.
       cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR),
+      meteredKeyWarning,
     });
   };
 }

@@ -48,6 +48,34 @@ export function commandOnPath(command: string, path: string | undefined): boolea
   return dirs.some((dir) => isExecutableFile(join(dir, command)));
 }
 
+/** An existing regular file (not necessarily executable — node runs scripts that aren't +x)? */
+function regularFileExists(candidate: string): boolean {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * For a `node <script.mjs> …` CLI lane (e.g. the antigravity companion), the `command`
+ * being runnable (`node` on PATH) is NOT enough — the SCRIPT it runs must also exist, or
+ * the lane spawns `node <missing/placeholder path>` and fails. So when the command is a
+ * node runtime, require the first script-looking arg (an absolute/relative `.mjs`/`.js`
+ * path, not a flag) to be a real file. This makes a template's `<ABSOLUTE-PATH-TO>/…`
+ * placeholder — or a stale post-upgrade companion path — correctly report unavailable.
+ * Lanes that aren't node-runners (codex, grok, claude, …) are unaffected.
+ */
+function nodeScriptArgPresent(lane: Lane): boolean {
+  const base = (lane.command ?? '').split('/').pop();
+  if (base !== 'node') return true; // not a node-runner lane — nothing extra to validate
+  const scriptArg = (lane.args ?? []).find(
+    (a) => !a.startsWith('-') && (a.endsWith('.mjs') || a.endsWith('.js')),
+  );
+  if (scriptArg === undefined) return true; // no script arg declared — leave it to the spawn
+  return regularFileExists(scriptArg);
+}
+
 /** Quick reachability check for a local (Ollama) endpoint. Any non-error response ⇒ up. */
 async function localReachable(base: string, fetchImpl: FetchLike | undefined): Promise<boolean> {
   if (!fetchImpl) return false;
@@ -76,7 +104,7 @@ export interface AvailabilityDeps {
 /** Whether a single lane is available to run now. */
 export async function isLaneAvailable(lane: Lane, deps: AvailabilityDeps): Promise<boolean> {
   if (lane.native) return true;
-  if (lane.kind === 'cli') return commandOnPath(lane.command ?? '', deps.path);
+  if (lane.kind === 'cli') return commandOnPath(lane.command ?? '', deps.path) && nodeScriptArgPresent(lane);
   if (lane.kind === 'local') return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
   if (lane.kind === 'api') return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
   return false; // unknown kind ⇒ fail closed (not selectable)

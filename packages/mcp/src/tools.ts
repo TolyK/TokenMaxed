@@ -15,14 +15,20 @@
 import type {
   AccessNeed,
   AccessNeedInput,
+  CapabilityPriorOverlay,
+  DifficultyBucket,
   LedgerEvent,
   LedgerSummary,
   Lane,
   ObservedCapabilityByLane,
+  ObservedCapabilityByModel,
+  ObservedCapabilityByModelDifficulty,
   Policy,
   PolicyContext,
   PolicyDecision,
   RepoClass,
+  ResolvedPrior,
+  ResolvedPriorOptions,
   RouteContext,
   RouteDecision,
   Sensitivity,
@@ -36,6 +42,7 @@ import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshn
 import type { ModelIdMismatchWarning, StalenessWarning } from './freshness-report.ts';
 import { formatLaneSetup } from './lane-setup.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
+import type { SettingKey, SettingsReport } from './settings.ts';
 import { formatSummaryBanner } from './summary.ts';
 import type { SummaryData } from './summary.ts';
 
@@ -52,7 +59,39 @@ export interface CorePort {
   evaluate: (task: Task, lane: Lane, ctx: PolicyContext, policy: Policy) => PolicyDecision;
   /** Canonical task categories (core's TASK_CATEGORIES). */
   taskCategories: readonly TaskCategory[];
+  classifyTask: (text: string) => { category: TaskCategory; confidence: number; scores: Partial<Record<TaskCategory, number>> };
+  MIN_CLASSIFY_CONFIDENCE: number;
+  CLASSIFY_FALLBACK_CATEGORY: TaskCategory;
+  /**
+   * P2: resolve a lane×category's rankings prior (provenance + clamping) so
+   * router_preview can explain the winner's prior source. Pure; optional so
+   * fakes/hosts without the prior surface can omit it.
+   */
+  resolvedPriorFor?: (lane: Lane, category: TaskCategory, priorOverlay?: CapabilityPriorOverlay, opts?: ResolvedPriorOptions) => ResolvedPrior;
 }
+
+/** P2: metadata about the active rankings snapshot, for /why + /status + setup. */
+export interface CapabilityPriorMeta {
+  /** Rankings source id(s) from the snapshot (`sources` joined). */
+  source: string;
+  /** Snapshot `generated` date string. */
+  generated: string;
+  /** Task categories the snapshot maps (keys of `mapping`). */
+  categories: string[];
+  /** Lane×category pairs with no chart match (declared fallback applies). */
+  unrankedCount: number;
+}
+
+/**
+ * P2: the adapter's capability-prior posture. `off` ⇒ flag not set (routing on
+ * declared priors, byte-identical to before); `error` ⇒ flag set but the
+ * snapshot failed to load/validate (routing UNAFFECTED — declared priors — with
+ * a warning to surface); `on` ⇒ overlay active (stale ⇒ zero-upward rule).
+ */
+export type CapabilityPriorState =
+  | { state: 'off' }
+  | { state: 'error'; warning: string }
+  | { state: 'on'; overlay: CapabilityPriorOverlay; stale: boolean; meta: CapabilityPriorMeta };
 
 /** A single text block in an MCP tool result. */
 export interface ToolTextContent {
@@ -88,6 +127,26 @@ export interface ToolDeps {
    * real run path).
    */
   observedCapability: () => ObservedCapabilityByLane | undefined;
+  /**
+   * Model-keyed learned capability overlay (P6 F-1), or `undefined` when learning
+   * is off. Takes precedence over {@link ServerDeps.observedCapability} when both
+   * are set. Built server-side from the ledger + clock.
+   */
+  observedCapabilityByModel?: () => ObservedCapabilityByModel | undefined;
+  /**
+   * P6 §4: the difficulty-conditioned learned overlay, or `undefined` when
+   * learning is off. Core consults it only for a difficulty-tagged task, so
+   * threading it unconditionally never changes an untagged route.
+   */
+  observedCapabilityByModelDifficulty?: () => ObservedCapabilityByModelDifficulty | undefined;
+  /**
+   * P2: the rankings capability-prior posture for a (model-resolved) lane set —
+   * `off` / `error` (flag on, snapshot bad; warning to surface) / `on` (overlay +
+   * staleness + snapshot meta). Built server-side from ONE loader so
+   * router_preview and router_delegate apply the SAME prior (no /why-vs-run
+   * divergence). Absent (old hosts/fakes) ⇒ treated as off.
+   */
+  capabilityPrior?: (lanes: readonly Lane[]) => CapabilityPriorState;
   /** The active routing policy (from policy.yaml via core/node). */
   loadPolicy: () => Policy;
   /**
@@ -111,6 +170,29 @@ export interface ToolDeps {
   tierFloor?: number;
   /** Per-lane cost signal (price-derived) for tiered ranking; optional. */
   laneCost?: (lanes: readonly Lane[]) => Record<string, number>;
+  /**
+   * B: the routed-share quota headroom map (RouteContext.capHeadroom) for a lane
+   * set, or undefined when no lane configures quotas — built server-side from
+   * the SAME ledger delegate routes with (parity). Absent dep ⇒ no pressure.
+   */
+  capHeadroom?: (lanes: readonly Lane[]) => Record<string, number> | undefined;
+  /** B: compact per-lane quota detail ("5h 12/40 routed · …") for /why lines. */
+  quotaDetail?: (lane: Lane) => string | undefined;
+  /**
+   * B3/B4: one advisory line per warn/critical quota lane — routed-share detail,
+   * an omit-first depletion projection, and the per-category overflow plan
+   * (pure preview re-routing with the capped lane excluded; nothing executes).
+   * Probes availability, so it is called only by status/summary — never hooks.
+   */
+  quotaAlerts?: () => Promise<string[]>;
+  /**
+   * A4: the persistent-settings report (per key: effective value + which layer —
+   * env/settings/default — supplied it). Powers /tokenmaxed:config. Optional so
+   * fakes/old hosts can omit the whole surface.
+   */
+  settings?: () => SettingsReport;
+  /** A4: write (value) or clear (null) ONE known setting in settings.json. */
+  setSetting?: (key: SettingKey, value: boolean | number | null) => void;
   /** Whether routing/offloading is enabled for the current project (A-4 toggle). */
   getEnabled: () => boolean;
   /**
@@ -193,6 +275,16 @@ export interface SetupReport {
   escalate: boolean;
   /** F-1: whether learned capability feedback is enabled (TOKENMAXED_LEARN_CAPABILITY). */
   learnCapability: boolean;
+  /**
+   * P2: rankings capability-prior posture (TOKENMAXED_CAPABILITY_PRIOR) — meta
+   * only, never the overlay itself (setup reports, it doesn't route).
+   */
+  capabilityPrior:
+    | { state: 'off' }
+    | { state: 'error'; warning: string }
+    | { state: 'on'; stale: boolean; source: string; generated: string; categories: string[]; unrankedCount: number };
+  /** A4: settings-file state — present ONLY when ~/.tokenmaxed/settings.json exists (byte-compat when absent). */
+  settings?: { path: string; applied: string[]; warning?: string };
   /** F-2: whether reader-egress is enabled (TOKENMAXED_READER_EGRESS). */
   readerEgress: boolean;
   /** MODEL-TIERS: whether tiered routing is enabled (TOKENMAXED_TIERED). */
@@ -207,6 +299,11 @@ export interface SetupReport {
    * or 'current'. Setup marks the set as reviewed when it runs.
    */
   laneReview: 'first-review' | 'changed' | 'current';
+  /**
+   * If an ENABLED api/BYOK lane belongs to a vendor that also ships a Claude Code CLI
+   * plugin (subscription, $0 metered), a nudge to use the plugin instead of the key.
+   */
+  pluginSuggestions?: { laneId: string; vendor: string; plugin: string; url: string }[];
 }
 
 /** Outcome of a manager review (content-free; the diff is never returned/stored). */
@@ -240,6 +337,13 @@ export interface DelegateRequest {
    * as the safety net for a repo-tight miss. Orthogonal to the data-egress policy.
    */
   access_need?: AccessNeedInput;
+  /**
+   * OPTIONAL expected difficulty (P6 §4). When set AND learned difficulty
+   * evidence exists for a candidate's model, routing conditions capability on
+   * that difficulty's pass record (e.g. `hard` favors models that keep passing
+   * hard reviews). Absent ⇒ category-level routing, unchanged.
+   */
+  difficulty?: DifficultyBucket;
 }
 
 /** The outcome of an offload (content-free; the host decides what to do with it). */
@@ -266,6 +370,35 @@ export interface DelegateOutcome {
    * pasted into untrusted contexts.
    */
   readerDerived?: boolean;
+  categoryInferred?: boolean;
+  inferredConfidence?: number;
+  hint?: string;
+  /** A3: content-free receipt for this offload's executed legs (absent ⇒ nothing ran). */
+  receipt?: DelegateReceipt;
+}
+
+/**
+ * A3 ambient receipt — the per-offload "which model, what it cost, what it
+ * saved" line rendered inline with every delegation result (trust research:
+ * visibility IS the product). Content-free by construction: numbers only,
+ * aggregated from the same recorded task legs the ledger keeps.
+ */
+export interface DelegateReceipt {
+  tokensIn: number;
+  tokensOut: number;
+  /** true ⇒ token counts include estimated parts (some CLIs don't report exact usage). */
+  tokensEstimated: boolean;
+  /** Real metered dollars spent across ALL legs (subscription/local legs are $0 metered). */
+  spentUsd: number;
+  /**
+   * Estimated metered-API dollars avoided, computed with the ledger's honest
+   * net (`summarize()`): baseline from DELIVERED (ok, non-superseded) legs
+   * minus metered spend across ALL legs — so a failed/discarded attempt that
+   * cost real money makes this ≤ 0 rather than being ignored.
+   */
+  meteredAvoidedUsd: number;
+  /** Executed task legs (1 = single pass; more ⇒ rework/escalation legs ran). */
+  legs: number;
 }
 
 /** A declarative tool: advertised by the server, invoked via its handler. */
@@ -377,6 +510,16 @@ function pct(alreadyPercent: number): string {
 const REPO_CLASSES: readonly RepoClass[] = ['public', 'private', 'unknown'];
 const SENSITIVITIES: readonly Sensitivity[] = ['normal', 'sensitive', 'unknown'];
 const ACCESS_NEEDS: readonly AccessNeedInput[] = ['worker-ok', 'repo-tight', 'auto'];
+// Local value list (tools.ts imports core types ONLY — see the module banner);
+// kept in sync with core's DIFFICULTY_BUCKETS by the type annotation.
+const DIFFICULTIES: readonly DifficultyBucket[] = ['easy', 'moderate', 'hard'];
+// A4: settable keys for router_config — typed against settings.ts (types only;
+// the value module imports node:fs, which this file must not pull in).
+const SETTING_KEYS_UI: readonly SettingKey[] = [
+  'gate_ready', 'escalate', 'learn_capability', 'capability_prior', 'reader_egress',
+  'tiered', 'tier_floor', 'review_on_stop', 'review_max_rounds',
+];
+const NUMERIC_SETTING_KEYS: ReadonlySet<SettingKey> = new Set(['tier_floor', 'review_max_rounds'] as const);
 
 // --- render helpers ------------------------------------------------------------
 
@@ -474,7 +617,14 @@ export function createTools(core: CorePort): ToolDef[] {
     handler: (deps) =>
       guardedAsync(async () => {
         const data = await deps.summary();
-        return ok(formatSummaryBanner(data), { summary: data as unknown as Record<string, unknown> });
+        // B4: append the overflow plan for capped lanes (advisory; computed by
+        // pure preview re-routing — nothing executes). Fail-open to nothing.
+        const alerts = deps.quotaAlerts ? await deps.quotaAlerts() : [];
+        const banner =
+          alerts.length > 0
+            ? `${formatSummaryBanner(data)}\n   Quota (routed share only):\n${alerts.map((a) => `     ${a}`).join('\n')}`
+            : formatSummaryBanner(data);
+        return ok(banner, { summary: data as unknown as Record<string, unknown>, ...(alerts.length ? { quotaAlerts: alerts } : {}) });
       }),
   };
 
@@ -501,6 +651,12 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL access requirement to preview. "repo-tight" filters worker/reader lanes out (only full-access lanes survive); "worker-ok"/"auto" (default) impose no access restriction — matching what router_delegate would route with.',
         },
+        difficulty: {
+          type: 'string',
+          enum: [...DIFFICULTIES],
+          description:
+            'OPTIONAL difficulty to preview — shows the pick a difficulty-tagged delegate would make when learned difficulty evidence exists. Omit for the category-level pick.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -510,6 +666,10 @@ export function createTools(core: CorePort): ToolDef[] {
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
         const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
+        const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
+        // The Task both ctx builds route on — difficulty rides it so the preview
+        // matches what a difficulty-tagged router_delegate would decide.
+        const task: Task = { category, ...(difficulty ? { difficulty } : {}) };
         // Mirror inferAccessNeed for the instruction-less preview case: an explicit
         // `repo-tight` is honored; `auto`/`worker-ok`/unset ⇒ `worker-ok` (no
         // restriction). Preview has no instruction/files, so a future heuristic that
@@ -545,6 +705,24 @@ export function createTools(core: CorePort): ToolDef[] {
         // Apply the learned overlay (F-1) so /tokenmaxed:why reflects the same
         // effective capability router_delegate routes with. Undefined ⇒ declared.
         const observedCapability = deps.observedCapability();
+        const observedCapabilityByModel = deps.observedCapabilityByModel?.();
+        // P6 §4: consulted by core only when the previewed task carries a difficulty.
+        const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
+        // P2: the rankings prior — the SAME loader delegate uses, so /why shows the
+        // same prior-adjusted pick. 'off'/'error' (or an absent dep) ⇒ no ctx fields
+        // ⇒ declared priors, byte-identical to before. NOTE: under escalation the
+        // preview lane set excludes the reserved reviewer lane, so the overlay's
+        // unranked COUNT is scoped to the lanes previewed (per-lane entries are
+        // independent, so shared lanes' prior values — and the pick — still match
+        // the real run; the banner wording scopes the count accordingly).
+        const capPrior = deps.capabilityPrior?.(lanes);
+        const priorCtx: Partial<RouteContext> =
+          capPrior?.state === 'on'
+            ? { capabilityPrior: capPrior.overlay, ...(capPrior.stale ? { capabilityPriorStale: true } : {}) }
+            : {};
+        // B: the same routed-share headroom map delegate routes with (parity).
+        const capHeadroom = deps.capHeadroom?.(lanes);
+        const quotaCtx: Partial<RouteContext> = capHeadroom ? { capHeadroom } : {};
         // Same availability filter delegate routes with (when the host provides it),
         // so /tokenmaxed:why never advertises a lane that can't actually run. Probe
         // ONLY the gate+policy-eligible lanes — never a disabled/blocked/gated lane
@@ -559,8 +737,12 @@ export function createTools(core: CorePort): ToolDef[] {
             access_need: resolvedAccessNeed,
             ...(yolo ? { yolo: true } : {}),
             ...(observedCapability ? { observedCapability } : {}),
+            ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+            ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
+            ...priorCtx,
+            ...quotaCtx,
           };
-          const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
+          const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
           availableIds = await deps.availableLaneIds(eligible);
         }
         // MODEL-TIERS: mirror delegate's tiered posture + cost signal so /why agrees.
@@ -583,6 +765,10 @@ export function createTools(core: CorePort): ToolDef[] {
           access_need: resolvedAccessNeed,
           ...(yolo ? { yolo: true } : {}),
           ...(observedCapability ? { observedCapability } : {}),
+          ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+          ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
+          ...priorCtx,
+          ...quotaCtx,
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
           ...(preferLaneId ? { preferLaneId } : {}),
@@ -590,7 +776,7 @@ export function createTools(core: CorePort): ToolDef[] {
 
         let decision: RouteDecision;
         try {
-          decision = core.routeDecide({ category }, ctx, policy);
+          decision = core.routeDecide(task, ctx, policy);
         } catch {
           // No selectable lane (all gated/blocked/unavailable) ⇒ the host does it.
           return ok(
@@ -614,15 +800,72 @@ export function createTools(core: CorePort): ToolDef[] {
         const yoloNote = yolo
           ? `  ⚠️ YOLO mode ON: trust/egress gates are bypassed — workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.`
           : undefined;
+        // B: quota-pressure visibility — detected via the ACTUAL score factors
+        // (no threshold duplication): a nonzero capPenalty on the winner means
+        // pressure applied yet it still won; on losers it means they were
+        // deprioritized. Preference overriding pressure is called out loudly.
+        const quotaLines: string[] = [];
+        const winnerCapPenalty = decision.scores.find((s) => s.laneId === decision.laneId)?.factors.capPenalty ?? 0;
+        if (winnerCapPenalty > 0) {
+          const detail = lane ? deps.quotaDetail?.(lane) : undefined;
+          quotaLines.push(`  quota: ${detail ?? 'near cap'} — pressure applied; it won anyway (no better capable alternative)`);
+          if (preferLaneId === decision.laneId) {
+            quotaLines.push(`  ⚠ preferred lane overrides quota pressure${detail ? ` (${detail})` : ''} — /tokenmaxed:prefer off to release it.`);
+          }
+        }
+        const pressuredLosers = decision.scores
+          .filter((s) => s.laneId !== decision.laneId && s.factors.capPenalty > 0)
+          .map((s) => s.laneId);
+        if (pressuredLosers.length > 0) {
+          quotaLines.push(`  quota-deprioritized: ${pressuredLosers.join(', ')} (routed-share near cap)`);
+        }
+        // P2: say where the winner's capability PRIOR came from (rankings overlay vs
+        // declared config), and describe the active snapshot — or its load error —
+        // so an adjusted score is never mistaken for a hand-set one.
+        const priorLines: string[] = [];
+        let priorStructured: Record<string, unknown> | undefined;
+        if (capPrior?.state === 'on') {
+          const m = capPrior.meta;
+          priorLines.push(
+            `  capability prior: ${m.source} (generated ${m.generated}${capPrior.stale ? '; STALE — no upward movement' : ''}) — categories ${m.categories.join('/')}; ${m.unrankedCount} of the previewed lane×category pairs unranked`,
+          );
+          const winnerPrior =
+            lane && core.resolvedPriorFor
+              ? core.resolvedPriorFor(lane, category, capPrior.overlay, { stale: capPrior.stale })
+              : undefined;
+          if (winnerPrior) {
+            priorLines.push(
+              `  prior for "${decision.laneId}": ${winnerPrior.provenance} ${winnerPrior.prior.toFixed(2)}${winnerPrior.clamped ? ' (clamped)' : ''}${winnerPrior.evidence ? ` [${winnerPrior.evidence.chart}, confidence ${winnerPrior.evidence.confidence}]` : ''}`,
+            );
+          }
+          priorStructured = {
+            state: 'on',
+            stale: capPrior.stale,
+            source: m.source,
+            generated: m.generated,
+            unrankedCount: m.unrankedCount,
+            ...(winnerPrior ? { winnerProvenance: winnerPrior.provenance, winnerPrior: winnerPrior.prior, winnerClamped: winnerPrior.clamped ?? false } : {}),
+          };
+        } else if (capPrior?.state === 'error') {
+          priorLines.push(`  capability prior: ERROR — ${capPrior.warning} (routing unaffected; declared capabilities in use)`);
+          priorStructured = { state: 'error', warning: capPrior.warning };
+        }
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
           `  why: ${decision.reason}`,
+          ...(difficulty
+            ? [
+                `  difficulty: ${difficulty} — learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`,
+              ]
+            : []),
+          ...quotaLines,
+          ...priorLines,
           ...(yoloNote ? [yoloNote] : []),
           ...(preferNote ? [preferNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(preferLaneId ? { preferLaneId } : {}) });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}) });
       }),
   };
 
@@ -648,6 +891,25 @@ export function createTools(core: CorePort): ToolDef[] {
         }
         if (preferred) {
           lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
+        }
+        // P2: the rankings-prior posture. Lanes aren't loaded on this read-only
+        // path, so the meta line reports the snapshot itself (per-category lane
+        // detail lives in /tokenmaxed:why). Rendered ONLY when on/error — the
+        // default-off path stays byte-identical to before this feature (the
+        // discovery hint lives in /tokenmaxed:setup, the surface that lists every
+        // opt-in flag's off state).
+        const capPrior = deps.capabilityPrior?.([]);
+        if (capPrior?.state === 'on') {
+          lines.push(
+            `Capability prior: ON — ${capPrior.meta.source}, generated ${capPrior.meta.generated}, categories ${capPrior.meta.categories.join('/')}${capPrior.stale ? ', STALE (no upward movement)' : ''}.`,
+          );
+        } else if (capPrior?.state === 'error') {
+          lines.push(`Capability prior: ERROR — ${capPrior.warning} (routing unaffected; declared capabilities in use).`);
+        }
+        // B3/B4: quota alerts (warn/critical lanes only ⇒ silent by default).
+        const quotaAlerts = enabled && deps.quotaAlerts ? await deps.quotaAlerts() : [];
+        if (quotaAlerts.length > 0) {
+          lines.push('', 'Quota (routed share only — not your total subscription usage):', ...quotaAlerts.map((a) => `  ${a}`));
         }
         if (mismatches.length > 0) {
           lines.push('', 'Model ids the vendor will REJECT (fix before offloading):', ...renderModelIdMismatchWarnings(mismatches));
@@ -757,9 +1019,13 @@ export function createTools(core: CorePort): ToolDef[] {
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['category', 'instruction'],
+      required: ['instruction'],
       properties: {
-        category: { type: 'string', enum: [...core.taskCategories], description: 'Task category (drives lane choice).' },
+        category: {
+          type: 'string',
+          enum: [...core.taskCategories],
+          description: 'OPTIONAL task category (drives lane choice). If omitted, it is inferred from the instruction.',
+        },
         instruction: {
           type: 'string',
           description:
@@ -769,7 +1035,7 @@ export function createTools(core: CorePort): ToolDef[] {
           type: 'array',
           items: { type: 'string' },
           description:
-            'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing — kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounded + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.',
+            'OPTIONAL repo-relative file paths to attach VERBATIM so the lane sees real repo facts (e.g. the file being edited, a registry, test fixtures) instead of guessing — kills the "blind to your repo" hallucination class. Read server-side, path-confined to the project, then scrubbed + size-bounds + policy-gated by the minimizer (private-repo files require a reader-trust lane + its egress opt-in). Prefer naming the exact files over pasting paraphrased snippets.',
         },
         repo_class: { type: 'string', enum: [...REPO_CLASSES], description: 'Repository class for policy (default unknown).' },
         sensitivity: { type: 'string', enum: [...SENSITIVITIES], description: 'Content sensitivity for policy (default unknown).' },
@@ -779,18 +1045,24 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL access requirement. "repo-tight" ⇒ the task needs full repo/tool/shell access, so it routes straight to a full-access lane (workers skipped). "worker-ok" ⇒ a worker may handle it. "auto" (default) lets the server decide (today: worker-ok, with worker give-back as the safety net). Orthogonal to repo_class/sensitivity policy.',
         },
+        difficulty: {
+          type: 'string',
+          enum: [...DIFFICULTIES],
+          description:
+            'OPTIONAL expected difficulty. When set and learned difficulty-specific evidence exists (TOKENMAXED_LEARN_CAPABILITY), routing conditions capability on that difficulty\'s real pass record — e.g. "hard" favors models that keep passing hard reviews. Omit when unsure (category-level routing, unchanged).',
+        },
       },
     },
     handler: (deps, args) =>
       guardedAsync(async () => {
-        const category = optEnum(args, 'category', core.taskCategories);
-        if (category === undefined) throw new ToolInputError('"category" is required.');
+        const passedCategory = optEnum(args, 'category', core.taskCategories);
         const instruction = optString(args, 'instruction');
         if (!instruction || instruction.trim() === '') throw new ToolInputError('"instruction" is required (non-empty).');
         const files = optStringArray(args, 'files');
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
         const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
+        const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
 
         // Respect the per-project toggle: when off, never offload — tell the host
         // to do it itself (no config load, no execution).
@@ -801,18 +1073,31 @@ export function createTools(core: CorePort): ToolDef[] {
           );
         }
 
+        const resolution = resolveCategory(core, passedCategory, instruction);
+
         const policyContext: PolicyContext = {
           ...(repo_class ? { repo_class } : {}),
           ...(sensitivity ? { sensitivity } : {}),
         };
         const outcome = await deps.delegate({
-          category,
+          category: resolution.category,
           instruction,
           ...(Object.keys(policyContext).length ? { policyContext } : {}),
           ...(files && files.length ? { files } : {}),
           ...(access_need ? { access_need } : {}),
+          ...(difficulty ? { difficulty } : {}),
         });
-        return renderDelegate(outcome);
+
+        const finalOutcome = resolution.categoryInferred
+          ? {
+              ...outcome,
+              categoryInferred: true,
+              inferredConfidence: resolution.inferredConfidence,
+              hint: resolution.hint,
+            }
+          : outcome;
+
+        return renderDelegate(finalOutcome);
       }),
   };
 
@@ -855,6 +1140,26 @@ export function createTools(core: CorePort): ToolDef[] {
           `  review loop: ${r.reviewOnStop ? `ON (default — reviews every finishing turn when a reviewer exists; up to ${r.reviewMaxRounds ?? 5} rework round(s))` : 'off'} (opt out with TOKENMAXED_REVIEW_ON_STOP=false; tune rounds with TOKENMAXED_REVIEW_MAX_ROUNDS)`,
           `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
           `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
+          // A4: rendered ONLY when the settings file exists (byte-compat when absent).
+          ...(r.settings
+            ? [
+                `  settings: ${r.settings.path}${
+                  r.settings.warning
+                    ? ` — ⚠ ${r.settings.warning}`
+                    : ` (${r.settings.applied.length ? `applies: ${r.settings.applied.join(', ')}` : 'no flags stored'}; /tokenmaxed:config to view/edit)`
+                }`,
+              ]
+            : []),
+          // P2: rendered ONLY when on/error — the default-off setup output stays
+          // byte-identical to pre-P2 (the A1 gate; discoverability moves to the
+          // A4 settings surface). The report FIELD is always present for hosts.
+          ...(r.capabilityPrior.state === 'on'
+            ? [
+                `  capability prior: ON — ${r.capabilityPrior.source}, generated ${r.capabilityPrior.generated}, categories ${r.capabilityPrior.categories.join('/')}, ${r.capabilityPrior.unrankedCount} lane×category unranked${r.capabilityPrior.stale ? ', STALE (no upward movement)' : ''}`,
+              ]
+            : r.capabilityPrior.state === 'error'
+              ? [`  capability prior: ERROR — ${r.capabilityPrior.warning} (routing unaffected; declared capabilities in use)`]
+              : []),
           `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
           `  tiered routing: ${r.tiered ? 'on' : 'off'} (enable with TOKENMAXED_TIERED=true — start on the cheapest lane clearing the capability floor, step up on review failure)`,
           `  YOLO mode: ${r.yolo ? '⚠️ ON (env default)' : 'off'} (the --dangerously-skip-permissions analogue: TOKENMAXED_YOLO=true or /tokenmaxed:yolo on — bypasses ALL trust/egress gates so every worker/reader lane is selectable; secret scanner still applies)`,
@@ -865,6 +1170,17 @@ export function createTools(core: CorePort): ToolDef[] {
               ? ['ℹ Lane review: confirm what each lane may see/do below (recorded so you\'re reminded if it changes).']
               : []),
           ...formatLaneSetup(r.lanes),
+          ...(r.pluginSuggestions && r.pluginSuggestions.length > 0
+            ? [
+                '',
+                '💡 These enabled lanes authenticate with a BYOK API key. The vendor also ships a Claude',
+                '   Code CLI plugin you can route on your flat-rate subscription instead — no key to manage',
+                '   (and no metered spend for a pay-per-token key):',
+                ...r.pluginSuggestions.map(
+                  (s) => `   • ${s.laneId} (${s.vendor}) → ${s.plugin}: ${s.url}`,
+                ),
+              ]
+            : []),
           '',
           `Next: edit ${r.lanesPath} to add/trust your lanes; for a BYOK api lane, set its key in env var TOKENMAXED_KEY_<authHandle>.`,
         ];
@@ -872,11 +1188,92 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool];
+  const configTool: ToolDef = {
+    name: 'router_config',
+    description:
+      'Show or persist TokenMaxed feature settings (~/.tokenmaxed/settings.json) — the durable alternative to launch-time env flags. A real environment variable ALWAYS overrides a stored setting. The kill-switch (TOKENMAXED_DISABLE), YOLO mode, and API keys are deliberately NOT settable here. Powers /tokenmaxed:config.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        key: {
+          type: 'string',
+          enum: [...SETTING_KEYS_UI],
+          description: 'OPTIONAL setting to show or change. Omit to list every setting with its effective value and source.',
+        },
+        value: {
+          type: 'string',
+          description:
+            'OPTIONAL new value: "true"/"false" for the boolean flags, a number for tier_floor (0..1) / review_max_rounds (integer ≥ 1), or "clear" to remove the stored key. Omit to just show the key.',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guardedAsync(async () => {
+        if (!deps.settings) throw new ToolInputError('settings are not available on this host.');
+        const key = optEnum(args, 'key', SETTING_KEYS_UI);
+        const rawValue = optString(args, 'value');
+        if (rawValue !== undefined && key === undefined) throw new ToolInputError('"value" requires "key".');
+
+        if (key !== undefined && rawValue !== undefined) {
+          if (!deps.setSetting) throw new ToolInputError('this host cannot write settings.');
+          let parsed: boolean | number | null;
+          if (rawValue === 'clear') parsed = null;
+          else if (rawValue === 'true' || rawValue === 'false') parsed = rawValue === 'true';
+          else if (NUMERIC_SETTING_KEYS.has(key) && Number.isFinite(Number(rawValue))) parsed = Number(rawValue);
+          else throw new ToolInputError(`invalid value "${rawValue}" for "${key}" — use true/false${NUMERIC_SETTING_KEYS.has(key) ? ', a number,' : ''} or "clear".`);
+          deps.setSetting(key, parsed); // throws with a clear message on invalid range/unwritable file
+        }
+
+        const report = deps.settings();
+        const rows = key !== undefined && rawValue === undefined ? report.rows.filter((r) => r.key === key) : report.rows;
+        const renderRow = (r: SettingsReport['rows'][number]): string => {
+          const value = r.source === 'default' ? '(default)' : r.effective;
+          const src = r.source === 'env' ? ` — env ${r.envVar} overrides` : r.source === 'settings' ? ' — from settings' : '';
+          return `  ${r.key} = ${value}${src}`;
+        };
+        const lines = [
+          `TokenMaxed settings (${report.path}${report.present ? '' : ' — not created yet'}):`,
+          ...(report.warning ? [`  ⚠ ${report.warning}`] : []),
+          ...(report.invalid.length ? [`  ⚠ ignored invalid value(s) for: ${report.invalid.join(', ')}`] : []),
+          ...rows.map(renderRow),
+          '',
+          'Precedence: env var > settings.json > default. Set with /tokenmaxed:config <key> <value>; "clear" removes a stored key. The kill-switch, YOLO, and API keys stay env-only by design. When they apply: hooks and the statusline read settings on every run; the MCP server reads them at session start, so routing flags apply from your NEXT Claude Code session.',
+        ];
+        return ok(lines.join('\n'), { path: report.path, present: report.present, ...(report.warning ? { warning: report.warning } : {}), rows: rows as unknown as Record<string, unknown>[] });
+      }),
+  };
+
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */
+/** A3: one compact, honest receipt line (est.-labeled tokens + finance-grade $). */
+function receiptLine(r: DelegateReceipt): string {
+  const int = (n: number): string => Math.round(n).toLocaleString('en-US');
+  const usd = (n: number): string => (n < 0 ? `-$${Math.abs(n).toFixed(4)}` : `$${n.toFixed(4)}`);
+  const legs = `${r.legs} leg${r.legs === 1 ? '' : 's'}`;
+  return (
+    `— receipt: ${int(r.tokensIn)} in / ${int(r.tokensOut)} out tok${r.tokensEstimated ? ' (est.)' : ''}` +
+    ` · spent ${usd(r.spentUsd)} metered · est. ${usd(r.meteredAvoidedUsd)} metered avoided · ${legs}`
+  );
+}
+
 function renderDelegate(o: DelegateOutcome): ToolResult {
+  const inferenceFields = o.categoryInferred
+    ? {
+        categoryInferred: true,
+        inferredConfidence: o.inferredConfidence,
+        hint: o.hint,
+      }
+    : {};
+  const inferenceText = o.categoryInferred && o.hint ? `\n\n${o.hint}` : '';
+  // A3 ambient receipt: rendered on EVERY path where legs actually ran —
+  // including a native give-back after failed/superseded legs, whose real spend
+  // must never disappear just because the host finished the task.
+  const receiptText = o.receipt ? `\n\n${receiptLine(o.receipt)}` : '';
+  const receiptFields = o.receipt ? { receipt: o.receipt as unknown as Record<string, unknown> } : {};
+
   // Anything that isn't a clean execution by another lane ⇒ the host does it.
   if (o.native || o.status !== 'ok') {
     const why =
@@ -898,7 +1295,7 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     const taint = o.readerDerived
       ? '\n\n⚠️ reader-derived: any quoted reader output above may include private repo code — do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts.'
       : '';
-    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note}${taint}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note}${taint}${receiptText}${inferenceText}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
@@ -906,6 +1303,8 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
       ...(o.failureKind ? { failureKind: o.failureKind } : {}),
       ...(o.readerDerived ? { readerDerived: true } : {}),
       ...(o.recordingFailed ? { recordingFailed: true } : {}),
+      ...receiptFields,
+      ...inferenceFields,
     });
   }
   const lane = o.model ? `${o.laneId} (${o.model})` : o.laneId;
@@ -921,13 +1320,13 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
   // result is UNREVIEWED, so do NOT tell the host to "use it"; flag it for review.
   if (o.reviewUnavailable) {
     return ok(
-      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.reason ? { reason: o.reason } : {}), ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}) },
+      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}${receiptText}${inferenceText}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.reason ? { reason: o.reason } : {}), ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}), ...receiptFields, ...inferenceFields },
     );
   }
   // C-13: `reason` may carry "escalated to X" / "reworked on X" (accept_after_*).
   const how = o.reason ? ` (${o.reason})` : '';
-  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${taint}${note}`, {
+  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${taint}${note}${receiptText}${inferenceText}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
@@ -935,7 +1334,41 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     ...(o.reason ? { reason: o.reason } : {}),
     ...taintFlag,
     ...(o.recordingFailed ? { recordingFailed: true } : {}),
+    ...receiptFields,
+    ...inferenceFields,
   });
+}
+
+export interface CategoryResolution {
+  category: TaskCategory;
+  categoryInferred: boolean;
+  inferredConfidence?: number;
+  hint?: string;
+}
+
+export function resolveCategory(
+  core: {
+    classifyTask: (text: string) => { category: TaskCategory; confidence: number };
+    MIN_CLASSIFY_CONFIDENCE: number;
+    CLASSIFY_FALLBACK_CATEGORY: TaskCategory;
+  },
+  passedCategory?: TaskCategory,
+  instruction?: string,
+): CategoryResolution {
+  if (passedCategory !== undefined) {
+    return {
+      category: passedCategory,
+      categoryInferred: false,
+    };
+  }
+  const c = core.classifyTask(instruction ?? '');
+  const resolvedCategory = c.confidence >= core.MIN_CLASSIFY_CONFIDENCE ? c.category : core.CLASSIFY_FALLBACK_CATEGORY;
+  return {
+    category: resolvedCategory,
+    categoryInferred: true,
+    inferredConfidence: c.confidence,
+    hint: `category inferred as '${resolvedCategory}' (confidence ${c.confidence.toFixed(2)}) — pass an explicit category for precise routing.`,
+  };
 }
 
 // --- dispatch (pure; testable without the SDK or a build) ----------------------

@@ -15,11 +15,14 @@ import { isManagerEligible, resolveLaneModel } from '@tokenmaxed/core';
 import { loadLaneConfig, loadPolicyConfig, loadPriceTable, makeGitleaksScanner } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
+import { loadCapabilityPriorState } from './capability-prior-load.ts';
+import { pluginSuggestionsFor } from './cli-plugins.ts';
 import { homeFile } from './config.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
 import { laneSetFingerprint, markLanesSeen, readLaneReviewState, writeLaneReviewState } from './lane-state.ts';
 import { selectManagerLane } from './manager-select.ts';
 import { parseMaxRounds, reviewLoopEnabled } from './reviewer.ts';
+import { settingsReport } from './settings.ts';
 import type { SetupReport } from './tools.ts';
 
 const LANES_STARTER = fileURLToPath(new URL('../lanes.starter.yaml', import.meta.url));
@@ -118,6 +121,27 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     // F-1 learned capability; also disabled by the global kill-switch.
     learnCapability:
       env.TOKENMAXED_LEARN_CAPABILITY === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
+    // A4: settings-file state — reported only when the file exists, so a
+    // settings-less setup output stays byte-identical.
+    ...((): { settings?: SetupReport['settings'] } => {
+      const rep = settingsReport(env);
+      if (!rep.present) return {};
+      return {
+        settings: {
+          path: rep.path,
+          applied: rep.rows.filter((r) => r.source === 'settings').map((r) => r.key),
+          ...(rep.warning ? { warning: rep.warning } : {}),
+        },
+      };
+    })(),
+    // P2 rankings prior — same loader the routing paths use, run over the RAW
+    // registry lanes with the price table so @latest resolves like everywhere else.
+    // Meta only (the overlay itself never enters the report).
+    capabilityPrior: ((): SetupReport['capabilityPrior'] => {
+      const p = loadCapabilityPriorState(env, [...registry.lanes], priceTable ? { priceTable } : {});
+      if (p.state !== 'on') return p;
+      return { state: 'on', stale: p.stale, ...p.meta };
+    })(),
     // F-2 reader egress; also disabled by the global kill-switch.
     readerEgress:
       env.TOKENMAXED_READER_EGRESS === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
@@ -132,5 +156,8 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
       !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
     lanes: laneRows,
     laneReview,
+    // If a user enabled a metered BYOK api lane for a vendor that ALSO ships a Claude Code
+    // CLI plugin (subscription, $0 metered), nudge them toward the plugin with a link.
+    pluginSuggestions: pluginSuggestionsFor(registry.lanes),
   };
 }

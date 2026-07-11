@@ -7367,7 +7367,7 @@ var require_dist = __commonJS({
 
 // ../mcp/src/hook-stop.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
 import { tmpdir as tmpdir2 } from "node:os";
 import { join as join4 } from "node:path";
 
@@ -7390,6 +7390,7 @@ var TASK_CATEGORIES = [
   "docs"
 ];
 var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
+var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
 // ../core/src/access.ts
@@ -7404,6 +7405,61 @@ function isExecutorCertified(lane) {
 function isReaderExecutorCertified(lane) {
   return lane.kind === "api";
 }
+
+// ../core/src/model-freshness.ts
+function parseModelAlias(model) {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
+  return { latest: false, id: model };
+}
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function releasedMs(table, id) {
+  const r = table.models[id]?.released;
+  return r === void 0 ? void 0 : Date.parse(r);
+}
+function compareNewestFirst(table, a, b) {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
+  return compareModelVersion(b, a);
+}
+function pricedIdsInFamily(table, family) {
+  return Object.keys(table.models).filter((id) => table.models[id].family === family);
+}
+function newestPricedInFamily(table, family) {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return void 0;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}
+function resolveLaneModel(lane, table) {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
+
+// ../core/src/capability-prior.ts
+var CATEGORIES = new Set(TASK_CATEGORIES);
 
 // ../core/src/policy.ts
 var import_yaml = __toESM(require_dist(), 1);
@@ -7583,67 +7639,19 @@ function declaredCapabilityFor(lane, category) {
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }
 
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
+
+// ../core/src/quota.ts
+var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist(), 1);
-
-// ../core/src/model-freshness.ts
-function parseModelAlias(model) {
-  const m = /^(.+)@latest$/.exec(model.trim());
-  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
-  return { latest: false, id: model };
-}
-function compareModelVersion(a, b) {
-  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
-  const ra = runs(a);
-  const rb = runs(b);
-  const n = Math.max(ra.length, rb.length);
-  for (let i = 0; i < n; i++) {
-    const xa = ra[i];
-    const xb = rb[i];
-    if (xa === void 0) return -1;
-    if (xb === void 0) return 1;
-    const na = /^\d+$/.test(xa);
-    const nb = /^\d+$/.test(xb);
-    if (na && nb) {
-      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
-      if (d !== 0) return d < 0 ? -1 : 1;
-    } else if (xa !== xb) {
-      return xa < xb ? -1 : 1;
-    }
-  }
-  return 0;
-}
-function releasedMs(table, id) {
-  const r = table.models[id]?.released;
-  return r === void 0 ? void 0 : Date.parse(r);
-}
-function compareNewestFirst(table, a, b) {
-  const ta = releasedMs(table, a);
-  const tb = releasedMs(table, b);
-  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
-  return compareModelVersion(b, a);
-}
-function pricedIdsInFamily(table, family) {
-  return Object.keys(table.models).filter((id) => table.models[id].family === family);
-}
-function newestPricedInFamily(table, family) {
-  const ids = pricedIdsInFamily(table, family);
-  if (ids.length === 0) return void 0;
-  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
-}
-function resolveLaneModel(lane, table) {
-  const spec = parseModelAlias(lane.model);
-  if (!spec.latest) return lane;
-  const concrete = newestPricedInFamily(table, spec.family);
-  return concrete ? { ...lane, model: concrete } : lane;
-}
-
-// ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
 var EXECUTION_MODES = ["answer-only", "agentic"];
-var CATEGORIES = new Set(TASK_CATEGORIES);
+var CATEGORIES2 = new Set(TASK_CATEGORIES);
 var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
@@ -7663,7 +7671,12 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "endpoint",
   "authHandle",
   "native",
-  "capability"
+  "capability",
+  "capability_source",
+  "requests_per_window",
+  "window_ms",
+  "requests_per_week",
+  "tokens_per_week"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7695,7 +7708,7 @@ function parseCapability(value, where) {
   }
   const out = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES.has(category)) {
+    if (!CATEGORIES2.has(category)) {
       throw new LaneConfigError(
         `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(", ")}.`
       );
@@ -7792,6 +7805,29 @@ function parseLane(entry, index) {
   }
   const capability = parseCapability(entry.capability, at("capability"));
   if (capability) lane.capability = capability;
+  if (entry.capability_source !== void 0) {
+    if (entry.capability_source !== "pinned") {
+      throw new LaneConfigError(`${at("capability_source")} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
+    }
+    lane.capability_source = "pinned";
+  }
+  if (entry.requests_per_window !== void 0) {
+    const n = entry.requests_per_window;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new LaneConfigError(
+        `${at("requests_per_window")} must be a positive finite number (got ${JSON.stringify(n)}).`
+      );
+    }
+    lane.requests_per_window = n;
+  }
+  for (const field of ["window_ms", "requests_per_week", "tokens_per_week"]) {
+    const v = entry[field];
+    if (v === void 0) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -7921,7 +7957,7 @@ function validatePriceTable(data) {
 }
 
 // ../core/src/ledger.ts
-var SCHEMA_VERSION = 1;
+var SCHEMA_VERSION = 2;
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
 var NATIVE_REASONS = ["no_route", "host_native"];
 var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
@@ -7970,6 +8006,9 @@ var OUTCOME_EVENT_FIELDS = [
   "category",
   "subject_lane_id",
   "subject_provenance",
+  "subject_model",
+  "subject_model_resolved",
+  "difficulty",
   "reviewer_lane_id",
   "reviewer_model",
   "reviewer_trust_mode",
@@ -8084,6 +8123,13 @@ function validateOutcomeInput(input) {
   if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
   const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
   if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
+  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
+  if (subject_model !== void 0) out.subject_model = subject_model;
+  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
+  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
+  if (input.difficulty !== void 0) {
+    out.difficulty = requireEnum2(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
+  }
   if (input.action_taken !== void 0) {
     out.action_taken = requireEnum2(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
   }
@@ -8177,6 +8223,11 @@ function classifyHttpStatus(status) {
 }
 
 // ../core/src/review.ts
+function canonicalizeModelKey(model) {
+  const spec = parseModelAlias(model);
+  if (spec.latest) return model.trim();
+  return spec.id;
+}
 var ReviewError = class extends Error {
   constructor(message) {
     super(message);
@@ -8221,6 +8272,8 @@ async function review(request, deps) {
   if (request.subjectLane) {
     event.subject_lane_id = request.subjectLane.id;
     event.subject_provenance = request.subjectLane.provenance;
+    event.subject_model = request.subjectLane.model;
+    event.subject_model_resolved = canonicalizeModelKey(request.subjectLane.model);
   }
   const result = { verdict: out.verdict, event };
   if (out.notes !== void 0) result.notes = out.notes;
@@ -8437,13 +8490,22 @@ function combinedPrompt(instruction, attachments) {
   return attachments && attachments.length > 0 ? [instruction, ...attachments.map((a) => a.content)].join("\n\n") : instruction;
 }
 var numOrUndef = (v) => typeof v === "number" ? v : void 0;
+var MAX_PROMPT_ARG_BYTES = 128 * 1024;
 function makeCliExecutor(spawnImpl) {
   const spawn = spawnImpl ?? ((cmd, args, opts) => spawnSync(cmd, [...args], opts));
   return async (lane, instruction, attachments) => {
     if (!lane.command) throw new Error(`cli lane "${lane.id}" has no command configured`);
     const input = combinedPrompt(instruction, attachments);
-    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model));
-    const res = spawn(lane.command, args, { input, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    const usesPromptArg = (lane.args ?? []).some((a) => a.includes("{prompt}"));
+    if (usesPromptArg && Buffer.byteLength(input, "utf8") > MAX_PROMPT_ARG_BYTES) {
+      throw new LaneFailure(
+        "provider_error",
+        `cli lane "${lane.id}" prompt is too large to pass as a command-line argument (> ${MAX_PROMPT_ARG_BYTES} bytes) \u2014 use a stdin-based CLI lane for large inputs`
+      );
+    }
+    const args = (lane.args ?? []).map((a) => a.replaceAll("{model}", lane.model).replaceAll("{prompt}", input));
+    const stdinInput = usesPromptArg ? "" : input;
+    const res = spawn(lane.command, args, { input: stdinInput, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (res.error) {
       const code = res.error.code;
       if (code === "ENOBUFS") throw new LaneFailure("provider_error", `cli lane "${lane.id}" produced too much output (exceeded the buffer limit)`);
@@ -8631,6 +8693,22 @@ function commandOnPath(command, path) {
   const dirs = (path ?? "").split(":").filter(Boolean);
   return dirs.some((dir) => isExecutableFile(join3(dir, command)));
 }
+function regularFileExists(candidate) {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+function nodeScriptArgPresent(lane) {
+  const base = (lane.command ?? "").split("/").pop();
+  if (base !== "node") return true;
+  const scriptArg = (lane.args ?? []).find(
+    (a) => !a.startsWith("-") && (a.endsWith(".mjs") || a.endsWith(".js"))
+  );
+  if (scriptArg === void 0) return true;
+  return regularFileExists(scriptArg);
+}
 async function localReachable(base, fetchImpl) {
   if (!fetchImpl) return false;
   const controller = new AbortController();
@@ -8646,7 +8724,7 @@ async function localReachable(base, fetchImpl) {
 }
 async function isLaneAvailable(lane, deps) {
   if (lane.native) return true;
-  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path) && nodeScriptArgPresent(lane);
   if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
   if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
   return false;
@@ -8948,10 +9026,79 @@ async function runReviewWithBudget(runner, newId, opts) {
   return { reviewed: false, errored: true, reason: lastReason };
 }
 
+// ../mcp/src/settings.ts
+import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+var SETTING_KEYS = {
+  gate_ready: "TOKENMAXED_GATE_READY",
+  escalate: "TOKENMAXED_ESCALATE",
+  learn_capability: "TOKENMAXED_LEARN_CAPABILITY",
+  capability_prior: "TOKENMAXED_CAPABILITY_PRIOR",
+  reader_egress: "TOKENMAXED_READER_EGRESS",
+  tiered: "TOKENMAXED_TIERED",
+  /** number in [0,1] */
+  tier_floor: "TOKENMAXED_TIER_FLOOR",
+  review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
+  /** positive integer */
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+};
+var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
+var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
+function settingsPath(env) {
+  return env.TOKENMAXED_SETTINGS ?? homeFile("settings.json");
+}
+function validValue(key, raw) {
+  if (NUMERIC_KEYS.has(key)) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return void 0;
+    if (key === "tier_floor" && (raw < 0 || raw > 1)) return void 0;
+    if (key === "review_max_rounds" && (!Number.isInteger(raw) || raw < 1)) return void 0;
+    return raw;
+  }
+  return typeof raw === "boolean" ? raw : void 0;
+}
+function loadSettings(env) {
+  const path = settingsPath(env);
+  if (!existsSync4(path)) return { values: {}, present: false, invalid: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync2(path, "utf8"));
+  } catch (err) {
+    return { values: {}, present: true, invalid: [], warning: `settings unreadable (${path}): ${err.message}` };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { values: {}, present: true, invalid: [], warning: `settings must be a JSON object (${path})` };
+  }
+  const obj = parsed;
+  const values = {};
+  const invalid = [];
+  for (const key of SETTING_KEY_LIST) {
+    if (!(key in obj)) continue;
+    const v = validValue(key, obj[key]);
+    if (v === void 0) invalid.push(key);
+    else values[key] = v;
+  }
+  return { values, present: true, invalid };
+}
+var SEEDED_KEYS = /* @__PURE__ */ new WeakMap();
+function effectiveEnv(env) {
+  const { values } = loadSettings(env);
+  const out = { ...env };
+  const seeded = new Set(SEEDED_KEYS.get(env) ?? []);
+  for (const key of SETTING_KEY_LIST) {
+    const envVar = SETTING_KEYS[key];
+    if (out[envVar] !== void 0) continue;
+    const v = values[key];
+    if (v === void 0) continue;
+    out[envVar] = String(v);
+    seeded.add(key);
+  }
+  if (seeded.size > 0) SEEDED_KEYS.set(out, seeded);
+  return out;
+}
+
 // ../mcp/src/hook-stop.ts
 function readCounter(file) {
   try {
-    const n = Number.parseInt(readFileSync2(file, "utf8"), 10);
+    const n = Number.parseInt(readFileSync3(file, "utf8"), 10);
     return Number.isFinite(n) && n > 0 ? n : 0;
   } catch {
     return 0;
@@ -8959,19 +9106,19 @@ function readCounter(file) {
 }
 function writeCounter(file, n) {
   try {
-    mkdirSync2(join4(file, ".."), { recursive: true });
-    writeFileSync2(file, String(n), "utf8");
+    mkdirSync3(join4(file, ".."), { recursive: true });
+    writeFileSync3(file, String(n), "utf8");
     return true;
   } catch {
     return false;
   }
 }
 async function main() {
-  const env = process.env;
+  const env = effectiveEnv(process.env);
   if (!reviewLoopEnabled(env)) return;
   let input = {};
   try {
-    input = JSON.parse(readFileSync2(0, "utf8") || "{}");
+    input = JSON.parse(readFileSync3(0, "utf8") || "{}");
   } catch {
   }
   const sessionId = (typeof input.session_id === "string" ? input.session_id : "default").replace(/[^A-Za-z0-9_.-]/g, "_");

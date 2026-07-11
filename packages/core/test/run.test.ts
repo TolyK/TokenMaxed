@@ -316,7 +316,7 @@ test('fallback honors the loop-guard and reports cooldowns for quota/rate', asyn
 
 // --- C-13 E-4: runWithEscalation orchestrator ---------------------------------
 
-import { runWithEscalation } from '../src/run.ts';
+import { deriveOutcomeDifficulty, runWithEscalation } from '../src/run.ts';
 import type { EscalationDeps } from '../src/run.ts';
 
 const elane = (over: Partial<Lane> & { id: string }): Lane => ({
@@ -348,7 +348,20 @@ test('escalation: pass on the first review ⇒ accept (no escalation)', async ()
   assert.equal(r.result.resultText, 'out:cheap');
   // 1 task (cheap) + 1 outcome (accept)
   assert.deepEqual(r.events.map((e) => e.kind), ['task', 'outcome']);
-  assert.equal((r.events[1]!.event as { action_taken?: string }).action_taken, 'accept');
+  const outcome = r.events[1]!.event as { action_taken?: string; difficulty?: string; subject_model?: string };
+  assert.equal(outcome.action_taken, 'accept');
+  assert.equal(outcome.difficulty, 'easy');
+  assert.equal(outcome.subject_model, 'gpt-5.5');
+});
+
+// --- P6 Phase 1b: difficulty + subject_model on escalation outcomes -----------
+
+test('deriveOutcomeDifficulty: stage-0 pass ⇒ easy; rework ⇒ moderate; escalate/give_back ⇒ hard', () => {
+  assert.equal(deriveOutcomeDifficulty(0, 'accept'), 'easy');
+  assert.equal(deriveOutcomeDifficulty(1, 'accept'), 'moderate');
+  assert.equal(deriveOutcomeDifficulty(0, 'rework'), 'moderate');
+  assert.equal(deriveOutcomeDifficulty(0, 'escalate'), 'hard');
+  assert.equal(deriveOutcomeDifficulty(0, 'give_back'), 'hard');
 });
 
 test('escalation: fail ⇒ escalate to a stronger lane, then accept_after_escalation', async () => {
@@ -358,9 +371,10 @@ test('escalation: fail ⇒ escalate to a stronger lane, then accept_after_escala
   assert.equal(r.result.resultText, 'out:target');
   // task(cheap), outcome(escalate→target), task(target), outcome(accept)
   assert.deepEqual(r.events.map((e) => e.kind), ['task', 'outcome', 'task', 'outcome']);
-  const esc = r.events[1]!.event as { action_taken?: string; target_lane_id?: string };
+  const esc = r.events[1]!.event as { action_taken?: string; target_lane_id?: string; difficulty?: string };
   assert.equal(esc.action_taken, 'escalate');
   assert.equal(esc.target_lane_id, 'target');
+  assert.equal(esc.difficulty, 'hard');
 });
 
 test('escalation: the superseded (rejected) leg is marked, the delivered leg is not', async () => {
@@ -384,7 +398,9 @@ test('escalation: needs-rework ⇒ one same-lane rework, then accept_after_rewor
   assert.equal(r.final_action, 'accept_after_rework');
   assert.equal(r.subjectLaneId, 'cheap'); // reworked on the same lane
   assert.deepEqual(r.events.map((e) => e.kind), ['task', 'outcome', 'task', 'outcome']);
-  assert.equal((r.events[1]!.event as { action_taken?: string }).action_taken, 'rework');
+  const rework = r.events[1]!.event as { action_taken?: string; difficulty?: string };
+  assert.equal(rework.action_taken, 'rework');
+  assert.equal(rework.difficulty, 'moderate');
 });
 
 test('escalation: no eligible manager ⇒ review_unavailable, original result kept', async () => {
@@ -400,7 +416,9 @@ test('escalation: fail but no qualifying target ⇒ give_back', async () => {
   // Only cheap + mgr; mgr is the manager (excluded as target), no other ≥capable lane.
   const r = await runWithEscalation(eReq, eCtx, noPolicy, edeps(['VERDICT: fail']), { candidates: [eCheap, eMgr] });
   assert.equal(r.final_action, 'give_back');
-  assert.equal((r.events[1]!.event as { action_taken?: string }).action_taken, 'give_back');
+  const gb = r.events[1]!.event as { action_taken?: string; difficulty?: string };
+  assert.equal(gb.action_taken, 'give_back');
+  assert.equal(gb.difficulty, 'hard');
 });
 
 test('escalation: unparseable verdict ⇒ review_unavailable (never a silent pass)', async () => {

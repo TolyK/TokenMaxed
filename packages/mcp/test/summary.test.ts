@@ -6,14 +6,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { filterEventsSince, summarize, tokenStats } from '../../core/src/index.ts';
+import {
+  filterEventsSince,
+  laneQuotaState,
+  requestsInWindow,
+  summarize,
+  tokenStats,
+  windowLevel,
+  windowUsedFraction,
+} from '../../core/src/index.ts';
 import type { LedgerEvent, Lane } from '../../core/src/index.ts';
 
 import { selectManagerLane } from '../src/manager-select.ts';
-import { buildSummaryData, clampBanner, formatSummaryBanner } from '../src/summary.ts';
+import { buildSummaryData, clampBanner, formatSummaryBanner, METERED_KEY_WARNING } from '../src/summary.ts';
+import { makeSummaryFromEnv } from '../src/summary-deps.ts';
 
 const NOW = Date.parse('2026-06-04T12:00:00.000Z');
-const core = { summarize, tokenStats, filterEventsSince };
+const core = { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel };
 
 function taskEvent(over: Partial<LedgerEvent> & { ts: string; laneId: string }): LedgerEvent {
   return {
@@ -108,6 +117,61 @@ test('an unavailable lane is flagged offline', () => {
   const d = build();
   assert.equal(d.lanes.find((l) => l.id === 'ollama-llama3')!.available, false);
   assert.equal(d.lanes.find((l) => l.id === 'codex-cli')!.available, true);
+});
+
+test('per-lane requestsIn5h counts routed task events in the trailing 5h window', () => {
+  const d = build();
+  assert.equal(d.lanes.find((l) => l.id === 'codex-cli')!.requestsIn5h, 1); // 1h ago
+  assert.equal(d.lanes.find((l) => l.id === 'minimax-api')!.requestsIn5h, 0); // 72h ago
+  assert.equal(d.lanes.find((l) => l.id === 'claude-haiku')!.requestsIn5h, 0);
+});
+
+test('banner shows routed 5h count per lane; quota warning only when limit set and near/over', () => {
+  const nearLimit = build({
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 1 })],
+    availableLaneIds: ['codex-cli'],
+  });
+  const bannerWarn = formatSummaryBanner(nearLimit);
+  assert.match(bannerWarn, /routed 5h: 1/);
+  assert.match(bannerWarn, /routed 5h: 1\/1 \(near limit/);
+  assert.match(bannerWarn, /ledger count only/);
+
+  const noLimit = build({ availableLaneIds: ['codex-cli', 'claude-haiku'] });
+  const bannerOk = formatSummaryBanner(noLimit);
+  assert.match(bannerOk, /Codex.*routed 5h: 1/);
+  assert.doesNotMatch(bannerOk, /Claude.*routed 5h/); // idle lane, no limit ⇒ no suffix
+  assert.doesNotMatch(bannerOk, /near limit|filling up/);
+});
+
+test('B: a window_ms override labels BOTH the lane row and the warning line with the real window', () => {
+  const custom = build({
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 1, window_ms: 2 * 60 * 60 * 1000 })],
+    availableLaneIds: ['codex-cli'],
+  });
+  const banner = formatSummaryBanner(custom);
+  assert.match(banner, /routed 2h: 1/); // lane row
+  assert.match(banner, /routed 2h: 1\/1 \(near limit/); // warning line — never mislabeled 5h
+  assert.doesNotMatch(banner, /routed 5h/);
+});
+
+test('requestsIn5h excludes native breadcrumb events (only routed task events count)', () => {
+  const withNative = build({
+    events: [
+      ...events,
+      taskEvent({ ts: hoursAgo(2), laneId: 'codex-cli', status: 'native', tokens_in: 0, tokens_out: 0 }),
+    ],
+  });
+  assert.equal(withNative.lanes.find((l) => l.id === 'codex-cli')!.requestsIn5h, 1); // still 1 routed, not 2
+});
+
+test('banner shows routed 5h count when limit is configured below warn threshold, without a warning line', () => {
+  const belowWarn = build({
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 100 })],
+    availableLaneIds: ['codex-cli'],
+  });
+  const banner = formatSummaryBanner(belowWarn);
+  assert.match(banner, /Codex.*routed 5h: 1/); // limit configured ⇒ suffix shown even at low count
+  assert.doesNotMatch(banner, /near limit|filling up|ledger count only/); // below warn ⇒ no warning line
 });
 
 test('per-lane tokensRouted is attributed from the ledger (byLane), 0 for a lane with no events', () => {
@@ -261,4 +325,115 @@ test('clampBanner GUARANTEES maxChars as a true postcondition even for a patholo
   assert.equal(clampBanner('abcdef', { maxChars: 0.5 }), ''); // fractional < 1 → 0
   // A fractional budget >= 1 floors down, and the result still fits the floored budget.
   assert.ok(clampBanner(banner, { maxChars: 80.9 }).length <= 80);
+});
+
+// --- meteredKeyWarning (ANTHROPIC_API_KEY trap) ------------------------------
+
+test('banner includes the metered warning line when meteredKeyWarning is true', async () => {
+  const b1 = formatSummaryBanner(build({ meteredKeyWarning: true }));
+  assert.match(b1, /   ⚠ ANTHROPIC_API_KEY is set — Claude Code bills per-token \(metered\) even on a Max\/Pro plan\. Unset it to use your subscription quota\./);
+  // also via detection in makeSummaryFromEnv (minimal env for empty path)
+  const envWith = { TOKENMAXED_LANES: '/no', TOKENMAXED_LEDGER: '/no', TOKENMAXED_STATE: '/no', ANTHROPIC_API_KEY: 'present' };
+  const d = await makeSummaryFromEnv(envWith)();
+  assert.equal(d.meteredKeyWarning, true);
+  assert.match(formatSummaryBanner(d), /ANTHROPIC_API_KEY is set/);
+});
+
+test('banner omits the metered warning when meteredKeyWarning false or undefined', () => {
+  assert.doesNotMatch(formatSummaryBanner(build({})), /ANTHROPIC_API_KEY/);
+  assert.doesNotMatch(formatSummaryBanner(build({ meteredKeyWarning: false })), /ANTHROPIC_API_KEY/);
+  assert.doesNotMatch(formatSummaryBanner(build({ meteredKeyWarning: undefined })), /ANTHROPIC_API_KEY/);
+});
+
+test('clampBanner does NOT drop the metered warning even under a tight maxLines budget', () => {
+  const banner = formatSummaryBanner(build({
+    meteredKeyWarning: true,
+    availableLaneIds: ['codex-cli', 'claude-haiku', 'minimax-api'],
+    staleness: [{ laneId: 'minimax-api', newest: 'minimax-m3', newestPriced: true }],
+    laneReview: 'first-review',
+  }));
+  const n = banner.split('\n').length;
+  // tight budget that drops lower-rank trailing (tips, stale, hint)
+  const out = clampBanner(banner, { maxLines: Math.max(3, n - 3), maxChars: 999999 });
+  assert.match(out, /ANTHROPIC_API_KEY is set — Claude Code bills per-token/); // warning (rank 0) never dropped
+  assert.doesNotMatch(out, /\/tokenmaxed:summary anytime/); // tips dropped
+  // required skeleton still present
+  assert.match(out, /🟢 TokenMaxed/);
+  assert.match(out, /24h|7d|lifetime/);
+});
+
+test('banner includes the metered warning when routing is OFF and meteredKeyWarning is true', () => {
+  const banner = formatSummaryBanner(build({ enabled: false, meteredKeyWarning: true }));
+  assert.match(banner, /routing is OFF/i);
+  assert.match(banner, /ANTHROPIC_API_KEY is set — Claude Code bills per-token/);
+  assert.doesNotMatch(formatSummaryBanner(build({ enabled: false })), /ANTHROPIC_API_KEY/);
+});
+
+test('clampBanner stays robust (no throw, within maxChars) when the banner is dominated by the metered warning line', () => {
+  const banner = formatSummaryBanner(build({ enabled: false, meteredKeyWarning: true }));
+  assert.match(banner, /ANTHROPIC_API_KEY is set — Claude Code bills per-token/);
+
+  const maxChars = 50;
+  let out = '';
+  assert.doesNotThrow(() => {
+    out = clampBanner(banner, { maxChars });
+  });
+  assert.equal(typeof out, 'string');
+  assert.ok(out.length <= maxChars);
+
+  const generous = clampBanner(banner, { maxChars: 2000 });
+  assert.ok(generous.includes(METERED_KEY_WARNING), 'full warning line survives under a generous budget');
+});
+
+test('clampBanner keeps the FULL metered warning intact under a tight maxChars budget', () => {
+  const banner = formatSummaryBanner(build({
+    meteredKeyWarning: true,
+    availableLaneIds: ['codex-cli', 'claude-haiku', 'minimax-api'],
+    staleness: [{ laneId: 'minimax-api', newest: 'minimax-m3', newestPriced: true }],
+    laneReview: 'first-review',
+  }));
+  // Force the longest-line ellipsize step: budget tight enough to trim, loose enough
+  // that the hard backstop does not slice the warning.
+  const out = clampBanner(banner, { maxLines: 999, maxChars: banner.length - 20 });
+  assert.ok(out.includes(METERED_KEY_WARNING), 'warning line must survive ellipsize intact');
+  assert.doesNotMatch(out, new RegExp(`${METERED_KEY_WARNING.slice(0, -1)}…`)); // not ellipsized
+});
+
+test('B3: warn-line forecast rendering — moderate shows a relative time, low shows a timeless notice', () => {
+  const base = {
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 1 })],
+    availableLaneIds: ['codex-cli'],
+  };
+  const moderate = build({
+    ...base,
+    core: { ...core, laneDepletionForecast: () => ({ etaMs: 2 * 86_400_000, confidence: 'moderate' as const }) },
+  });
+  assert.match(formatSummaryBanner(moderate), /near limit — ledger count only, not your full session\) — est\. ~2d at routed pace/);
+  const low = build({
+    ...base,
+    core: { ...core, laneDepletionForecast: () => ({ etaMs: 60_000, confidence: 'low' as const }) },
+  });
+  const banner = formatSummaryBanner(low);
+  assert.match(banner, /— approaching cap \(routed\)/);
+  assert.doesNotMatch(banner, /est\. ~/); // low NEVER renders a time
+});
+
+test('B3: weekly-only caps alert and forecast too; eta 0 renders "now" (never "~1m")', () => {
+  const weeklyLane = lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', tokens_per_week: 200 });
+  const d = build({
+    lanes: [weeklyLane],
+    availableLaneIds: ['codex-cli'],
+    core: {
+      ...core,
+      laneQuotaState: (evts, l, n) => laneQuotaState(evts, l, n),
+      laneDepletionForecast: () => ({ etaMs: 0, confidence: 'moderate' as const }),
+    },
+  });
+  // 150 of 200 weekly tokens used (the 1h-ago event) ⇒ warn on the weekly axis only.
+  const row = d.lanes.find((l) => l.id === 'codex-cli')!;
+  assert.equal(row.weekLevel, 'warn');
+  assert.equal(row.forecastEtaMs, 0);
+  const banner = formatSummaryBanner(d);
+  assert.match(banner, /routed 7d 150\/200 tok \(filling up — ledger count only, not your full session\) — est\. now at routed pace/);
+  assert.doesNotMatch(banner, /~1m/);
 });

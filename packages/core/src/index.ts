@@ -12,13 +12,51 @@ export {
   declaredCapabilityFor,
   effectiveCapability,
   effectiveCapabilityFor,
+  effectiveCapabilityOptsFromContext,
+  effectiveOptsForTask,
+  resolveLaneModelKey,
   DEFAULT_CAPABILITY,
   DEFAULT_PRIOR_STRENGTH,
   DEFAULT_TIER_FLOOR,
 } from './route.ts';
+export {
+  MAX_PRIOR_DELTA,
+  PRIOR_STRENGTH_BY_CONFIDENCE,
+  priorStrengthFromConfidence,
+  resolvedPriorFor,
+  clampOverlayPrior,
+  validateSnapshot,
+  computeSnapshotHash,
+  overlayFromSnapshot,
+  priorOptsFromContext,
+} from './capability-prior.ts';
+export type {
+  ResolvedPriorOptions,
+  CapabilitySnapshot,
+  CapabilitySnapshotEntry,
+  ValidateSnapshotResult,
+  OverlayFromSnapshotOptions,
+  OverlayBuildResult,
+} from './capability-prior.ts';
 export type { EffectiveCapabilityOptions, EligibleLane } from './route.ts';
-export { outcomeCapability, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
+export { laneDepletionForecast, laneObservations, laneQuotaState, projectOccupancy, quotaHeadroomMap, WEEK_MS } from './quota.ts';
+export type { DepletionProjection, LaneDepletionForecast, LaneQuotaState, QuotaAxisState, QuotaObservation } from './quota.ts';
+export { outcomeCapability, outcomeCapabilityByDifficulty, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
 export type { OutcomeCapabilityOptions } from './feedback.ts';
+export { buildLeaderboard, sortLeaderboard } from './leaderboard.ts';
+export type { LeaderboardRow, LeaderboardDifficulty, LeaderboardSortBy } from './leaderboard.ts';
+export {
+  MIN_TOTAL,
+  MIN_USERS,
+  SHARE_ROW_FIELDS,
+  SHARE_SNAPSHOT_FIELDS,
+  mergeShareSnapshots,
+  publishLeaderboard,
+  serializeShareSnapshot,
+  shareSnapshotFromRows,
+  validateShareSnapshot,
+} from './leaderboard-share.ts';
+export type { MergeOptions, MergedCell, PublishOptions, ShareRow, ShareSnapshot, ValidateShareResult } from './leaderboard-share.ts';
 export { LaneRegistry, LaneConfigError, parseLaneConfig } from './registry.ts';
 export {
   PriceError,
@@ -138,6 +176,23 @@ export {
   CAP_CRITICAL_USED,
 } from './usage.ts';
 export type { RawUsage, ResolvedUsage, CapLevel } from './usage.ts';
+export {
+  FIVE_HOUR_MS,
+  WINDOW_WARN_USED,
+  WINDOW_CRITICAL_USED,
+  requestsInWindow,
+  windowUsedFraction,
+  windowHeadroom,
+  windowLevel,
+  msUntilWindowFrees,
+} from './window-quota.ts';
+export type { WindowLevel } from './window-quota.ts';
+export {
+  MIN_CLASSIFY_CONFIDENCE,
+  CLASSIFY_FALLBACK_CATEGORY,
+  classifyTask,
+} from './classify.ts';
+export type { Classification } from './classify.ts';
 // File I/O (loadLaneConfig, loadPriceTable, JsonlLedger) lives in the Node
 // adapter: import from "@tokenmaxed/core/node" so the core barrel stays free
 // of node:fs.

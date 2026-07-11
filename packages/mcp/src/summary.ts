@@ -12,16 +12,65 @@
  * spend — computed only from existing content-free ledger primitives.
  */
 
-import type { LedgerEvent, LedgerSummary, Lane, Policy, TokenStats } from '@tokenmaxed/core';
+import type { LedgerEvent, LedgerSummary, Lane, Policy, TokenStats, WindowLevel } from '@tokenmaxed/core';
 import type { ManagerSelectPort } from './manager-select.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+/** Mirrors {@link FIVE_HOUR_MS} in core — kept local so this module stays runtime-core-free. */
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+
+/** B: humanize a window length for labels ("5h", "2h", "90m"). */
+export function fmtWindow(ms: number): string {
+  if (ms >= 3_600_000) {
+    const hours = ms / 3_600_000;
+    const rounded = Math.round(hours * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded}h`;
+  }
+  return `${Math.max(1, Math.round(ms / 60_000))}m`;
+}
+
+/** B3: humanize a projected duration — relative, coarse, never a calendar time. */
+export function fmtEta(ms: number): string {
+  const minutes = ms / 60_000;
+  // Already at/over the cap: say so honestly rather than "~1m away".
+  if (minutes < 0.75) return 'now';
+  if (minutes < 90) return `~${Math.max(1, Math.round(minutes))}m`;
+  const hours = minutes / 60;
+  if (hours < 36) return `~${Math.round(hours)}h`;
+  return `~${Math.round(hours / 24)}d`;
+}
 
 /** Core aggregate functions, injected so this module needs no runtime core import. */
 export interface SummaryCorePort {
   summarize: (events: readonly LedgerEvent[]) => LedgerSummary;
   tokenStats: (events: readonly LedgerEvent[]) => TokenStats;
   filterEventsSince: <E extends { ts: string }>(events: readonly E[], sinceIso?: string) => E[];
+  /** Rolling-window request count (injected — core stays out of this module at runtime). */
+  requestsInWindow: (timestampsMs: readonly number[], now: number, windowMs?: number) => number;
+  windowUsedFraction: (count: number, limit: number) => number;
+  windowLevel: (usedFraction: number) => WindowLevel;
+  /**
+   * B3: earliest projected depletion across a lane's configured quota axes
+   * (routed-share only; omit-first evidence gates). Optional — absent ⇒ no
+   * forecasts anywhere in the summary.
+   */
+  laneDepletionForecast?: (
+    events: readonly LedgerEvent[],
+    lane: Lane,
+    now: number,
+  ) => { etaMs: number; confidence: 'low' | 'moderate' } | undefined;
+  /**
+   * B: full quota state (all axes) so weekly-only caps also gate forecasts and
+   * render alerts. Optional — absent ⇒ window-axis behavior only.
+   */
+  laneQuotaState?: (
+    events: readonly LedgerEvent[],
+    lane: Lane,
+    now: number,
+  ) => {
+    weekRequests?: { count: number; limit: number; level: WindowLevel };
+    weekTokens?: { count: number; limit: number; level: WindowLevel };
+  };
 }
 
 /** Everything the builder needs; all I/O is resolved by the caller. */
@@ -59,6 +108,7 @@ export interface SummaryInput {
    * one lane (the first whose model matches). Optional — absent ⇒ routed-only counts.
    */
   cliUsageByModel?: Record<string, { in: number; out: number }>;
+  meteredKeyWarning?: boolean;
 }
 
 /** A stale-model finding for one lane (structural subset of a freshness warning). */
@@ -88,6 +138,22 @@ export interface LaneSummary {
   provenance: Lane['provenance'];
   /** Lifetime tokens routed to THIS lane (from tokenStats().byLane); 0 if none yet. */
   tokensRouted: number;
+  /** Routed task events in the lane's trailing window (ledger-only; not total subscription usage). */
+  requestsIn5h: number;
+  /** B: hours of a non-default window (lane window_ms override); absent ⇒ the 5h default. */
+  windowHours?: number;
+  /** B3: projected ms until a quota axis depletes at the current ROUTED pace (moderate confidence only). */
+  forecastEtaMs?: number;
+  /** B3: true ⇒ a projection exists but only at low confidence (render no time). */
+  forecastLow?: boolean;
+  /** B: worst weekly-axis level, when a weekly cap is configured and warn/critical. */
+  weekLevel?: 'warn' | 'critical';
+  /** B: compact weekly-axis detail ("7d 8/10 req · 7d 10,500/15,000 tok"). */
+  weekDetail?: string;
+  /** Configured per-5h request limit, when set on the lane. */
+  requestsPerWindow?: number;
+  /** Quota level vs {@link requestsPerWindow}, when configured. */
+  requestWindowLevel?: WindowLevel;
   /** True for the lane the review path would actually use right now. */
   isActiveReviewer: boolean;
   available: boolean;
@@ -107,6 +173,7 @@ export interface SummaryData {
   activeReviewerId?: string;
   /** SETUP-1 B: lane-review status (drives a read-only "run /tokenmaxed:setup" hint). */
   laneReview?: 'first-review' | 'changed' | 'current';
+  meteredKeyWarning?: boolean;
   /** True when there are no routed task events yet (new user). */
   empty: boolean;
 }
@@ -152,6 +219,20 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
   // Lifetime tokens routed per lane (the summary is global ⇒ all events).
   const byLane = core.tokenStats(events).byLane;
+  // Per-lane routed-task timestamps for the 5h request window (excludes native
+  // breadcrumbs — those never ran on a lane and are not "routed" work).
+  const routedTsByLane = new Map<string, number[]>();
+  for (const e of events) {
+    if (e.event_type !== 'task' || e.status === 'native') continue;
+    const ms = Date.parse(e.ts);
+    if (!Number.isFinite(ms)) continue;
+    let arr = routedTsByLane.get(e.laneId);
+    if (!arr) {
+      arr = [];
+      routedTsByLane.set(e.laneId, arr);
+    }
+    arr.push(ms);
+  }
   // Fold the host CLI's own per-model usage into per-lane counts, attributing each
   // model's tokens to AT MOST ONE lane (the first whose resolved model matches) so a
   // model shared by two lanes (e.g. a CLI + an API lane) isn't double-counted.
@@ -165,6 +246,31 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
+    // B: honor a configured window_ms override so this count always agrees with
+    // the quota state routing uses (count parity + honest labeling).
+    const windowMs = typeof l.window_ms === 'number' && l.window_ms > 0 ? l.window_ms : FIVE_HOUR_MS;
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, windowMs);
+    const limit = l.requests_per_window;
+    const requestWindowLevel =
+      limit !== undefined ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : undefined;
+    // B: weekly axes (requests_per_week / tokens_per_week) so weekly-only caps
+    // alert and gate forecasts too — not just the rolling window.
+    const weekState = core.laneQuotaState?.(input.events, l, now);
+    const weekLevels = [weekState?.weekRequests?.level, weekState?.weekTokens?.level];
+    const weekLevel = weekLevels.includes('critical') ? 'critical' : weekLevels.includes('warn') ? 'warn' : undefined;
+    const weekDetail = weekState
+      ? [
+          ...(weekState.weekRequests ? [`7d ${weekState.weekRequests.count}/${weekState.weekRequests.limit} req`] : []),
+          ...(weekState.weekTokens
+            ? [`7d ${Math.round(weekState.weekTokens.count).toLocaleString('en-US')}/${weekState.weekTokens.limit.toLocaleString('en-US')} tok`]
+            : []),
+        ].join(' · ')
+      : '';
+    // B3: project depletion ONLY for lanes at warn/critical on ANY configured
+    // axis (the quiet majority get no forecast churn).
+    const anyPressure =
+      requestWindowLevel === 'warn' || requestWindowLevel === 'critical' || weekLevel !== undefined;
+    const forecast = core.laneDepletionForecast && anyPressure ? core.laneDepletionForecast(input.events, l, now) : undefined;
     return {
       id: l.id,
       kind: l.kind,
@@ -172,6 +278,11 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       trustMode: l.trust_mode,
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
+      requestsIn5h,
+      ...(windowMs !== FIVE_HOUR_MS ? { windowHours: windowMs / 3_600_000 } : {}),
+      ...(limit !== undefined ? { requestsPerWindow: limit, requestWindowLevel } : {}),
+      ...(weekLevel && weekDetail ? { weekLevel, weekDetail } : {}),
+      ...(forecast ? (forecast.confidence === 'moderate' ? { forecastEtaMs: forecast.etaMs } : { forecastLow: true }) : {}),
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...(s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}),
@@ -187,11 +298,15 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
     lanes: laneSummaries,
     ...(reviewer ? { activeReviewerId: reviewer.id } : {}),
     ...(input.laneReview ? { laneReview: input.laneReview } : {}),
+    ...(input.meteredKeyWarning ? { meteredKeyWarning: true } : {}),
     empty: lifetime.offloads === 0,
   };
 }
 
 // --- rendering (dependency-free: pure data → string) ---------------------------
+
+export const METERED_KEY_WARNING =
+  '   ⚠ ANTHROPIC_API_KEY is set — Claude Code bills per-token (metered) even on a Max/Pro plan. Unset it to use your subscription quota.';
 
 const usd = (n: number): string => `$${n.toFixed(2)}`;
 const pct = (share: number): string => `${Math.round(share * 100)}%`;
@@ -204,11 +319,13 @@ function tok(n: number): string {
 /** Render the banner. Dependency-free; safe to call from any caller. */
 export function formatSummaryBanner(data: SummaryData): string {
   if (!data.enabled) {
-    return '⏸  TokenMaxed routing is OFF for this project — run /tokenmaxed:on to re-enable.';
+    const off = '⏸  TokenMaxed routing is OFF for this project — run /tokenmaxed:on to re-enable.';
+    return data.meteredKeyWarning ? `${off}\n${METERED_KEY_WARNING}` : off;
   }
   const lines: string[] = [];
   if (data.empty) {
     lines.push('🟢 TokenMaxed — ready. No routed work yet; your savings will show here.');
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
   } else {
     lines.push('🟢 TokenMaxed — maximizing your flat-rate capacity');
     lines.push(
@@ -216,6 +333,7 @@ export function formatSummaryBanner(data: SummaryData): string {
         `${usd(data.meteredAvoided7d)} last 7d`,
     );
     lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
     lines.push('');
     for (const w of data.windows) {
       const nf =
@@ -245,8 +363,12 @@ export function formatSummaryBanner(data: SummaryData): string {
     const width = Math.max(...visible.map((l) => vendorName(l).length));
     // Per-lane counts are often small, so show the EXACT count (grouped) rather than
     // tok()'s thousands-rounding, which would render e.g. 150 tokens as a misleading "0k".
-    const laneLine = (l: LaneSummary): string =>
-      `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` · ${l.tokensRouted.toLocaleString('en-US')} tok` : ''}${l.stale ? ' ⚠ stale' : ''}`;
+    const laneLine = (l: LaneSummary): string => {
+      const windowLabel = l.windowHours !== undefined ? fmtWindow(l.windowHours * 3_600_000) : '5h';
+      const routed5h =
+        l.requestsIn5h > 0 || l.requestsPerWindow !== undefined ? ` · routed ${windowLabel}: ${l.requestsIn5h}` : '';
+      return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` · ${l.tokensRouted.toLocaleString('en-US')} tok` : ''}${routed5h}${l.stale ? ' ⚠ stale' : ''}`;
+    };
     const groups: Array<{ title: string; mode: Lane['trust_mode'] }> = [
       { title: 'Full access', mode: 'full' },
       { title: 'Workers', mode: 'worker' },
@@ -273,6 +395,40 @@ export function formatSummaryBanner(data: SummaryData): string {
     lines.push('   ⚠ your lanes changed since you last reviewed them — run /tokenmaxed:setup to review');
   } else if (data.lanes.length > 0 && data.laneReview === 'first-review') {
     lines.push('   ℹ run /tokenmaxed:setup to review what each lane may see/do');
+  }
+  // Routed window quota warnings (ledger-only counts — NOT total subscription usage).
+  for (const l of visible.filter(
+    (x) => x.requestsPerWindow !== undefined && (x.requestWindowLevel === 'warn' || x.requestWindowLevel === 'critical'),
+  )) {
+    const tag = l.requestWindowLevel === 'critical' ? 'near limit' : 'filling up';
+    const windowLabel = l.windowHours !== undefined ? fmtWindow(l.windowHours * 3_600_000) : '5h';
+    // B3: confidence controls WHETHER and HOW time renders — moderate ⇒ a
+    // relative duration; low ⇒ a timeless notice; neither ⇒ nothing extra.
+    const forecast =
+      l.forecastEtaMs !== undefined
+        ? ` — est. ${fmtEta(l.forecastEtaMs)} at routed pace`
+        : l.forecastLow
+          ? ' — approaching cap (routed)'
+          : '';
+    lines.push(
+      `   ⚠ ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} — ledger count only, not your full session)${forecast}`,
+    );
+  }
+  // B: weekly-only quota alerts — lanes whose WEEKLY axes are warn/critical while
+  // the rolling window (if any) is not; the window loop above already carries the
+  // forecast when both are hot, so these never double-render.
+  for (const l of visible.filter(
+    (x) =>
+      x.weekLevel !== undefined && !(x.requestWindowLevel === 'warn' || x.requestWindowLevel === 'critical'),
+  )) {
+    const tag = l.weekLevel === 'critical' ? 'near limit' : 'filling up';
+    const forecast =
+      l.forecastEtaMs !== undefined
+        ? ` — est. ${fmtEta(l.forecastEtaMs)} at routed pace`
+        : l.forecastLow
+          ? ' — approaching cap (routed)'
+          : '';
+    lines.push(`   ⚠ ${vendorName(l)} routed ${l.weekDetail} (${tag} — ledger count only, not your full session)${forecast}`);
   }
   // Spell out stale models, but only for the VISIBLE (capped) lanes — so the spell-out
   // count is bounded by MAX_LANES, never the full set. Offline/blocked lanes are
@@ -377,8 +533,18 @@ export function clampBanner(banner: string, opts: { maxLines?: number; maxChars?
   // (a big lane set) lands here with the skeleton intact.
   let out = lines.join('\n');
   if (out.length > maxChars) {
-    let idx = 0;
-    for (let k = 1; k < lines.length; k++) if (lines[k]!.length > lines[idx]!.length) idx = k;
+    // Never ellipsize the metered-key warning unless it is the only line left.
+    let candidates = lines
+      .map((line, i) => ({ line, i }))
+      .filter(({ line }) => line !== METERED_KEY_WARNING || lines.length === 1);
+    // Defensive: CLAMP_POINTER is always appended above and is never the warning, so at
+    // least one non-warning candidate always exists; this guard only protects against future
+    // changes that might remove that invariant.
+    if (candidates.length === 0) candidates = lines.map((line, i) => ({ line, i }));
+    let idx = candidates[0]!.i;
+    for (let k = 1; k < candidates.length; k++) {
+      if (lines[candidates[k]!.i]!.length > lines[idx]!.length) idx = candidates[k]!.i;
+    }
     const overBy = out.length - maxChars;
     const target = Math.max(0, lines[idx]!.length - overBy - 1); // -1 for the ellipsis char
     lines[idx] = `${lines[idx]!.slice(0, target)}…`;

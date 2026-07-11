@@ -28,6 +28,7 @@ import { join } from 'node:path';
 
 import { REVIEW_BUDGET_MS, makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
 import { runReviewWithBudget } from './review-budget.ts';
+import { effectiveEnv } from './settings.ts';
 import { parseMaxRounds, reviewLoopEnabled, stopHookAction } from './reviewer.ts';
 
 function readCounter(file: string): number {
@@ -51,7 +52,7 @@ function writeCounter(file: string, n: number): boolean {
 }
 
 async function main(): Promise<void> {
-  const env = process.env;
+  const env = effectiveEnv(process.env);
   // DEFAULT-ON: runs unless explicitly opted out (TOKENMAXED_REVIEW_ON_STOP=false)
   // or globally disabled (TOKENMAXED_DISABLE, also our recursion guard). When no
   // reviewer lane is configured the review no-ops downstream, so default-on means

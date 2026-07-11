@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  DIFFICULTY_BUCKETS,
   EVENT_FIELDS,
   OUTCOME_EVENT_FIELDS,
   SCHEMA_VERSION,
@@ -377,6 +378,90 @@ test('tokenStats: overall, per-model, per-lane with estimated/reported split', (
 });
 
 // --- C-13 E-5: superseded legs excluded from savings (honesty) ----------------
+
+// --- P6 Phase 1a: subject_model + difficulty schema ---------------------------
+
+test('outcome with subject_model/subject_model_resolved/difficulty round-trips at schema_version 2', () => {
+  const full = outcome({
+    subject_model: 'claude-opus-4-8',
+    subject_model_resolved: 'claude-opus-4-8',
+    difficulty: 'moderate',
+  });
+  assert.equal(full.schema_version, SCHEMA_VERSION);
+  assert.equal(SCHEMA_VERSION, 2);
+  const line = JSON.parse(serializeEvent(full)) as Record<string, unknown>;
+  assert.equal(line.schema_version, 2);
+  assert.equal(line.subject_model, 'claude-opus-4-8');
+  assert.equal(line.subject_model_resolved, 'claude-opus-4-8');
+  assert.equal(line.difficulty, 'moderate');
+  const round = parseEvent(line);
+  assert.deepEqual(round, full);
+});
+
+test('outcome without P6 fields serializes with fields absent; legacy v1 outcome parses', () => {
+  const without = outcome();
+  const line = JSON.parse(serializeEvent(without)) as Record<string, unknown>;
+  assert.ok(!('subject_model' in line));
+  assert.ok(!('subject_model_resolved' in line));
+  assert.ok(!('difficulty' in line));
+  assert.equal(line.schema_version, 2);
+  const round = parseEvent(line);
+  assert.deepEqual(round, without);
+
+  const legacyV1 = {
+    event_type: 'outcome',
+    schema_version: 1,
+    id: 'o-legacy',
+    seq: 3,
+    ts: '2026-06-01T00:00:00.000Z',
+    subject_id: 't-0',
+    subject_type: 'router_task',
+    task_id: 't-0',
+    review_id: 'r-0',
+    attempt: 0,
+    category: 'bugfix',
+    subject_lane_id: 'codex-cli',
+    subject_provenance: 'openai',
+    reviewer_lane_id: 'claude-native',
+    reviewer_model: 'claude-opus-4-7',
+    reviewer_trust_mode: 'full',
+    reviewer_provenance: 'anthropic',
+    verdict: 'pass',
+    voter: 'reviewer_model',
+    policy_verdict: 'allow',
+  };
+  const parsed = parseEvent(legacyV1);
+  assert.equal(parsed.event_type, 'outcome');
+  assert.equal(parsed.schema_version, 1);
+  if (parsed.event_type === 'outcome') {
+    assert.equal(parsed.subject_model, undefined);
+    assert.equal(parsed.subject_model_resolved, undefined);
+    assert.equal(parsed.difficulty, undefined);
+  }
+});
+
+test('validateOutcomeInput rejects invalid difficulty and accepts valid/omitted', () => {
+  assert.throws(
+    () => validateOutcomeInput({ ...outcome(), difficulty: 'trivial' as never }),
+    (err: unknown) => err instanceof LedgerError && /difficulty/.test(err.message),
+  );
+  const valid = validateOutcomeInput({ ...outcome(), difficulty: 'hard' });
+  assert.equal(valid.difficulty, 'hard');
+  const omitted = validateOutcomeInput(outcome());
+  assert.equal(omitted.difficulty, undefined);
+  assert.deepEqual(DIFFICULTY_BUCKETS, ['easy', 'moderate', 'hard']);
+});
+
+test('serializeEvent drops non-allowlisted outcome fields (content-free guarantee)', () => {
+  const sneaky = outcome() as OutcomeEvent & { prompt?: string; notes?: string };
+  sneaky.prompt = 'secret prompt';
+  sneaky.notes = 'reviewer commentary';
+  const parsed = JSON.parse(serializeEvent(sneaky)) as Record<string, unknown>;
+  assert.equal(parsed.prompt, undefined);
+  assert.equal(parsed.notes, undefined);
+  const allow = new Set<string>(OUTCOME_EVENT_FIELDS);
+  for (const key of Object.keys(parsed)) assert.ok(allow.has(key), `unexpected field ${key}`);
+});
 
 test('summarize: a superseded ok leg counts spend but never claims savings', () => {
   // Delivered leg: frontier_cost 1, free ⇒ avoided 1. Superseded leg: frontier_cost

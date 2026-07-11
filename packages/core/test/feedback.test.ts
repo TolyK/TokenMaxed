@@ -13,6 +13,7 @@ import type { LedgerEvent, OutcomeEvent, TaskEvent } from '../src/ledger.ts';
 
 const MS_PER_DAY = 86_400_000;
 const NOW = Date.parse('2026-06-02T00:00:00.000Z');
+const MODEL = 'gpt-5-codex';
 
 /** ISO timestamp `days` before NOW (negative ⇒ in the future). */
 function isoDaysAgo(days: number): string {
@@ -35,6 +36,8 @@ function outcome(overrides: Partial<OutcomeEvent> = {}): OutcomeEvent {
     category: 'bugfix',
     subject_lane_id: 'codex-cli',
     subject_provenance: 'openai',
+    subject_model: MODEL,
+    subject_model_resolved: MODEL,
     reviewer_lane_id: 'claude-native',
     reviewer_model: 'claude-opus-4-7',
     reviewer_trust_mode: 'full',
@@ -56,8 +59,8 @@ test('no events yields an empty overlay', () => {
 
 test('a single fresh pass gives rate 1 and n 1', () => {
   const o = outcomeCapability([outcome({ verdict: 'pass' })], NOW);
-  near(o['codex-cli']!.bugfix!.rate, 1);
-  near(o['codex-cli']!.bugfix!.n, 1);
+  near(o[MODEL]!.bugfix!.rate, 1);
+  near(o[MODEL]!.bugfix!.n, 1);
 });
 
 test('verdicts map onto the dogfood scale (pass=1, needs-rework=½, fail=0)', () => {
@@ -67,8 +70,8 @@ test('verdicts map onto the dogfood scale (pass=1, needs-rework=½, fail=0)', ()
     outcome({ task_id: 'c', subject_id: 'c', verdict: 'fail' }),
   ];
   const o = outcomeCapability(events, NOW);
-  near(o['codex-cli']!.bugfix!.rate, (1 + 0.5 + 0) / 3);
-  near(o['codex-cli']!.bugfix!.n, 3);
+  near(o[MODEL]!.bugfix!.rate, (1 + 0.5 + 0) / 3);
+  near(o[MODEL]!.bugfix!.n, 3);
 });
 
 test('recency decay: an outcome one half-life old weighs half a fresh one', () => {
@@ -78,18 +81,18 @@ test('recency decay: an outcome one half-life old weighs half a fresh one', () =
   ];
   const o = outcomeCapability(events, NOW);
   // fresh: weight 1 value 1; old: weight 0.5 value 0 ⇒ rate = 1/1.5, n = 1.5
-  near(o['codex-cli']!.bugfix!.rate, 1 / 1.5);
-  near(o['codex-cli']!.bugfix!.n, 1.5);
+  near(o[MODEL]!.bugfix!.rate, 1 / 1.5);
+  near(o[MODEL]!.bugfix!.n, 1.5);
 });
 
-test('de-dup: only the latest (max seq) outcome per (task,attempt,lane,category) counts', () => {
+test('de-dup: only the latest (max seq) outcome per (task,attempt,model,category) counts', () => {
   const events: LedgerEvent[] = [
     outcome({ seq: 1, verdict: 'fail' }), // earlier review of the same attempt
     outcome({ seq: 5, verdict: 'pass' }), // latest review wins
   ];
   const o = outcomeCapability(events, NOW);
-  near(o['codex-cli']!.bugfix!.rate, 1); // pass, not the fail
-  near(o['codex-cli']!.bugfix!.n, 1); // counted once, not twice
+  near(o[MODEL]!.bugfix!.rate, 1); // pass, not the fail
+  near(o[MODEL]!.bugfix!.n, 1); // counted once, not twice
 });
 
 test('non-reviewer / unattributed / host-turn / task events are excluded', () => {
@@ -106,7 +109,7 @@ test('non-reviewer / unattributed / host-turn / task events are excluded', () =>
 
 test('future-dated outcomes are clamped to age 0 (weight ≤ 1, never amplified)', () => {
   const o = outcomeCapability([outcome({ ts: isoDaysAgo(-100), verdict: 'pass' })], NOW);
-  near(o['codex-cli']!.bugfix!.n, 1); // weight 1, not >1
+  near(o[MODEL]!.bugfix!.n, 1); // weight 1, not >1
 });
 
 test('outcomes with an unparseable timestamp are dropped', () => {
@@ -118,19 +121,82 @@ test('invalid halfLifeDays falls back to the default', () => {
   const expected = outcomeCapability(events, NOW); // default
   for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
     const got = outcomeCapability(events, NOW, { halfLifeDays: bad });
-    near(got['codex-cli']!.bugfix!.n, expected['codex-cli']!.bugfix!.n);
+    near(got[MODEL]!.bugfix!.n, expected[MODEL]!.bugfix!.n);
   }
 });
 
-test('lanes and categories are aggregated independently', () => {
+test('models and categories are aggregated independently', () => {
   const events: LedgerEvent[] = [
-    outcome({ task_id: 'a', subject_id: 'a', subject_lane_id: 'codex-cli', category: 'bugfix', verdict: 'pass' }),
-    outcome({ task_id: 'b', subject_id: 'b', subject_lane_id: 'codex-cli', category: 'docs', verdict: 'fail' }),
-    outcome({ task_id: 'c', subject_id: 'c', subject_lane_id: 'kimi', category: 'bugfix', verdict: 'needs-rework' }),
+    outcome({ task_id: 'a', subject_id: 'a', subject_model: 'model-a', subject_model_resolved: 'model-a', category: 'bugfix', verdict: 'pass' }),
+    outcome({ task_id: 'b', subject_id: 'b', subject_model: 'model-a', subject_model_resolved: 'model-a', category: 'docs', verdict: 'fail' }),
+    outcome({ task_id: 'c', subject_id: 'c', subject_model: 'model-b', subject_model_resolved: 'model-b', category: 'bugfix', verdict: 'needs-rework' }),
   ];
   const o = outcomeCapability(events, NOW);
-  near(o['codex-cli']!.bugfix!.rate, 1);
-  near(o['codex-cli']!.docs!.rate, 0);
-  near(o['kimi']!.bugfix!.rate, 0.5);
-  assert.equal(o['kimi']!.docs, undefined);
+  near(o['model-a']!.bugfix!.rate, 1);
+  near(o['model-a']!.docs!.rate, 0);
+  near(o['model-b']!.bugfix!.rate, 0.5);
+  assert.equal(o['model-b']!.docs, undefined);
+});
+
+// --- P6 Phase 1c: model-keyed learning ----------------------------------------
+
+test('verdicts for the same model across different lanes aggregate together', () => {
+  const events: LedgerEvent[] = [
+    outcome({ task_id: 'a', subject_id: 'a', subject_lane_id: 'lane-a', subject_model: 'shared-m', subject_model_resolved: 'shared-m', verdict: 'pass' }),
+    outcome({ task_id: 'b', subject_id: 'b', subject_lane_id: 'lane-b', subject_model: 'shared-m', subject_model_resolved: 'shared-m', verdict: 'fail' }),
+  ];
+  const o = outcomeCapability(events, NOW);
+  near(o['shared-m']!.bugfix!.rate, 0.5);
+  near(o['shared-m']!.bugfix!.n, 2);
+  assert.equal(o['lane-a'], undefined);
+  assert.equal(o['lane-b'], undefined);
+});
+
+test('verdicts for different models stay separate', () => {
+  const events: LedgerEvent[] = [
+    outcome({ task_id: 'a', subject_id: 'a', subject_model: 'model-x', subject_model_resolved: 'model-x', verdict: 'pass' }),
+    outcome({ task_id: 'b', subject_id: 'b', subject_model: 'model-y', subject_model_resolved: 'model-y', verdict: 'fail' }),
+  ];
+  const o = outcomeCapability(events, NOW);
+  near(o['model-x']!.bugfix!.rate, 1);
+  near(o['model-y']!.bugfix!.rate, 0);
+});
+
+test('legacy outcomes without subject_model are excluded from model-keyed learning', () => {
+  const events: LedgerEvent[] = [
+    outcome({ task_id: 'legacy', subject_id: 'legacy', subject_model: undefined, subject_model_resolved: undefined, verdict: 'pass' }),
+    outcome({ task_id: 'modern', subject_id: 'modern', subject_model: 'modern-m', subject_model_resolved: 'modern-m', verdict: 'pass' }),
+  ];
+  const o = outcomeCapability(events, NOW);
+  assert.equal(Object.keys(o).length, 1);
+  near(o['modern-m']!.bugfix!.rate, 1);
+});
+
+test('subject_model_resolved is preferred over subject_model for the key', () => {
+  const events: LedgerEvent[] = [
+    outcome({
+      task_id: 'a',
+      subject_id: 'a',
+      subject_model: 'raw-alias',
+      subject_model_resolved: 'concrete-id',
+      verdict: 'pass',
+    }),
+  ];
+  const o = outcomeCapability(events, NOW);
+  near(o['concrete-id']!.bugfix!.rate, 1);
+  assert.equal(o['raw-alias'], undefined);
+});
+
+test('subject_model alone is used when subject_model_resolved is absent', () => {
+  const events: LedgerEvent[] = [
+    outcome({
+      task_id: 'a',
+      subject_id: 'a',
+      subject_model: 'only-raw',
+      subject_model_resolved: undefined,
+      verdict: 'pass',
+    }),
+  ];
+  const o = outcomeCapability(events, NOW);
+  near(o['only-raw']!.bugfix!.rate, 1);
 });

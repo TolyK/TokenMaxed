@@ -141,18 +141,107 @@ export interface Lane {
   repo_read_attestation?: boolean;
   /**
    * Per-category capability in [0, 1]. A missing category falls back to
-   * {@link DEFAULT_CAPABILITY}. This is the lane's competence at a category,
-   * later overlaid by the registry feed's `capability_scores`.
+   * {@link DEFAULT_CAPABILITY}. This is the lane's offline/unranked floor when
+   * the rankings prior overlay has no entry; set `capability_source: pinned` to
+   * ignore the overlay and trust this number instead.
    */
   capability?: Partial<Record<TaskCategory, number>>;
+  /**
+   * When `pinned`, the hand-set {@link capability} wins over the rankings prior
+   * overlay for this lane. Absent ⇒ overlay prior applies when present.
+   */
+  capability_source?: CapabilitySource;
+  /**
+   * Optional per-5h rolling-window request limit for subscription plans that gate
+   * on request count (e.g. Claude Max). Absent ⇒ no limit configured; the summary
+   * still shows routed request counts but does not emit quota warnings.
+   */
+  requests_per_window?: number;
+  /**
+   * B: override the rolling window length (ms) for {@link requests_per_window}.
+   * Absent ⇒ the 5h default. Positive finite ms.
+   */
+  window_ms?: number;
+  /**
+   * B: trailing-7-day request cap. All quota counts are the ROUTED share from
+   * the local ledger — never total subscription usage (honesty law).
+   */
+  requests_per_week?: number;
+  /** B: trailing-7-day token cap (tokens_in + tokens_out), routed share only. */
+  tokens_per_week?: number;
+}
+
+/**
+ * How a lane's hand-set {@link Lane.capability} interacts with the rankings prior
+ * overlay. Only `pinned` is defined in v1.
+ */
+export type CapabilitySource = 'pinned';
+
+/**
+ * Raw rankings evidence for one lane × category prior entry. Carried through to
+ * `/why` for honesty — never treated as ground truth.
+ */
+export interface CapabilityPriorEvidence {
+  /** Normalized prior value in [0, 1] (coarse bucket / calibrated score). */
+  value: number;
+  /** Rankings source id, e.g. `mercor-apex-v1`. */
+  source: string;
+  /** Chart id within the source. */
+  chart: string;
+  rank?: number;
+  score?: number;
+  /** ISO date of the chart snapshot used. */
+  date: string;
+  /** Chart size when known. */
+  n?: number;
+  confidence: 'low' | 'moderate' | 'high';
+}
+
+/**
+ * Rankings-sourced capability PRIOR overlay, keyed by lane id then category.
+ * Feeds ONLY the declared-prior slot of {@link effectiveCapability}; separate
+ * from the F-1 observed overlay. Never mutates {@link Lane.capability}.
+ */
+export type CapabilityPriorOverlay = Record<string, Partial<Record<TaskCategory, CapabilityPriorEvidence>>>;
+
+/** Provenance of a resolved rankings prior for `/why` and debugging. */
+export type PriorProvenance = 'opt-out' | 'pinned' | 'overlay' | 'overlay-stale' | 'fallback' | 'default';
+
+/** Result of {@link resolvedPriorFor} — the prior slot before F-1 blending. */
+export interface ResolvedPrior {
+  prior: number;
+  priorStrength: number;
+  provenance: PriorProvenance;
+  evidence?: CapabilityPriorEvidence;
+  /** True when the overlay value was clamped by the ±Δ or stale-upward cap. */
+  clamped?: boolean;
+  /** True when no chart match exists for this lane×category (fallback used). */
+  unranked?: boolean;
 }
 
 /** Provenances treated as trusted-by-origin (locally executed or first-party). */
 export const TRUSTED_PROVENANCES: readonly string[] = ['anthropic', 'openai', 'google', 'meta'];
 
+/**
+ * Bounded difficulty bucket (content-free enum). Recorded on outcomes from the
+ * escalation stage (P6 §4); optionally supplied on a task to condition the
+ * capability lookup on the difficulty-specific pass record.
+ */
+export type DifficultyBucket = 'easy' | 'moderate' | 'hard';
+export const DIFFICULTY_BUCKETS: readonly DifficultyBucket[] = ['easy', 'moderate', 'hard'];
+
 /** A unit of work to route. v0 needs only its category to decide a lane. */
 export interface Task {
   category: TaskCategory;
+  /**
+   * Optional expected/observed difficulty. When set AND a learned
+   * {@link RouteContext.observedCapabilityByModelDifficulty} cell has evidence,
+   * routing conditions capability on that cell (back-off ladder). Absent ⇒
+   * category-level behavior, byte-identical to before difficulty existed.
+   * Escalation retries set this from the review stage ('hard' for an escalated
+   * leg); callers may set it explicitly for work they know is hard.
+   */
+  difficulty?: DifficultyBucket;
 }
 
 /** Caller-supplied access need for a task; `auto` defers the decision to `inferAccessNeed`. */
@@ -196,6 +285,28 @@ export interface ObservedCapability {
  */
 export type ObservedCapabilityByLane = Record<string, Partial<Record<TaskCategory, ObservedCapability>>>;
 
+/**
+ * Observed capability evidence keyed by resolved model id then task category (P6).
+ * A learned overlay on top of the declared config prior; absent entries fall back
+ * to declared capability. Sparse by construction (only models/categories with
+ * evidence appear).
+ */
+export type ObservedCapabilityByModel = Record<string, Partial<Record<TaskCategory, ObservedCapability>>>;
+
+/**
+ * Observed capability evidence keyed by resolved model id, task category, then
+ * difficulty bucket (P6 §4). The difficulty-conditioned view of
+ * {@link ObservedCapabilityByModel}: a cell holds the decay-weighted pass record
+ * for work whose review landed in that bucket. Sparse; outcomes recorded without
+ * a difficulty are excluded here (they still feed the category-level view).
+ * NOTE the bucket is escalation-depth under the active reviewer — a behavioral
+ * proxy for hardness, not ground truth (see feedback.ts banner).
+ */
+export type ObservedCapabilityByModelDifficulty = Record<
+  string,
+  Partial<Record<TaskCategory, Partial<Record<DifficultyBucket, ObservedCapability>>>>
+>;
+
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];
@@ -215,6 +326,46 @@ export interface RouteContext {
    * opt-out always stay on the DECLARED score regardless of this overlay.
    */
   observedCapability?: ObservedCapabilityByLane;
+  /**
+   * Optional model-keyed learned capability overlay (P6 F-1). When present,
+   * routing, reassignment, and escalation-target selection resolve each lane to
+   * its canonical model key and blend observed review evidence from that model's
+   * cell. Takes precedence over {@link observedCapability} when both are set.
+   * Absent ⇒ falls back to lane-keyed overlay, then declared capability.
+   * Reviewer-manager selection and the `capability: 0` opt-out always stay on
+   * the DECLARED score regardless of this overlay.
+   */
+  observedCapabilityByModel?: ObservedCapabilityByModel;
+  /**
+   * Optional difficulty-conditioned learned overlay (P6 §4). Consulted ONLY when
+   * the task carries a {@link Task.difficulty}: the matching model×category×
+   * difficulty cell (when it has evidence) is blended on top of the category-level
+   * effective capability via the same shrinkage form (back-off ladder:
+   * difficulty cell → category cell → declared/prior). Absent, or no task
+   * difficulty, or an empty cell ⇒ byte-identical to the category-level score.
+   * Reviewer-manager selection and the `capability: 0` opt-out are unaffected.
+   */
+  observedCapabilityByModelDifficulty?: ObservedCapabilityByModelDifficulty;
+  /**
+   * Optional rankings-sourced capability PRIOR overlay (separate from F-1
+   * {@link observedCapability}). When present, routing and escalation read the
+   * resolved rankings prior instead of the raw declared score for the prior
+   * slot; F-1 observed evidence still blends on top unchanged. Absent ⇒
+   * byte-identical to declared capability. Reviewer eligibility and the
+   * `capability: 0` opt-out always stay on the DECLARED score.
+   */
+  capabilityPrior?: CapabilityPriorOverlay;
+  /**
+   * When true, cached rankings priors may decrease but MUST NOT increase any
+   * previously-accepted prior (stale-feed integrity rule).
+   */
+  capabilityPriorStale?: boolean;
+  /**
+   * Previously-accepted overlay prior values per lane×category, used for the
+   * per-refresh ±Δ movement cap. Absent for a slot ⇒ first-acceptance baseline
+   * is the resolved local fallback after opt-out/pinned handling.
+   */
+  capabilityPriorAccepted?: Record<string, Partial<Record<TaskCategory, number>>>;
   /**
    * Whether the minimization/policy gate is built and CI-green. Defaults to
    * `false`. While false, only `full`, non-API lanes are selectable (non-`full`

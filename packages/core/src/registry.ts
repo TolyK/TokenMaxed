@@ -52,6 +52,11 @@ const ALLOWED_LANE_KEYS = new Set([
   'authHandle',
   'native',
   'capability',
+  'capability_source',
+  'requests_per_window',
+  'window_ms',
+  'requests_per_week',
+  'tokens_per_week',
 ]);
 
 /** Raised for any malformed or invalid lane configuration, with a clear message. */
@@ -209,6 +214,30 @@ function parseLane(entry: unknown, index: number): Lane {
 
   const capability = parseCapability(entry.capability, at('capability'));
   if (capability) lane.capability = capability;
+  if (entry.capability_source !== undefined) {
+    if (entry.capability_source !== 'pinned') {
+      throw new LaneConfigError(`${at('capability_source')} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
+    }
+    lane.capability_source = 'pinned';
+  }
+  if (entry.requests_per_window !== undefined) {
+    const n = entry.requests_per_window;
+    if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) {
+      throw new LaneConfigError(
+        `${at('requests_per_window')} must be a positive finite number (got ${JSON.stringify(n)}).`,
+      );
+    }
+    lane.requests_per_window = n;
+  }
+  // B quota-brain fields: same positive-finite rule as requests_per_window.
+  for (const field of ['window_ms', 'requests_per_week', 'tokens_per_week'] as const) {
+    const v = entry[field];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
+  }
 
   // A SELECTABLE (full/worker/reader), non-native lane must be executable: cli
   // needs a command, api needs an endpoint (local defaults to localhost). Reject

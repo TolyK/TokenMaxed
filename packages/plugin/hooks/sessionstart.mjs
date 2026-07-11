@@ -7365,10 +7365,110 @@ var require_dist = __commonJS({
   }
 });
 
-// ../mcp/src/summary-deps.ts
-import { existsSync as existsSync5, readFileSync as readFileSync4 } from "node:fs";
-import { dirname as dirname3, join as join4 } from "node:path";
-import { fileURLToPath as fileURLToPath2 } from "node:url";
+// ../mcp/src/settings.ts
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+
+// ../mcp/src/config.ts
+import { existsSync as existsSync2 } from "node:fs";
+import { homedir as homedir2 } from "node:os";
+import { delimiter, dirname as dirname2, join as join2 } from "node:path";
+
+// ../core/src/node.ts
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// ../core/src/registry.ts
+var import_yaml2 = __toESM(require_dist(), 1);
+
+// ../core/src/model-freshness.ts
+function parseModelAlias(model) {
+  const m = /^(.+)@latest$/.exec(model.trim());
+  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
+  return { latest: false, id: model };
+}
+function compareModelVersion(a, b) {
+  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
+  const ra = runs(a);
+  const rb = runs(b);
+  const n = Math.max(ra.length, rb.length);
+  for (let i = 0; i < n; i++) {
+    const xa = ra[i];
+    const xb = rb[i];
+    if (xa === void 0) return -1;
+    if (xb === void 0) return 1;
+    const na = /^\d+$/.test(xa);
+    const nb = /^\d+$/.test(xb);
+    if (na && nb) {
+      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (xa !== xb) {
+      return xa < xb ? -1 : 1;
+    }
+  }
+  return 0;
+}
+function releasedMs(table, id) {
+  const r = table.models[id]?.released;
+  return r === void 0 ? void 0 : Date.parse(r);
+}
+function compareNewestFirst(table, a, b) {
+  const ta = releasedMs(table, a);
+  const tb = releasedMs(table, b);
+  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
+  return compareModelVersion(b, a);
+}
+function pricedIdsInFamily(table, family) {
+  return Object.keys(table.models).filter((id) => table.models[id].family === family);
+}
+function newestPricedInFamily(table, family) {
+  const ids = pricedIdsInFamily(table, family);
+  if (ids.length === 0) return void 0;
+  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
+}
+function resolveLaneModel(lane, table) {
+  const spec = parseModelAlias(lane.model);
+  if (!spec.latest) return lane;
+  const concrete = newestPricedInFamily(table, spec.family);
+  return concrete ? { ...lane, model: concrete } : lane;
+}
+function staleAgainstPriceTable(lanes, table) {
+  const out = [];
+  for (const lane of lanes) {
+    const spec = parseModelAlias(lane.model);
+    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
+    if (!pinned) continue;
+    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
+    if (!family) continue;
+    const newest = newestPricedInFamily(table, family);
+    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
+      out.push({ laneId: lane.id, family, pinned, newest });
+    }
+  }
+  return out;
+}
+function sameFamily(id, family) {
+  const i = id.toLowerCase();
+  const f = family.toLowerCase();
+  if (i === f) return true;
+  if (!i.startsWith(f)) return false;
+  const next = i.charAt(f.length);
+  return next !== "" && !/[a-z0-9]/.test(next);
+}
+function assessStaleness(pinnedId, family, remote, table) {
+  const fam = remote.filter((m) => sameFamily(m.id, family));
+  if (fam.length === 0) return { status: "unknown" };
+  const newest = [...fam].sort(
+    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
+  )[0];
+  if (newest.id === pinnedId) return { status: "fresh" };
+  const pinned = fam.find((m) => m.id === pinnedId);
+  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
+  if (!newer) return { status: "fresh" };
+  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
+}
 
 // ../core/src/types.ts
 var TRUST_MODES = ["full", "worker", "reader", "blocked"];
@@ -7383,6 +7483,7 @@ var TASK_CATEGORIES = [
   "docs"
 ];
 var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
+var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
 // ../core/src/access.ts
@@ -7396,6 +7497,9 @@ function isExecutorCertified(lane) {
 function isReaderExecutorCertified(lane) {
   return lane.kind === "api";
 }
+
+// ../core/src/capability-prior.ts
+var CATEGORIES = new Set(TASK_CATEGORIES);
 
 // ../core/src/policy.ts
 var import_yaml = __toESM(require_dist(), 1);
@@ -7576,101 +7680,11 @@ function declaredCapabilityFor(lane, category) {
 }
 
 // ../core/src/registry.ts
-var import_yaml2 = __toESM(require_dist(), 1);
-
-// ../core/src/model-freshness.ts
-function parseModelAlias(model) {
-  const m = /^(.+)@latest$/.exec(model.trim());
-  if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
-  return { latest: false, id: model };
-}
-function compareModelVersion(a, b) {
-  const runs = (s) => s.toLowerCase().match(/(\d+|\D+)/g) ?? [];
-  const ra = runs(a);
-  const rb = runs(b);
-  const n = Math.max(ra.length, rb.length);
-  for (let i = 0; i < n; i++) {
-    const xa = ra[i];
-    const xb = rb[i];
-    if (xa === void 0) return -1;
-    if (xb === void 0) return 1;
-    const na = /^\d+$/.test(xa);
-    const nb = /^\d+$/.test(xb);
-    if (na && nb) {
-      const d = Number.parseInt(xa, 10) - Number.parseInt(xb, 10);
-      if (d !== 0) return d < 0 ? -1 : 1;
-    } else if (xa !== xb) {
-      return xa < xb ? -1 : 1;
-    }
-  }
-  return 0;
-}
-function releasedMs(table, id) {
-  const r = table.models[id]?.released;
-  return r === void 0 ? void 0 : Date.parse(r);
-}
-function compareNewestFirst(table, a, b) {
-  const ta = releasedMs(table, a);
-  const tb = releasedMs(table, b);
-  if (ta !== void 0 && tb !== void 0 && ta !== tb) return tb - ta;
-  return compareModelVersion(b, a);
-}
-function pricedIdsInFamily(table, family) {
-  return Object.keys(table.models).filter((id) => table.models[id].family === family);
-}
-function newestPricedInFamily(table, family) {
-  const ids = pricedIdsInFamily(table, family);
-  if (ids.length === 0) return void 0;
-  return [...ids].sort((a, b) => compareNewestFirst(table, a, b))[0];
-}
-function resolveLaneModel(lane, table) {
-  const spec = parseModelAlias(lane.model);
-  if (!spec.latest) return lane;
-  const concrete = newestPricedInFamily(table, spec.family);
-  return concrete ? { ...lane, model: concrete } : lane;
-}
-function staleAgainstPriceTable(lanes, table) {
-  const out = [];
-  for (const lane of lanes) {
-    const spec = parseModelAlias(lane.model);
-    const pinned = spec.latest ? newestPricedInFamily(table, spec.family) : spec.id;
-    if (!pinned) continue;
-    const family = spec.latest ? spec.family : lane.model_family ?? table.models[pinned]?.family;
-    if (!family) continue;
-    const newest = newestPricedInFamily(table, family);
-    if (newest && newest !== pinned && compareNewestFirst(table, newest, pinned) < 0) {
-      out.push({ laneId: lane.id, family, pinned, newest });
-    }
-  }
-  return out;
-}
-function sameFamily(id, family) {
-  const i = id.toLowerCase();
-  const f = family.toLowerCase();
-  if (i === f) return true;
-  if (!i.startsWith(f)) return false;
-  const next = i.charAt(f.length);
-  return next !== "" && !/[a-z0-9]/.test(next);
-}
-function assessStaleness(pinnedId, family, remote, table) {
-  const fam = remote.filter((m) => sameFamily(m.id, family));
-  if (fam.length === 0) return { status: "unknown" };
-  const newest = [...fam].sort(
-    (a, b) => a.created !== void 0 && b.created !== void 0 && a.created !== b.created ? b.created - a.created : compareModelVersion(b.id, a.id)
-  )[0];
-  if (newest.id === pinnedId) return { status: "fresh" };
-  const pinned = fam.find((m) => m.id === pinnedId);
-  const newer = pinned?.created !== void 0 && newest.created !== void 0 ? newest.created > pinned.created : compareModelVersion(newest.id, pinnedId) > 0;
-  if (!newer) return { status: "fresh" };
-  return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
-}
-
-// ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
 var EXECUTION_MODES = ["answer-only", "agentic"];
-var CATEGORIES = new Set(TASK_CATEGORIES);
+var CATEGORIES2 = new Set(TASK_CATEGORIES);
 var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
@@ -7690,7 +7704,12 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "endpoint",
   "authHandle",
   "native",
-  "capability"
+  "capability",
+  "capability_source",
+  "requests_per_window",
+  "window_ms",
+  "requests_per_week",
+  "tokens_per_week"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7722,7 +7741,7 @@ function parseCapability(value, where) {
   }
   const out = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES.has(category)) {
+    if (!CATEGORIES2.has(category)) {
       throw new LaneConfigError(
         `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(", ")}.`
       );
@@ -7819,6 +7838,29 @@ function parseLane(entry, index) {
   }
   const capability = parseCapability(entry.capability, at("capability"));
   if (capability) lane.capability = capability;
+  if (entry.capability_source !== void 0) {
+    if (entry.capability_source !== "pinned") {
+      throw new LaneConfigError(`${at("capability_source")} must be 'pinned' (got ${JSON.stringify(entry.capability_source)}).`);
+    }
+    lane.capability_source = "pinned";
+  }
+  if (entry.requests_per_window !== void 0) {
+    const n = entry.requests_per_window;
+    if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) {
+      throw new LaneConfigError(
+        `${at("requests_per_window")} must be a positive finite number (got ${JSON.stringify(n)}).`
+      );
+    }
+    lane.requests_per_window = n;
+  }
+  for (const field of ["window_ms", "requests_per_week", "tokens_per_week"]) {
+    const v = entry[field];
+    if (v === void 0) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -7948,7 +7990,7 @@ function validatePriceTable(data) {
 }
 
 // ../core/src/ledger.ts
-var SCHEMA_VERSION = 1;
+var SCHEMA_VERSION = 2;
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
 var NATIVE_REASONS = ["no_route", "host_native"];
 var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
@@ -7997,6 +8039,9 @@ var OUTCOME_EVENT_FIELDS = [
   "category",
   "subject_lane_id",
   "subject_provenance",
+  "subject_model",
+  "subject_model_resolved",
+  "difficulty",
   "reviewer_lane_id",
   "reviewer_model",
   "reviewer_trust_mode",
@@ -8111,6 +8156,13 @@ function validateOutcomeInput(input) {
   if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
   const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
   if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
+  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
+  if (subject_model !== void 0) out.subject_model = subject_model;
+  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
+  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
+  if (input.difficulty !== void 0) {
+    out.difficulty = requireEnum2(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
+  }
   if (input.action_taken !== void 0) {
     out.action_taken = requireEnum2(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
   }
@@ -8248,11 +8300,6 @@ function tokenStats(events) {
 }
 
 // ../core/src/node.ts
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 function loadLaneConfig(path) {
   const filePath = typeof path === "string" ? path : fileURLToPath(path);
   let text;
@@ -8414,15 +8461,9 @@ var JsonlLedger = class {
     return event;
   }
 };
-
-// ../mcp/src/availability.ts
-import { accessSync, constants, statSync } from "node:fs";
-import { join as join3 } from "node:path";
+var MAX_PROMPT_ARG_BYTES = 128 * 1024;
 
 // ../mcp/src/config.ts
-import { existsSync as existsSync2 } from "node:fs";
-import { homedir as homedir2 } from "node:os";
-import { delimiter, dirname as dirname2, join as join2 } from "node:path";
 var HOME_TM = join2(homedir2(), ".tokenmaxed");
 function homeFile(name) {
   return join2(HOME_TM, name);
@@ -8449,7 +8490,236 @@ function spawnPath(execPath = process.execPath, base = process.env.PATH) {
   return [binDir, ...parts].join(delimiter);
 }
 
+// ../mcp/src/settings.ts
+var SETTING_KEYS = {
+  gate_ready: "TOKENMAXED_GATE_READY",
+  escalate: "TOKENMAXED_ESCALATE",
+  learn_capability: "TOKENMAXED_LEARN_CAPABILITY",
+  capability_prior: "TOKENMAXED_CAPABILITY_PRIOR",
+  reader_egress: "TOKENMAXED_READER_EGRESS",
+  tiered: "TOKENMAXED_TIERED",
+  /** number in [0,1] */
+  tier_floor: "TOKENMAXED_TIER_FLOOR",
+  review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
+  /** positive integer */
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+};
+var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
+var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
+function settingsPath(env) {
+  return env.TOKENMAXED_SETTINGS ?? homeFile("settings.json");
+}
+function validValue(key, raw) {
+  if (NUMERIC_KEYS.has(key)) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return void 0;
+    if (key === "tier_floor" && (raw < 0 || raw > 1)) return void 0;
+    if (key === "review_max_rounds" && (!Number.isInteger(raw) || raw < 1)) return void 0;
+    return raw;
+  }
+  return typeof raw === "boolean" ? raw : void 0;
+}
+function loadSettings(env) {
+  const path = settingsPath(env);
+  if (!existsSync3(path)) return { values: {}, present: false, invalid: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync2(path, "utf8"));
+  } catch (err) {
+    return { values: {}, present: true, invalid: [], warning: `settings unreadable (${path}): ${err.message}` };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { values: {}, present: true, invalid: [], warning: `settings must be a JSON object (${path})` };
+  }
+  const obj = parsed;
+  const values = {};
+  const invalid = [];
+  for (const key of SETTING_KEY_LIST) {
+    if (!(key in obj)) continue;
+    const v = validValue(key, obj[key]);
+    if (v === void 0) invalid.push(key);
+    else values[key] = v;
+  }
+  return { values, present: true, invalid };
+}
+var SEEDED_KEYS = /* @__PURE__ */ new WeakMap();
+function effectiveEnv(env) {
+  const { values } = loadSettings(env);
+  const out = { ...env };
+  const seeded = new Set(SEEDED_KEYS.get(env) ?? []);
+  for (const key of SETTING_KEY_LIST) {
+    const envVar = SETTING_KEYS[key];
+    if (out[envVar] !== void 0) continue;
+    const v = values[key];
+    if (v === void 0) continue;
+    out[envVar] = String(v);
+    seeded.add(key);
+  }
+  if (seeded.size > 0) SEEDED_KEYS.set(out, seeded);
+  return out;
+}
+
+// ../mcp/src/summary-deps.ts
+import { existsSync as existsSync6, readFileSync as readFileSync5 } from "node:fs";
+import { dirname as dirname3, join as join4 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
+var WINDOW_WARN_USED = 0.7;
+var WINDOW_CRITICAL_USED = 0.9;
+function effectiveWindowMs(windowMs) {
+  return windowMs > 0 && Number.isFinite(windowMs) ? windowMs : FIVE_HOUR_MS;
+}
+function saneCount(count) {
+  if (!Number.isFinite(count) || count < 0) return 0;
+  return count;
+}
+function requestsInWindow(timestampsMs, now, windowMs = FIVE_HOUR_MS) {
+  const w = effectiveWindowMs(windowMs);
+  if (!Number.isFinite(now)) return 0;
+  const cutoff = now - w;
+  let n = 0;
+  for (const t of timestampsMs) {
+    if (!Number.isFinite(t)) continue;
+    if (t > cutoff && t <= now) n += 1;
+  }
+  return n;
+}
+function windowUsedFraction(count, limit) {
+  if (!(limit > 0)) return 0;
+  return saneCount(count) / limit;
+}
+function windowLevel(usedFraction) {
+  if (usedFraction >= WINDOW_CRITICAL_USED) return "critical";
+  if (usedFraction >= WINDOW_WARN_USED) return "warn";
+  return "ok";
+}
+
+// ../core/src/quota.ts
+var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+function laneObservations(events, laneId, weightTokens) {
+  const out = [];
+  for (const e of events) {
+    if (e.event_type !== "task" || e.laneId !== laneId || e.status === "native") continue;
+    const ts = Date.parse(e.ts);
+    if (!Number.isFinite(ts)) continue;
+    out.push({ ts, amount: weightTokens ? e.tokens_in + e.tokens_out : 1 });
+  }
+  return out;
+}
+function amountInWindow(observations, now, windowMs) {
+  let sum = 0;
+  for (const o of observations) {
+    if (o.ts > now || o.ts <= now - windowMs) continue;
+    if (!(Number.isFinite(o.amount) && o.amount > 0)) continue;
+    sum += o.amount;
+  }
+  return sum;
+}
+function axisState(count, limit) {
+  const used = windowUsedFraction(count, limit);
+  return { count, limit, used, level: windowLevel(used) };
+}
+function laneQuotaState(events, lane, now) {
+  const axes = [];
+  const state = { headroom: 1 };
+  const hasWindow = typeof lane.requests_per_window === "number" && lane.requests_per_window > 0;
+  const hasWeekRequests = typeof lane.requests_per_week === "number" && lane.requests_per_week > 0;
+  const hasWeekTokens = typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
+  if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
+  const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
+  if (hasWindow) {
+    const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+    const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
+    state.window = axisState(count, lane.requests_per_window);
+    axes.push(state.window);
+  }
+  if (hasWeekRequests) {
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week);
+    axes.push(state.weekRequests);
+  }
+  if (hasWeekTokens) {
+    const tokens = laneObservations(events, lane.id, true);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week);
+    axes.push(state.weekTokens);
+  }
+  let headroom = 1;
+  for (const a of axes) headroom = Math.min(headroom, Math.max(0, 1 - a.used));
+  state.headroom = headroom;
+  return state;
+}
+var MIN_SAMPLES = 8;
+var MIN_SPAN_FRACTION = 0.25;
+var MAX_HALF_RATE_RATIO = 3;
+var MODERATE_SPAN_FRACTION = 0.5;
+var MODERATE_HALF_RATE_RATIO = 2;
+function projectOccupancy(observations, limit, windowMs, now) {
+  if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return void 0;
+  const inWindow = observations.filter((o) => Number.isFinite(o.ts) && o.ts > now - windowMs && o.ts <= now && Number.isFinite(o.amount) && o.amount > 0).sort((a, b) => a.ts - b.ts);
+  if (inWindow.length < MIN_SAMPLES) return void 0;
+  const span = inWindow[inWindow.length - 1].ts - inWindow[0].ts;
+  const spanFraction = span / windowMs;
+  if (spanFraction < MIN_SPAN_FRACTION) return void 0;
+  const mid = now - windowMs / 2;
+  let firstHalf = 0;
+  let secondHalf = 0;
+  for (const o of inWindow) {
+    if (o.ts <= mid) firstHalf += o.amount;
+    else secondHalf += o.amount;
+  }
+  if (!(firstHalf > 0) || !(secondHalf > 0)) return void 0;
+  const ratio = Math.max(firstHalf, secondHalf) / Math.min(firstHalf, secondHalf);
+  if (ratio >= MAX_HALF_RATE_RATIO) return void 0;
+  const total = firstHalf + secondHalf;
+  const lambda = total / windowMs;
+  let occupancy = total;
+  if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
+  const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
+  let t = now;
+  let idx = 0;
+  const horizonEnd = now + windowMs;
+  while (t < horizonEnd) {
+    const nextExpiry = idx < expirations.length ? Math.min(expirations[idx].at, horizonEnd) : horizonEnd;
+    if (lambda > 0) {
+      const tCross = t + (limit - occupancy) / lambda;
+      if (tCross < nextExpiry) return { etaMs: tCross - now, confidence: confidenceOf(spanFraction, ratio) };
+    }
+    if (nextExpiry >= horizonEnd) break;
+    occupancy += lambda * (nextExpiry - t) - expirations[idx].amount;
+    t = nextExpiry;
+    idx += 1;
+  }
+  return void 0;
+}
+function confidenceOf(spanFraction, ratio) {
+  return spanFraction >= MODERATE_SPAN_FRACTION && ratio <= MODERATE_HALF_RATE_RATIO ? "moderate" : "low";
+}
+function laneDepletionForecast(events, lane, now) {
+  const axes = [
+    {
+      axis: "window",
+      limit: lane.requests_per_window,
+      windowMs: typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS,
+      weighted: false
+    },
+    { axis: "weekRequests", limit: lane.requests_per_week, windowMs: WEEK_MS, weighted: false },
+    { axis: "weekTokens", limit: lane.tokens_per_week, windowMs: WEEK_MS, weighted: true }
+  ];
+  let best;
+  let requests;
+  let tokens;
+  for (const a of axes) {
+    if (!(typeof a.limit === "number" && a.limit > 0)) continue;
+    const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
+    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
+  }
+  return best;
+}
+
 // ../mcp/src/availability.ts
+import { accessSync, constants, statSync } from "node:fs";
+import { join as join3 } from "node:path";
 var DEFAULT_OLLAMA_BASE = "http://localhost:11434";
 var LOCAL_PROBE_TIMEOUT_MS = 700;
 function isExecutableFile(candidate) {
@@ -8467,6 +8737,22 @@ function commandOnPath(command, path) {
   const dirs = (path ?? "").split(":").filter(Boolean);
   return dirs.some((dir) => isExecutableFile(join3(dir, command)));
 }
+function regularFileExists(candidate) {
+  try {
+    return statSync(candidate).isFile();
+  } catch {
+    return false;
+  }
+}
+function nodeScriptArgPresent(lane) {
+  const base = (lane.command ?? "").split("/").pop();
+  if (base !== "node") return true;
+  const scriptArg = (lane.args ?? []).find(
+    (a) => !a.startsWith("-") && (a.endsWith(".mjs") || a.endsWith(".js"))
+  );
+  if (scriptArg === void 0) return true;
+  return regularFileExists(scriptArg);
+}
 async function localReachable(base, fetchImpl) {
   if (!fetchImpl) return false;
   const controller = new AbortController();
@@ -8482,7 +8768,7 @@ async function localReachable(base, fetchImpl) {
 }
 async function isLaneAvailable(lane, deps) {
   if (lane.native) return true;
-  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path);
+  if (lane.kind === "cli") return commandOnPath(lane.command ?? "", deps.path) && nodeScriptArgPresent(lane);
   if (lane.kind === "local") return localReachable(lane.endpoint ?? DEFAULT_OLLAMA_BASE, deps.fetchImpl);
   if (lane.kind === "api") return !!lane.authHandle && deps.resolveAuth(lane.authHandle).length > 0;
   return false;
@@ -8499,7 +8785,7 @@ function makeAvailabilityProbe(env) {
 }
 
 // ../mcp/src/model-cache.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
 var CACHE_VERSION = 1;
 function emptyCache() {
   return { version: CACHE_VERSION, endpoints: /* @__PURE__ */ Object.create(null) };
@@ -8536,7 +8822,7 @@ function putEntry(cache, endpoint, models, now) {
 }
 function readFreshnessCache(path) {
   try {
-    return existsSync3(path) ? coerceCache(JSON.parse(readFileSync2(path, "utf8"))) : emptyCache();
+    return existsSync4(path) ? coerceCache(JSON.parse(readFileSync3(path, "utf8"))) : emptyCache();
   } catch {
     return emptyCache();
   }
@@ -8581,7 +8867,7 @@ async function reportFreshness(lanes, deps, opts) {
 
 // ../mcp/src/lane-state.ts
 import { createHash } from "node:crypto";
-import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
+import { existsSync as existsSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync4, writeFileSync as writeFileSync4 } from "node:fs";
 var STATE_VERSION = 1;
 function canonicalLane(l) {
   return {
@@ -8635,7 +8921,7 @@ function coerceLaneReviewState(raw) {
 }
 function readLaneReviewState(path) {
   try {
-    return existsSync4(path) ? coerceLaneReviewState(JSON.parse(readFileSync3(path, "utf8"))) : emptyLaneReviewState();
+    return existsSync5(path) ? coerceLaneReviewState(JSON.parse(readFileSync4(path, "utf8"))) : emptyLaneReviewState();
   } catch {
     return emptyLaneReviewState();
   }
@@ -8652,6 +8938,23 @@ function selectManagerLane(lanes, policy, gateReady, available = null) {
 
 // ../mcp/src/summary.ts
 var DAY_MS = 24 * 60 * 60 * 1e3;
+var FIVE_HOUR_MS2 = 5 * 60 * 60 * 1e3;
+function fmtWindow(ms) {
+  if (ms >= 36e5) {
+    const hours = ms / 36e5;
+    const rounded = Math.round(hours * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded}h`;
+  }
+  return `${Math.max(1, Math.round(ms / 6e4))}m`;
+}
+function fmtEta(ms) {
+  const minutes = ms / 6e4;
+  if (minutes < 0.75) return "now";
+  if (minutes < 90) return `~${Math.max(1, Math.round(minutes))}m`;
+  const hours = minutes / 60;
+  if (hours < 36) return `~${Math.round(hours)}h`;
+  return `~${Math.round(hours / 24)}d`;
+}
 function buildSummaryData(input) {
   const { events, lanes, policy, availableLaneIds: availableLaneIds2, gateReady, enabled, now, core, selectManager } = input;
   const availableSet = new Set(availableLaneIds2);
@@ -8686,6 +8989,18 @@ function buildSummaryData(input) {
   const reviewer = selectManager(lanes, policy, gateReady, availableSet);
   const staleByLane = new Map(input.staleness.map((s) => [s.laneId, s]));
   const byLane = core.tokenStats(events).byLane;
+  const routedTsByLane = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (e.event_type !== "task" || e.status === "native") continue;
+    const ms = Date.parse(e.ts);
+    if (!Number.isFinite(ms)) continue;
+    let arr = routedTsByLane.get(e.laneId);
+    if (!arr) {
+      arr = [];
+      routedTsByLane.set(e.laneId, arr);
+    }
+    arr.push(ms);
+  }
   const cliUsageByModel = input.cliUsageByModel;
   const cliConsumed = /* @__PURE__ */ new Set();
   const laneSummaries = lanes.map((l) => {
@@ -8696,6 +9011,19 @@ function buildSummaryData(input) {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
+    const windowMs = typeof l.window_ms === "number" && l.window_ms > 0 ? l.window_ms : FIVE_HOUR_MS2;
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, windowMs);
+    const limit = l.requests_per_window;
+    const requestWindowLevel = limit !== void 0 ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : void 0;
+    const weekState = core.laneQuotaState?.(input.events, l, now);
+    const weekLevels = [weekState?.weekRequests?.level, weekState?.weekTokens?.level];
+    const weekLevel = weekLevels.includes("critical") ? "critical" : weekLevels.includes("warn") ? "warn" : void 0;
+    const weekDetail = weekState ? [
+      ...weekState.weekRequests ? [`7d ${weekState.weekRequests.count}/${weekState.weekRequests.limit} req`] : [],
+      ...weekState.weekTokens ? [`7d ${Math.round(weekState.weekTokens.count).toLocaleString("en-US")}/${weekState.weekTokens.limit.toLocaleString("en-US")} tok`] : []
+    ].join(" \xB7 ") : "";
+    const anyPressure = requestWindowLevel === "warn" || requestWindowLevel === "critical" || weekLevel !== void 0;
+    const forecast = core.laneDepletionForecast && anyPressure ? core.laneDepletionForecast(input.events, l, now) : void 0;
     return {
       id: l.id,
       kind: l.kind,
@@ -8703,6 +9031,11 @@ function buildSummaryData(input) {
       trustMode: l.trust_mode,
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
+      requestsIn5h,
+      ...windowMs !== FIVE_HOUR_MS2 ? { windowHours: windowMs / 36e5 } : {},
+      ...limit !== void 0 ? { requestsPerWindow: limit, requestWindowLevel } : {},
+      ...weekLevel && weekDetail ? { weekLevel, weekDetail } : {},
+      ...forecast ? forecast.confidence === "moderate" ? { forecastEtaMs: forecast.etaMs } : { forecastLow: true } : {},
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
@@ -8717,9 +9050,11 @@ function buildSummaryData(input) {
     lanes: laneSummaries,
     ...reviewer ? { activeReviewerId: reviewer.id } : {},
     ...input.laneReview ? { laneReview: input.laneReview } : {},
+    ...input.meteredKeyWarning ? { meteredKeyWarning: true } : {},
     empty: lifetime.offloads === 0
   };
 }
+var METERED_KEY_WARNING = "   \u26A0 ANTHROPIC_API_KEY is set \u2014 Claude Code bills per-token (metered) even on a Max/Pro plan. Unset it to use your subscription quota.";
 var usd = (n) => `$${n.toFixed(2)}`;
 var pct = (share) => `${Math.round(share * 100)}%`;
 function tok(n) {
@@ -8728,17 +9063,21 @@ function tok(n) {
 }
 function formatSummaryBanner(data) {
   if (!data.enabled) {
-    return "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    const off = "\u23F8  TokenMaxed routing is OFF for this project \u2014 run /tokenmaxed:on to re-enable.";
+    return data.meteredKeyWarning ? `${off}
+${METERED_KEY_WARNING}` : off;
   }
   const lines = [];
   if (data.empty) {
     lines.push("\u{1F7E2} TokenMaxed \u2014 ready. No routed work yet; your savings will show here.");
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
   } else {
     lines.push("\u{1F7E2} TokenMaxed \u2014 maximizing your flat-rate capacity");
     lines.push(
       `   Saved ${usd(data.meteredAvoidedLifetime)} in metered API spend (lifetime) \xB7 ${usd(data.meteredAvoided7d)} last 7d`
     );
     lines.push(`   ${pct(data.zeroMeteredShare)} of routed tokens cost $0 metered`);
+    if (data.meteredKeyWarning) lines.push(METERED_KEY_WARNING);
     lines.push("");
     for (const w of data.windows) {
       const nf = w.nativeFallbacks > 0 ? ` \xB7 ${w.nativeFallbacks} native fallback${w.nativeFallbacks === 1 ? "" : "s"}` : "";
@@ -8756,7 +9095,11 @@ function formatSummaryBanner(data) {
   } else {
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
-    const laneLine = (l) => `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${l.stale ? " \u26A0 stale" : ""}`;
+    const laneLine = (l) => {
+      const windowLabel = l.windowHours !== void 0 ? fmtWindow(l.windowHours * 36e5) : "5h";
+      const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed ${windowLabel}: ${l.requestsIn5h}` : "";
+      return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${routed5h}${l.stale ? " \u26A0 stale" : ""}`;
+    };
     const groups = [
       { title: "Full access", mode: "full" },
       { title: "Workers", mode: "worker" },
@@ -8781,6 +9124,23 @@ function formatSummaryBanner(data) {
     lines.push("   \u26A0 your lanes changed since you last reviewed them \u2014 run /tokenmaxed:setup to review");
   } else if (data.lanes.length > 0 && data.laneReview === "first-review") {
     lines.push("   \u2139 run /tokenmaxed:setup to review what each lane may see/do");
+  }
+  for (const l of visible.filter(
+    (x) => x.requestsPerWindow !== void 0 && (x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
+  )) {
+    const tag = l.requestWindowLevel === "critical" ? "near limit" : "filling up";
+    const windowLabel = l.windowHours !== void 0 ? fmtWindow(l.windowHours * 36e5) : "5h";
+    const forecast = l.forecastEtaMs !== void 0 ? ` \u2014 est. ${fmtEta(l.forecastEtaMs)} at routed pace` : l.forecastLow ? " \u2014 approaching cap (routed)" : "";
+    lines.push(
+      `   \u26A0 ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)${forecast}`
+    );
+  }
+  for (const l of visible.filter(
+    (x) => x.weekLevel !== void 0 && !(x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
+  )) {
+    const tag = l.weekLevel === "critical" ? "near limit" : "filling up";
+    const forecast = l.forecastEtaMs !== void 0 ? ` \u2014 est. ${fmtEta(l.forecastEtaMs)} at routed pace` : l.forecastLow ? " \u2014 approaching cap (routed)" : "";
+    lines.push(`   \u26A0 ${vendorName(l)} routed ${l.weekDetail} (${tag} \u2014 ledger count only, not your full session)${forecast}`);
   }
   for (const l of visible.filter((l2) => l2.stale)) {
     lines.push(
@@ -8832,8 +9192,12 @@ function clampBanner(banner, opts = {}) {
   lines.push(CLAMP_POINTER);
   let out = lines.join("\n");
   if (out.length > maxChars) {
-    let idx = 0;
-    for (let k = 1; k < lines.length; k++) if (lines[k].length > lines[idx].length) idx = k;
+    let candidates = lines.map((line, i) => ({ line, i })).filter(({ line }) => line !== METERED_KEY_WARNING || lines.length === 1);
+    if (candidates.length === 0) candidates = lines.map((line, i) => ({ line, i }));
+    let idx = candidates[0].i;
+    for (let k = 1; k < candidates.length; k++) {
+      if (lines[candidates[k].i].length > lines[idx].length) idx = candidates[k].i;
+    }
     const overBy = out.length - maxChars;
     const target = Math.max(0, lines[idx].length - overBy - 1);
     lines[idx] = `${lines[idx].slice(0, target)}\u2026`;
@@ -8863,7 +9227,7 @@ function readOnlyToggleStore(statePath) {
   return {
     read: () => {
       try {
-        return existsSync5(statePath) ? JSON.parse(readFileSync4(statePath, "utf8")) : {};
+        return existsSync6(statePath) ? JSON.parse(readFileSync5(statePath, "utf8")) : {};
       } catch {
         return {};
       }
@@ -8887,12 +9251,13 @@ function makeSummaryFromEnv(env) {
   const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join4(dirname3(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
   const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join4(dirname3(statePath), "lane-review.json");
+  const meteredKeyWarning = !!(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
   return async () => {
-    const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+    const lanes = existsSync6(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     const now = Date.now();
     let priceTable;
-    if (existsSync5(pricesPath)) {
+    if (existsSync6(pricesPath)) {
       try {
         priceTable = loadPriceTable(pricesPath);
       } catch {
@@ -8940,21 +9305,22 @@ function makeSummaryFromEnv(env) {
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
-      core: { summarize, tokenStats, filterEventsSince },
+      core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel, laneDepletionForecast, laneQuotaState },
       selectManager: selectManagerLane,
       staleness,
       laneReview,
       // Fold the host CLI's own per-model usage (real, transcript-derived) into the
       // per-lane counts. Best-effort: readCliUsageByModel fails open to {} so the
       // summary never breaks if transcripts are unreadable.
-      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR)
+      cliUsageByModel: readCliUsageByModel(env.CLAUDE_PROJECT_DIR),
+      meteredKeyWarning
     });
   };
 }
 
 // ../mcp/src/hook-sessionstart.ts
 async function main() {
-  const env = process.env;
+  const env = effectiveEnv(process.env);
   if (env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true") return;
   let data;
   try {
