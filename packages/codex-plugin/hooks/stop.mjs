@@ -8959,7 +8959,7 @@ function readUntrackedDiff(cwd) {
   return { diff: parts.join("\n"), omitted: Math.max(0, all.length - included), enumerationFailed: false };
 }
 function makeHostReviewDeps(env) {
-  const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
+  const cwd = env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath2(new URL("../prices.seed.json", import.meta.url));

@@ -1,0 +1,27 @@
+// TokenMaxed in OpenCode — merge into your opencode.json (project root) or
+// ~/.config/opencode/opencode.json. See packages/opencode-plugin/README notes
+// in the repo README ("Use in OpenCode").
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "tokenmaxed": {
+      "type": "local",
+      // Absolute path to the committed server bundle in your TokenMaxed checkout:
+      "command": ["node", "/ABSOLUTE/PATH/TO/TokenMaxed/packages/opencode-plugin/server/index.mjs"],
+      "enabled": true,
+      // Host identity for per-lane `hosts:` allowlists — REQUIRED, do not remove:
+      // hosts:-scoped lanes (e.g. the claude-CLI lanes) fail closed without it.
+      "environment": { "TOKENMAXED_HOST": "opencode" }
+    }
+  },
+  // The lifecycle plugin (banner + routing gate + review loop): path-like specs
+  // are resolved relative to this config file. Alternatively copy BOTH
+  // plugin/tokenmaxed.js AND plugin/tokenmaxed-review.mjs (the review child —
+  // it must sit next to tokenmaxed.js) into .opencode/plugin/ or
+  // ~/.config/opencode/plugin/.
+  "plugin": ["/ABSOLUTE/PATH/TO/TokenMaxed/packages/opencode-plugin/plugin/tokenmaxed.js"],
+  "permission": {
+    // TokenMaxed tools are content-free routers; allow them without prompts.
+    "tokenmaxed_*": "allow"
+  }
+}

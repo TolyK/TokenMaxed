@@ -1,0 +1,356 @@
+# TokenMaxed lane registry (example).
+#
+# Copy this file to config/lanes.yaml and edit it for your machine.
+# Lane identity and trust live ONLY here. The hosted registry feed may later
+# overlay reference data (prices, capability scores) onto a lane, but it can
+# never create, enable, or re-trust one.
+#
+# Fields:
+#   id              unique local identifier for the lane
+#   kind            cli | api | local
+#   model           model id used for pricing / registry lookups
+#   trust_mode      full | worker | reader | blocked
+#                     full     = may see repo + tools + broad context (trusted)
+#                     reader   = bounded repo-READ context, no secrets/shell/tools,
+#                                answer-only (opt-in: TOKENMAXED_READER_EGRESS +
+#                                repo_read_attestation). Sends repo code to the vendor.
+#                     worker   = minimized, scrubbed, bounded task only (no repo/tools)
+#                     blocked  = never selected
+#                   Non-`full` lanes only run once the minimization/policy gate is ready.
+#   costBasis       subscription | metered | local
+#   provenance      vendor/org, e.g. anthropic, openai, google, meta
+#   jurisdiction    legal jurisdiction of the provider, e.g. US, CN
+#   roles           optional: [manager] / [worker]  (manager reviews + (re)assigns)
+#   manager_allowed optional bool: may this lane act as the manager/reviewer?
+#   execution_mode  answer-only (default) | agentic
+#                     agentic (lane edits files / runs commands) is ONLY allowed
+#                     when trust_mode is `full`.
+#   attestation     optional bool: explicit user attestation that a non-first-party
+#                     lane is trusted enough to be manager-eligible.
+#   capability      optional per-category competence in [0, 1]; omit a category to
+#                   use the default, or set it to 0 to opt the lane out entirely.
+#
+#   hosts           optional host allowlist: where this lane may be SELECTED, e.g.
+#                   [claude-code, cli]. Omit = allowed under every host adapter
+#                   (Claude Code, Codex CLI, ...). When set, the lane only routes
+#                   under a listed host id — and an UNKNOWN host fails closed.
+#                   Adding a host id here is YOUR acknowledgement of the relevant
+#                   vendor's terms for running this lane inside that framework;
+#                   TokenMaxed never auto-adds one.
+#
+#   Quota (all optional; counts are the ROUTED share from the local ledger — never
+#   your total subscription usage). When any is set, routing deprioritizes the lane
+#   as it fills (warn at 70% used, critical at 90%), the summary/status warn on
+#   every axis (the statusline shows the tightest rolling request window), and
+#   near-cap lanes get an honest depletion estimate + overflow plan:
+#   requests_per_window   rolling-window request limit (default window: 5h)
+#   window_ms             override the rolling window length in milliseconds
+#   requests_per_week     trailing-7-day request cap
+#   tokens_per_week       trailing-7-day token cap (tokens in + out)
+
+lanes:
+  - id: claude-native
+    kind: cli
+    model: claude-opus@latest   # self-updating: tracks the newest PRICED claude-opus (e.g. claude-opus-4-8) — never a hard-pinned version
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    native: true          # the host model (do-it-yourself lane)
+    hosts: [claude-code]  # "native" means THIS host does it — only meaningful under Claude Code
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      feature: 0.95
+      refactor: 0.90
+      bugfix: 0.88
+      boilerplate: 0.90
+      explain: 0.90
+      codegen: 0.88
+      docs: 0.85
+
+  - id: codex-cli
+    kind: cli
+    model: gpt-5.5
+    trust_mode: full
+    costBasis: subscription
+    provenance: openai
+    jurisdiction: US
+    execution_mode: answer-only
+    command: codex          # the provider CLI to spawn (exact flags verified per tool).
+                            # If the plugin host spawns hooks under a Node whose bin dir
+                            # lacks this CLI and it "failed to spawn", set an ABSOLUTE path
+                            # here (e.g. /abs/path/to/codex) — PATH-independent.
+    args: [exec]
+    # Default reviewer for all code: the host-turn review (/tokenmaxed:review and
+    # the default-on Stop review loop) sends the working-tree diff to the FIRST
+    # eligible manager in file order, and codex-cli is listed before claude-haiku
+    # — so Codex reviews by default. (A full CLI manager needs no safety gate; the
+    # review loop is ON by default — opt out with TOKENMAXED_REVIEW_ON_STOP=false.)
+    # The host-turn
+    # path has no capability gate, so this works for any diff.
+    # NOTE on the SEPARATE escalation path (C-13, reviewing an offloaded output):
+    # selectReviewManager requires an INDEPENDENT manager that is at-least-as-
+    # capable as the subject for that category. claude-haiku can only fill that
+    # role for categories where it isn't weaker than Codex (boilerplate/docs/
+    # explain — Codex is at the 0.5 default there); for Codex's strong categories
+    # (bugfix/codegen/feature/refactor) Haiku is NOT eligible, so a Codex-authored
+    # output has no independent reviewer: runWithEscalation returns
+    # `review_unavailable` and DELIVERS Codex's result UNREVIEWED (it is not given
+    # back). Add a stronger independent manager if you want Codex's own offloads
+    # independently reviewed — e.g. point claude-haiku at Sonnet/Opus AND raise its
+    # per-category `capability` scores to >= Codex's (selectReviewManager compares
+    # the declared `capability` numbers, not the model id), or trust another
+    # already-capable lane as manager.
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      bugfix: 0.92
+      codegen: 0.90
+      feature: 0.85
+      refactor: 0.82
+
+  # --- Plugin-backed CLI lanes (grok + antigravity) ---------------------------
+  # Installed as Claude Code plugins (grok-plugin-cc, antigravity-plugin-cc), these
+  # make xAI Grok and Google Antigravity callable like codex — routing can hand them
+  # bounded subtasks (and antigravity can also review). Both are subscription CLI lanes,
+  # so they cost $0 metered. Token usage is ESTIMATED (CLIs don't report exact tokens),
+  # exactly like the codex-cli lane above.
+
+  - id: grok-cli                # xAI Grok Build CLI. Worker-only offload.
+    kind: cli
+    model: grok-code-fast-1     # label for a SUBSCRIPTION lane (xAI flat-rate); not sent to a vendor pricing API
+    trust_mode: full            # → blocked to disable. Trusts xAI with repo + tools. Availability-gated:
+                                # routing skips it unless the `grok` CLI is installed (so `full` is safe here).
+    costBasis: subscription
+    provenance: xai
+    jurisdiction: US
+    execution_mode: answer-only
+    command: grok               # bare CLI (the plugin installs it). If it "failed to spawn", the hook/server
+                                # PATH likely omits ~/.grok/bin — set an ABSOLUTE path here
+                                # (e.g. /Users/you/.grok/bin/grok), like the codex note above.
+    # grok reads the prompt as an ARGV arg (not stdin) ⇒ pass it via the {prompt} placeholder.
+    # read-only sandbox + auto-approve: a headless worker never blocks on a confirmation and never
+    # edits files (answer-only — it RETURNS the code/text and the host applies it).
+    args: ["-p", "{prompt}", "--output-format", "plain", "--sandbox", "read-only", "--always-approve"]
+    # Worker only: no roles/manager_allowed ⇒ grok never reviews (xai isn't trusted-by-origin, so it
+    # could only be a manager via `attestation: true` anyway).
+    capability:
+      codegen: 0.86
+      bugfix: 0.84
+      feature: 0.80
+      refactor: 0.80
+
+  - id: antigravity-cli         # Google Antigravity CLI (Gemini engine). Worker + reviewer.
+    kind: cli
+    model: gemini-3-pro         # label for a SUBSCRIPTION lane (Antigravity/Gemini); not sent to a vendor pricing API
+    trust_mode: blocked         # → full to enable — but SET THE COMPANION PATH below FIRST, else it
+                                # spawns `node <placeholder>` and fails. (Blocked, not full, because a
+                                # generic template can't know your machine's companion path.)
+    costBasis: subscription
+    provenance: google
+    jurisdiction: US
+    execution_mode: answer-only
+    # `agy` needs a PTY for headless output, so it MUST run through the plugin's companion script
+    # (it wraps agy under `script`). The companion reads the prompt from STDIN via `--stdin`, which
+    # the lane executor already pipes in (no {prompt} placeholder needed). Set `command` to your node
+    # binary (absolute if the hook PATH is stripped) and the FIRST arg to the companion's ABSOLUTE
+    # path — it lives at (VERSIONED; update after a plugin upgrade):
+    #   ~/.claude/plugins/cache/antigravity-cc/antigravity/<version>/scripts/agy-companion.mjs
+    command: node
+    args: ["<ABSOLUTE-PATH-TO>/agy-companion.mjs", "ask", "--stdin"]
+    # Worker AND reviewer: listed AFTER codex-cli ⇒ codex stays the default reviewer and antigravity
+    # is a fallback / independent reviewer (google is trusted-by-origin ⇒ no attestation needed).
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      codegen: 0.85
+      refactor: 0.84
+      bugfix: 0.83
+      feature: 0.82
+      boilerplate: 0.84
+      explain: 0.84
+      docs: 0.84
+
+  - id: ollama-llama3            # Local Ollama model. OPT-IN: a local server is the
+    kind: local                  # least likely thing to be present, so it is NOT an
+    model: llama3.1:8b           # enabled default — you choose it deliberately.
+    trust_mode: blocked          # → full to enable (requires a running local Ollama
+    costBasis: local             #   server reachable at the endpoint; default
+    provenance: meta             #   http://localhost:11434). Routing skips it anyway
+    jurisdiction: US             #   if the server isn't reachable (availability gate).
+    capability:
+      boilerplate: 0.70
+      docs: 0.60
+      explain: 0.60
+
+  # Cheaper-same-family lane (Claude Code): hand a bounded subtask to a cheaper
+  # Claude (Haiku) via `claude -p` instead of running it on the Opus main session.
+  # Fully trusted (100% Anthropic), so NO minimization — and it spends the same
+  # subscription, not metered $. The cheapest, safest offload. (Spawned children
+  # run with TOKENMAXED_DISABLE=1 so they never re-enter routing / recurse.)
+  - id: claude-haiku
+    kind: cli
+    model: claude-haiku@latest   # self-updating; the {model} arg below spawns the resolved id
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    execution_mode: answer-only
+    command: claude
+    args: ["-p", "--model", "{model}"]   # {model} ⇒ the resolved newest priced claude-haiku
+    # hosts: this lane SPAWNS the genuine `claude` binary on your subscription.
+    # Anthropic sanctions that inside Claude Code (and TokenMaxed's own CLI is a
+    # first-party surface); running it inside OTHER host frameworks (Codex CLI,
+    # OpenCode, ...) is officially UNADDRESSED gray zone — so it ships restricted.
+    # Adding another host id is YOUR deliberate acknowledgement of that gray zone,
+    # not a claim that Anthropic permits it.
+    hosts: [claude-code, cli]
+    # Secondary / in-family manager. Codex above is the default host-turn reviewer
+    # (first eligible in file order). On the escalation path this lane can only
+    # independently review an offloaded output in categories where it isn't weaker
+    # than the subject (e.g. boilerplate/docs/explain) — it is NOT capable enough
+    # to review Codex's bugfix/codegen/feature/refactor outputs (see codex-cli's
+    # note). To make it qualify, point it at Sonnet/Opus AND raise its per-category
+    # `capability` scores below to >= Codex's (selection reads the declared
+    # `capability` numbers, not the model id).
+    # To make Claude the default reviewer instead, move this lane above codex-cli
+    # (or drop codex-cli's manager fields).
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      boilerplate: 0.82
+      docs: 0.85
+      explain: 0.82
+      codegen: 0.72
+
+  # Full-access Sonnet (Claude Code): a stronger in-family offload than Haiku for
+  # bounded subtasks, still on the same subscription (no metered $). Self-updating via
+  # claude-sonnet@latest; the {model} arg spawns the resolved id. As a manager it is a
+  # capable INDEPENDENT reviewer for Codex's strong categories (which Haiku can't cover).
+  - id: claude-sonnet
+    kind: cli
+    model: claude-sonnet@latest
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    execution_mode: answer-only
+    command: claude
+    args: ["-p", "--model", "{model}"]   # {model} ⇒ the resolved newest priced claude-sonnet
+    # hosts: this lane SPAWNS the genuine `claude` binary on your subscription.
+    # Anthropic sanctions that inside Claude Code (and TokenMaxed's own CLI is a
+    # first-party surface); running it inside OTHER host frameworks (Codex CLI,
+    # OpenCode, ...) is officially UNADDRESSED gray zone — so it ships restricted.
+    # Adding another host id is YOUR deliberate acknowledgement of that gray zone,
+    # not a claim that Anthropic permits it.
+    hosts: [claude-code, cli]
+    roles: [manager]
+    manager_allowed: true
+    capability:
+      feature: 0.90
+      refactor: 0.86
+      bugfix: 0.85
+      boilerplate: 0.88
+      explain: 0.88
+      codegen: 0.85
+      docs: 0.86
+
+  # --- Other provider lanes (SUPPORTED) ---------------------------------------
+  # Popular vendors, shipped as SAFE inert TEMPLATES: each is `blocked` (never
+  # selected) until YOU pick a trust_mode. (The enabled defaults ABOVE are the host
+  # `claude-native`, `codex-cli` (the default reviewer), and the in-family Claude Code
+  # lanes `claude-haiku` + `claude-sonnet` — all first-party or availability-gated.
+  # `ollama-llama3` ships
+  # `blocked` too: a local server isn't assumed. In your own config, set every
+  # lane's trust deliberately.) The vendor lanes here add nothing to your trust
+  # surface until you change `blocked`. Trust ladder: blocked < worker < reader < full.
+  #   • worker — cheapest safe offload: a minimized, scrubbed, no-repo task. API/BYOK only.
+  #   • reader — repo-READ context (no secrets/shell/tools, answer-only) for a vendor you
+  #              trust with CODE but not secrets. Sends repo code to the vendor. API/BYOK
+  #              only, and needs ALL of: `repo_read_attestation: true` here, the env flags
+  #              TOKENMAXED_GATE_READY=true (safety gate; needs gitleaks) AND
+  #              TOKENMAXED_READER_EGRESS=true, and an allow rule in policy.yaml for the
+  #              repo. worker/reader executors are API-only in v1.
+  #   • full   — repo + tools (+ optional agentic). For a vendor you FULLY trust. CLIs can
+  #              only be `full` (or blocked). NOTE: a full *api* lane also needs
+  #              TOKENMAXED_GATE_READY=true (the pre-gate guard blocks api lanes until the
+  #              safety gate is open); full CLI/local lanes need no flag.
+  # BYOK api lanes: put the key in env TOKENMAXED_KEY_<authHandle> (never in this file).
+  # TIP: before adding a metered API key, check whether the vendor has a Claude Code CLI
+  #   plugin — OpenAI/Codex, xAI/Grok (github.com/TolyK/grok-plugin-cc), Google/Antigravity
+  #   (github.com/TolyK/antigravity-plugin-cc), Anthropic/Claude Code. A CLI plugin routes
+  #   on the flat-rate SUBSCRIPTION ($0 metered) with no key to manage, so it's usually the
+  #   better lane. /tokenmaxed:setup reminds you whenever an enabled api lane has one.
+  # api lanes speak the OpenAI /chat/completions schema — point `endpoint` at your
+  # provider's OpenAI-COMPATIBLE chat-completions URL (not a vendor-proprietary one).
+  # COST: `costBasis` is YOUR billing model — NOT implied by `api`. Many vendors (e.g.
+  # MiniMax) are a flat-rate SUBSCRIPTION token ⇒ `costBasis: subscription` (treated as
+  # $0 and preferred by routing, like a CLI subscription); pay-per-token ⇒ `metered`.
+  # /tokenmaxed:setup ASKS you per api lane — TokenMaxed never assumes metered.
+  # CLI lanes (gemini-cli, kimi-cli) can only be `full` or `blocked` — worker/reader
+  # executors are API-only, so a CLI lane set to worker/reader loads but never routes.
+
+  - id: gemini-cli              # Google Gemini CLI (subscription). CLI ⇒ full or blocked.
+    kind: cli
+    model: gemini-3.5-flash
+    trust_mode: blocked         # → full to enable (trusts Google with repo + tools)
+    costBasis: subscription
+    provenance: google
+    jurisdiction: US
+    command: gemini
+    args: [generate]
+    capability: { boilerplate: 0.80, docs: 0.80, explain: 0.78, codegen: 0.75 }
+
+  - id: kimi-cli                # Moonshot Kimi CLI (subscription). CLI ⇒ full or blocked.
+    kind: cli
+    model: kimi-k2
+    trust_mode: blocked         # → full to enable (trusts Moonshot with repo + tools)
+    costBasis: subscription
+    provenance: moonshot
+    jurisdiction: CN
+    command: kimi
+    args: [code]
+    capability: { bugfix: 0.80, codegen: 0.80, refactor: 0.76 }
+
+  - id: glm-api                 # Zhipu GLM via BYOK API. Can be worker / reader / full.
+    kind: api
+    model: glm@latest           # tracks the newest PRICED glm model (vs a stale pin)
+    trust_mode: blocked         # → worker (no repo) or reader (repo-read; see above) or full
+    # repo_read_attestation: true   # uncomment + set trust_mode: reader to allow repo-read egress
+    costBasis: metered
+    provenance: zhipu
+    jurisdiction: CN
+    endpoint: https://open.bigmodel.cn/api/paas/v4/chat/completions
+    authHandle: ZHIPU
+    capability: { codegen: 0.82, bugfix: 0.80, refactor: 0.78 }
+
+  - id: minimax-api             # MiniMax via BYOK API. Can be worker / reader / full.
+    kind: api
+    model: minimax@latest       # tracks the newest PRICED minimax model (vs a stale pin
+                                #   like minimax-m2). To stay on a specific version, pin a
+                                #   concrete id: a PRICED pin is still staleness-checked
+                                #   automatically (family from the price table); for an
+                                #   unpriced pin add `model_family: minimax`.
+    trust_mode: blocked         # → worker (no repo) or reader (repo-read; see above) or full
+    costBasis: subscription     # MiniMax is typically a flat-rate SUBSCRIPTION token (not pay-per-token); /tokenmaxed:setup confirms this with you
+    provenance: minimax
+    jurisdiction: CN
+    endpoint: https://api.minimax.io/v1/chat/completions   # use the OpenAI-compatible URL
+    authHandle: MINIMAX
+    capability: { codegen: 0.80, boilerplate: 0.80, docs: 0.76 }
+
+  # Sonnet via Anthropic API (BYOK) — an OPT-IN alternative to the Claude Code CLI
+  # lane above, NOT a default. When the `claude` CLI is available, the subscription
+  # CLI lane runs Sonnet (no metered $); this is here only if you deliberately want
+  # Sonnet over the API. Flip trust_mode to worker/full to enable. Self-updating.
+  - id: claude-sonnet-api
+    kind: api
+    model: claude-sonnet@latest
+    trust_mode: blocked
+    costBasis: metered
+    provenance: anthropic
+    jurisdiction: US
+    endpoint: https://api.anthropic.com/v1/chat/completions   # Anthropic's OpenAI-compatible endpoint
+    authHandle: ANTHROPIC
+    capability: { codegen: 0.85, boilerplate: 0.86, docs: 0.86, explain: 0.88 }

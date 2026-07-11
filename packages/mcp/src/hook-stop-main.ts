@@ -32,7 +32,8 @@ import { runReviewWithBudget } from './review-budget.ts';
 import { effectiveEnv } from './settings.ts';
 import { parseMaxRounds, reviewLoopEnabled, stopHookAction } from './reviewer.ts';
 
-function readCounter(file: string): number {
+/** Read the per-session review-loop block counter (0 on any error). */
+export function readCounter(file: string): number {
   try {
     const n = Number.parseInt(readFileSync(file, 'utf8'), 10);
     return Number.isFinite(n) && n > 0 ? n : 0;
@@ -42,7 +43,7 @@ function readCounter(file: string): number {
 }
 
 /** Persist the block counter; returns false if it could not be written. */
-function writeCounter(file: string, n: number): boolean {
+export function writeCounter(file: string, n: number): boolean {
   try {
     mkdirSync(join(file, '..'), { recursive: true });
     writeFileSync(file, String(n), 'utf8');
