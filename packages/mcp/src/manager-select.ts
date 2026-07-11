@@ -6,7 +6,7 @@
  * (which would break tools.ts's no-runtime-import test shape).
  */
 
-import { evaluate, isManagerEligible, isSelectablePreGate, laneAllowedByVerdict } from '@tokenmaxed/core';
+import { evaluate, hostAllowsLane, isManagerEligible, isSelectablePreGate, laneAllowedByVerdict } from '@tokenmaxed/core';
 import type { Lane, Policy } from '@tokenmaxed/core';
 
 /** The signature of {@link selectManagerLane}, for dependency injection (no static import). */
@@ -15,6 +15,7 @@ export type ManagerSelectPort = (
   policy: Policy,
   gateReady: boolean,
   available: ReadonlySet<string> | null,
+  host?: string,
 ) => Lane | undefined;
 
 /**
@@ -24,6 +25,7 @@ export type ManagerSelectPort = (
  *  - EXECUTABLE (not the native host — we can't run the host from here)
  *  - gate-selectable (an API manager only once the safety gate is open — egress)
  *  - AVAILABLE to run now (when an availability set is supplied)
+ *  - allowed under THIS host (F `hosts:` allowlist; unknown host fails closed)
  *  - not policy-disabled / blocked. The diff IS the user's real code, so egress is
  *    evaluated as the most sensitive context (private + sensitive).
  */
@@ -32,6 +34,7 @@ export function selectManagerLane(
   policy: Policy,
   gateReady: boolean,
   available: ReadonlySet<string> | null = null,
+  host?: string,
 ): Lane | undefined {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const reviewContext = { repo_class: 'private' as const, sensitivity: 'sensitive' as const };
@@ -39,6 +42,10 @@ export function selectManagerLane(
     (l) =>
       isManagerEligible(l) &&
       !l.native &&
+      // F: a lane with a hosts: allowlist may only review under a listed host
+      // (independent filter — the review path must not spawn e.g. the claude
+      // binary inside a host framework the user hasn't opted in). Fail closed.
+      hostAllowsLane(l, { host }) &&
       isSelectablePreGate(l, gateReady) &&
       !disabled.has(l.id) &&
       (!available || available.has(l.id)) &&

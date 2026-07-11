@@ -169,6 +169,17 @@ export interface Lane {
   requests_per_week?: number;
   /** B: trailing-7-day token cap (tokens_in + tokens_out), routed share only. */
   tokens_per_week?: number;
+  /**
+   * F: host allowlist — the host frameworks this lane may be selected under
+   * (e.g. ['claude-code', 'cli']). ABSENT ⇒ allowed everywhere (back-compat).
+   * PRESENT ⇒ the routing context's host must be present AND listed — an
+   * unknown/mis-threaded host FAILS CLOSED (missing identity grants less
+   * authority, never more). Adding a host here is YOUR acknowledgement of the
+   * relevant vendor's terms for running this lane inside that framework — it
+   * is not a claim that the use is permitted. Not YOLO-overridable (host rules
+   * encode third-party terms, not your own data-trust choices).
+   */
+  hosts?: string[];
 }
 
 /**
@@ -310,6 +321,13 @@ export type ObservedCapabilityByModelDifficulty = Record<
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];
+  /**
+   * F: the host framework this routing runs under (lowercase id, e.g.
+   * 'claude-code' | 'codex-cli' | 'cli'). Set by each adapter (TOKENMAXED_HOST).
+   * Consumed ONLY by {@link Lane.hosts} allowlists; absent + no allowlists ⇒
+   * byte-identical routing.
+   */
+  host?: string;
   /**
    * Optional remaining weekly-cap headroom per lane id, in [0, 1] (1 = full /
    * no cap). Near-cap subscription lanes are deprioritized; a lane at/over its

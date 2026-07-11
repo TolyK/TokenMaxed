@@ -29,6 +29,8 @@ export interface LaneSetupRow {
   available: boolean;
   /** Declared per-category capability scores (the user's config), for transparency. */
   capability?: Partial<Record<string, number>>;
+  /** F: the lane's host allowlist when set (where it may be selected); absent ⇒ all hosts. */
+  hosts?: readonly string[];
 }
 
 /**
@@ -66,6 +68,9 @@ export function formatLaneSetup(rows: readonly LaneSetupRow[]): string[] {
   let anyApi = false;
   for (const r of rows) {
     const model = r.rawModel && r.rawModel !== r.model ? `${r.rawModel} → ${r.model}` : r.model;
+    // F: surface a host-scoped lane explicitly — the scope is the user's own
+    // acknowledgement boundary, so setup must show it, never infer it.
+    const hostScope = r.hosts && r.hosts.length > 0 ? ` · hosts=${r.hosts.join(',')}` : '';
     const caps = r.capability && Object.keys(r.capability).length > 0
       ? ' · caps ' + Object.entries(r.capability).map(([c, v]) => `${c}=${v}`).join(',')
       : '';
@@ -75,7 +80,7 @@ export function formatLaneSetup(rows: readonly LaneSetupRow[]): string[] {
     if (r.kind === 'api') anyApi = true;
     lines.push(
       `  • ${r.id} [${r.kind}] ${model} · trust=${r.trustMode} → ${permissionFor(r.trustMode, r.executionMode)}` +
-        `${billing} · role=${ROLE_LABEL[r.role]} · ${r.available ? 'available' : 'unavailable now'}${caps}`,
+        `${billing} · role=${ROLE_LABEL[r.role]} · ${r.available ? 'available' : 'unavailable now'}${hostScope}${caps}`,
     );
   }
   if (anyApi) {

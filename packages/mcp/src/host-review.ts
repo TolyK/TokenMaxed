@@ -29,6 +29,7 @@ import {
 import { makeAvailabilityProbe } from './availability.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { selectManagerLane } from './manager-select.ts';
+import { hostFromEnv } from './host-id.ts';
 import { buildReviewPrompt, parseManagerVerdict } from './reviewer.ts';
 
 /** Outcome of a host-turn review. */
@@ -78,6 +79,8 @@ export interface HostReviewDeps {
   appendOutcome: (event: OutcomeEventInput) => void;
   /** The safety-gate posture — gates API managers (egress) just like routing. */
   gateReady: boolean;
+  /** F: this adapter's host id — a hosts:-restricted manager needs it listed (fail closed). */
+  host?: string;
   newId: () => string;
 }
 
@@ -93,7 +96,7 @@ export async function runHostTurnReview(turnId: string, deps: HostReviewDeps): P
   // Skip a manager that can't run now (e.g. Codex not installed) so review falls
   // through to an available manager instead of failing to spawn.
   const available = new Set(await deps.availableLaneIds(lanes));
-  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady, available);
+  const manager = selectManagerLane(lanes, deps.loadPolicy(), deps.gateReady, available, deps.host);
   if (!manager) {
     return {
       reviewed: false,
@@ -315,6 +318,10 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
       new JsonlLedger(ledgerPath).appendOutcome(event);
     },
     gateReady: env.TOKENMAXED_GATE_READY === 'true',
+    ...((): { host?: string } => {
+      const h = hostFromEnv(env);
+      return h ? { host: h } : {};
+    })(),
     newId: () => randomUUID(),
   };
 }

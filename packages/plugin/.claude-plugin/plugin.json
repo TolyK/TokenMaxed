@@ -15,7 +15,8 @@
       "env": {
         "TOKENMAXED_PRICES": "${CLAUDE_PLUGIN_ROOT}/prices.seed.json",
         "TOKENMAXED_STATE": "${CLAUDE_PLUGIN_DATA}/state.json",
-        "TOKENMAXED_PROJECT": "${CLAUDE_PROJECT_DIR}"
+        "TOKENMAXED_PROJECT": "${CLAUDE_PROJECT_DIR}",
+        "TOKENMAXED_HOST": "claude-code"
       }
     }
   },

@@ -30,6 +30,14 @@
 #   capability      optional per-category competence in [0, 1]; omit a category to
 #                   use the default, or set it to 0 to opt the lane out entirely.
 #
+#   hosts           optional host allowlist: where this lane may be SELECTED, e.g.
+#                   [claude-code, cli]. Omit = allowed under every host adapter
+#                   (Claude Code, Codex CLI, ...). When set, the lane only routes
+#                   under a listed host id — and an UNKNOWN host fails closed.
+#                   Adding a host id here is YOUR acknowledgement of the relevant
+#                   vendor's terms for running this lane inside that framework;
+#                   TokenMaxed never auto-adds one.
+#
 #   Quota (all optional; counts are the ROUTED share from the local ledger — never
 #   your total subscription usage). When any is set, routing deprioritizes the lane
 #   as it fills (warn at 70% used, critical at 90%), the summary/status warn on
@@ -49,6 +57,7 @@ lanes:
     provenance: anthropic
     jurisdiction: US
     native: true          # the host model (do-it-yourself lane)
+    hosts: [claude-code]  # "native" means THIS host does it — only meaningful under Claude Code
     roles: [manager]
     manager_allowed: true
     capability:
@@ -190,6 +199,13 @@ lanes:
     execution_mode: answer-only
     command: claude
     args: ["-p", "--model", "{model}"]   # {model} ⇒ the resolved newest priced claude-haiku
+    # hosts: this lane SPAWNS the genuine `claude` binary on your subscription.
+    # Anthropic sanctions that inside Claude Code (and TokenMaxed's own CLI is a
+    # first-party surface); running it inside OTHER host frameworks (Codex CLI,
+    # OpenCode, ...) is officially UNADDRESSED gray zone — so it ships restricted.
+    # Adding another host id is YOUR deliberate acknowledgement of that gray zone,
+    # not a claim that Anthropic permits it.
+    hosts: [claude-code, cli]
     # Secondary / in-family manager. Codex above is the default host-turn reviewer
     # (first eligible in file order). On the escalation path this lane can only
     # independently review an offloaded output in categories where it isn't weaker
@@ -222,6 +238,13 @@ lanes:
     execution_mode: answer-only
     command: claude
     args: ["-p", "--model", "{model}"]   # {model} ⇒ the resolved newest priced claude-sonnet
+    # hosts: this lane SPAWNS the genuine `claude` binary on your subscription.
+    # Anthropic sanctions that inside Claude Code (and TokenMaxed's own CLI is a
+    # first-party surface); running it inside OTHER host frameworks (Codex CLI,
+    # OpenCode, ...) is officially UNADDRESSED gray zone — so it ships restricted.
+    # Adding another host id is YOUR deliberate acknowledgement of that gray zone,
+    # not a claim that Anthropic permits it.
+    hosts: [claude-code, cli]
     roles: [manager]
     manager_allowed: true
     capability:

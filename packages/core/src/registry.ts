@@ -53,6 +53,7 @@ const ALLOWED_LANE_KEYS = new Set([
   'native',
   'capability',
   'capability_source',
+  'hosts',
   'requests_per_window',
   'window_ms',
   'requests_per_week',
@@ -239,6 +240,22 @@ function parseLane(entry: unknown, index: number): Lane {
     lane[field] = v;
   }
 
+  // F: host allowlist — where this lane may be SELECTED (hostAllowsLane).
+  // Absent ⇒ all hosts. Present ⇒ non-empty array of lowercase host ids; an
+  // empty array would silently block the lane everywhere, so reject it loudly.
+  if (entry.hosts !== undefined) {
+    const v = entry.hosts;
+    if (!Array.isArray(v) || v.length === 0) {
+      throw new LaneConfigError(`${at('hosts')} must be a non-empty array of host ids (e.g. [claude-code, cli]) — omit the field to allow all hosts.`);
+    }
+    for (const h of v) {
+      if (typeof h !== 'string' || !/^[a-z0-9-]+$/.test(h)) {
+        throw new LaneConfigError(`${at('hosts')}: host ids must be lowercase [a-z0-9-]+ strings (got ${JSON.stringify(h)}).`);
+      }
+    }
+    lane.hosts = v as string[];
+  }
+
   // A SELECTABLE (full/worker/reader), non-native lane must be executable: cli
   // needs a command, api needs an endpoint (local defaults to localhost). Reject
   // at load so an unexecutable lane can never be selected and silently degrade —
@@ -275,6 +292,7 @@ function freezeLane(lane: Lane): Lane {
   if (clone.capability) clone.capability = Object.freeze({ ...clone.capability });
   if (clone.roles) clone.roles = Object.freeze([...clone.roles]) as Lane['roles'];
   if (clone.args) clone.args = Object.freeze([...clone.args]) as Lane['args'];
+  if (clone.hosts) clone.hosts = Object.freeze([...clone.hosts]) as Lane['hosts'];
   return Object.freeze(clone);
 }
 

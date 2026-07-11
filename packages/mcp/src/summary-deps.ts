@@ -33,6 +33,7 @@ import { homeFile, makeLoadPolicy } from './config.ts';
 import { reportFreshness } from './freshness-report.ts';
 import { laneSetFingerprint, readLaneReviewState } from './lane-state.ts';
 import { selectManagerLane } from './manager-select.ts';
+import { hostFromEnv } from './host-id.ts';
 import { readFreshnessCache } from './model-cache.ts';
 import { buildSummaryData } from './summary.ts';
 import type { SummaryData } from './summary.ts';
@@ -148,7 +149,10 @@ export function makeSummaryFromEnv(env: NodeJS.ProcessEnv): () => Promise<Summar
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
       core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel, laneDepletionForecast, laneQuotaState },
-      selectManager: selectManagerLane,
+      // F: bind the host identity so the summary reports the SAME reviewer the
+      // review path would select under this host (a hosts:-restricted manager
+      // fails closed on an unknown host).
+      selectManager: (l, pol, gr, avail) => selectManagerLane(l, pol, gr, avail, hostFromEnv(env)),
       staleness,
       laneReview,
       // Fold the host CLI's own per-model usage (real, transcript-derived) into the

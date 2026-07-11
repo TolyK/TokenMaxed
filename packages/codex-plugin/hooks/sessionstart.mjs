@@ -6,6 +6,7 @@ import { dirname as __d } from 'node:path';
 const require = __cr(import.meta.url);
 const __filename = __f(import.meta.url);
 const __dirname = __d(__filename);
+process.env.TOKENMAXED_HOST ??= 'codex-cli';
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -7678,6 +7679,10 @@ function declaredCapabilityFor(lane, category) {
   const declared = lane.capability?.[category];
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }
+function hostAllowsLane(lane, ctx) {
+  if (!lane.hosts || lane.hosts.length === 0) return true;
+  return typeof ctx.host === "string" && ctx.host !== "" && lane.hosts.includes(ctx.host);
+}
 
 // ../core/src/registry.ts
 var LANE_KINDS = ["cli", "api", "local"];
@@ -7706,6 +7711,7 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "native",
   "capability",
   "capability_source",
+  "hosts",
   "requests_per_window",
   "window_ms",
   "requests_per_week",
@@ -7861,6 +7867,18 @@ function parseLane(entry, index) {
     }
     lane[field] = v;
   }
+  if (entry.hosts !== void 0) {
+    const v = entry.hosts;
+    if (!Array.isArray(v) || v.length === 0) {
+      throw new LaneConfigError(`${at("hosts")} must be a non-empty array of host ids (e.g. [claude-code, cli]) \u2014 omit the field to allow all hosts.`);
+    }
+    for (const h of v) {
+      if (typeof h !== "string" || !/^[a-z0-9-]+$/.test(h)) {
+        throw new LaneConfigError(`${at("hosts")}: host ids must be lowercase [a-z0-9-]+ strings (got ${JSON.stringify(h)}).`);
+      }
+    }
+    lane.hosts = v;
+  }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
     if (lane.kind === "cli" && lane.command === void 0) {
@@ -7880,6 +7898,7 @@ function freezeLane(lane) {
   if (clone.capability) clone.capability = Object.freeze({ ...clone.capability });
   if (clone.roles) clone.roles = Object.freeze([...clone.roles]);
   if (clone.args) clone.args = Object.freeze([...clone.args]);
+  if (clone.hosts) clone.hosts = Object.freeze([...clone.hosts]);
   return Object.freeze(clone);
 }
 var LaneRegistry = class {
@@ -8928,12 +8947,21 @@ function readLaneReviewState(path) {
 }
 
 // ../mcp/src/manager-select.ts
-function selectManagerLane(lanes, policy, gateReady, available = null) {
+function selectManagerLane(lanes, policy, gateReady, available = null, host) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const reviewContext = { repo_class: "private", sensitivity: "sensitive" };
   return lanes.find(
-    (l) => isManagerEligible(l) && !l.native && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
+    (l) => isManagerEligible(l) && !l.native && // F: a lane with a hosts: allowlist may only review under a listed host
+    // (independent filter — the review path must not spawn e.g. the claude
+    // binary inside a host framework the user hasn't opted in). Fail closed.
+    hostAllowsLane(l, { host }) && isSelectablePreGate(l, gateReady) && !disabled.has(l.id) && (!available || available.has(l.id)) && laneAllowedByVerdict(l, evaluate({ category: "refactor" }, l, reviewContext, policy).verdict)
   );
+}
+
+// ../mcp/src/host-id.ts
+function hostFromEnv(env) {
+  const raw = env.TOKENMAXED_HOST?.trim().toLowerCase();
+  return raw ? raw : void 0;
 }
 
 // ../mcp/src/summary.ts
@@ -9306,7 +9334,10 @@ function makeSummaryFromEnv(env) {
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
       core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel, laneDepletionForecast, laneQuotaState },
-      selectManager: selectManagerLane,
+      // F: bind the host identity so the summary reports the SAME reviewer the
+      // review path would select under this host (a hosts:-restricted manager
+      // fails closed on an unknown host).
+      selectManager: (l, pol, gr, avail) => selectManagerLane(l, pol, gr, avail, hostFromEnv(env)),
       staleness,
       laneReview,
       // Fold the host CLI's own per-model usage (real, transcript-derived) into the
