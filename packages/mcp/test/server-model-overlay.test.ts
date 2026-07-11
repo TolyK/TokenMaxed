@@ -100,7 +100,11 @@ function outcome(overrides: Partial<OutcomeEvent> = {}): OutcomeEvent {
   };
 }
 
-function near(actual: number, expected: number, eps = 1e-9): void {
+// Fixtures use wall-clock timestamps and makeServerDeps decays against its OWN
+// Date.now(), so a slow runner (CI) shaves ~1e-9..1e-5 off the decay-weighted
+// counts between fixture creation and assertion. 1e-3 tolerates minutes of
+// scheduler pause while still catching any real aggregation error.
+function near(actual: number, expected: number, eps = 1e-3): void {
   assert.ok(Math.abs(actual - expected) <= eps, `expected ${actual} ≈ ${expected}`);
 }
 
