@@ -482,6 +482,40 @@ yet (Codex has no command-backed status line — tracked upstream), and the
 per-project on/off toggle keys globally under Codex v1. Everything else —
 lanes, policy, ledger, settings — is the same user-owned `~/.tokenmaxed`.
 
+## Use in OpenCode (plugin)
+
+The same brain in [OpenCode](https://opencode.ai) (v1.17+): a bundled MCP
+server (tools appear as `tokenmaxed_router_delegate` etc.), an in-process
+lifecycle plugin (session summary banner, deterministic routing gate on the
+delegate tool), and all thirteen commands (`/tokenmaxed-setup`,
+`/tokenmaxed-why`, … — generated from the Claude Code skills, one source of
+truth).
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git && cd TokenMaxed
+npm install
+npm run build:opencode-plugin   # bundle server + plugin + generate commands
+# then merge packages/opencode-plugin/opencode.example.jsonc into your
+# opencode.json (absolute paths), or copy plugin/tokenmaxed.js AND
+# plugin/tokenmaxed-review.mjs (must stay side by side) into
+# ~/.config/opencode/plugin/ and command/*.md into ~/.config/opencode/command/
+```
+
+**Keep the `environment: { "TOKENMAXED_HOST": "opencode" }` block** on the MCP
+server — it is the host identity for [per-host lane permissions](#per-host-lane-permissions-hosts);
+without it, `hosts:`-scoped lanes (like the claude-CLI lanes) fail closed, and
+with it they *stay* blocked here unless you deliberately add `opencode` to a
+lane's `hosts:` list.
+
+**Reduced protection — honest note:** OpenCode has no blocking Stop hook, so
+the turn-end review loop is weaker than under Claude Code / Codex CLI. On
+`session.idle` the review runs in a child process (so it never freezes the
+OpenCode UI) and, when the reviewer wants rework, TokenMaxed sends the notes
+back into the session as a follow-up prompt (bounded by the same per-session
+round limit); a finished turn can be *continued* but never *vetoed*, and if
+the prompt-back fails or isn't available the notes surface as a toast instead.
+Opt out with `TOKENMAXED_REVIEW_ON_STOP=false`.
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
@@ -595,7 +629,8 @@ per host — each host controlling which lanes are even allowed to run inside it
 | **CLI** (`tokenmaxed`) | available | the commands above, after `npm run build` |
 | **Claude Code plugin** | available | `claude --plugin-dir packages/plugin`, then `/tokenmaxed:setup` |
 | **Codex CLI plugin** | available | `packages/codex-plugin` — bundled MCP server + skills + hooks (see [Use in Codex CLI](#use-in-codex-cli-plugin)) |
-| Pi · OpenCode · OpenClaw · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
+| **OpenCode plugin** | available | `packages/opencode-plugin` — bundled MCP server + in-process plugin + commands (see [Use in OpenCode](#use-in-opencode-plugin)) |
+| Pi · OpenClaw · Cline · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.

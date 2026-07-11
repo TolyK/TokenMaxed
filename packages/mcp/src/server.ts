@@ -631,7 +631,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // and surfaced to the caller (never silently). No files requested ⇒ unchanged.
     const fileResult = request.files?.length
       ? readRepoFiles(request.files, {
-          projectDir: env.CLAUDE_PROJECT_DIR,
+          projectDir: env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR,
           realpath: realpathSync,
           readFile: (p) => readFileSync(p, 'utf8'),
           stat: (p) => {

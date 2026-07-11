@@ -238,9 +238,11 @@ function readUntrackedDiff(cwd: string): { diff: string; omitted: number; enumer
 
 /** Build the real host-review deps from the environment (git + executor + ledger). */
 export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
-  // CLAUDE_PROJECT_DIR is a real path; TOKENMAXED_PROJECT is only the toggle KEY
-  // (may be a logical id), so it must NOT be used as git's cwd.
-  const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
+  // A REAL path is required for git's cwd: TOKENMAXED_PROJECT_DIR (host-neutral,
+  // set by non-Claude adapters like the OpenCode plugin) wins, then Claude's
+  // CLAUDE_PROJECT_DIR. TOKENMAXED_PROJECT is only the toggle KEY (may be a
+  // logical id), so it must NOT be used here — a wrong cwd reviews the wrong repo.
+  const cwd = env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile('lanes.yaml');
   const ledgerPath = env.TOKENMAXED_LEDGER; // undefined ⇒ JsonlLedger default
   // Same package-relative seed the server/summary use, so the review path resolves

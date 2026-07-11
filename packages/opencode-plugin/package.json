@@ -1,0 +1,11 @@
+{
+  "name": "@tokenmaxed/opencode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TokenMaxed as an OpenCode plugin: bundled MCP server, lifecycle plugin, and generated commands.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}

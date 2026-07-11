@@ -27074,7 +27074,7 @@ function readUntrackedDiff(cwd) {
   return { diff: parts.join("\n"), omitted: Math.max(0, all.length - included), enumerationFailed: false };
 }
 function makeHostReviewDeps(env) {
-  const cwd = env.CLAUDE_PROJECT_DIR ?? process.cwd();
+  const cwd = env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
@@ -28493,7 +28493,7 @@ function makeServerDeps(env = process.env) {
       newId: () => randomUUID3()
     };
     const fileResult = request.files?.length ? readRepoFiles(request.files, {
-      projectDir: env.CLAUDE_PROJECT_DIR,
+      projectDir: env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR,
       realpath: realpathSync,
       readFile: (p) => readFileSync7(p, "utf8"),
       stat: (p) => {
