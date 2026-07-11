@@ -7639,6 +7639,12 @@ function declaredCapabilityFor(lane, category) {
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }
 
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
+
+// ../core/src/quota.ts
+var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist(), 1);
 var LANE_KINDS = ["cli", "api", "local"];
@@ -7667,7 +7673,10 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "native",
   "capability",
   "capability_source",
-  "requests_per_window"
+  "requests_per_window",
+  "window_ms",
+  "requests_per_week",
+  "tokens_per_week"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7810,6 +7819,14 @@ function parseLane(entry, index) {
       );
     }
     lane.requests_per_window = n;
+  }
+  for (const field of ["window_ms", "requests_per_week", "tokens_per_week"]) {
+    const v = entry[field];
+    if (v === void 0) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
   }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
@@ -8269,9 +8286,6 @@ function estimateTokens(text) {
   if (text.length === 0) return 0;
   return Math.ceil(text.length / 4);
 }
-
-// ../core/src/window-quota.ts
-var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
 
 // ../core/src/node.ts
 import { spawnSync } from "node:child_process";

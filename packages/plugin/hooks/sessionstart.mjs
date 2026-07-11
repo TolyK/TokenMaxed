@@ -7706,7 +7706,10 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "native",
   "capability",
   "capability_source",
-  "requests_per_window"
+  "requests_per_window",
+  "window_ms",
+  "requests_per_week",
+  "tokens_per_week"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7849,6 +7852,14 @@ function parseLane(entry, index) {
       );
     }
     lane.requests_per_window = n;
+  }
+  for (const field of ["window_ms", "requests_per_week", "tokens_per_week"]) {
+    const v = entry[field];
+    if (v === void 0) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
   }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
@@ -8584,6 +8595,9 @@ function windowLevel(usedFraction) {
   return "ok";
 }
 
+// ../core/src/quota.ts
+var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+
 // ../mcp/src/availability.ts
 import { accessSync, constants, statSync } from "node:fs";
 import { join as join3 } from "node:path";
@@ -8862,7 +8876,8 @@ function buildSummaryData(input) {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
-    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, FIVE_HOUR_MS2);
+    const windowMs = typeof l.window_ms === "number" && l.window_ms > 0 ? l.window_ms : FIVE_HOUR_MS2;
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, windowMs);
     const limit = l.requests_per_window;
     const requestWindowLevel = limit !== void 0 ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : void 0;
     return {
@@ -8873,6 +8888,7 @@ function buildSummaryData(input) {
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
       requestsIn5h,
+      ...windowMs !== FIVE_HOUR_MS2 ? { windowHours: windowMs / 36e5 } : {},
       ...limit !== void 0 ? { requestsPerWindow: limit, requestWindowLevel } : {},
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
@@ -8934,7 +8950,8 @@ ${METERED_KEY_WARNING}` : off;
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
     const laneLine = (l) => {
-      const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed 5h: ${l.requestsIn5h}` : "";
+      const windowLabel = l.windowHours !== void 0 ? `${l.windowHours}h` : "5h";
+      const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed ${windowLabel}: ${l.requestsIn5h}` : "";
       return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${routed5h}${l.stale ? " \u26A0 stale" : ""}`;
     };
     const groups = [
@@ -8966,8 +8983,9 @@ ${METERED_KEY_WARNING}` : off;
     (x) => x.requestsPerWindow !== void 0 && (x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
   )) {
     const tag = l.requestWindowLevel === "critical" ? "near limit" : "filling up";
+    const windowLabel = l.windowHours !== void 0 ? `${l.windowHours}h` : "5h";
     lines.push(
-      `   \u26A0 ${vendorName(l)} routed 5h: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)`
+      `   \u26A0 ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)`
     );
   }
   for (const l of visible.filter((l2) => l2.stale)) {

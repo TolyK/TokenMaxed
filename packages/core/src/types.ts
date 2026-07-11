@@ -157,6 +157,18 @@ export interface Lane {
    * still shows routed request counts but does not emit quota warnings.
    */
   requests_per_window?: number;
+  /**
+   * B: override the rolling window length (ms) for {@link requests_per_window}.
+   * Absent ⇒ the 5h default. Positive finite ms.
+   */
+  window_ms?: number;
+  /**
+   * B: trailing-7-day request cap. All quota counts are the ROUTED share from
+   * the local ledger — never total subscription usage (honesty law).
+   */
+  requests_per_week?: number;
+  /** B: trailing-7-day token cap (tokens_in + tokens_out), routed share only. */
+  tokens_per_week?: number;
 }
 
 /**

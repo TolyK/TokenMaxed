@@ -171,6 +171,14 @@ export interface ToolDeps {
   /** Per-lane cost signal (price-derived) for tiered ranking; optional. */
   laneCost?: (lanes: readonly Lane[]) => Record<string, number>;
   /**
+   * B: the routed-share quota headroom map (RouteContext.capHeadroom) for a lane
+   * set, or undefined when no lane configures quotas — built server-side from
+   * the SAME ledger delegate routes with (parity). Absent dep ⇒ no pressure.
+   */
+  capHeadroom?: (lanes: readonly Lane[]) => Record<string, number> | undefined;
+  /** B: compact per-lane quota detail ("5h 12/40 routed · …") for /why lines. */
+  quotaDetail?: (lane: Lane) => string | undefined;
+  /**
    * A4: the persistent-settings report (per key: effective value + which layer —
    * env/settings/default — supplied it). Powers /tokenmaxed:config. Optional so
    * fakes/old hosts can omit the whole surface.
@@ -698,6 +706,9 @@ export function createTools(core: CorePort): ToolDef[] {
           capPrior?.state === 'on'
             ? { capabilityPrior: capPrior.overlay, ...(capPrior.stale ? { capabilityPriorStale: true } : {}) }
             : {};
+        // B: the same routed-share headroom map delegate routes with (parity).
+        const capHeadroom = deps.capHeadroom?.(lanes);
+        const quotaCtx: Partial<RouteContext> = capHeadroom ? { capHeadroom } : {};
         // Same availability filter delegate routes with (when the host provides it),
         // so /tokenmaxed:why never advertises a lane that can't actually run. Probe
         // ONLY the gate+policy-eligible lanes — never a disabled/blocked/gated lane
@@ -715,6 +726,7 @@ export function createTools(core: CorePort): ToolDef[] {
             ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
             ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
             ...priorCtx,
+            ...quotaCtx,
           };
           const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
           availableIds = await deps.availableLaneIds(eligible);
@@ -742,6 +754,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
           ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
           ...priorCtx,
+          ...quotaCtx,
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
           ...(preferLaneId ? { preferLaneId } : {}),
@@ -773,6 +786,25 @@ export function createTools(core: CorePort): ToolDef[] {
         const yoloNote = yolo
           ? `  ⚠️ YOLO mode ON: trust/egress gates are bypassed — workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.`
           : undefined;
+        // B: quota-pressure visibility — detected via the ACTUAL score factors
+        // (no threshold duplication): a nonzero capPenalty on the winner means
+        // pressure applied yet it still won; on losers it means they were
+        // deprioritized. Preference overriding pressure is called out loudly.
+        const quotaLines: string[] = [];
+        const winnerCapPenalty = decision.scores.find((s) => s.laneId === decision.laneId)?.factors.capPenalty ?? 0;
+        if (winnerCapPenalty > 0) {
+          const detail = lane ? deps.quotaDetail?.(lane) : undefined;
+          quotaLines.push(`  quota: ${detail ?? 'near cap'} — pressure applied; it won anyway (no better capable alternative)`);
+          if (preferLaneId === decision.laneId) {
+            quotaLines.push(`  ⚠ preferred lane overrides quota pressure${detail ? ` (${detail})` : ''} — /tokenmaxed:prefer off to release it.`);
+          }
+        }
+        const pressuredLosers = decision.scores
+          .filter((s) => s.laneId !== decision.laneId && s.factors.capPenalty > 0)
+          .map((s) => s.laneId);
+        if (pressuredLosers.length > 0) {
+          quotaLines.push(`  quota-deprioritized: ${pressuredLosers.join(', ')} (routed-share near cap)`);
+        }
         // P2: say where the winner's capability PRIOR came from (rankings overlay vs
         // declared config), and describe the active snapshot — or its load error —
         // so an adjusted score is never mistaken for a hand-set one.
@@ -814,6 +846,7 @@ export function createTools(core: CorePort): ToolDef[] {
                 `  difficulty: ${difficulty} — learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`,
               ]
             : []),
+          ...quotaLines,
           ...priorLines,
           ...(yoloNote ? [yoloNote] : []),
           ...(preferNote ? [preferNote] : []),

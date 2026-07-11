@@ -81,13 +81,13 @@ test('buildStatuslineData: tightest 5h window wins; native breadcrumbs are not r
   events.push(taskEvent({ laneId: 'codex-cli', status: 'native', native_reason: 'no_route' })); // not counted
   const d = buildStatuslineData(events, lanes, NOW);
   assert.deepEqual(d.window, { laneId: 'codex-cli', count: 8, limit: 10, level: 'warn' });
-  assert.match(formatStatusline(d), /5h codex-cli 8\/10 ⚠/);
+  assert.match(formatStatusline(d), /5h codex-cli 8\/10 routed ⚠/);
 });
 
 test('formatStatusline: critical marker at >=90% used; no marker when ok', () => {
   assert.match(
     formatStatusline({ avoided7dUsd: 1, window: { laneId: 'x', count: 9, limit: 10, level: 'critical' }, empty: false }),
-    /5h x 9\/10 🛑/,
+    /5h x 9\/10 routed 🛑/,
   );
   assert.doesNotMatch(
     formatStatusline({ avoided7dUsd: 1, window: { laneId: 'x', count: 1, limit: 10, level: 'ok' }, empty: false }),
@@ -116,7 +116,7 @@ test('statuslineFromEnv: reads temp lanes + ledger; missing lanes file ⇒ still
       { TOKENMAXED_LANES: join(dir, 'lanes.yaml'), TOKENMAXED_LEDGER: join(dir, 'ledger.jsonl') },
       NOW,
     );
-    assert.match(line, /^tmax · est\. \$3\.00 metered avoided \(7d\) · 5h codex-cli 3\/10$/);
+    assert.match(line, /^tmax · est\. \$3\.00 metered avoided \(7d\) · 5h codex-cli 3\/10 routed$/);
     // Missing lanes file ⇒ no window segment, still a valid line (fail-open shape).
     const noLanes = statuslineFromEnv(
       { TOKENMAXED_LANES: join(dir, 'nope.yaml'), TOKENMAXED_LEDGER: join(dir, 'ledger.jsonl') },

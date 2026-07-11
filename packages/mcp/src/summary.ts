@@ -95,8 +95,10 @@ export interface LaneSummary {
   provenance: Lane['provenance'];
   /** Lifetime tokens routed to THIS lane (from tokenStats().byLane); 0 if none yet. */
   tokensRouted: number;
-  /** Routed task events in the trailing 5h window (ledger-only; not total subscription usage). */
+  /** Routed task events in the lane's trailing window (ledger-only; not total subscription usage). */
   requestsIn5h: number;
+  /** B: hours of a non-default window (lane window_ms override); absent ⇒ the 5h default. */
+  windowHours?: number;
   /** Configured per-5h request limit, when set on the lane. */
   requestsPerWindow?: number;
   /** Quota level vs {@link requestsPerWindow}, when configured. */
@@ -193,7 +195,10 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
-    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, FIVE_HOUR_MS);
+    // B: honor a configured window_ms override so this count always agrees with
+    // the quota state routing uses (count parity + honest labeling).
+    const windowMs = typeof l.window_ms === 'number' && l.window_ms > 0 ? l.window_ms : FIVE_HOUR_MS;
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, windowMs);
     const limit = l.requests_per_window;
     const requestWindowLevel =
       limit !== undefined ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : undefined;
@@ -205,6 +210,7 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
       requestsIn5h,
+      ...(windowMs !== FIVE_HOUR_MS ? { windowHours: windowMs / 3_600_000 } : {}),
       ...(limit !== undefined ? { requestsPerWindow: limit, requestWindowLevel } : {}),
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
@@ -287,8 +293,9 @@ export function formatSummaryBanner(data: SummaryData): string {
     // Per-lane counts are often small, so show the EXACT count (grouped) rather than
     // tok()'s thousands-rounding, which would render e.g. 150 tokens as a misleading "0k".
     const laneLine = (l: LaneSummary): string => {
+      const windowLabel = l.windowHours !== undefined ? `${l.windowHours}h` : '5h';
       const routed5h =
-        l.requestsIn5h > 0 || l.requestsPerWindow !== undefined ? ` · routed 5h: ${l.requestsIn5h}` : '';
+        l.requestsIn5h > 0 || l.requestsPerWindow !== undefined ? ` · routed ${windowLabel}: ${l.requestsIn5h}` : '';
       return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` · ${l.tokensRouted.toLocaleString('en-US')} tok` : ''}${routed5h}${l.stale ? ' ⚠ stale' : ''}`;
     };
     const groups: Array<{ title: string; mode: Lane['trust_mode'] }> = [
@@ -318,13 +325,14 @@ export function formatSummaryBanner(data: SummaryData): string {
   } else if (data.lanes.length > 0 && data.laneReview === 'first-review') {
     lines.push('   ℹ run /tokenmaxed:setup to review what each lane may see/do');
   }
-  // Routed 5h quota warnings (ledger-only counts — NOT total subscription usage).
+  // Routed window quota warnings (ledger-only counts — NOT total subscription usage).
   for (const l of visible.filter(
     (x) => x.requestsPerWindow !== undefined && (x.requestWindowLevel === 'warn' || x.requestWindowLevel === 'critical'),
   )) {
     const tag = l.requestWindowLevel === 'critical' ? 'near limit' : 'filling up';
+    const windowLabel = l.windowHours !== undefined ? `${l.windowHours}h` : '5h';
     lines.push(
-      `   ⚠ ${vendorName(l)} routed 5h: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} — ledger count only, not your full session)`,
+      `   ⚠ ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} — ledger count only, not your full session)`,
     );
   }
   // Spell out stale models, but only for the VISIBLE (capped) lanes — so the spell-out

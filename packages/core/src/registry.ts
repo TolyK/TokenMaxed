@@ -54,6 +54,9 @@ const ALLOWED_LANE_KEYS = new Set([
   'capability',
   'capability_source',
   'requests_per_window',
+  'window_ms',
+  'requests_per_week',
+  'tokens_per_week',
 ]);
 
 /** Raised for any malformed or invalid lane configuration, with a clear message. */
@@ -225,6 +228,15 @@ function parseLane(entry: unknown, index: number): Lane {
       );
     }
     lane.requests_per_window = n;
+  }
+  // B quota-brain fields: same positive-finite rule as requests_per_window.
+  for (const field of ['window_ms', 'requests_per_week', 'tokens_per_week'] as const) {
+    const v = entry[field];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
   }
 
   // A SELECTABLE (full/worker/reader), non-native lane must be executable: cli

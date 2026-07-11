@@ -142,6 +142,17 @@ test('banner shows routed 5h count per lane; quota warning only when limit set a
   assert.doesNotMatch(bannerOk, /near limit|filling up/);
 });
 
+test('B: a window_ms override labels BOTH the lane row and the warning line with the real window', () => {
+  const custom = build({
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 1, window_ms: 2 * 60 * 60 * 1000 })],
+    availableLaneIds: ['codex-cli'],
+  });
+  const banner = formatSummaryBanner(custom);
+  assert.match(banner, /routed 2h: 1/); // lane row
+  assert.match(banner, /routed 2h: 1\/1 \(near limit/); // warning line — never mislabeled 5h
+  assert.doesNotMatch(banner, /routed 5h/);
+});
+
 test('requestsIn5h excludes native breadcrumb events (only routed task events count)', () => {
   const withNative = build({
     events: [

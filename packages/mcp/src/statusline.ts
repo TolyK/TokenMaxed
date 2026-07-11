@@ -33,8 +33,8 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 export interface StatuslineData {
   /** Estimated metered $ avoided over the trailing 7 days. */
   avoided7dUsd: number;
-  /** The tightest configured 5h window (highest used fraction), if any lane declares one. */
-  window?: { laneId: string; count: number; limit: number; level: WindowLevel };
+  /** The tightest configured rolling window (highest used fraction), if any lane declares one. */
+  window?: { laneId: string; count: number; limit: number; level: WindowLevel; windowHours?: number };
   /** True when the ledger has no task events yet. */
   empty: boolean;
 }
@@ -60,11 +60,19 @@ export function buildStatuslineData(events: readonly LedgerEvent[], lanes: reado
   for (const lane of lanes) {
     const limit = lane.requests_per_window;
     if (!(typeof limit === 'number' && limit > 0)) continue;
-    const count = requestsInWindow(tsByLane.get(lane.id) ?? [], now, FIVE_HOUR_MS);
+    // B: honor a configured window_ms override (parity with quota state + summary).
+    const windowMs = typeof lane.window_ms === 'number' && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+    const count = requestsInWindow(tsByLane.get(lane.id) ?? [], now, windowMs);
     const fraction = windowUsedFraction(count, limit);
     if (fraction > worstFraction) {
       worstFraction = fraction;
-      window = { laneId: lane.id, count, limit, level: windowLevel(fraction) };
+      window = {
+        laneId: lane.id,
+        count,
+        limit,
+        level: windowLevel(fraction),
+        ...(windowMs !== FIVE_HOUR_MS ? { windowHours: windowMs / 3_600_000 } : {}),
+      };
     }
   }
 
@@ -77,7 +85,8 @@ export function formatStatusline(d: StatuslineData): string {
   const parts = [`tmax · est. $${d.avoided7dUsd.toFixed(2)} metered avoided (7d)`];
   if (d.window) {
     const marker = d.window.level === 'critical' ? ' 🛑' : d.window.level === 'warn' ? ' ⚠' : '';
-    parts.push(`5h ${d.window.laneId} ${d.window.count}/${d.window.limit}${marker}`);
+    const label = d.window.windowHours !== undefined ? `${d.window.windowHours}h` : '5h';
+    parts.push(`${label} ${d.window.laneId} ${d.window.count}/${d.window.limit} routed${marker}`);
   }
   return parts.join(' · ');
 }

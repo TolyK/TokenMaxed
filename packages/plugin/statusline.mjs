@@ -7415,6 +7415,41 @@ function declaredCapabilityFor(lane, category) {
   return clamp01(declared ?? DEFAULT_CAPABILITY);
 }
 
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
+var WINDOW_WARN_USED = 0.7;
+var WINDOW_CRITICAL_USED = 0.9;
+function effectiveWindowMs(windowMs) {
+  return windowMs > 0 && Number.isFinite(windowMs) ? windowMs : FIVE_HOUR_MS;
+}
+function saneCount(count) {
+  if (!Number.isFinite(count) || count < 0) return 0;
+  return count;
+}
+function requestsInWindow(timestampsMs, now, windowMs = FIVE_HOUR_MS) {
+  const w = effectiveWindowMs(windowMs);
+  if (!Number.isFinite(now)) return 0;
+  const cutoff = now - w;
+  let n = 0;
+  for (const t of timestampsMs) {
+    if (!Number.isFinite(t)) continue;
+    if (t > cutoff && t <= now) n += 1;
+  }
+  return n;
+}
+function windowUsedFraction(count, limit) {
+  if (!(limit > 0)) return 0;
+  return saneCount(count) / limit;
+}
+function windowLevel(usedFraction) {
+  if (usedFraction >= WINDOW_CRITICAL_USED) return "critical";
+  if (usedFraction >= WINDOW_WARN_USED) return "warn";
+  return "ok";
+}
+
+// ../core/src/quota.ts
+var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist(), 1);
 var LANE_KINDS = ["cli", "api", "local"];
@@ -7443,7 +7478,10 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "native",
   "capability",
   "capability_source",
-  "requests_per_window"
+  "requests_per_window",
+  "window_ms",
+  "requests_per_week",
+  "tokens_per_week"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7586,6 +7624,14 @@ function parseLane(entry, index) {
       );
     }
     lane.requests_per_window = n;
+  }
+  for (const field of ["window_ms", "requests_per_week", "tokens_per_week"]) {
+    const v = entry[field];
+    if (v === void 0) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
   }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
@@ -7927,38 +7973,6 @@ function summarize(events) {
   return { events: realEvents, savings, actual_cost, metered_spent_total, laneMix, blockCount, nativeFallbacks };
 }
 
-// ../core/src/window-quota.ts
-var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
-var WINDOW_WARN_USED = 0.7;
-var WINDOW_CRITICAL_USED = 0.9;
-function effectiveWindowMs(windowMs) {
-  return windowMs > 0 && Number.isFinite(windowMs) ? windowMs : FIVE_HOUR_MS;
-}
-function saneCount(count) {
-  if (!Number.isFinite(count) || count < 0) return 0;
-  return count;
-}
-function requestsInWindow(timestampsMs, now, windowMs = FIVE_HOUR_MS) {
-  const w = effectiveWindowMs(windowMs);
-  if (!Number.isFinite(now)) return 0;
-  const cutoff = now - w;
-  let n = 0;
-  for (const t of timestampsMs) {
-    if (!Number.isFinite(t)) continue;
-    if (t > cutoff && t <= now) n += 1;
-  }
-  return n;
-}
-function windowUsedFraction(count, limit) {
-  if (!(limit > 0)) return 0;
-  return saneCount(count) / limit;
-}
-function windowLevel(usedFraction) {
-  if (usedFraction >= WINDOW_CRITICAL_USED) return "critical";
-  if (usedFraction >= WINDOW_WARN_USED) return "warn";
-  return "ok";
-}
-
 // ../core/src/node.ts
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -8151,11 +8165,18 @@ function buildStatuslineData(events, lanes, now) {
   for (const lane of lanes) {
     const limit = lane.requests_per_window;
     if (!(typeof limit === "number" && limit > 0)) continue;
-    const count = requestsInWindow(tsByLane.get(lane.id) ?? [], now, FIVE_HOUR_MS);
+    const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+    const count = requestsInWindow(tsByLane.get(lane.id) ?? [], now, windowMs);
     const fraction = windowUsedFraction(count, limit);
     if (fraction > worstFraction) {
       worstFraction = fraction;
-      window = { laneId: lane.id, count, limit, level: windowLevel(fraction) };
+      window = {
+        laneId: lane.id,
+        count,
+        limit,
+        level: windowLevel(fraction),
+        ...windowMs !== FIVE_HOUR_MS ? { windowHours: windowMs / 36e5 } : {}
+      };
     }
   }
   return { avoided7dUsd: summary.savings.metered_avoided, ...window ? { window } : {}, empty };
@@ -8165,7 +8186,8 @@ function formatStatusline(d) {
   const parts = [`tmax \xB7 est. $${d.avoided7dUsd.toFixed(2)} metered avoided (7d)`];
   if (d.window) {
     const marker = d.window.level === "critical" ? " \u{1F6D1}" : d.window.level === "warn" ? " \u26A0" : "";
-    parts.push(`5h ${d.window.laneId} ${d.window.count}/${d.window.limit}${marker}`);
+    const label = d.window.windowHours !== void 0 ? `${d.window.windowHours}h` : "5h";
+    parts.push(`${label} ${d.window.laneId} ${d.window.count}/${d.window.limit} routed${marker}`);
   }
   return parts.join(" \xB7 ");
 }

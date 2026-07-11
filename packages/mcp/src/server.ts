@@ -36,7 +36,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -267,6 +267,34 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // learned adjustment (no /why-vs-run divergence). Built from the ledger + clock
   // the adapter owns; undefined when learning is off. Lazy per call (cheap: local
   // JSONL, opt-in).
+  // B quota brain: the routed-share headroom map (RouteContext.capHeadroom).
+  // Fail-open; an EMPTY map is returned as undefined so a config with no quota
+  // fields anywhere stays byte-identical (zero-change-when-absent).
+  const buildCapHeadroom = (lanes: readonly Lane[]): Record<string, number> | undefined => {
+    try {
+      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanes, Date.now());
+      return Object.keys(map).length > 0 ? map : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  // B: one compact, content-free detail string per quota-configured lane (counts
+  // are the ROUTED share — the label says so) for /why and the override warning.
+  const quotaDetailFor = (lane: Lane): string | undefined => {
+    try {
+      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), lane, Date.now());
+      const parts: string[] = [];
+      // Honest labeling: say the CONFIGURED window, not "5h", when overridden.
+      const windowMs = typeof lane.window_ms === 'number' && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+      const windowLabel = windowMs === FIVE_HOUR_MS ? '5h' : `${windowMs / 3_600_000}h`;
+      if (s.window) parts.push(`${windowLabel} ${s.window.count}/${s.window.limit} routed`);
+      if (s.weekRequests) parts.push(`7d ${s.weekRequests.count}/${s.weekRequests.limit} req routed`);
+      if (s.weekTokens) parts.push(`7d ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok routed`);
+      return parts.length > 0 ? parts.join(' · ') : undefined;
+    } catch {
+      return undefined;
+    }
+  };
   // P2 rankings prior — ONE loader (capability-prior-load.ts) shared by delegate,
   // preview, and status so every surface reports/routes the same posture. Loaded
   // per call (like prices) so snapshot edits apply without a restart. Fail-open:
@@ -390,6 +418,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // preserves it through its effective-context spread, so escalation/reassign benefit.
     const observedCapabilityByModel = buildObservedByModel();
     const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
+    // B: routed-share quota headroom (undefined when no lane configures quotas).
+    const capHeadroom = buildCapHeadroom(lanes);
     // Exclude lanes that can't run now (e.g. Ollama down) so routing never picks an
     // unavailable lane on cost; threads through runTask/runWithEscalation to
     // routeDecide + canReassign. Empty ⇒ no candidate ⇒ runTask degrades to native.
@@ -412,6 +442,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       ...(readYoloState() ? { yolo: true } : {}),
       ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
       ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
+      // B quota pressure: near-cap lanes are deprioritized by scoreLane's
+      // capPenalty; a capped lane can still win when it's the only capable one.
+      ...(capHeadroom ? { capHeadroom } : {}),
       // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
       // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
       // runWithEscalation preserves these through its effective-context spread, so
@@ -488,6 +521,24 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join('; ')})`
         : '';
 
+    // B (plan §1.3): preference deliberately OVERRIDES quota pressure — make the
+    // override loud rather than silent, on BOTH the plain and escalation paths.
+    // Detection mirrors core exactly by reading the decision's ACTUAL capPenalty
+    // factor (no threshold/epsilon duplication).
+    const preferOverrideNoteFor = (laneId: string, decision: { scores: readonly { laneId: string; factors: { capPenalty: number } }[] } | undefined): string => {
+      if (readPreferredLane() !== laneId) return '';
+      const capPenalty = decision?.scores.find((s) => s.laneId === laneId)?.factors.capPenalty ?? 0;
+      if (!(capPenalty > 0)) return '';
+      const winnerLane = lanes.find((l) => l.id === laneId);
+      const detail = winnerLane ? quotaDetailFor(winnerLane) : undefined;
+      return ` ⚠ preferred lane overrides quota pressure${detail ? ` (${detail})` : ''}.`;
+    };
+    const withPreferOverrideNote = (outcome: DelegateOutcome, decision: Parameters<typeof preferOverrideNoteFor>[1]): DelegateOutcome => {
+      const note = preferOverrideNoteFor(outcome.laneId, decision);
+      if (!note) return outcome;
+      return { ...outcome, reason: outcome.reason ? `${outcome.reason}${note}` : note.trim() };
+    };
+
     // C-13 (opt-in): offload → review → escalate/rework/give_back. The manager
     // runs via the same trusted executor (core restricts managers to marginal-free
     // lanes). Persist BOTH task + outcome events; a recording failure never
@@ -516,7 +567,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       }
       const escReceipt = receiptFromEvents(esc.events.flatMap((e) => (e.kind === 'task' ? [e.event] : [])));
       return withSkippedNote(
-        { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
+        withPreferOverrideNote(
+          { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
+          esc.result.decision,
+        ),
         skippedNote,
       );
     }
@@ -530,7 +584,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     }
     const resultModel = modelOf(result.laneId);
     return withSkippedNote(
-      {
+      withPreferOverrideNote(
+        {
         laneId: result.laneId,
         status: result.status,
         ...(result.native ? { native: true } : {}),
@@ -548,7 +603,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
           const receipt = receiptFromEvents(result.events);
           return receipt ? { receipt } : {};
         })(),
-      },
+        },
+        result.decision,
+      ),
       skippedNote,
     );
   };
@@ -578,6 +635,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
     // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
     capabilityPrior: capabilityPriorFor,
+    // B: same routed-share headroom map + per-lane detail delegate routes with,
+    // so /tokenmaxed:why shows the identical quota pressure (parity law).
+    capHeadroom: buildCapHeadroom,
+    quotaDetail: quotaDetailFor,
     // A4: persistent settings (env always wins). NOTE the flag consts above were
     // captured from the wrapped env at server start, so a /config edit reaches
     // ROUTING at the next session; hooks/statusline read settings on every run.

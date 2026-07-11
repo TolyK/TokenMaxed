@@ -23751,6 +23751,101 @@ function orderTiered(scored, candidates, task, ctx) {
   return [...clears.sort(byTier), ...rest];
 }
 
+// ../core/src/window-quota.ts
+var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
+var WINDOW_WARN_USED = 0.7;
+var WINDOW_CRITICAL_USED = 0.9;
+function effectiveWindowMs(windowMs) {
+  return windowMs > 0 && Number.isFinite(windowMs) ? windowMs : FIVE_HOUR_MS;
+}
+function saneCount(count) {
+  if (!Number.isFinite(count) || count < 0) return 0;
+  return count;
+}
+function requestsInWindow(timestampsMs, now, windowMs = FIVE_HOUR_MS) {
+  const w = effectiveWindowMs(windowMs);
+  if (!Number.isFinite(now)) return 0;
+  const cutoff = now - w;
+  let n = 0;
+  for (const t of timestampsMs) {
+    if (!Number.isFinite(t)) continue;
+    if (t > cutoff && t <= now) n += 1;
+  }
+  return n;
+}
+function windowUsedFraction(count, limit) {
+  if (!(limit > 0)) return 0;
+  return saneCount(count) / limit;
+}
+function windowLevel(usedFraction) {
+  if (usedFraction >= WINDOW_CRITICAL_USED) return "critical";
+  if (usedFraction >= WINDOW_WARN_USED) return "warn";
+  return "ok";
+}
+
+// ../core/src/quota.ts
+var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+function laneObservations(events, laneId, weightTokens) {
+  const out = [];
+  for (const e of events) {
+    if (e.event_type !== "task" || e.laneId !== laneId || e.status === "native") continue;
+    const ts = Date.parse(e.ts);
+    if (!Number.isFinite(ts)) continue;
+    out.push({ ts, amount: weightTokens ? e.tokens_in + e.tokens_out : 1 });
+  }
+  return out;
+}
+function amountInWindow(observations, now, windowMs) {
+  let sum = 0;
+  for (const o of observations) {
+    if (o.ts > now || o.ts <= now - windowMs) continue;
+    if (!(Number.isFinite(o.amount) && o.amount > 0)) continue;
+    sum += o.amount;
+  }
+  return sum;
+}
+function axisState(count, limit) {
+  const used = windowUsedFraction(count, limit);
+  return { count, limit, used, level: windowLevel(used) };
+}
+function laneQuotaState(events, lane, now) {
+  const axes = [];
+  const state = { headroom: 1 };
+  const hasWindow = typeof lane.requests_per_window === "number" && lane.requests_per_window > 0;
+  const hasWeekRequests = typeof lane.requests_per_week === "number" && lane.requests_per_week > 0;
+  const hasWeekTokens = typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
+  if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
+  const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
+  if (hasWindow) {
+    const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+    const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
+    state.window = axisState(count, lane.requests_per_window);
+    axes.push(state.window);
+  }
+  if (hasWeekRequests) {
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week);
+    axes.push(state.weekRequests);
+  }
+  if (hasWeekTokens) {
+    const tokens = laneObservations(events, lane.id, true);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week);
+    axes.push(state.weekTokens);
+  }
+  let headroom = 1;
+  for (const a of axes) headroom = Math.min(headroom, Math.max(0, 1 - a.used));
+  state.headroom = headroom;
+  return state;
+}
+function quotaHeadroomMap(events, lanes, now) {
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const lane of lanes) {
+    const hasAny = typeof lane.requests_per_window === "number" && lane.requests_per_window > 0 || typeof lane.requests_per_week === "number" && lane.requests_per_week > 0 || typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
+    if (!hasAny) continue;
+    out[lane.id] = laneQuotaState(events, lane, now).headroom;
+  }
+  return out;
+}
+
 // ../core/src/feedback.ts
 var MS_PER_DAY = 864e5;
 var SEP = "\0";
@@ -23880,7 +23975,10 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "native",
   "capability",
   "capability_source",
-  "requests_per_window"
+  "requests_per_window",
+  "window_ms",
+  "requests_per_week",
+  "tokens_per_week"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -24023,6 +24121,14 @@ function parseLane(entry, index) {
       );
     }
     lane.requests_per_window = n;
+  }
+  for (const field of ["window_ms", "requests_per_week", "tokens_per_week"]) {
+    const v = entry[field];
+    if (v === void 0) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
+    }
+    lane[field] = v;
   }
   const selectable = lane.trust_mode === "full" || lane.trust_mode === "worker" || lane.trust_mode === "reader";
   if (selectable && !lane.native) {
@@ -25065,38 +25171,6 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
     subjectLane = nextLane;
   }
   return complete({ final_action: "give_back", reason: "escalation budget exhausted", subjectLaneId: subjectLane.id, result: current, events });
-}
-
-// ../core/src/window-quota.ts
-var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
-var WINDOW_WARN_USED = 0.7;
-var WINDOW_CRITICAL_USED = 0.9;
-function effectiveWindowMs(windowMs) {
-  return windowMs > 0 && Number.isFinite(windowMs) ? windowMs : FIVE_HOUR_MS;
-}
-function saneCount(count) {
-  if (!Number.isFinite(count) || count < 0) return 0;
-  return count;
-}
-function requestsInWindow(timestampsMs, now, windowMs = FIVE_HOUR_MS) {
-  const w = effectiveWindowMs(windowMs);
-  if (!Number.isFinite(now)) return 0;
-  const cutoff = now - w;
-  let n = 0;
-  for (const t of timestampsMs) {
-    if (!Number.isFinite(t)) continue;
-    if (t > cutoff && t <= now) n += 1;
-  }
-  return n;
-}
-function windowUsedFraction(count, limit) {
-  if (!(limit > 0)) return 0;
-  return saneCount(count) / limit;
-}
-function windowLevel(usedFraction) {
-  if (usedFraction >= WINDOW_CRITICAL_USED) return "critical";
-  if (usedFraction >= WINDOW_WARN_USED) return "warn";
-  return "ok";
 }
 
 // ../core/src/classify.ts
@@ -26470,7 +26544,8 @@ function buildSummaryData(input) {
       cliConsumed.add(l.model);
       cliTokens = cu.in + cu.out;
     }
-    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, FIVE_HOUR_MS2);
+    const windowMs = typeof l.window_ms === "number" && l.window_ms > 0 ? l.window_ms : FIVE_HOUR_MS2;
+    const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, windowMs);
     const limit = l.requests_per_window;
     const requestWindowLevel = limit !== void 0 ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : void 0;
     return {
@@ -26481,6 +26556,7 @@ function buildSummaryData(input) {
       provenance: l.provenance,
       tokensRouted: (byLane[l.id]?.total ?? 0) + cliTokens,
       requestsIn5h,
+      ...windowMs !== FIVE_HOUR_MS2 ? { windowHours: windowMs / 36e5 } : {},
       ...limit !== void 0 ? { requestsPerWindow: limit, requestWindowLevel } : {},
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
@@ -26542,7 +26618,8 @@ ${METERED_KEY_WARNING}` : off;
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
     const laneLine = (l) => {
-      const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed 5h: ${l.requestsIn5h}` : "";
+      const windowLabel = l.windowHours !== void 0 ? `${l.windowHours}h` : "5h";
+      const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed ${windowLabel}: ${l.requestsIn5h}` : "";
       return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${routed5h}${l.stale ? " \u26A0 stale" : ""}`;
     };
     const groups = [
@@ -26574,8 +26651,9 @@ ${METERED_KEY_WARNING}` : off;
     (x) => x.requestsPerWindow !== void 0 && (x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
   )) {
     const tag = l.requestWindowLevel === "critical" ? "near limit" : "filling up";
+    const windowLabel = l.windowHours !== void 0 ? `${l.windowHours}h` : "5h";
     lines.push(
-      `   \u26A0 ${vendorName(l)} routed 5h: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)`
+      `   \u26A0 ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)`
     );
   }
   for (const l of visible.filter((l2) => l2.stale)) {
@@ -27347,6 +27425,8 @@ function createTools(core) {
       const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
       const capPrior = deps.capabilityPrior?.(lanes);
       const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
+      const capHeadroom2 = deps.capHeadroom?.(lanes);
+      const quotaCtx = capHeadroom2 ? { capHeadroom: capHeadroom2 } : {};
       let availableIds;
       if (deps.availableLaneIds) {
         const baseCtx = {
@@ -27359,7 +27439,8 @@ function createTools(core) {
           ...observedCapability ? { observedCapability } : {},
           ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
           ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
-          ...priorCtx
+          ...priorCtx,
+          ...quotaCtx
         };
         const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
@@ -27381,6 +27462,7 @@ function createTools(core) {
         ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
         ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
         ...priorCtx,
+        ...quotaCtx,
         ...availableIds ? { availableLaneIds: availableIds } : {},
         ...tieredCtx,
         ...preferLaneId ? { preferLaneId } : {}
@@ -27398,6 +27480,19 @@ function createTools(core) {
       const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy).verdict : decision.policyVerdict;
       const preferNote = preferLaneId && decision.laneId !== preferLaneId ? `  note: preferred lane "${preferLaneId}" was not used \u2014 it isn't eligible, available, or capable for this category (fell back to normal routing).` : void 0;
       const yoloNote = yolo ? `  \u26A0\uFE0F YOLO mode ON: trust/egress gates are bypassed \u2014 workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.` : void 0;
+      const quotaLines = [];
+      const winnerCapPenalty = decision.scores.find((s) => s.laneId === decision.laneId)?.factors.capPenalty ?? 0;
+      if (winnerCapPenalty > 0) {
+        const detail = lane ? deps.quotaDetail?.(lane) : void 0;
+        quotaLines.push(`  quota: ${detail ?? "near cap"} \u2014 pressure applied; it won anyway (no better capable alternative)`);
+        if (preferLaneId === decision.laneId) {
+          quotaLines.push(`  \u26A0 preferred lane overrides quota pressure${detail ? ` (${detail})` : ""} \u2014 /tokenmaxed:prefer off to release it.`);
+        }
+      }
+      const pressuredLosers = decision.scores.filter((s) => s.laneId !== decision.laneId && s.factors.capPenalty > 0).map((s) => s.laneId);
+      if (pressuredLosers.length > 0) {
+        quotaLines.push(`  quota-deprioritized: ${pressuredLosers.join(", ")} (routed-share near cap)`);
+      }
       const priorLines = [];
       let priorStructured;
       if (capPrior?.state === "on") {
@@ -27431,6 +27526,7 @@ function createTools(core) {
         ...difficulty ? [
           `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
         ] : [],
+        ...quotaLines,
         ...priorLines,
         ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
@@ -28006,6 +28102,28 @@ function makeServerDeps(env = process.env) {
     }
     return out;
   };
+  const buildCapHeadroom = (lanes) => {
+    try {
+      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanes, Date.now());
+      return Object.keys(map).length > 0 ? map : void 0;
+    } catch {
+      return void 0;
+    }
+  };
+  const quotaDetailFor = (lane) => {
+    try {
+      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), lane, Date.now());
+      const parts = [];
+      const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+      const windowLabel = windowMs === FIVE_HOUR_MS ? "5h" : `${windowMs / 36e5}h`;
+      if (s.window) parts.push(`${windowLabel} ${s.window.count}/${s.window.limit} routed`);
+      if (s.weekRequests) parts.push(`7d ${s.weekRequests.count}/${s.weekRequests.limit} req routed`);
+      if (s.weekTokens) parts.push(`7d ${Math.round(s.weekTokens.count).toLocaleString("en-US")}/${s.weekTokens.limit.toLocaleString("en-US")} tok routed`);
+      return parts.length > 0 ? parts.join(" \xB7 ") : void 0;
+    } catch {
+      return void 0;
+    }
+  };
   const capabilityPriorFor = (lanes) => loadCapabilityPriorState(env, lanes);
   const buildObservedByModel = () => {
     if (!learnEnabled) return void 0;
@@ -28062,6 +28180,7 @@ function makeServerDeps(env = process.env) {
     const modelOf = (laneId) => lanes.find((l) => l.id === laneId)?.model ?? registry2.byId(laneId)?.model;
     const observedCapabilityByModel = buildObservedByModel();
     const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
+    const capHeadroom2 = buildCapHeadroom(lanes);
     const baseCtx = {
       lanes,
       gateReady,
@@ -28079,6 +28198,9 @@ function makeServerDeps(env = process.env) {
       ...readYoloState() ? { yolo: true } : {},
       ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
       ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+      // B quota pressure: near-cap lanes are deprioritized by scoreLane's
+      // capPenalty; a capped lane can still win when it's the only capable one.
+      ...capHeadroom2 ? { capHeadroom: capHeadroom2 } : {},
       // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
       // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
       // runWithEscalation preserves these through its effective-context spread, so
@@ -28129,6 +28251,19 @@ function makeServerDeps(env = process.env) {
       ...fileResult.attachments.length ? { attachments: fileResult.attachments } : {}
     };
     const skippedNote = fileResult.skipped.length > 0 ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join("; ")})` : "";
+    const preferOverrideNoteFor = (laneId, decision) => {
+      if (readPreferredLane() !== laneId) return "";
+      const capPenalty = decision?.scores.find((s) => s.laneId === laneId)?.factors.capPenalty ?? 0;
+      if (!(capPenalty > 0)) return "";
+      const winnerLane = lanes.find((l) => l.id === laneId);
+      const detail = winnerLane ? quotaDetailFor(winnerLane) : void 0;
+      return ` \u26A0 preferred lane overrides quota pressure${detail ? ` (${detail})` : ""}.`;
+    };
+    const withPreferOverrideNote = (outcome, decision) => {
+      const note = preferOverrideNoteFor(outcome.laneId, decision);
+      if (!note) return outcome;
+      return { ...outcome, reason: outcome.reason ? `${outcome.reason}${note}` : note.trim() };
+    };
     if (escalateEnabled) {
       const escDeps = {
         ...runDeps,
@@ -28147,7 +28282,10 @@ function makeServerDeps(env = process.env) {
       }
       const escReceipt = receiptFromEvents(esc2.events.flatMap((e) => e.kind === "task" ? [e.event] : []));
       return withSkippedNote(
-        { ...escToOutcome(esc2, modelOf, escRecordingFailed), ...escReceipt ? { receipt: escReceipt } : {} },
+        withPreferOverrideNote(
+          { ...escToOutcome(esc2, modelOf, escRecordingFailed), ...escReceipt ? { receipt: escReceipt } : {} },
+          esc2.result.decision
+        ),
         skippedNote
       );
     }
@@ -28160,21 +28298,24 @@ function makeServerDeps(env = process.env) {
     }
     const resultModel = modelOf(result.laneId);
     return withSkippedNote(
-      {
-        laneId: result.laneId,
-        status: result.status,
-        ...result.native ? { native: true } : {},
-        ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
-        ...resultModel ? { model: resultModel } : {},
-        ...result.failureKind ? { failureKind: result.failureKind } : {},
-        ...result.failureKind === "insufficient_context" ? { reason: `worker handed back (insufficient context): ${result.resultText ?? "needs repo/tool access"} \u2014 host should complete` } : result.decision?.reason ? { reason: result.decision.reason } : {},
-        ...result.readerDerived ? { readerDerived: true } : {},
-        ...recordingFailed ? { recordingFailed: true } : {},
-        ...(() => {
-          const receipt = receiptFromEvents(result.events);
-          return receipt ? { receipt } : {};
-        })()
-      },
+      withPreferOverrideNote(
+        {
+          laneId: result.laneId,
+          status: result.status,
+          ...result.native ? { native: true } : {},
+          ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
+          ...resultModel ? { model: resultModel } : {},
+          ...result.failureKind ? { failureKind: result.failureKind } : {},
+          ...result.failureKind === "insufficient_context" ? { reason: `worker handed back (insufficient context): ${result.resultText ?? "needs repo/tool access"} \u2014 host should complete` } : result.decision?.reason ? { reason: result.decision.reason } : {},
+          ...result.readerDerived ? { readerDerived: true } : {},
+          ...recordingFailed ? { recordingFailed: true } : {},
+          ...(() => {
+            const receipt = receiptFromEvents(result.events);
+            return receipt ? { receipt } : {};
+          })()
+        },
+        result.decision
+      ),
       skippedNote
     );
   };
@@ -28203,6 +28344,10 @@ function makeServerDeps(env = process.env) {
     // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
     // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
     capabilityPrior: capabilityPriorFor,
+    // B: same routed-share headroom map + per-lane detail delegate routes with,
+    // so /tokenmaxed:why shows the identical quota pressure (parity law).
+    capHeadroom: buildCapHeadroom,
+    quotaDetail: quotaDetailFor,
     // A4: persistent settings (env always wins). NOTE the flag consts above were
     // captured from the wrapped env at server start, so a /config edit reaches
     // ROUTING at the next session; hooks/statusline read settings on every run.
