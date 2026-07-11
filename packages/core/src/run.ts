@@ -35,6 +35,12 @@ export interface RunRequest {
   /** Attempt index for this logical task (default 0); set by fallback for retries. */
   attempt?: number;
   category: TaskCategory;
+  /**
+   * Optional expected difficulty (P6 §4). Threads into {@link Task.difficulty} so
+   * routing conditions on the difficulty-specific learned record when evidence
+   * exists. Absent ⇒ category-level routing, unchanged.
+   */
+  difficulty?: DifficultyBucket;
   /** The scoped instruction to perform. */
   instruction: string;
   attachments?: MinimizedAttachment[];
@@ -143,7 +149,11 @@ export async function runTask(
   // policy blocks everything), degrade to native rather than throwing.
   let decision: RouteDecision;
   try {
-    decision = routeDecide({ category: request.category }, effectiveCtx, policy);
+    decision = routeDecide(
+      { category: request.category, ...(request.difficulty ? { difficulty: request.difficulty } : {}) },
+      effectiveCtx,
+      policy,
+    );
   } catch {
     // No selectable lane (lanes empty, gated, disabled, or policy-blocked — e.g. a
     // reader lane blocked on a private/unknown repo). The host does it, but we leave
@@ -539,7 +549,10 @@ export async function runWithEscalation(
   const maxReworks = opts.maxReworks ?? 1;
   const maxEscalations = opts.maxEscalations ?? 1;
   const minCapabilityDelta = opts.minCapabilityDelta ?? 0.15;
-  const task: Task = { category: request.category };
+  const task: Task = {
+    category: request.category,
+    ...(request.difficulty ? { difficulty: request.difficulty } : {}),
+  };
   const events: EscalationEvent[] = [];
 
   // A request.policyContext overrides ctx.policyContext (as runTask does). Use the
@@ -606,7 +619,10 @@ export async function runWithEscalation(
     }
     let target: Lane | null = null;
     if (action === 'escalate') {
-      target = selectEscalationTarget(subjectLane, candidates, task, effectiveCtx, policy, {
+      // P6 §4: an escalated leg has PROVEN hard (same semantics as the recorded
+      // outcome's difficulty below), so rank targets on their hard-cell record.
+      const escTask: Task = { ...task, difficulty: deriveOutcomeDifficulty(stage, action) };
+      target = selectEscalationTarget(subjectLane, candidates, escTask, effectiveCtx, policy, {
         minDelta: minCapabilityDelta,
         excludeIds: [manager.id],
       });

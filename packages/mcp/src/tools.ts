@@ -16,11 +16,13 @@ import type {
   AccessNeed,
   AccessNeedInput,
   CapabilityPriorOverlay,
+  DifficultyBucket,
   LedgerEvent,
   LedgerSummary,
   Lane,
   ObservedCapabilityByLane,
   ObservedCapabilityByModel,
+  ObservedCapabilityByModelDifficulty,
   Policy,
   PolicyContext,
   PolicyDecision,
@@ -130,6 +132,12 @@ export interface ToolDeps {
    * are set. Built server-side from the ledger + clock.
    */
   observedCapabilityByModel?: () => ObservedCapabilityByModel | undefined;
+  /**
+   * P6 §4: the difficulty-conditioned learned overlay, or `undefined` when
+   * learning is off. Core consults it only for a difficulty-tagged task, so
+   * threading it unconditionally never changes an untagged route.
+   */
+  observedCapabilityByModelDifficulty?: () => ObservedCapabilityByModelDifficulty | undefined;
   /**
    * P2: the rankings capability-prior posture for a (model-resolved) lane set —
    * `off` / `error` (flag on, snapshot bad; warning to surface) / `on` (overlay +
@@ -303,6 +311,13 @@ export interface DelegateRequest {
    * as the safety net for a repo-tight miss. Orthogonal to the data-egress policy.
    */
   access_need?: AccessNeedInput;
+  /**
+   * OPTIONAL expected difficulty (P6 §4). When set AND learned difficulty
+   * evidence exists for a candidate's model, routing conditions capability on
+   * that difficulty's pass record (e.g. `hard` favors models that keep passing
+   * hard reviews). Absent ⇒ category-level routing, unchanged.
+   */
+  difficulty?: DifficultyBucket;
 }
 
 /** The outcome of an offload (content-free; the host decides what to do with it). */
@@ -443,6 +458,9 @@ function pct(alreadyPercent: number): string {
 const REPO_CLASSES: readonly RepoClass[] = ['public', 'private', 'unknown'];
 const SENSITIVITIES: readonly Sensitivity[] = ['normal', 'sensitive', 'unknown'];
 const ACCESS_NEEDS: readonly AccessNeedInput[] = ['worker-ok', 'repo-tight', 'auto'];
+// Local value list (tools.ts imports core types ONLY — see the module banner);
+// kept in sync with core's DIFFICULTY_BUCKETS by the type annotation.
+const DIFFICULTIES: readonly DifficultyBucket[] = ['easy', 'moderate', 'hard'];
 
 // --- render helpers ------------------------------------------------------------
 
@@ -567,6 +585,12 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL access requirement to preview. "repo-tight" filters worker/reader lanes out (only full-access lanes survive); "worker-ok"/"auto" (default) impose no access restriction — matching what router_delegate would route with.',
         },
+        difficulty: {
+          type: 'string',
+          enum: [...DIFFICULTIES],
+          description:
+            'OPTIONAL difficulty to preview — shows the pick a difficulty-tagged delegate would make when learned difficulty evidence exists. Omit for the category-level pick.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -576,6 +600,10 @@ export function createTools(core: CorePort): ToolDef[] {
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
         const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
+        const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
+        // The Task both ctx builds route on — difficulty rides it so the preview
+        // matches what a difficulty-tagged router_delegate would decide.
+        const task: Task = { category, ...(difficulty ? { difficulty } : {}) };
         // Mirror inferAccessNeed for the instruction-less preview case: an explicit
         // `repo-tight` is honored; `auto`/`worker-ok`/unset ⇒ `worker-ok` (no
         // restriction). Preview has no instruction/files, so a future heuristic that
@@ -612,6 +640,8 @@ export function createTools(core: CorePort): ToolDef[] {
         // effective capability router_delegate routes with. Undefined ⇒ declared.
         const observedCapability = deps.observedCapability();
         const observedCapabilityByModel = deps.observedCapabilityByModel?.();
+        // P6 §4: consulted by core only when the previewed task carries a difficulty.
+        const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
         // P2: the rankings prior — the SAME loader delegate uses, so /why shows the
         // same prior-adjusted pick. 'off'/'error' (or an absent dep) ⇒ no ctx fields
         // ⇒ declared priors, byte-identical to before. NOTE: under escalation the
@@ -639,9 +669,10 @@ export function createTools(core: CorePort): ToolDef[] {
             ...(yolo ? { yolo: true } : {}),
             ...(observedCapability ? { observedCapability } : {}),
             ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+            ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
             ...priorCtx,
           };
-          const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
+          const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
           availableIds = await deps.availableLaneIds(eligible);
         }
         // MODEL-TIERS: mirror delegate's tiered posture + cost signal so /why agrees.
@@ -665,6 +696,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(yolo ? { yolo: true } : {}),
           ...(observedCapability ? { observedCapability } : {}),
           ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+          ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
           ...priorCtx,
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
@@ -673,7 +705,7 @@ export function createTools(core: CorePort): ToolDef[] {
 
         let decision: RouteDecision;
         try {
-          decision = core.routeDecide({ category }, ctx, policy);
+          decision = core.routeDecide(task, ctx, policy);
         } catch {
           // No selectable lane (all gated/blocked/unavailable) ⇒ the host does it.
           return ok(
@@ -733,11 +765,16 @@ export function createTools(core: CorePort): ToolDef[] {
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
           `  why: ${decision.reason}`,
+          ...(difficulty
+            ? [
+                `  difficulty: ${difficulty} — learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`,
+              ]
+            : []),
           ...priorLines,
           ...(yoloNote ? [yoloNote] : []),
           ...(preferNote ? [preferNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}) });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}) });
       }),
   };
 
@@ -912,6 +949,12 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL access requirement. "repo-tight" ⇒ the task needs full repo/tool/shell access, so it routes straight to a full-access lane (workers skipped). "worker-ok" ⇒ a worker may handle it. "auto" (default) lets the server decide (today: worker-ok, with worker give-back as the safety net). Orthogonal to repo_class/sensitivity policy.',
         },
+        difficulty: {
+          type: 'string',
+          enum: [...DIFFICULTIES],
+          description:
+            'OPTIONAL expected difficulty. When set and learned difficulty-specific evidence exists (TOKENMAXED_LEARN_CAPABILITY), routing conditions capability on that difficulty\'s real pass record — e.g. "hard" favors models that keep passing hard reviews. Omit when unsure (category-level routing, unchanged).',
+        },
       },
     },
     handler: (deps, args) =>
@@ -923,6 +966,7 @@ export function createTools(core: CorePort): ToolDef[] {
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
         const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
+        const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
 
         // Respect the per-project toggle: when off, never offload — tell the host
         // to do it itself (no config load, no execution).
@@ -945,6 +989,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(Object.keys(policyContext).length ? { policyContext } : {}),
           ...(files && files.length ? { files } : {}),
           ...(access_need ? { access_need } : {}),
+          ...(difficulty ? { difficulty } : {}),
         });
 
         const finalOutcome = resolution.categoryInferred

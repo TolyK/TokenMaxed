@@ -36,8 +36,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, parseModelAlias, priceForModel, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, PriceTable, RouteContext, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -257,6 +257,17 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       return undefined;
     }
   };
+  // P6 §4: the difficulty-conditioned sibling — same learn gate, same fail-open.
+  // Consulted by core only for a difficulty-tagged task (explicit on the request,
+  // or an escalation leg), so its presence alone never changes routing.
+  const buildObservedByModelDifficulty = (): ObservedCapabilityByModelDifficulty | undefined => {
+    if (!learnEnabled) return undefined;
+    try {
+      return outcomeCapabilityByDifficulty(new JsonlLedger(ledgerPath).readAll(), Date.now());
+    } catch {
+      return undefined;
+    }
+  };
   // A lane is reserved from the initial offload only if it can ACTUALLY serve as
   // the auto-review manager: manager-eligible AND marginal-free (the reviewer
   // restriction in selectReviewManager). A metered manager-eligible lane can't
@@ -352,6 +363,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // scores). Core selectors read ctx.observedCapabilityByModel; runWithEscalation
     // preserves it through its effective-context spread, so escalation/reassign benefit.
     const observedCapabilityByModel = buildObservedByModel();
+    const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
     // Exclude lanes that can't run now (e.g. Ollama down) so routing never picks an
     // unavailable lane on cost; threads through runTask/runWithEscalation to
     // routeDecide + canReassign. Empty ⇒ no candidate ⇒ runTask degrades to native.
@@ -373,6 +385,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // takes effect without a relaunch; the kill-switch still forces it off.
       ...(readYoloState() ? { yolo: true } : {}),
       ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+      ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
       // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
       // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
       // runWithEscalation preserves these through its effective-context spread, so
@@ -438,6 +451,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const taskInput = {
       category: request.category,
       instruction: request.instruction,
+      ...(request.difficulty ? { difficulty: request.difficulty } : {}),
       ...(request.policyContext ? { policyContext: request.policyContext } : {}),
       ...(fileResult.attachments.length ? { attachments: fileResult.attachments } : {}),
     };
@@ -524,6 +538,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // F-1/P6: same model-keyed learned overlay delegate routes with (undefined ⇒
     // declared), so /tokenmaxed:why reflects the effective capability, not the stale prior.
     observedCapabilityByModel: buildObservedByModel,
+    // P6 §4: same difficulty-conditioned overlay delegate routes with; preview
+    // consults it only when the caller previews a difficulty.
+    observedCapabilityByModelDifficulty: buildObservedByModelDifficulty,
     // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
     // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
     capabilityPrior: capabilityPriorFor,

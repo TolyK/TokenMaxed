@@ -19,12 +19,14 @@ import { evaluate, laneAllowedByVerdict } from './policy.ts';
 import { TRUSTED_PROVENANCES } from './types.ts';
 import type {
   CapabilityPriorOverlay,
+  DifficultyBucket,
   ExecutionMode,
   Lane,
   LaneScore,
   ObservedCapability,
   ObservedCapabilityByLane,
   ObservedCapabilityByModel,
+  ObservedCapabilityByModelDifficulty,
   Policy,
   PolicyVerdict,
   RouteContext,
@@ -213,6 +215,14 @@ export interface EffectiveCapabilityOptions {
    * resolving the lane to its canonical model key via {@link resolveLaneModelKey}.
    */
   modelOverlay?: ObservedCapabilityByModel;
+  /**
+   * P6 §4: difficulty-conditioned observed overlay. Consulted only when
+   * {@link EffectiveCapabilityOptions.difficulty} is also set — see the
+   * back-off ladder note on {@link effectiveCapabilityFor}.
+   */
+  difficultyOverlay?: ObservedCapabilityByModelDifficulty;
+  /** The task's difficulty bucket; enables the difficulty-cell blend when set. */
+  difficulty?: DifficultyBucket;
 }
 
 /**
@@ -245,6 +255,45 @@ export function effectiveCapabilityOptsFromContext(ctx: RouteContext): Effective
     priorOverlay: ctx.capabilityPrior,
     priorOpts: priorOptsFromContext(ctx),
   };
+}
+
+/**
+ * Task-aware effective-capability options: the context-level opts plus the
+ * difficulty-cell inputs when BOTH the task carries a difficulty and the context
+ * carries the difficulty-conditioned overlay (P6 §4). Undefined when nothing
+ * applies — so callers passing the result through behave byte-identically to
+ * before difficulty existed.
+ */
+export function effectiveOptsForTask(ctx: RouteContext, task: Task): EffectiveCapabilityOptions | undefined {
+  const base = effectiveCapabilityOptsFromContext(ctx);
+  const conditioned =
+    task.difficulty && ctx.observedCapabilityByModelDifficulty
+      ? { difficulty: task.difficulty, difficultyOverlay: ctx.observedCapabilityByModelDifficulty }
+      : undefined;
+  if (!base && !conditioned) return undefined;
+  return { ...base, ...conditioned };
+}
+
+/**
+ * P6 §4 back-off ladder, applied on top of a category-level effective
+ * capability: when the options carry a difficulty + overlay and the lane's
+ * model×category×difficulty cell has evidence, blend the cell toward the
+ * category-level value with the SAME shrinkage form (k = priorStrength,
+ * default {@link DEFAULT_PRIOR_STRENGTH}); otherwise return the category-level
+ * value unchanged (difficulty cell → category cell → declared/prior). A
+ * categoryLevel of 0 (the opt-out) short-circuits inside
+ * {@link effectiveCapability} and can never be resurrected by a cell.
+ */
+function applyDifficultyCell(
+  categoryLevel: number,
+  lane: Lane,
+  category: Task['category'],
+  opts?: EffectiveCapabilityOptions,
+): number {
+  if (!opts?.difficulty || !opts.difficultyOverlay) return categoryLevel;
+  const cell = opts.difficultyOverlay[resolveLaneModelKey(lane)]?.[category]?.[opts.difficulty];
+  if (!cell) return categoryLevel;
+  return effectiveCapability(categoryLevel, cell, { priorStrength: opts.priorStrength });
 }
 
 /**
@@ -297,12 +346,13 @@ export function effectiveCapabilityFor(
   const observed = observedForLane(lane, category, overlay, opts?.modelOverlay);
   if (opts?.priorOverlay) {
     const resolved = resolvedPriorFor(lane, category, opts.priorOverlay, opts.priorOpts);
-    return effectiveCapability(resolved.prior, observed, {
+    const categoryLevel = effectiveCapability(resolved.prior, observed, {
       priorStrength: opts.priorStrength ?? resolved.priorStrength,
     });
+    return applyDifficultyCell(categoryLevel, lane, category, opts);
   }
   const declared = declaredCapabilityFor(lane, category);
-  return effectiveCapability(declared, observed, opts);
+  return applyDifficultyCell(effectiveCapability(declared, observed, opts), lane, category, opts);
 }
 
 function scoreLane(
@@ -318,9 +368,13 @@ function scoreLane(
   const effOpts: EffectiveCapabilityOptions | undefined = observedCapabilityByModel
     ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel }
     : effectiveOpts;
-  const capability = effOpts?.priorOverlay
-    ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts)
-    : effectiveCapability(declared, observed);
+  // Route everything through effectiveCapabilityFor when ANY overlay input is in
+  // play (prior overlay or a difficulty cell); the bare two-arg blend remains the
+  // no-overlay fast path, byte-identical to pre-P2/P6 behavior.
+  const capability =
+    effOpts?.priorOverlay || (effOpts?.difficulty && effOpts?.difficultyOverlay)
+      ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts)
+      : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
@@ -442,7 +496,9 @@ export function routeDecide(
     );
   }
 
-  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  // Task-aware opts: context-level (rankings prior) + the difficulty cell when
+  // the task carries a bucket and the learned difficulty overlay is present.
+  const effectiveOpts = effectiveOptsForTask(ctx, task);
   const scored = candidates.map((lane) =>
     scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts),
   );

@@ -13,15 +13,16 @@
  */
 
 import type { SavingsSummary } from './price.ts';
-import { POLICY_VERDICTS, TASK_CATEGORIES, TRUST_MODES } from './types.ts';
-import type { PolicyVerdict, TaskCategory, TrustMode } from './types.ts';
+import { DIFFICULTY_BUCKETS, POLICY_VERDICTS, TASK_CATEGORIES, TRUST_MODES } from './types.ts';
+import type { DifficultyBucket, PolicyVerdict, TaskCategory, TrustMode } from './types.ts';
 
 /** Current ledger schema version (stamped on every event). */
 export const SCHEMA_VERSION = 2;
 
-/** Bounded difficulty bucket for model-keyed learning (content-free enum). */
-export type DifficultyBucket = 'easy' | 'moderate' | 'hard';
-export const DIFFICULTY_BUCKETS: readonly DifficultyBucket[] = ['easy', 'moderate', 'hard'];
+// Difficulty bucket lives in types.ts (routing consumes it via Task.difficulty);
+// re-exported here so existing `from './ledger.ts'` importers keep working.
+export { DIFFICULTY_BUCKETS };
+export type { DifficultyBucket };
 
 /**
  * Status of an executed/attempted task. Only `ok` feeds savings claims. `native` is

@@ -11,7 +11,7 @@
  */
 
 import { evaluate, laneAllowedByVerdict } from './policy.ts';
-import { canDoRepoTight, effectiveCapabilityFor, effectiveCapabilityOptsFromContext, isSelectablePreGate } from './route.ts';
+import { canDoRepoTight, effectiveCapabilityFor, effectiveOptsForTask, isSelectablePreGate } from './route.ts';
 import type { ReviewVerdict } from './ledger.ts';
 import type { Lane, Policy, RouteContext, Task, TrustMode } from './types.ts';
 
@@ -89,7 +89,9 @@ export function reassignmentTarget(
   if (attempts >= max) return null;
 
   // Use EFFECTIVE capability so an empirically-degrading lane isn't preferred.
-  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  // Task-aware (P6 §4): a difficulty-tagged task ranks targets on their
+  // difficulty-cell record when evidence exists.
+  const effectiveOpts = effectiveOptsForTask(ctx, task);
   const cap = (l: Lane) =>
     effectiveCapabilityFor(l, task.category, ctx.observedCapability, {
       ...effectiveOpts,
@@ -195,7 +197,10 @@ export function selectEscalationTarget(
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
   // Use EFFECTIVE capability: don't escalate to an empirically-failing lane.
-  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  // Task-aware (P6 §4): an escalated leg is difficulty-tagged 'hard' by the
+  // orchestrator, so targets are ranked on their HARD-cell record when evidence
+  // exists — the hard tail is exactly where misrouting lives.
+  const effectiveOpts = effectiveOptsForTask(ctx, task);
   const cap = (l: Lane) =>
     effectiveCapabilityFor(l, task.category, ctx.observedCapability, {
       ...effectiveOpts,

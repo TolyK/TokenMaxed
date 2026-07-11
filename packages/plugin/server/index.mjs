@@ -22804,6 +22804,7 @@ var TASK_CATEGORIES = [
   "docs"
 ];
 var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
+var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
 // ../core/src/minimize.ts
@@ -23608,6 +23609,18 @@ function effectiveCapabilityOptsFromContext(ctx) {
     priorOpts: priorOptsFromContext(ctx)
   };
 }
+function effectiveOptsForTask(ctx, task) {
+  const base = effectiveCapabilityOptsFromContext(ctx);
+  const conditioned = task.difficulty && ctx.observedCapabilityByModelDifficulty ? { difficulty: task.difficulty, difficultyOverlay: ctx.observedCapabilityByModelDifficulty } : void 0;
+  if (!base && !conditioned) return void 0;
+  return { ...base, ...conditioned };
+}
+function applyDifficultyCell(categoryLevel, lane, category, opts) {
+  if (!opts?.difficulty || !opts.difficultyOverlay) return categoryLevel;
+  const cell = opts.difficultyOverlay[resolveLaneModelKey(lane)]?.[category]?.[opts.difficulty];
+  if (!cell) return categoryLevel;
+  return effectiveCapability(categoryLevel, cell, { priorStrength: opts.priorStrength });
+}
 function effectiveCapability(declared, observed, opts = {}) {
   const prior = clamp012(declared);
   if (prior === 0) return 0;
@@ -23622,18 +23635,19 @@ function effectiveCapabilityFor(lane, category, overlay, opts) {
   const observed = observedForLane(lane, category, overlay, opts?.modelOverlay);
   if (opts?.priorOverlay) {
     const resolved = resolvedPriorFor(lane, category, opts.priorOverlay, opts.priorOpts);
-    return effectiveCapability(resolved.prior, observed, {
+    const categoryLevel = effectiveCapability(resolved.prior, observed, {
       priorStrength: opts.priorStrength ?? resolved.priorStrength
     });
+    return applyDifficultyCell(categoryLevel, lane, category, opts);
   }
   const declared = declaredCapabilityFor(lane, category);
-  return effectiveCapability(declared, observed, opts);
+  return applyDifficultyCell(effectiveCapability(declared, observed, opts), lane, category, opts);
 }
 function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts) {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
   const effOpts = observedCapabilityByModel ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel } : effectiveOpts;
-  const capability = effOpts?.priorOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts) : effectiveCapability(declared, observed);
+  const capability = effOpts?.priorOverlay || effOpts?.difficulty && effOpts?.difficultyOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts) : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
@@ -23688,7 +23702,7 @@ function routeDecide(task, ctx, policy) {
       "routeDecide: no candidate lanes available (lanes empty, disabled, excluded before the gate, unavailable to run, or blocked/forced-trusted away by policy)."
     );
   }
-  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  const effectiveOpts = effectiveOptsForTask(ctx, task);
   const scored = candidates.map(
     (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts)
   );
@@ -23794,6 +23808,46 @@ function outcomeCapability(events, now, opts = {}) {
     const observed = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
     const inner = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
     inner[a.category] = observed;
+  }
+  return overlay;
+}
+function outcomeCapabilityByDifficulty(events, now, opts = {}) {
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const latest = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (!isLearnableOutcome(e)) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    if (!modelKey) continue;
+    if (!Number.isFinite(Date.parse(e.ts))) continue;
+    const key = dedupKey(e);
+    const prev = latest.get(key);
+    if (!prev || e.seq > prev.seq) latest.set(key, e);
+  }
+  const acc = /* @__PURE__ */ new Map();
+  for (const e of latest.values()) {
+    const difficulty = e.difficulty;
+    if (!difficulty) continue;
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    const accKey = [modelKey, e.category, difficulty].join(SEP);
+    let a = acc.get(accKey);
+    if (!a) {
+      a = { modelKey, category: e.category, difficulty, weightSum: 0, weightedValueSum: 0 };
+      acc.set(accKey, a);
+    }
+    a.weightSum += weight;
+    a.weightedValueSum += weight * verdictValue(e.verdict);
+  }
+  const overlay = /* @__PURE__ */ Object.create(null);
+  for (const a of acc.values()) {
+    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
+    const byCategory = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
+    const byDifficulty = byCategory[a.category] ?? (byCategory[a.category] = /* @__PURE__ */ Object.create(null));
+    byDifficulty[a.difficulty] = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
   }
   return overlay;
 }
@@ -24128,7 +24182,6 @@ function computeCostPrimitives(table, lane, usage) {
 
 // ../core/src/ledger.ts
 var SCHEMA_VERSION = 2;
-var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
 var NATIVE_REASONS = ["no_route", "host_native"];
 var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
@@ -24470,7 +24523,7 @@ function escalationDecision(verdict, counters, caps = {}) {
 function selectEscalationTarget(subject, candidates, task, ctx, policy, opts = {}) {
   const minDelta = Math.max(0, opts.minDelta ?? 0.15);
   const exclude = new Set(opts.excludeIds ?? []);
-  const effectiveOpts = effectiveCapabilityOptsFromContext(ctx);
+  const effectiveOpts = effectiveOptsForTask(ctx, task);
   const cap = (l) => effectiveCapabilityFor(l, task.category, ctx.observedCapability, {
     ...effectiveOpts,
     modelOverlay: ctx.observedCapabilityByModel
@@ -24723,7 +24776,11 @@ async function runTask(request, ctx, policy, deps) {
   const policyContext = effectiveCtx.policyContext ?? {};
   let decision;
   try {
-    decision = routeDecide({ category: request.category }, effectiveCtx, policy);
+    decision = routeDecide(
+      { category: request.category, ...request.difficulty ? { difficulty: request.difficulty } : {} },
+      effectiveCtx,
+      policy
+    );
   } catch {
     const breadcrumb = {
       task_id: request.task_id ?? deps.newId(),
@@ -24917,7 +24974,10 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
   const maxReworks = opts.maxReworks ?? 1;
   const maxEscalations = opts.maxEscalations ?? 1;
   const minCapabilityDelta = opts.minCapabilityDelta ?? 0.15;
-  const task = { category: request.category };
+  const task = {
+    category: request.category,
+    ...request.difficulty ? { difficulty: request.difficulty } : {}
+  };
   const events = [];
   const effectiveCtx = request.policyContext ? { ...ctx, policyContext: request.policyContext } : ctx;
   const candidates = opts.candidates ?? effectiveCtx.lanes;
@@ -24955,7 +25015,8 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
     }
     let target = null;
     if (action === "escalate") {
-      target = selectEscalationTarget(subjectLane, candidates, task, effectiveCtx, policy, {
+      const escTask = { ...task, difficulty: deriveOutcomeDifficulty(stage, action) };
+      target = selectEscalationTarget(subjectLane, candidates, escTask, effectiveCtx, policy, {
         minDelta: minCapabilityDelta,
         excludeIds: [manager.id]
       });
@@ -27018,6 +27079,7 @@ function pct2(alreadyPercent) {
 var REPO_CLASSES2 = ["public", "private", "unknown"];
 var SENSITIVITIES2 = ["normal", "sensitive", "unknown"];
 var ACCESS_NEEDS = ["worker-ok", "repo-tight", "auto"];
+var DIFFICULTIES = ["easy", "moderate", "hard"];
 function renderSavings(summary, tokens, period) {
   const s = summary.savings;
   const scope = period && period !== "all" ? ` (last ${period})` : "";
@@ -27115,6 +27177,11 @@ function createTools(core) {
           type: "string",
           enum: [...ACCESS_NEEDS],
           description: 'OPTIONAL access requirement to preview. "repo-tight" filters worker/reader lanes out (only full-access lanes survive); "worker-ok"/"auto" (default) impose no access restriction \u2014 matching what router_delegate would route with.'
+        },
+        difficulty: {
+          type: "string",
+          enum: [...DIFFICULTIES],
+          description: "OPTIONAL difficulty to preview \u2014 shows the pick a difficulty-tagged delegate would make when learned difficulty evidence exists. Omit for the category-level pick."
         }
       }
     },
@@ -27124,6 +27191,8 @@ function createTools(core) {
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
+      const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
+      const task = { category, ...difficulty ? { difficulty } : {} };
       const resolvedAccessNeed = access_need === "repo-tight" ? "repo-tight" : "worker-ok";
       if (!deps.getEnabled()) {
         return ok(
@@ -27141,6 +27210,7 @@ function createTools(core) {
       const policy = deps.loadPolicy();
       const observedCapability = deps.observedCapability();
       const observedCapabilityByModel = deps.observedCapabilityByModel?.();
+      const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
       const capPrior = deps.capabilityPrior?.(lanes);
       const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
       let availableIds;
@@ -27154,9 +27224,10 @@ function createTools(core) {
           ...yolo ? { yolo: true } : {},
           ...observedCapability ? { observedCapability } : {},
           ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+          ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
           ...priorCtx
         };
-        const eligible = core.eligibleLanes({ category }, baseCtx, policy).map((e) => e.lane);
+        const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
       }
       const tieredCtx = deps.tieredStrategy === "tiered" ? {
@@ -27174,6 +27245,7 @@ function createTools(core) {
         ...yolo ? { yolo: true } : {},
         ...observedCapability ? { observedCapability } : {},
         ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+        ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
         ...priorCtx,
         ...availableIds ? { availableLaneIds: availableIds } : {},
         ...tieredCtx,
@@ -27181,7 +27253,7 @@ function createTools(core) {
       };
       let decision;
       try {
-        decision = core.routeDecide({ category }, ctx, policy);
+        decision = core.routeDecide(task, ctx, policy);
       } catch {
         return ok(
           `category "${category}": no eligible lane (gate_ready=${gateReady}) \u2014 would run on the host (native).`,
@@ -27222,11 +27294,14 @@ function createTools(core) {
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
         `  why: ${decision.reason}`,
+        ...difficulty ? [
+          `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
+        ] : [],
         ...priorLines,
         ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {} });
     })
   };
   const statusTool = {
@@ -27370,6 +27445,11 @@ function createTools(core) {
           type: "string",
           enum: [...ACCESS_NEEDS],
           description: 'OPTIONAL access requirement. "repo-tight" \u21D2 the task needs full repo/tool/shell access, so it routes straight to a full-access lane (workers skipped). "worker-ok" \u21D2 a worker may handle it. "auto" (default) lets the server decide (today: worker-ok, with worker give-back as the safety net). Orthogonal to repo_class/sensitivity policy.'
+        },
+        difficulty: {
+          type: "string",
+          enum: [...DIFFICULTIES],
+          description: `OPTIONAL expected difficulty. When set and learned difficulty-specific evidence exists (TOKENMAXED_LEARN_CAPABILITY), routing conditions capability on that difficulty's real pass record \u2014 e.g. "hard" favors models that keep passing hard reviews. Omit when unsure (category-level routing, unchanged).`
         }
       }
     },
@@ -27381,6 +27461,7 @@ function createTools(core) {
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
+      const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       if (!deps.getEnabled()) {
         return ok(
           "TokenMaxed routing is DISABLED for this project \u2014 handle this task yourself (native). Run /tokenmaxed:on to re-enable.",
@@ -27397,7 +27478,8 @@ function createTools(core) {
         instruction,
         ...Object.keys(policyContext).length ? { policyContext } : {},
         ...files && files.length ? { files } : {},
-        ...access_need ? { access_need } : {}
+        ...access_need ? { access_need } : {},
+        ...difficulty ? { difficulty } : {}
       });
       const finalOutcome = resolution.categoryInferred ? {
         ...outcome,
@@ -27718,6 +27800,14 @@ function makeServerDeps(env = process.env) {
       return void 0;
     }
   };
+  const buildObservedByModelDifficulty = () => {
+    if (!learnEnabled) return void 0;
+    try {
+      return outcomeCapabilityByDifficulty(new JsonlLedger(ledgerPath).readAll(), Date.now());
+    } catch {
+      return void 0;
+    }
+  };
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
   const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname7(statePath), "prefer.json");
@@ -27756,6 +27846,7 @@ function makeServerDeps(env = process.env) {
     const lanes = registry2.candidateLanes(request.category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
     const modelOf = (laneId) => lanes.find((l) => l.id === laneId)?.model ?? registry2.byId(laneId)?.model;
     const observedCapabilityByModel = buildObservedByModel();
+    const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
     const baseCtx = {
       lanes,
       gateReady,
@@ -27772,6 +27863,7 @@ function makeServerDeps(env = process.env) {
       // takes effect without a relaunch; the kill-switch still forces it off.
       ...readYoloState() ? { yolo: true } : {},
       ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+      ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
       // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
       // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
       // runWithEscalation preserves these through its effective-context spread, so
@@ -27817,6 +27909,7 @@ function makeServerDeps(env = process.env) {
     const taskInput = {
       category: request.category,
       instruction: request.instruction,
+      ...request.difficulty ? { difficulty: request.difficulty } : {},
       ...request.policyContext ? { policyContext: request.policyContext } : {},
       ...fileResult.attachments.length ? { attachments: fileResult.attachments } : {}
     };
@@ -27881,6 +27974,9 @@ function makeServerDeps(env = process.env) {
     // F-1/P6: same model-keyed learned overlay delegate routes with (undefined ⇒
     // declared), so /tokenmaxed:why reflects the effective capability, not the stale prior.
     observedCapabilityByModel: buildObservedByModel,
+    // P6 §4: same difficulty-conditioned overlay delegate routes with; preview
+    // consults it only when the caller previews a difficulty.
+    observedCapabilityByModelDifficulty: buildObservedByModelDifficulty,
     // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
     // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
     capabilityPrior: capabilityPriorFor,

@@ -210,9 +210,26 @@ export interface ResolvedPrior {
 /** Provenances treated as trusted-by-origin (locally executed or first-party). */
 export const TRUSTED_PROVENANCES: readonly string[] = ['anthropic', 'openai', 'google', 'meta'];
 
+/**
+ * Bounded difficulty bucket (content-free enum). Recorded on outcomes from the
+ * escalation stage (P6 §4); optionally supplied on a task to condition the
+ * capability lookup on the difficulty-specific pass record.
+ */
+export type DifficultyBucket = 'easy' | 'moderate' | 'hard';
+export const DIFFICULTY_BUCKETS: readonly DifficultyBucket[] = ['easy', 'moderate', 'hard'];
+
 /** A unit of work to route. v0 needs only its category to decide a lane. */
 export interface Task {
   category: TaskCategory;
+  /**
+   * Optional expected/observed difficulty. When set AND a learned
+   * {@link RouteContext.observedCapabilityByModelDifficulty} cell has evidence,
+   * routing conditions capability on that cell (back-off ladder). Absent ⇒
+   * category-level behavior, byte-identical to before difficulty existed.
+   * Escalation retries set this from the review stage ('hard' for an escalated
+   * leg); callers may set it explicitly for work they know is hard.
+   */
+  difficulty?: DifficultyBucket;
 }
 
 /** Caller-supplied access need for a task; `auto` defers the decision to `inferAccessNeed`. */
@@ -264,6 +281,20 @@ export type ObservedCapabilityByLane = Record<string, Partial<Record<TaskCategor
  */
 export type ObservedCapabilityByModel = Record<string, Partial<Record<TaskCategory, ObservedCapability>>>;
 
+/**
+ * Observed capability evidence keyed by resolved model id, task category, then
+ * difficulty bucket (P6 §4). The difficulty-conditioned view of
+ * {@link ObservedCapabilityByModel}: a cell holds the decay-weighted pass record
+ * for work whose review landed in that bucket. Sparse; outcomes recorded without
+ * a difficulty are excluded here (they still feed the category-level view).
+ * NOTE the bucket is escalation-depth under the active reviewer — a behavioral
+ * proxy for hardness, not ground truth (see feedback.ts banner).
+ */
+export type ObservedCapabilityByModelDifficulty = Record<
+  string,
+  Partial<Record<TaskCategory, Partial<Record<DifficultyBucket, ObservedCapability>>>>
+>;
+
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];
@@ -293,6 +324,16 @@ export interface RouteContext {
    * the DECLARED score regardless of this overlay.
    */
   observedCapabilityByModel?: ObservedCapabilityByModel;
+  /**
+   * Optional difficulty-conditioned learned overlay (P6 §4). Consulted ONLY when
+   * the task carries a {@link Task.difficulty}: the matching model×category×
+   * difficulty cell (when it has evidence) is blended on top of the category-level
+   * effective capability via the same shrinkage form (back-off ladder:
+   * difficulty cell → category cell → declared/prior). Absent, or no task
+   * difficulty, or an empty cell ⇒ byte-identical to the category-level score.
+   * Reviewer-manager selection and the `capability: 0` opt-out are unaffected.
+   */
+  observedCapabilityByModelDifficulty?: ObservedCapabilityByModelDifficulty;
   /**
    * Optional rankings-sourced capability PRIOR overlay (separate from F-1
    * {@link observedCapability}). When present, routing and escalation read the

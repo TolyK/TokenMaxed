@@ -25,8 +25,10 @@ import type {
   ReviewVerdict,
 } from './ledger.ts';
 import type {
+  DifficultyBucket,
   ObservedCapability,
   ObservedCapabilityByModel,
+  ObservedCapabilityByModelDifficulty,
   TaskCategory,
 } from './types.ts';
 
@@ -150,6 +152,72 @@ export function outcomeCapability(
     const observed: ObservedCapability = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
     const inner = overlay[a.modelKey] ?? (overlay[a.modelKey] = Object.create(null));
     inner[a.category] = observed;
+  }
+  return overlay;
+}
+
+/**
+ * The difficulty-conditioned view of {@link outcomeCapability} (P6 §4): the same
+ * learnability filter, de-dup (latest per task/attempt/model/category — an
+ * attempt's difficulty rides its winning outcome), and recency decay, but
+ * accumulated into model×category×difficulty cells. Outcomes recorded WITHOUT a
+ * difficulty are excluded here (treat-as-unknown — they still feed the
+ * category-level overlay), so a cell only ever contains evidence that was
+ * actually bucketed. Same caveat as the module banner: the bucket is
+ * escalation-depth under the active reviewer, a proxy — not ground truth.
+ */
+export function outcomeCapabilityByDifficulty(
+  events: readonly LedgerEvent[],
+  now: number,
+  opts: OutcomeCapabilityOptions = {},
+): ObservedCapabilityByModelDifficulty {
+  const halfLife =
+    Number.isFinite(opts.halfLifeDays) && (opts.halfLifeDays as number) > 0
+      ? (opts.halfLifeDays as number)
+      : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+
+  // De-dup identically to outcomeCapability so the two views can never disagree
+  // about WHICH outcome represents an attempt (only about whether it's bucketed).
+  const latest = new Map<string, OutcomeEvent>();
+  for (const e of events) {
+    if (!isLearnableOutcome(e)) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    if (!modelKey) continue;
+    if (!Number.isFinite(Date.parse(e.ts))) continue;
+    const key = dedupKey(e);
+    const prev = latest.get(key);
+    if (!prev || e.seq > prev.seq) latest.set(key, e);
+  }
+
+  interface DifficultyAccumulator extends Accumulator {
+    difficulty: DifficultyBucket;
+  }
+  const acc = new Map<string, DifficultyAccumulator>();
+  for (const e of latest.values()) {
+    const difficulty = e.difficulty;
+    if (!difficulty) continue; // unbucketed ⇒ category-level view only
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+    const modelKey = modelKeyFromOutcome(e)!;
+    const accKey = [modelKey, e.category, difficulty].join(SEP);
+    let a = acc.get(accKey);
+    if (!a) {
+      a = { modelKey, category: e.category, difficulty, weightSum: 0, weightedValueSum: 0 };
+      acc.set(accKey, a);
+    }
+    a.weightSum += weight;
+    a.weightedValueSum += weight * verdictValue(e.verdict);
+  }
+
+  const overlay: ObservedCapabilityByModelDifficulty = Object.create(null);
+  for (const a of acc.values()) {
+    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
+    const byCategory = overlay[a.modelKey] ?? (overlay[a.modelKey] = Object.create(null));
+    const byDifficulty = byCategory[a.category] ?? (byCategory[a.category] = Object.create(null));
+    byDifficulty[a.difficulty] = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
   }
   return overlay;
 }

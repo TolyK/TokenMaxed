@@ -13,6 +13,7 @@ export {
   effectiveCapability,
   effectiveCapabilityFor,
   effectiveCapabilityOptsFromContext,
+  effectiveOptsForTask,
   resolveLaneModelKey,
   DEFAULT_CAPABILITY,
   DEFAULT_PRIOR_STRENGTH,
@@ -38,7 +39,7 @@ export type {
   OverlayBuildResult,
 } from './capability-prior.ts';
 export type { EffectiveCapabilityOptions, EligibleLane } from './route.ts';
-export { outcomeCapability, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
+export { outcomeCapability, outcomeCapabilityByDifficulty, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
 export type { OutcomeCapabilityOptions } from './feedback.ts';
 export { buildLeaderboard, sortLeaderboard } from './leaderboard.ts';
 export type { LeaderboardRow, LeaderboardDifficulty, LeaderboardSortBy } from './leaderboard.ts';

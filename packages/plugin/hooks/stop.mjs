@@ -7390,6 +7390,7 @@ var TASK_CATEGORIES = [
   "docs"
 ];
 var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
+var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
 // ../core/src/access.ts
@@ -7940,7 +7941,6 @@ function validatePriceTable(data) {
 
 // ../core/src/ledger.ts
 var SCHEMA_VERSION = 2;
-var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
 var NATIVE_REASONS = ["no_route", "host_native"];
 var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
