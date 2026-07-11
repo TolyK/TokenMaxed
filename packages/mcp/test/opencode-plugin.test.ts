@@ -22,7 +22,7 @@ import {
   opencodePluginEnv,
 } from '../src/opencode-plugin.ts';
 import type { IdleReviewDeps, OpencodePluginInput } from '../src/opencode-plugin.ts';
-import type { OpencodeReviewAction } from '../src/opencode-review-main.ts';
+import type { ReviewChildAction } from '../src/review-child-main.ts';
 
 // --- env threading ---------------------------------------------------------------
 
@@ -134,13 +134,15 @@ test('chat.message: silent under the kill-switch', async () => {
 
 // --- the review loop (handler-level: injectable deps) ------------------------------
 
-function idleDeps(over: Partial<IdleReviewDeps> & { action?: OpencodeReviewAction }): {
+function idleDeps(over: Partial<IdleReviewDeps> & { action?: ReviewChildAction }): {
   deps: IdleReviewDeps;
   prompts: string[];
   toasts: string[];
+  counters: Map<string, number>;
 } {
   const prompts: string[] = [];
   const toasts: string[] = [];
+  const counters = new Map<string, number>();
   const deps: IdleReviewDeps = {
     env: () => ({}) as NodeJS.ProcessEnv, // review loop is default-ON
     runReview: async () => over.action ?? { kind: 'allow' },
@@ -148,16 +150,43 @@ function idleDeps(over: Partial<IdleReviewDeps> & { action?: OpencodeReviewActio
     toast: async (m) => {
       toasts.push(m);
     },
+    counter: {
+      read: (id) => counters.get(id) ?? 0,
+      write: (id, n) => {
+        counters.set(id, n);
+        return true;
+      },
+    },
     ...over,
   };
-  return { deps, prompts, toasts };
+  return { deps, prompts, toasts, counters };
 }
 
-test('idle handler: block ⇒ rework prompt-back with the marker prefix; nothing else', async () => {
-  const { deps, prompts, toasts } = idleDeps({ action: { kind: 'block', reason: 'fix the null check' } });
+test('idle handler: block ⇒ rework prompt-back with the marker prefix; the PARENT banks the round', async () => {
+  const { deps, prompts, toasts, counters } = idleDeps({ action: { kind: 'block', reason: 'fix the null check' } });
   await makeIdleReviewHandler(deps)('ses');
   assert.deepEqual(prompts, [REWORK_PROMPT_PREFIX + 'fix the null check']);
   assert.deepEqual(toasts, []);
+  assert.equal(counters.get('ses'), 1); // parent-owned counter banked the round
+});
+
+test('idle handler: allow resets the counter; a counter write failure means NO prompt-back (never-stuck)', async () => {
+  const seq = idleDeps({ action: { kind: 'block', reason: 'notes' } });
+  const handle = makeIdleReviewHandler(seq.deps);
+  await handle('ses');
+  assert.equal(seq.counters.get('ses'), 1);
+  (seq.deps as { runReview: IdleReviewDeps['runReview'] }).runReview = async () => ({ kind: 'allow' });
+  await handle('ses');
+  assert.equal(seq.counters.get('ses'), 0); // reset on allow
+
+  const failing = idleDeps({
+    action: { kind: 'block', reason: 'notes' },
+    counter: { read: () => 0, write: () => false },
+  });
+  await makeIdleReviewHandler(failing.deps)('ses');
+  assert.deepEqual(failing.prompts, []); // must NOT iterate when the guard can't persist
+  assert.equal(failing.toasts.length, 1);
+  assert.match(failing.toasts[0]!, /loop-state file could not be written/);
 });
 
 test('idle handler: allow ⇒ silent; notify ⇒ toast', async () => {

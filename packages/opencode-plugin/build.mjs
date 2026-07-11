@@ -79,7 +79,7 @@ console.error('[opencode-plugin] bundled plugin → plugin/tokenmaxed.js');
 // installs must copy both. A child process, so the host-identity env default
 // banner is correct here too.
 await build({
-  entryPoints: [mcpSrc('opencode-review-main.ts')],
+  entryPoints: [mcpSrc('review-child-main.ts')],
   outfile: resolve(root, 'plugin/tokenmaxed-review.mjs'),
   bundle: true,
   platform: 'node',

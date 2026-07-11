@@ -1,0 +1,25 @@
+{
+  "$comment": "TokenMaxed in OpenClaw — merge into ~/.openclaw/openclaw.json. The plugin itself installs with: openclaw plugins install --link /ABSOLUTE/PATH/TO/TokenMaxed/packages/openclaw-plugin",
+  "mcp": {
+    "servers": {
+      "tokenmaxed": {
+        "command": "node",
+        "args": ["/ABSOLUTE/PATH/TO/TokenMaxed/packages/openclaw-plugin/server/index.mjs"],
+        "env": { "TOKENMAXED_HOST": "openclaw" }
+      }
+    }
+  },
+  "plugins": {
+    "enabled": true,
+    "entries": {
+      "tokenmaxed": {
+        "enabled": true,
+        "hooks": {
+          "$comment": "allowConversationAccess is REQUIRED for the turn-end review (before_agent_finalize reads the conversation). The plugin requests its own hook timeout (340s, covering the review-child budget); this timeouts pin is belt-and-suspenders for operator policies that clamp plugin-requested timeouts. Overriding it BELOW ~340s is unsupported (reviews would time out fail-open every turn).",
+          "allowConversationAccess": true,
+          "timeouts": { "before_agent_finalize": 340000 }
+        }
+      }
+    }
+  }
+}

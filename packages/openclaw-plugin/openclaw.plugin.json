@@ -1,0 +1,10 @@
+{
+  "id": "tokenmaxed",
+  "name": "TokenMaxed",
+  "description": "Quota-continuity router: offload right-sized subtasks to the cheapest capable, policy-allowed lane. Session banner, routing gate, and turn-end review.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

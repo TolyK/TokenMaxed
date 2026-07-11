@@ -7365,10 +7365,8 @@ var require_dist = __commonJS({
   }
 });
 
-// ../mcp/src/opencode-review-main.ts
+// ../mcp/src/review-child-main.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { tmpdir as tmpdir2 } from "node:os";
-import { join as join5 } from "node:path";
 
 // ../mcp/src/host-review.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
@@ -9019,10 +9017,6 @@ function makeHostReviewDeps(env) {
   };
 }
 
-// ../mcp/src/hook-stop-main.ts
-import { mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
-import { join as join4 } from "node:path";
-
 // ../mcp/src/review-budget.ts
 async function runReviewWithBudget(runner, newId, opts) {
   const totalBudgetMs = opts?.totalBudgetMs ?? 12e4;
@@ -9129,37 +9123,17 @@ function effectiveEnv(env) {
   return out;
 }
 
-// ../mcp/src/hook-stop-main.ts
-function readCounter(file) {
-  try {
-    const n = Number.parseInt(readFileSync3(file, "utf8"), 10);
-    return Number.isFinite(n) && n > 0 ? n : 0;
-  } catch {
-    return 0;
-  }
-}
-function writeCounter(file, n) {
-  try {
-    mkdirSync3(join4(file, ".."), { recursive: true });
-    writeFileSync3(file, String(n), "utf8");
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// ../mcp/src/opencode-review-main.ts
+// ../mcp/src/review-child-main.ts
 async function main() {
   const env = effectiveEnv(process.env);
   if (!reviewLoopEnabled(env)) return print({ kind: "allow" });
-  const sessionId = (process.argv[2] ?? "default").replace(/[^A-Za-z0-9_.-]/g, "_");
-  const counterFile = join5(tmpdir2(), "tokenmaxed-stop", sessionId);
+  const rawPrior = env.TOKENMAXED_REVIEW_PRIOR_BLOCKS ?? "0";
+  const priorBlocks = /^[0-9]+$/.test(rawPrior) ? Number.parseInt(rawPrior, 10) : 0;
   const maxRounds = parseMaxRounds(env);
   const result = await runReviewWithBudget(makeReviewRunner(makeHostReviewDeps(env)), randomUUID3, {
     totalBudgetMs: REVIEW_BUDGET_MS,
     maxRetries: 0
   });
-  const priorBlocks = readCounter(counterFile);
   const action = stopHookAction({
     reviewed: result.reviewed,
     errored: result.errored,
@@ -9170,20 +9144,8 @@ async function main() {
     priorBlocks,
     maxRounds
   });
-  if (action.kind === "allow") {
-    writeCounter(counterFile, 0);
-    return print({ kind: "allow" });
-  }
-  if (action.kind === "notify") {
-    writeCounter(counterFile, 0);
-    return print({ kind: "notify", message: action.message });
-  }
-  if (!writeCounter(counterFile, priorBlocks + 1)) {
-    return print({
-      kind: "notify",
-      message: "\u26A0 TokenMaxed: review wanted rework but the loop-state file could not be written; not re-prompting to avoid a loop. Notes: " + action.reason
-    });
-  }
+  if (action.kind === "allow") return print({ kind: "allow" });
+  if (action.kind === "notify") return print({ kind: "notify", message: action.message });
   return print({ kind: "block", reason: action.reason });
 }
 function print(action) {
