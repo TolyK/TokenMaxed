@@ -347,6 +347,32 @@ export interface DelegateOutcome {
   categoryInferred?: boolean;
   inferredConfidence?: number;
   hint?: string;
+  /** A3: content-free receipt for this offload's executed legs (absent ⇒ nothing ran). */
+  receipt?: DelegateReceipt;
+}
+
+/**
+ * A3 ambient receipt — the per-offload "which model, what it cost, what it
+ * saved" line rendered inline with every delegation result (trust research:
+ * visibility IS the product). Content-free by construction: numbers only,
+ * aggregated from the same recorded task legs the ledger keeps.
+ */
+export interface DelegateReceipt {
+  tokensIn: number;
+  tokensOut: number;
+  /** true ⇒ token counts include estimated parts (some CLIs don't report exact usage). */
+  tokensEstimated: boolean;
+  /** Real metered dollars spent across ALL legs (subscription/local legs are $0 metered). */
+  spentUsd: number;
+  /**
+   * Estimated metered-API dollars avoided, computed with the ledger's honest
+   * net (`summarize()`): baseline from DELIVERED (ok, non-superseded) legs
+   * minus metered spend across ALL legs — so a failed/discarded attempt that
+   * cost real money makes this ≤ 0 rather than being ignored.
+   */
+  meteredAvoidedUsd: number;
+  /** Executed task legs (1 = single pass; more ⇒ rework/escalation legs ran). */
+  legs: number;
 }
 
 /** A declarative tool: advertised by the server, invoked via its handler. */
@@ -1086,6 +1112,17 @@ export function createTools(core: CorePort): ToolDef[] {
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */
+/** A3: one compact, honest receipt line (est.-labeled tokens + finance-grade $). */
+function receiptLine(r: DelegateReceipt): string {
+  const int = (n: number): string => Math.round(n).toLocaleString('en-US');
+  const usd = (n: number): string => (n < 0 ? `-$${Math.abs(n).toFixed(4)}` : `$${n.toFixed(4)}`);
+  const legs = `${r.legs} leg${r.legs === 1 ? '' : 's'}`;
+  return (
+    `— receipt: ${int(r.tokensIn)} in / ${int(r.tokensOut)} out tok${r.tokensEstimated ? ' (est.)' : ''}` +
+    ` · spent ${usd(r.spentUsd)} metered · est. ${usd(r.meteredAvoidedUsd)} metered avoided · ${legs}`
+  );
+}
+
 function renderDelegate(o: DelegateOutcome): ToolResult {
   const inferenceFields = o.categoryInferred
     ? {
@@ -1095,6 +1132,11 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
       }
     : {};
   const inferenceText = o.categoryInferred && o.hint ? `\n\n${o.hint}` : '';
+  // A3 ambient receipt: rendered on EVERY path where legs actually ran —
+  // including a native give-back after failed/superseded legs, whose real spend
+  // must never disappear just because the host finished the task.
+  const receiptText = o.receipt ? `\n\n${receiptLine(o.receipt)}` : '';
+  const receiptFields = o.receipt ? { receipt: o.receipt as unknown as Record<string, unknown> } : {};
 
   // Anything that isn't a clean execution by another lane ⇒ the host does it.
   if (o.native || o.status !== 'ok') {
@@ -1117,7 +1159,7 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     const taint = o.readerDerived
       ? '\n\n⚠️ reader-derived: any quoted reader output above may include private repo code — do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts.'
       : '';
-    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note}${taint}${inferenceText}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note}${taint}${receiptText}${inferenceText}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
@@ -1125,6 +1167,7 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
       ...(o.failureKind ? { failureKind: o.failureKind } : {}),
       ...(o.readerDerived ? { readerDerived: true } : {}),
       ...(o.recordingFailed ? { recordingFailed: true } : {}),
+      ...receiptFields,
       ...inferenceFields,
     });
   }
@@ -1141,13 +1184,13 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
   // result is UNREVIEWED, so do NOT tell the host to "use it"; flag it for review.
   if (o.reviewUnavailable) {
     return ok(
-      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}${inferenceText}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.reason ? { reason: o.reason } : {}), ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}), ...inferenceFields },
+      `Offloaded to ${lane} — UNREVIEWED (${o.reason ?? 'manager review unavailable'}). Inspect it yourself before using:\n\n${o.resultText ?? ''}${taint}${note}${receiptText}${inferenceText}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...(o.reason ? { reason: o.reason } : {}), ...taintFlag, ...(o.recordingFailed ? { recordingFailed: true } : {}), ...receiptFields, ...inferenceFields },
     );
   }
   // C-13: `reason` may carry "escalated to X" / "reworked on X" (accept_after_*).
   const how = o.reason ? ` (${o.reason})` : '';
-  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${taint}${note}${inferenceText}`, {
+  return ok(`Offloaded to ${lane}${how}. Use this result:\n\n${o.resultText ?? ''}${taint}${note}${receiptText}${inferenceText}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
@@ -1155,6 +1198,7 @@ function renderDelegate(o: DelegateOutcome): ToolResult {
     ...(o.reason ? { reason: o.reason } : {}),
     ...taintFlag,
     ...(o.recordingFailed ? { recordingFailed: true } : {}),
+    ...receiptFields,
     ...inferenceFields,
   });
 }

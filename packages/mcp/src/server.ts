@@ -37,7 +37,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -69,7 +69,7 @@ import type { ToggleStore } from './toggle.ts';
 import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
 import { readYolo, writeYolo } from './yolo.ts';
-import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
+import type { CorePort, DelegateOutcome, DelegateReceipt, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
 
 // User-owned (NOT repo-controlled) — see the SECURITY note above. HOME_TM and the
 // auth/spawn helpers come from config.ts so they have one shared definition.
@@ -191,6 +191,31 @@ function filePreferStore(statePath: string): PreferStore {
 
 /** The real core operations, bound for injection into the tools. */
 const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+
+/**
+ * A3: aggregate the recorded task legs into the content-free receipt rendered
+ * with every delegation result. MIRRORS `summarize()`'s honest net exactly
+ * (ledger.ts): `native` breadcrumbs are not legs (nothing ran, zero spend); the
+ * savings baseline counts only DELIVERED (`status: 'ok'`, non-superseded) legs;
+ * metered spend counts over ALL legs (failed/superseded included) — so avoided
+ * can be ≤ 0 when a discarded/failed attempt cost real money, and the receipt
+ * can never disagree with /tokenmaxed:savings over the same events.
+ */
+export function receiptFromEvents(events: readonly TaskEventInput[]): DelegateReceipt | undefined {
+  const legs = events.filter((e) => e.status !== 'native');
+  if (legs.length === 0) return undefined;
+  const receipt: DelegateReceipt = { tokensIn: 0, tokensOut: 0, tokensEstimated: false, spentUsd: 0, meteredAvoidedUsd: 0, legs: legs.length };
+  let deliveredFrontier = 0;
+  for (const e of legs) {
+    receipt.tokensIn += e.tokens_in;
+    receipt.tokensOut += e.tokens_out;
+    receipt.tokensEstimated = receipt.tokensEstimated || e.tokens_estimated;
+    receipt.spentUsd += e.metered_spent;
+    if (e.status === 'ok' && e.superseded !== true) deliveredFrontier += e.frontier_cost;
+  }
+  receipt.meteredAvoidedUsd = deliveredFrontier - receipt.spentUsd;
+  return receipt;
+}
 
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
@@ -488,7 +513,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       } catch {
         escRecordingFailed = true;
       }
-      return withSkippedNote(escToOutcome(esc, modelOf, escRecordingFailed), skippedNote);
+      const escReceipt = receiptFromEvents(esc.events.flatMap((e) => (e.kind === 'task' ? [e.event] : [])));
+      return withSkippedNote(
+        { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
+        skippedNote,
+      );
     }
 
     const result = await runTask(taskInput, ctx, policy, runDeps);
@@ -514,6 +543,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
             : {}),
         ...(result.readerDerived ? { readerDerived: true } : {}),
         ...(recordingFailed ? { recordingFailed: true } : {}),
+        ...((): { receipt?: DelegateReceipt } => {
+          const receipt = receiptFromEvents(result.events);
+          return receipt ? { receipt } : {};
+        })(),
       },
       skippedNote,
     );

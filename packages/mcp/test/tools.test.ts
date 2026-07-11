@@ -378,6 +378,43 @@ test('delegate offloads and returns the lane result to use', async () => {
   assert.match(r.content[0]!.text, /done\(\)/);
 });
 
+test('delegate renders the A3 receipt line + structured field when the outcome carries one', async () => {
+  const receipt = { tokensIn: 12340, tokensOut: 2100, tokensEstimated: true, spentUsd: 0, meteredAvoidedUsd: 0.8412, legs: 2 };
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'codex-cli', model: 'gpt-5.5', status: 'ok', resultText: 'done()', receipt }) }),
+    { category: 'codegen', instruction: 'write a hello function' },
+  );
+  assert.notEqual(r.isError, true);
+  assert.match(
+    r.content[0]!.text,
+    /— receipt: 12,340 in \/ 2,100 out tok \(est\.\) · spent \$0\.0000 metered · est\. \$0\.8412 metered avoided · 2 legs/,
+  );
+  assert.deepEqual(r.structuredContent!.receipt, receipt);
+});
+
+test('delegate receipt also renders on a native give-back (spend never disappears)', async () => {
+  const receipt = { tokensIn: 500, tokensOut: 100, tokensEstimated: false, spentUsd: 0.02, meteredAvoidedUsd: 0, legs: 1 };
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'native', status: 'ok', native: true, reason: 'gave back', receipt }) }),
+    { category: 'codegen', instruction: 'x' },
+  );
+  assert.match(r.content[0]!.text, /Handle this task yourself \(native\)/);
+  assert.match(r.content[0]!.text, /— receipt: 500 in \/ 100 out tok · spent \$0\.0200 metered/);
+  assert.deepEqual(r.structuredContent!.receipt, receipt);
+});
+
+test('delegate output has NO receipt line when the outcome carries none (unchanged)', async () => {
+  const r = await call(
+    'router_delegate',
+    deps({ delegate: async () => ({ laneId: 'codex-cli', model: 'gpt-5.5', status: 'ok', resultText: 'done()' }) }),
+    { category: 'codegen', instruction: 'x' },
+  );
+  assert.doesNotMatch(r.content[0]!.text, /— receipt:/);
+  assert.equal(r.structuredContent!.receipt, undefined);
+});
+
 test('delegate forwards repo-relative `files` to the delegate dep (verbatim repo facts)', async () => {
   let captured: DelegateRequest | undefined;
   const r = await call(

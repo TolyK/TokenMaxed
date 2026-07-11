@@ -147,6 +147,12 @@ files only reach a **reader**-trust lane with reader egress enabled; otherwise
 they're dropped and the reply says which and why. Still review offloaded output —
 visibility fixes facts, not logic.
 
+Every delegation also returns an inline **receipt** — tokens in/out (estimates
+labeled), real metered dollars spent, the estimated metered dollars avoided, and
+how many legs ran (rework/escalation legs included; a failed offload's spend is
+never hidden) — so you see what each offload cost and saved as it happens, not
+only in the reports.
+
 **Tandem routing (worker-first, full-access lane steps in for repo-tight work).**
 Some subtasks genuinely need live repo/tool/shell access — running the test suite,
 coordinated multi-file edits, broad cross-file reasoning — and no amount of
@@ -358,6 +364,25 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     are comfortable sending to every lane you've configured.
   - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
     regardless of the flags above (including YOLO mode).
+
+### Statusline quota gauge (optional)
+
+A one-line, always-visible gauge for Claude Code's status bar: estimated metered
+dollars avoided (last 7 days) plus the tightest routed-5h request window among
+lanes that declare `requests_per_window` (⚠ at 70% used, 🛑 at 90%). It reads
+only the local lanes + content-free ledger — no probes, no network — and fails
+silent, so it can never wedge the status bar. The 5h count is the **routed**
+share of the window (ledger-only), never claimed as your total subscription
+usage. Wire it up in `~/.claude/settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node /ABS/PATH/TO/packages/plugin/statusline.mjs"
+  }
+}
+```
 
 ### Model freshness (never silently run a stale model)
 

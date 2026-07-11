@@ -27555,6 +27555,12 @@ ${r.notes}` : "";
   };
   return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool];
 }
+function receiptLine(r) {
+  const int2 = (n) => Math.round(n).toLocaleString("en-US");
+  const usd2 = (n) => n < 0 ? `-$${Math.abs(n).toFixed(4)}` : `$${n.toFixed(4)}`;
+  const legs = `${r.legs} leg${r.legs === 1 ? "" : "s"}`;
+  return `\u2014 receipt: ${int2(r.tokensIn)} in / ${int2(r.tokensOut)} out tok${r.tokensEstimated ? " (est.)" : ""} \xB7 spent ${usd2(r.spentUsd)} metered \xB7 est. ${usd2(r.meteredAvoidedUsd)} metered avoided \xB7 ${legs}`;
+}
 function renderDelegate(o) {
   const inferenceFields = o.categoryInferred ? {
     categoryInferred: true,
@@ -27564,12 +27570,16 @@ function renderDelegate(o) {
   const inferenceText = o.categoryInferred && o.hint ? `
 
 ${o.hint}` : "";
+  const receiptText = o.receipt ? `
+
+${receiptLine(o.receipt)}` : "";
+  const receiptFields = o.receipt ? { receipt: o.receipt } : {};
   if (o.native || o.status !== "ok") {
     const why = o.status === "blocked" ? "blocked by policy/minimization (sensitive content stays on the host)" : o.status === "failed" ? `lane failed (${o.failureKind ?? "error"})` : o.reason ?? "no cheaper capable lane available";
     const reasonNote = (o.status === "blocked" || o.status === "failed") && o.reason ? ` \u2014 ${o.reason}` : "";
     const note2 = o.recordingFailed ? " (note: this attempt could not be recorded to the ledger)" : "";
     const taint2 = o.readerDerived ? "\n\n\u26A0\uFE0F reader-derived: any quoted reader output above may include private repo code \u2014 do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts." : "";
-    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}${inferenceText}`, {
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}${receiptText}${inferenceText}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
@@ -27577,6 +27587,7 @@ ${o.hint}` : "";
       ...o.failureKind ? { failureKind: o.failureKind } : {},
       ...o.readerDerived ? { readerDerived: true } : {},
       ...o.recordingFailed ? { recordingFailed: true } : {},
+      ...receiptFields,
       ...inferenceFields
     });
   }
@@ -27588,14 +27599,14 @@ ${o.hint}` : "";
     return ok(
       `Offloaded to ${lane} \u2014 UNREVIEWED (${o.reason ?? "manager review unavailable"}). Inspect it yourself before using:
 
-${o.resultText ?? ""}${taint}${note}${inferenceText}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {}, ...inferenceFields }
+${o.resultText ?? ""}${taint}${note}${receiptText}${inferenceText}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {}, ...receiptFields, ...inferenceFields }
     );
   }
   const how = o.reason ? ` (${o.reason})` : "";
   return ok(`Offloaded to ${lane}${how}. Use this result:
 
-${o.resultText ?? ""}${taint}${note}${inferenceText}`, {
+${o.resultText ?? ""}${taint}${note}${receiptText}${inferenceText}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
@@ -27603,6 +27614,7 @@ ${o.resultText ?? ""}${taint}${note}${inferenceText}`, {
     ...o.reason ? { reason: o.reason } : {},
     ...taintFlag,
     ...o.recordingFailed ? { recordingFailed: true } : {},
+    ...receiptFields,
     ...inferenceFields
   });
 }
@@ -27768,6 +27780,21 @@ function filePreferStore(statePath) {
   };
 }
 var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+function receiptFromEvents(events) {
+  const legs = events.filter((e) => e.status !== "native");
+  if (legs.length === 0) return void 0;
+  const receipt = { tokensIn: 0, tokensOut: 0, tokensEstimated: false, spentUsd: 0, meteredAvoidedUsd: 0, legs: legs.length };
+  let deliveredFrontier = 0;
+  for (const e of legs) {
+    receipt.tokensIn += e.tokens_in;
+    receipt.tokensOut += e.tokens_out;
+    receipt.tokensEstimated = receipt.tokensEstimated || e.tokens_estimated;
+    receipt.spentUsd += e.metered_spent;
+    if (e.status === "ok" && e.superseded !== true) deliveredFrontier += e.frontier_cost;
+  }
+  receipt.meteredAvoidedUsd = deliveredFrontier - receipt.spentUsd;
+  return receipt;
+}
 function makeServerDeps(env = process.env) {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
   const lanesPathExplicit = env.TOKENMAXED_LANES !== void 0;
@@ -27930,7 +27957,11 @@ function makeServerDeps(env = process.env) {
       } catch {
         escRecordingFailed = true;
       }
-      return withSkippedNote(escToOutcome(esc2, modelOf, escRecordingFailed), skippedNote);
+      const escReceipt = receiptFromEvents(esc2.events.flatMap((e) => e.kind === "task" ? [e.event] : []));
+      return withSkippedNote(
+        { ...escToOutcome(esc2, modelOf, escRecordingFailed), ...escReceipt ? { receipt: escReceipt } : {} },
+        skippedNote
+      );
     }
     const result = await runTask(taskInput, ctx, policy, runDeps);
     let recordingFailed = false;
@@ -27950,7 +27981,11 @@ function makeServerDeps(env = process.env) {
         ...result.failureKind ? { failureKind: result.failureKind } : {},
         ...result.failureKind === "insufficient_context" ? { reason: `worker handed back (insufficient context): ${result.resultText ?? "needs repo/tool access"} \u2014 host should complete` } : result.decision?.reason ? { reason: result.decision.reason } : {},
         ...result.readerDerived ? { readerDerived: true } : {},
-        ...recordingFailed ? { recordingFailed: true } : {}
+        ...recordingFailed ? { recordingFailed: true } : {},
+        ...(() => {
+          const receipt = receiptFromEvents(result.events);
+          return receipt ? { receipt } : {};
+        })()
       },
       skippedNote
     );
