@@ -62,8 +62,8 @@ packages/
 machine to a TokenMaxed-hosted backend. Downstream model lanes receive only
 minimized, policy-gated payloads.* The local event log is content-free by
 construction (integers, enums, model ids — never text), which is also what lets
-an optional web dashboard be added later as a pure forwarder, with zero schema
-changes and nothing new leaving the machine.
+the local dashboard (`tokenmaxed dashboard`) be a pure forwarder — zero schema
+changes and nothing leaving the machine.
 
 ## Requirements
 
@@ -369,6 +369,30 @@ per-launch if you'd rather opt into the gate explicitly each time.)
   - Set `TOKENMAXED_DISABLE=true` to turn the whole router off (kill-switch)
     regardless of the flags above (including YOLO mode).
 
+### Quota brain (never hit your weekly cap blind)
+
+Declare what your plans actually enforce on any lane (all optional; see
+`config/lanes.example.yaml`): `requests_per_window` (rolling 5h by default,
+`window_ms` to override), `requests_per_week`, and/or `tokens_per_week`. Then:
+
+- **Routing pressure** — as a lane's ROUTED share of its quota fills, routing
+  deprioritizes it (warn at 70% used, critical at 90%); a capped lane can still
+  win when it's the only capable one, and `/tokenmaxed:why` explains every
+  quota-affected pick. An explicit `/tokenmaxed:prefer` deliberately overrides
+  the pressure — loudly, never silently.
+- **Honest depletion estimates** — a rolling-window-correct projection (it
+  models consumption expiring out of the window, so a stable pace never fakes
+  a depletion) that renders only with enough evidence: `est. ~2d at routed
+  pace`, or just "approaching cap" when confidence is low, `now` when you're
+  there. Never a calendar timestamp.
+- **Overflow plans** — `/tokenmaxed:status` and `/tokenmaxed:summary` show,
+  per near-cap lane, where its top categories would route with it excluded:
+  `near cap: codex-cli — overflow: bugfix/codegen → claude-cli, docs → glm-api`.
+
+Everything is labeled the **routed share**: TokenMaxed only sees what it
+routed, so counts are floors on real usage, never totals — consistent with the
+honest-accounting law.
+
 ### Statusline quota gauge (optional)
 
 A one-line, always-visible gauge for Claude Code's status bar: estimated metered
@@ -482,6 +506,11 @@ ledger (`~/.tokenmaxed/ledger.jsonl` by default) and reports on it:
 npx tokenmaxed savings              # actual spend + metered $ avoided (headline) + baseline context + tokens
 npx tokenmaxed tokens --by lane     # full per-lane token breakdown (--by model is the default)
 npx tokenmaxed outcomes             # manager-review verdicts (pass/needs-rework/fail) + success rate per lane
+npx tokenmaxed leaderboard          # real-usage per-model leaderboard (× category × difficulty), honest N
+npx tokenmaxed leaderboard --html --open  # the same as a self-contained page (local view; nothing uploaded)
+npx tokenmaxed dashboard --open     # the local dashboard: savings tiles, quota meters + forecasts,
+                                    #   leaderboard, outcomes, recent offloads — ONE self-contained HTML
+                                    #   file from your content-free ledger; no server, no network
 npx tokenmaxed lanes                # your configured lanes: trust mode, autonomy, roles, manager eligibility
 npx tokenmaxed savings --period 7d  # any command takes --period all|Nd|Nh
 npx tokenmaxed help                 # full usage
