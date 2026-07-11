@@ -26,6 +26,8 @@ export interface CliArgs {
   outPath?: string;
   /** dashboard: open the generated file with the platform opener. */
   open: boolean;
+  /** leaderboard: emit the standalone static HTML page instead of text. */
+  html: boolean;
 }
 
 /** A flattened view of a lane's trust config, for the `lanes` command. */
@@ -68,13 +70,14 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   let lanesPath: string | undefined;
   let outPath: string | undefined;
   let open = false;
+  let html = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     switch (arg) {
       case '-h':
       case '--help':
-        return { command: 'help', period, by, leaderboardBy, json, open };
+        return { command: 'help', period, by, leaderboardBy, json, open, html };
       case '--period':
         period = takeValue(argv, i, '--period');
         i++;
@@ -101,6 +104,9 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       case '--open':
         open = true;
         break;
+      case '--html':
+        html = true;
+        break;
       default:
         if (arg.startsWith('-')) {
           throw new CliArgError(`Unknown option "${arg}".`);
@@ -116,10 +122,14 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   }
 
   const resolved = command ?? 'help';
-  // Dashboard-only flags stay dashboard-only (an unknown flag elsewhere must
-  // not become silently ignored).
-  if ((open || outPath !== undefined) && resolved !== 'dashboard') {
-    throw new CliArgError(`--open/--out are only valid for "dashboard" (got command "${resolved}").`);
+  // Output flags stay scoped (an unknown flag elsewhere must not become
+  // silently ignored): dashboard always; leaderboard only with --html.
+  if (html && resolved !== 'leaderboard') {
+    throw new CliArgError(`--html is only valid for "leaderboard" (got command "${resolved}").`);
+  }
+  const emitsFile = resolved === 'dashboard' || (resolved === 'leaderboard' && html);
+  if ((open || outPath !== undefined) && !emitsFile) {
+    throw new CliArgError(`--open/--out are only valid for "dashboard" or "leaderboard --html" (got command "${resolved}").`);
   }
   if (byRaw !== undefined) {
     if (resolved === 'leaderboard') {
@@ -144,6 +154,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     leaderboardBy,
     json,
     open,
+    html,
     ...(ledgerPath ? { ledgerPath } : {}),
     ...(lanesPath ? { lanesPath } : {}),
     ...(outPath ? { outPath } : {}),

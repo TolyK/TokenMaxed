@@ -22,7 +22,21 @@ import {
 } from '@tokenmaxed/core';
 import { JsonlLedger, loadLaneConfig } from '@tokenmaxed/core/node';
 
+import { mergeShareSnapshots, shareSnapshotFromRows } from '@tokenmaxed/core';
 import { buildDashboardData, renderDashboardHtml } from './dashboard.ts';
+import { renderLeaderboardPage } from './leaderboard-page.ts';
+
+/** Best-effort platform opener — never crashes the CLI after the write. */
+function openFile(path: string): void {
+  const child =
+    process.platform === 'win32'
+      ? spawn('explorer.exe', [path], { detached: true, stdio: 'ignore' })
+      : spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [path], { detached: true, stdio: 'ignore' });
+  child.on('error', () => {
+    /* best-effort — the path was already printed */
+  });
+  child.unref();
+}
 
 import {
   CliArgError,
@@ -43,7 +57,7 @@ Usage:
   tokenmaxed savings  [--period <p>] [--ledger <path>]
   tokenmaxed tokens   [--period <p>] [--by model|lane] [--ledger <path>]
   tokenmaxed outcomes    [--period <p>] [--ledger <path>]
-  tokenmaxed leaderboard [--period <p>] [--by performance|tokens|difficulty] [--json] [--ledger <path>]
+  tokenmaxed leaderboard [--period <p>] [--by performance|tokens|difficulty] [--json] [--html [--out <path>] [--open]] [--ledger <path>]
   tokenmaxed lanes       [--lanes <path>]
   tokenmaxed dashboard   [--out <path>] [--open] [--ledger <path>] [--lanes <path>]
   tokenmaxed help
@@ -110,19 +124,7 @@ function main(): void {
       mkdirSync(dirname(outPath), { recursive: true });
       writeFileSync(outPath, html, 'utf8');
       process.stdout.write(`dashboard written: ${outPath}\n(local-first — one self-contained file, no network; regenerate any time)\n`);
-      if (args.open) {
-        // Best-effort, platform-correct, injection-safe: explorer.exe is a real
-        // executable (no cmd.exe re-parsing of `&`/`^` in the path), and a
-        // missing opener must never crash the CLI after the file was written.
-        const child =
-          process.platform === 'win32'
-            ? spawn('explorer.exe', [outPath], { detached: true, stdio: 'ignore' })
-            : spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [outPath], { detached: true, stdio: 'ignore' });
-        child.on('error', () => {
-          /* best-effort — the path was already printed */
-        });
-        child.unref();
-      }
+      if (args.open) openFile(outPath);
       return;
     }
 
@@ -139,6 +141,22 @@ function main(): void {
       process.stdout.write(formatTokens({ tokens: tokenStats(events), by: args.by, periodLabel: label }) + '\n');
     } else if (args.command === 'leaderboard') {
       const rows = sortLeaderboard(buildLeaderboard(events), args.leaderboardBy);
+      if (args.html) {
+        // D: the standalone local-mode page (N=1, unsuppressed, loudly labeled)
+        // — the SAME static artifact the published Vercel page will be, fed a
+        // densified aggregate instead. users=1 via a single local snapshot.
+        const cells = mergeShareSnapshots(
+          [shareSnapshotFromRows(rows, { contributor_id: 'local', window_id: 'local', revision: 1 })],
+          { localOnly: true }, // on-machine view; the wire path requires a catalog
+        );
+        const html = renderLeaderboardPage(cells, { mode: 'local', generatedAtIso: new Date().toISOString() });
+        const outPath = resolve(args.outPath ?? join(homedir(), '.tokenmaxed', 'leaderboard.html'));
+        mkdirSync(dirname(outPath), { recursive: true });
+        writeFileSync(outPath, html, 'utf8');
+        process.stdout.write(`leaderboard page written: ${outPath}\n(local view — nothing uploaded)\n`);
+        if (args.open) openFile(outPath);
+        return;
+      }
       process.stdout.write(
         formatLeaderboard({ rows, periodLabel: label, sortBy: args.leaderboardBy, json: args.json }),
       );

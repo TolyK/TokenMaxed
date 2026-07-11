@@ -45,6 +45,18 @@ export { outcomeCapability, outcomeCapabilityByDifficulty, DEFAULT_HALF_LIFE_DAY
 export type { OutcomeCapabilityOptions } from './feedback.ts';
 export { buildLeaderboard, sortLeaderboard } from './leaderboard.ts';
 export type { LeaderboardRow, LeaderboardDifficulty, LeaderboardSortBy } from './leaderboard.ts';
+export {
+  MIN_TOTAL,
+  MIN_USERS,
+  SHARE_ROW_FIELDS,
+  SHARE_SNAPSHOT_FIELDS,
+  mergeShareSnapshots,
+  publishLeaderboard,
+  serializeShareSnapshot,
+  shareSnapshotFromRows,
+  validateShareSnapshot,
+} from './leaderboard-share.ts';
+export type { MergeOptions, MergedCell, PublishOptions, ShareRow, ShareSnapshot, ValidateShareResult } from './leaderboard-share.ts';
 export { LaneRegistry, LaneConfigError, parseLaneConfig } from './registry.ts';
 export {
   PriceError,
