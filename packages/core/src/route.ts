@@ -1,15 +1,18 @@
 /**
  * The routing brain: pure, deterministic, no I/O.
  *
- * `routeDecide` picks the cheapest capable lane for a task. In v0 the rule is
- * deliberately simple and explainable: score each candidate by its capability
- * for the task's category, minus a penalty for its marginal cost basis, then
- * take the highest score. Ties break deterministically by lane id so the same
- * inputs always yield the same decision.
- *
- * Richer category rules, capability floors, and health/cap gating arrive in
- * later steps (P1-S5, P1-S12); the policy gate (P1-S9) filters candidates
- * before scoring once untrusted lanes exist. The shape returned here is stable.
+ * `routeDecide` picks the right-sized lane for a task. The core score is a
+ * lane's EFFECTIVE capability for the task's category minus a marginal-cost
+ * penalty — where effective capability layers, in order: the declared config
+ * prior (or the rankings prior overlay, P2), the learned model-keyed review
+ * evidence (F-1/P6), and the difficulty-conditioned cell when the task carries
+ * a bucket (P6 §4 back-off ladder). Quota pressure (B) deprioritizes near-cap
+ * lanes via `capHeadroom`; the tiered strategy instead takes the cheapest lane
+ * clearing a capability floor; an explicit `preferLaneId` overrides ranking
+ * (never the hard rails). Candidates are pre-filtered by the structural
+ * pre-gate, the data-egress policy, the access-need gate, and availability.
+ * Ties break deterministically by lane id so the same inputs always yield the
+ * same decision, and `decision.scores` explains every candidate (/why).
  */
 
 import { isExecutorCertified, isReaderExecutorCertified } from './boundary.ts';

@@ -70,8 +70,9 @@ Options:
   --ledger <p>   ledger file path (default: ~/.tokenmaxed/ledger.jsonl)
   --lanes <p>    lane config path for "lanes"/"dashboard" (default: config/lanes.yaml;
                  dashboard prefers ~/.tokenmaxed/lanes.yaml when it exists)
-  --out <p>      dashboard: output HTML path (default: ~/.tokenmaxed/dashboard.html)
-  --open         dashboard: open the generated file
+  --out <p>      dashboard / leaderboard --html: output HTML path
+                 (defaults: ~/.tokenmaxed/dashboard.html / leaderboard.html)
+  --open         dashboard / leaderboard --html: open the generated file
   -h, --help     show this help
 
 The dashboard is fully local-first: one self-contained HTML file generated from

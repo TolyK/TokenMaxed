@@ -148,11 +148,12 @@ files only reach a **reader**-trust lane with reader egress enabled; otherwise
 they're dropped and the reply says which and why. Still review offloaded output —
 visibility fixes facts, not logic.
 
-Every delegation also returns an inline **receipt** — tokens in/out (estimates
-labeled), real metered dollars spent, the estimated metered dollars avoided, and
-how many legs ran (rework/escalation legs included; a failed offload's spend is
-never hidden) — so you see what each offload cost and saved as it happens, not
-only in the reports.
+Every delegation that ran one or more lane legs returns an inline **receipt** —
+tokens in/out (estimates labeled), real metered dollars spent, the estimated
+metered dollars avoided, and how many legs ran (rework/escalation legs included;
+a failed offload's spend is never hidden) — so you see what each offload cost
+and saved as it happens, not only in the reports. (A delegation that never ran
+a lane — e.g. routing degraded straight to native — has nothing to receipt.)
 
 **Tandem routing (worker-first, full-access lane steps in for repo-tight work).**
 Some subtasks genuinely need live repo/tool/shell access — running the test suite,
@@ -494,8 +495,8 @@ console.log(`${decision.laneId} — ${decision.reason}`);
 ```
 
 `routeDecide` is pure and deterministic: the same inputs always pick the same
-lane, and `decision.scores` shows how every candidate ranked (useful for a
-future `why` command).
+lane, and `decision.scores` shows how every candidate ranked — exactly what
+`/tokenmaxed:why` renders.
 
 ### 4. See your savings and token usage (CLI)
 
@@ -512,7 +513,7 @@ npx tokenmaxed dashboard --open     # the local dashboard: savings tiles, quota 
                                     #   leaderboard, outcomes, recent offloads — ONE self-contained HTML
                                     #   file from your content-free ledger; no server, no network
 npx tokenmaxed lanes                # your configured lanes: trust mode, autonomy, roles, manager eligibility
-npx tokenmaxed savings --period 7d  # any command takes --period all|Nd|Nh
+npx tokenmaxed savings --period 7d  # report commands take --period all|Nd|Nh
 npx tokenmaxed help                 # full usage
 ```
 

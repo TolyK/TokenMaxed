@@ -1,11 +1,15 @@
 /**
- * Token estimation + subscription-cap tracking (P1-S5). Pure: no I/O.
+ * Token estimation + LEGACY cap-fraction helpers. Pure: no I/O.
  *
- * Some lanes (Ollama/local, and some CLIs) don't report token usage, so we
- * estimate it heuristically and flag the event `tokens_estimated: true`. We also
- * track how much of a subscription lane's weekly cap has been consumed and
- * surface warn/critical alerts as it fills, which routing uses to deprioritize
- * near-cap lanes.
+ * Token estimation is live: some lanes (Ollama/local, and some CLIs) don't
+ * report usage, so we estimate heuristically and flag events
+ * `tokens_estimated: true`.
+ *
+ * The cap-fraction helpers below (`capUsedFraction`/`capHeadroom`/`capLevel`/
+ * `alertsCrossed`) are LEGACY: routing's quota pressure is now fed by
+ * `quota.ts` (ledger-derived, multi-axis routed-share headroom) — nothing in
+ * production populates these from a hand-tracked weekly number. They remain
+ * exported for compatibility and as pure math utilities only.
  */
 
 import type { Usage } from './types.ts';

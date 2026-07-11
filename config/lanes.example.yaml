@@ -32,8 +32,9 @@
 #
 #   Quota (all optional; counts are the ROUTED share from the local ledger — never
 #   your total subscription usage). When any is set, routing deprioritizes the lane
-#   as it fills (warn at 70% used, critical at 90%), the summary/statusline warn,
-#   and near-cap lanes get an honest depletion estimate + overflow plan:
+#   as it fills (warn at 70% used, critical at 90%), the summary/status warn on
+#   every axis (the statusline shows the tightest rolling request window), and
+#   near-cap lanes get an honest depletion estimate + overflow plan:
 #   requests_per_window   rolling-window request limit (default window: 5h)
 #   window_ms             override the rolling window length in milliseconds
 #   requests_per_week     trailing-7-day request cap
