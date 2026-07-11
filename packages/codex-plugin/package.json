@@ -1,0 +1,11 @@
+{
+  "name": "@tokenmaxed/codex-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TokenMaxed as a Codex CLI plugin: bundled MCP server, skills, and lifecycle hooks.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}

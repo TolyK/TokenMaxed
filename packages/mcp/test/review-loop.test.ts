@@ -126,3 +126,17 @@ test('long notes are truncated in surfaced/blocked messages', () => {
   const block = stopHookAction({ reviewed: true, verdict: 'fail', notes: big, priorBlocks: 0, maxRounds: 5 });
   assert.match((block as { reason: string }).reason, /\[notes truncated\]/);
 });
+
+// --- E: per-host Stop block payload dialects --------------------------------------
+
+test('blockPayload: Claude dialect carries the envelope; Codex dialect is strict-schema clean', async () => {
+  const { blockPayload } = await import('../src/hook-stop-main.ts');
+  const claude = blockPayload('claude', 'fix X');
+  assert.equal(claude.decision, 'block');
+  assert.equal(claude.reason, 'fix X');
+  assert.deepEqual(claude.hookSpecificOutput, { hookEventName: 'Stop', additionalContext: 'fix X' });
+  const codex = blockPayload('codex', 'fix X');
+  // Codex's Stop schema is additionalProperties:false — EXACTLY these keys.
+  assert.deepEqual(Object.keys(codex).sort(), ['decision', 'reason']);
+  assert.deepEqual(codex, { decision: 'block', reason: 'fix X' });
+});
