@@ -1,0 +1,17 @@
+{
+  "name": "tokenmaxed",
+  "version": "0.1.0",
+  "description": "Route coding subtasks to the cheapest capable, policy-allowed lane — subscription-first, local-first, honest accounting. Quota pressure, learned per-model routing, receipts, and a turn-end review loop.",
+  "author": { "name": "TokenMaxed contributors" },
+  "repository": "https://github.com/TolyK/TokenMaxed",
+  "license": "MIT",
+  "keywords": ["routing", "mcp", "cost", "quota", "multi-model"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "TokenMaxed",
+    "shortDescription": "Right-size every coding subtask across your model subscriptions",
+    "category": "Productivity"
+  }
+}

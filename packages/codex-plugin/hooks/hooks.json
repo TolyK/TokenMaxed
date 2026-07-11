@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/hooks/sessionstart.mjs",
+            "statusMessage": "TokenMaxed summary"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "tokenmaxed:router_delegate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/hooks/pretooluse.mjs",
+            "statusMessage": "TokenMaxed routing gate"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ${PLUGIN_ROOT}/hooks/stop.mjs",
+            "statusMessage": "TokenMaxed turn-end review",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

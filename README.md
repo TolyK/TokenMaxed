@@ -1,21 +1,32 @@
 # TokenMaxed
 
-> Route every coding task to the **cheapest capable, policy-allowed lane** — local-first, content-free, and honest about what it saves you.
+> **Never hit your weekly cap blind.** TokenMaxed is a portfolio manager for
+> your AI subscriptions that rides inside the coding agents you already use —
+> routing every subtask to the cheapest capable, policy-allowed lane, with
+> receipts for every decision.
 
 [![CI](https://github.com/TolyK/TokenMaxed/actions/workflows/ci.yml/badge.svg)](https://github.com/TolyK/TokenMaxed/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Status: v0 / early](https://img.shields.io/badge/status-v0%20early-orange.svg)](#project-status)
 
-TokenMaxed is a router for coding agents. You already pay flat-rate for tools
-like Claude Max and a ChatGPT/Codex subscription, and you may have a capable
-model running locally. TokenMaxed spends that **already-paid, flat-rate capacity
-first**, falls back to metered APIs only when it has to, and shows you — in real
-dollars — what you *actually* spent and how much metered API cost you avoided (with
-the all-frontier comparison kept as a clearly-labeled hypothetical, not the headline).
+If you're a power user, you already juggle a portfolio: Claude Max, a
+ChatGPT/Codex plan, maybe a GLM/Kimi/MiniMax coding plan, a local model — and
+you route between them by gut, until a weekly cap kills your week mid-flow.
+TokenMaxed makes the portfolio work as one system: it spends your
+**already-paid, flat-rate capacity first**, right-sizes each subtask to the
+cheapest model that keeps passing *your* reviews, applies **quota pressure**
+before you hit a cap (with honest depletion estimates and an overflow plan),
+and falls back to metered APIs only when it has to.
 
-It is **local-first**: the routing brain, your prompts, and your code stay on
-your machine. Any hosted feature added later transmits only content-free
-metadata you explicitly opt into.
+It **meets you where you work**: TokenMaxed is not another app — it rides
+inside your agent as a plugin. Claude Code today, Codex CLI next, more hosts
+(Pi, OpenCode, OpenClaw, Hermes, …) on the roadmap — each with per-host
+control over which lanes are even allowed to run there.
+
+It is **local-first and honest**: the routing brain, your prompts, and your
+code stay on your machine; every count is labeled for exactly what it is
+(routed share, estimate, or fact); and any hosted feature only ever transmits
+content-free aggregates you explicitly opt into.
 
 > **New here? Start with Claude Code →** [Use in Claude Code](#use-in-claude-code-plugin)
 > — install the plugin, run `/tokenmaxed:setup`, done.
@@ -24,16 +35,25 @@ metadata you explicitly opt into.
 
 ## Why
 
+- **Quota continuity.** Caps are the sharpest pain of the subscription era.
+  TokenMaxed tracks each lane's routed share of its windows, deprioritizes
+  near-cap lanes before they run dry, projects depletion honestly, and shows
+  you where the overflow would route.
 - **Subsidy capture.** Subscriptions are flat-rate; their marginal cost is ~$0
   until you hit caps. TokenMaxed defaults to that capacity before burning
   metered API dollars.
-- **Data minimization (the moat).** Trusted lanes (Claude, Codex, local) can see
-  your repo and tools. Untrusted lanes receive only a scrubbed, bounded,
-  no-tool sub-request — never your repo, tokens, or paths.
+- **Right-sizing with receipts.** The cheapest model that keeps passing your
+  reviews wins — per category, per difficulty, learned from real reviewed work.
+  Every delegation shows which lane ran, what it cost, and what it saved. No
+  invisible downgrades, ever.
+- **Data minimization (the trust moat).** You decide which vendor sees what:
+  trusted lanes (Claude, Codex, local) can see your repo and tools; untrusted
+  lanes receive only a scrubbed, bounded, no-tool sub-request — never your
+  repo, tokens, or paths.
 - **Honest accounting.** The headline is the finance-grade number — what you
   *actually* spent and the metered dollars avoided; the all-frontier baseline
-  (every task on the top model) is shown too but clearly labeled a *hypothetical*,
-  never the headline. We never claim caps don't exist.
+  is shown too but clearly labeled a *hypothetical*, never the headline. We
+  never claim caps don't exist.
 
 ## Project status
 
@@ -438,6 +458,30 @@ that visible and gives you the choice:
   family newest-first. CLI lanes (Codex/Gemini/Kimi) pin a concrete model the provider
   runtime selects — there's no model endpoint to auto-verify, so `@latest` is api-only.
 
+## Use in Codex CLI (plugin)
+
+The same brain, natively in OpenAI's Codex CLI (v0.124+ for hooks): the plugin
+bundles the MCP server (tools appear as `tokenmaxed:router_delegate` etc.),
+all thirteen skills (`$tokenmaxed-setup`, `$tokenmaxed-why`, …, generated from
+the Claude Code skills — one source of truth), and the same lifecycle
+protections — the session-start summary, the PreToolUse routing gate, and the
+turn-end review loop (Codex's Stop hook `block` semantics drive the rework
+iteration natively).
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git && cd TokenMaxed
+npm install
+npm run build:codex-plugin      # bundle server + hooks + generate skills
+codex plugin marketplace add ./ # this repo doubles as a local marketplace
+# then: /plugins → install "tokenmaxed" → run $tokenmaxed-setup once
+```
+
+Hooks require one-time trust via `/hooks` (Codex's standard flow for
+non-managed hooks). Notes vs the Claude Code plugin: no statusline equivalent
+yet (Codex has no command-backed status line — tracked upstream), and the
+per-project on/off toggle keys globally under Codex v1. Everything else —
+lanes, policy, ledger, settings — is the same user-owned `~/.tokenmaxed`.
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
@@ -543,11 +587,15 @@ recorded yet", while `tokenmaxed lanes` works immediately off your
 
 ### Surfaces (where you can use TokenMaxed)
 
+We meet power users where they are: the same portable core, one thin adapter
+per host — each host controlling which lanes are even allowed to run inside it.
+
 | Surface | Status | How |
 |---|---|---|
 | **CLI** (`tokenmaxed`) | available | the commands above, after `npm run build` |
 | **Claude Code plugin** | available | `claude --plugin-dir packages/plugin`, then `/tokenmaxed:setup` |
-| Other hosts (Codex, Gemini, Cursor, Kimi Code, Pi, …) | planned | same core, thin per-host adapters |
+| **Codex CLI plugin** | in progress | `packages/codex-plugin` — bundled MCP server + skills + hooks (see [Use in Codex CLI](#use-in-codex-cli-plugin)) |
+| Pi · OpenCode · OpenClaw · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.

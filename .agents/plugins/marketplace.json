@@ -1,0 +1,15 @@
+{
+  "plugins": [
+    {
+      "name": "tokenmaxed",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/TolyK/TokenMaxed.git",
+        "path": "./packages/codex-plugin",
+        "ref": "main"
+      },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Productivity"
+    }
+  ]
+}

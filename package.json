@@ -2,7 +2,7 @@
   "name": "tokenmaxed",
   "version": "0.0.0",
   "private": true,
-  "description": "A Claude-Code-native router that sends each coding task to the cheapest capable, policy-allowed lane — local-first, content-free.",
+  "description": "A Claude-Code-native router that sends each coding task to the cheapest capable, policy-allowed lane \u2014 local-first, content-free.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -15,7 +15,8 @@
     "build": "npm run build -w @tokenmaxed/core && npm run build -w @tokenmaxed/cli && npm run build -w @tokenmaxed/mcp",
     "build:plugin": "npm run build && npm run build -w @tokenmaxed/plugin",
     "test": "node --test \"packages/**/test/**/*.test.ts\"",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "build:codex-plugin": "npm run build && npm run build -w @tokenmaxed/codex-plugin"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
