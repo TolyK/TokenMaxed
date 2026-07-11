@@ -123,6 +123,135 @@ export function laneQuotaState(events: readonly LedgerEvent[], lane: Lane, now: 
   return state;
 }
 
+// ---------------------------------------------------------------------------
+// B3 — depletion projection (plan §1.4). Rolling-window-correct: consumption
+// EXPIRES out of a trailing window, so `remaining / ingress-rate` would forecast
+// depletion even for stable occupancy. Instead we simulate NET occupancy
+// forward: continuous arrivals (λ·dt, λ in units/ms) over the DISCRETE schedule
+// of known expirations (each observation leaves at ts + windowMs), with the
+// earliest limit-crossing found analytically per piecewise-linear segment.
+// ---------------------------------------------------------------------------
+
+/** Gates for rendering a projection at all / with a time (plan §1.4). */
+const MIN_SAMPLES = 8;
+const MIN_SPAN_FRACTION = 0.25;
+const MAX_HALF_RATE_RATIO = 3;
+const MODERATE_SPAN_FRACTION = 0.5;
+const MODERATE_HALF_RATE_RATIO = 2;
+
+export interface DepletionProjection {
+  /** ms from `now` until projected occupancy first reaches the limit. */
+  etaMs: number;
+  /**
+   * Rendering guidance (labels are NOT printed): `moderate` ⇒ a relative
+   * duration may be shown; `low` ⇒ only a timeless "approaching cap" notice.
+   */
+  confidence: 'low' | 'moderate';
+}
+
+/**
+ * Project the earliest time the rolling-window occupancy reaches `limit`.
+ * Undefined when the evidence gates fail (omission over false precision) or
+ * when occupancy never crosses within one window length (stable/falling).
+ * Expiration-first at same-instant ties: an expiring amount is subtracted
+ * before the crossing test at that instant.
+ */
+export function projectOccupancy(
+  observations: readonly QuotaObservation[],
+  limit: number,
+  windowMs: number,
+  now: number,
+): DepletionProjection | undefined {
+  if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return undefined;
+  // In-window, valid observations — same (now - window, now] boundary as the counts.
+  const inWindow = observations
+    .filter((o) => Number.isFinite(o.ts) && o.ts > now - windowMs && o.ts <= now && Number.isFinite(o.amount) && o.amount > 0)
+    .sort((a, b) => a.ts - b.ts);
+  if (inWindow.length < MIN_SAMPLES) return undefined;
+
+  // Coverage: the observed span must fill enough of the burn horizon.
+  const span = inWindow[inWindow.length - 1]!.ts - inWindow[0]!.ts;
+  const spanFraction = span / windowMs;
+  if (spanFraction < MIN_SPAN_FRACTION) return undefined;
+
+  // Stability: weighted rate of each half of the horizon; both must be positive
+  // and comparable (max/min), else omit (one active burst is not a trend).
+  const mid = now - windowMs / 2;
+  let firstHalf = 0;
+  let secondHalf = 0;
+  for (const o of inWindow) {
+    if (o.ts <= mid) firstHalf += o.amount;
+    else secondHalf += o.amount;
+  }
+  if (!(firstHalf > 0) || !(secondHalf > 0)) return undefined;
+  const ratio = Math.max(firstHalf, secondHalf) / Math.min(firstHalf, secondHalf);
+  if (ratio >= MAX_HALF_RATE_RATIO) return undefined;
+
+  const total = firstHalf + secondHalf;
+  const lambda = total / windowMs; // units per ms over the full horizon
+
+  // Simulate: piecewise-linear occupancy between expirations.
+  let occupancy = total;
+  if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
+  const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
+  let t = now;
+  let idx = 0;
+  const horizonEnd = now + windowMs;
+  while (t < horizonEnd) {
+    const nextExpiry = idx < expirations.length ? Math.min(expirations[idx]!.at, horizonEnd) : horizonEnd;
+    // Crossing strictly inside the segment [t, nextExpiry)?
+    if (lambda > 0) {
+      const tCross = t + (limit - occupancy) / lambda;
+      if (tCross < nextExpiry) return { etaMs: tCross - now, confidence: confidenceOf(spanFraction, ratio) };
+    }
+    if (nextExpiry >= horizonEnd) break;
+    // Expiration-first at the boundary instant: drop, then continue.
+    occupancy += lambda * (nextExpiry - t) - expirations[idx]!.amount;
+    t = nextExpiry;
+    idx += 1;
+  }
+  return undefined; // stable or falling — no depletion within one window
+}
+
+function confidenceOf(spanFraction: number, ratio: number): 'low' | 'moderate' {
+  return spanFraction >= MODERATE_SPAN_FRACTION && ratio <= MODERATE_HALF_RATE_RATIO ? 'moderate' : 'low';
+}
+
+/** A lane's earliest projected depletion across its configured axes. */
+export interface LaneDepletionForecast extends DepletionProjection {
+  axis: 'window' | 'weekRequests' | 'weekTokens';
+}
+
+/**
+ * Run the projection for every configured axis and return the EARLIEST
+ * depletion, if any axis projects one. Same routed-share-only caveat as all
+ * quota state: this extrapolates only what TokenMaxed itself routed.
+ */
+export function laneDepletionForecast(events: readonly LedgerEvent[], lane: Lane, now: number): LaneDepletionForecast | undefined {
+  const axes: Array<{ axis: LaneDepletionForecast['axis']; limit: number | undefined; windowMs: number; weighted: boolean }> = [
+    {
+      axis: 'window',
+      limit: lane.requests_per_window,
+      windowMs: typeof lane.window_ms === 'number' && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS,
+      weighted: false,
+    },
+    { axis: 'weekRequests', limit: lane.requests_per_week, windowMs: WEEK_MS, weighted: false },
+    { axis: 'weekTokens', limit: lane.tokens_per_week, windowMs: WEEK_MS, weighted: true },
+  ];
+  let best: LaneDepletionForecast | undefined;
+  let requests: QuotaObservation[] | undefined;
+  let tokens: QuotaObservation[] | undefined;
+  for (const a of axes) {
+    if (!(typeof a.limit === 'number' && a.limit > 0)) continue;
+    const obs = a.weighted
+      ? (tokens ??= laneObservations(events, lane.id, true))
+      : (requests ??= laneObservations(events, lane.id, false));
+    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    if (p && (best === undefined || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
+  }
+  return best;
+}
+
 /**
  * The headroom map routing consumes (RouteContext.capHeadroom): lane id →
  * min-axis remaining fraction. Lanes with NO quota config are OMITTED — an

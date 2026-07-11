@@ -18,9 +18,15 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { overlayFromSnapshot, validateSnapshot } from '@tokenmaxed/core';
-import type { Lane, PriceTable } from '@tokenmaxed/core';
+import type { CapabilitySnapshot, Lane, PriceTable } from '@tokenmaxed/core';
 
 import type { CapabilityPriorState } from './tools.ts';
+
+/** The validated snapshot itself (read ONCE), before any lane-set overlay build. */
+export type CapabilitySnapshotState =
+  | { state: 'off' }
+  | { state: 'error'; warning: string }
+  | { state: 'on'; snapshot: CapabilitySnapshot; stale: boolean };
 
 // Rankings capability-prior seed shipped WITH this package, resolved module-
 // relative (same ../ pattern as prices.seed.json — sits next to dist/ in the
@@ -49,11 +55,12 @@ export function capabilityPriorEnabled(env: NodeJS.ProcessEnv): boolean {
  * Never throws: any load/validation failure returns `{ state: 'error' }` with a
  * one-line warning, and routing proceeds on declared capabilities.
  */
-export function loadCapabilityPriorState(
-  env: NodeJS.ProcessEnv,
-  lanes: readonly Lane[],
-  opts: { priceTable?: PriceTable; now?: number } = {},
-): CapabilityPriorState {
+/**
+ * Read + validate the snapshot FILE once (no overlay build). Callers that need
+ * a consistent posture across several lane sets (e.g. the quota-alert overflow
+ * plan) capture this once and derive per-set overlays purely from it.
+ */
+export function loadCapabilitySnapshotState(env: NodeJS.ProcessEnv, opts: { now?: number } = {}): CapabilitySnapshotState {
   if (!capabilityPriorEnabled(env)) return { state: 'off' };
   const path = env.TOKENMAXED_CAPABILITY_SNAPSHOT ?? DEFAULT_CAPABILITY_SNAPSHOT;
 
@@ -70,22 +77,39 @@ export function loadCapabilityPriorState(
   }
 
   const snapshot = validated.snapshot;
-  const { overlay, unranked } = overlayFromSnapshot(snapshot, lanes, opts.priceTable ? { priceTable: opts.priceTable } : {});
   // An unparseable `generated` date counts as stale (conservative: a snapshot of
   // unknown age must not move any prior upward).
   const generatedMs = Date.parse(snapshot.generated);
   const now = opts.now ?? Date.now();
   const stale = !Number.isFinite(generatedMs) || now - generatedMs > MAX_SNAPSHOT_AGE_MS;
+  return { state: 'on', snapshot, stale };
+}
 
+/** Build the lane-keyed overlay state from an already-loaded snapshot (pure). */
+export function priorStateFromSnapshot(
+  loaded: CapabilitySnapshotState,
+  lanes: readonly Lane[],
+  opts: { priceTable?: PriceTable } = {},
+): CapabilityPriorState {
+  if (loaded.state !== 'on') return loaded;
+  const { overlay, unranked } = overlayFromSnapshot(loaded.snapshot, lanes, opts.priceTable ? { priceTable: opts.priceTable } : {});
   return {
     state: 'on',
     overlay,
-    stale,
+    stale: loaded.stale,
     meta: {
-      source: snapshot.sources.join(', '),
-      generated: snapshot.generated,
-      categories: Object.keys(snapshot.mapping),
+      source: loaded.snapshot.sources.join(', '),
+      generated: loaded.snapshot.generated,
+      categories: Object.keys(loaded.snapshot.mapping),
       unrankedCount: unranked.length,
     },
   };
+}
+
+export function loadCapabilityPriorState(
+  env: NodeJS.ProcessEnv,
+  lanes: readonly Lane[],
+  opts: { priceTable?: PriceTable; now?: number } = {},
+): CapabilityPriorState {
+  return priorStateFromSnapshot(loadCapabilitySnapshotState(env, opts), lanes, opts);
 }

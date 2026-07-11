@@ -179,6 +179,13 @@ export interface ToolDeps {
   /** B: compact per-lane quota detail ("5h 12/40 routed · …") for /why lines. */
   quotaDetail?: (lane: Lane) => string | undefined;
   /**
+   * B3/B4: one advisory line per warn/critical quota lane — routed-share detail,
+   * an omit-first depletion projection, and the per-category overflow plan
+   * (pure preview re-routing with the capped lane excluded; nothing executes).
+   * Probes availability, so it is called only by status/summary — never hooks.
+   */
+  quotaAlerts?: () => Promise<string[]>;
+  /**
    * A4: the persistent-settings report (per key: effective value + which layer —
    * env/settings/default — supplied it). Powers /tokenmaxed:config. Optional so
    * fakes/old hosts can omit the whole surface.
@@ -610,7 +617,14 @@ export function createTools(core: CorePort): ToolDef[] {
     handler: (deps) =>
       guardedAsync(async () => {
         const data = await deps.summary();
-        return ok(formatSummaryBanner(data), { summary: data as unknown as Record<string, unknown> });
+        // B4: append the overflow plan for capped lanes (advisory; computed by
+        // pure preview re-routing — nothing executes). Fail-open to nothing.
+        const alerts = deps.quotaAlerts ? await deps.quotaAlerts() : [];
+        const banner =
+          alerts.length > 0
+            ? `${formatSummaryBanner(data)}\n   Quota (routed share only):\n${alerts.map((a) => `     ${a}`).join('\n')}`
+            : formatSummaryBanner(data);
+        return ok(banner, { summary: data as unknown as Record<string, unknown>, ...(alerts.length ? { quotaAlerts: alerts } : {}) });
       }),
   };
 
@@ -891,6 +905,11 @@ export function createTools(core: CorePort): ToolDef[] {
           );
         } else if (capPrior?.state === 'error') {
           lines.push(`Capability prior: ERROR — ${capPrior.warning} (routing unaffected; declared capabilities in use).`);
+        }
+        // B3/B4: quota alerts (warn/critical lanes only ⇒ silent by default).
+        const quotaAlerts = enabled && deps.quotaAlerts ? await deps.quotaAlerts() : [];
+        if (quotaAlerts.length > 0) {
+          lines.push('', 'Quota (routed share only — not your total subscription usage):', ...quotaAlerts.map((a) => `  ${a}`));
         }
         if (mismatches.length > 0) {
           lines.push('', 'Model ids the vendor will REJECT (fix before offloading):', ...renderModelIdMismatchWarnings(mismatches));

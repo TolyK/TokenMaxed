@@ -140,3 +140,78 @@ test('quotaHeadroomMap: only quota-configured lanes appear (empty map when none)
   assert.deepEqual(Object.keys(some), ['codex-cli']);
   assert.ok(Math.abs(some['codex-cli']! - 0.5) < 1e-9); // 1/2 used
 });
+
+// --- B3: depletion projection ----------------------------------------------------
+
+import { laneDepletionForecast, projectOccupancy } from '../src/quota.ts';
+import type { QuotaObservation } from '../src/quota.ts';
+
+const W = 100_000; // test window (ms)
+
+/** n observations of `amount`, evenly spaced across [NOW-spanFrom, NOW-spanTo]. */
+function spread(n: number, fromAgo: number, toAgo: number, amount = 1): QuotaObservation[] {
+  const out: QuotaObservation[] = [];
+  const step = n > 1 ? (fromAgo - toAgo) / (n - 1) : 0;
+  for (let i = 0; i < n; i++) out.push({ ts: NOW - (fromAgo - i * step), amount });
+  return out;
+}
+
+test('projectOccupancy: steady state (balanced arrivals/expirations) yields NO eta', () => {
+  // 20 obs evenly across the window: occupancy oscillates, never rises to the limit.
+  const obs = spread(20, 97_500, 2_500);
+  assert.equal(projectOccupancy(obs, 22, W, NOW), undefined);
+});
+
+test('projectOccupancy: rising rate projects an ANALYTIC crossing (net of expirations)', () => {
+  // First half 6 obs, second half 12 (ratio 2 ⇒ moderate); occupancy 18, limit 20.
+  // Expirations: 6 in (now, now+30k], then none until +52k; crossing lands in the
+  // gap at t* = 30000 + (20 - 17.4)/1.8e-4 = 44444.44… ms.
+  const obs = [...spread(6, 95_000, 70_000), ...spread(12, 48_000, 4_000)];
+  const p = projectOccupancy(obs, 20, W, NOW);
+  assert.ok(p, 'expected a projection');
+  assert.equal(p!.confidence, 'moderate'); // span 91% ≥ 50%, ratio 2 ≤ 2
+  assert.ok(Math.abs(p!.etaMs - (30_000 + 2.6 / 1.8e-4)) < 0.01, `eta ${p!.etaMs}`);
+});
+
+test('projectOccupancy: same-instant tie resolves expiration-first (no crossing)', () => {
+  // 8 obs every 10k, occ 8, λ=8e-5; limit hit EXACTLY at the first expiration
+  // (+10k) — the expiring unit drops first, and net drift is negative ⇒ no eta.
+  const obs = spread(8, 90_000, 20_000);
+  assert.equal(projectOccupancy(obs, 8 + 8e-5 * 10_000, W, NOW), undefined);
+});
+
+test('projectOccupancy: evidence gates — samples, span, zero-half, ratio', () => {
+  assert.equal(projectOccupancy(spread(7, 90_000, 20_000), 100, W, NOW), undefined); // < 8 samples
+  assert.equal(projectOccupancy(spread(10, 20_000, 1_000), 100, W, NOW), undefined); // span 19% < 25%
+  assert.equal(projectOccupancy(spread(10, 45_000, 5_000), 100, W, NOW), undefined); // first half zero
+  const bursty = [...spread(2, 95_000, 90_000), ...spread(8, 45_000, 5_000)]; // ratio 4 ≥ 3
+  assert.equal(projectOccupancy(bursty, 100, W, NOW), undefined);
+});
+
+test('projectOccupancy: already at/over the limit projects eta 0', () => {
+  const obs = spread(20, 97_500, 2_500);
+  const p = projectOccupancy(obs, 20, W, NOW);
+  assert.equal(p?.etaMs, 0);
+});
+
+test('projectOccupancy: token weights drive the weighted series', () => {
+  // Same shape as the rising case but each obs carries 100 tokens ⇒ same eta
+  // against a 100×-scaled limit.
+  const obs = [...spread(6, 95_000, 70_000, 100), ...spread(12, 48_000, 4_000, 100)];
+  const p = projectOccupancy(obs, 2_000, W, NOW);
+  assert.ok(p);
+  assert.ok(Math.abs(p!.etaMs - (30_000 + 260 / 1.8e-2)) < 0.01, `eta ${p!.etaMs}`);
+});
+
+test('laneDepletionForecast: earliest axis wins; respects window_ms override', () => {
+  const l = lane({ id: 'codex-cli', requests_per_window: 20, window_ms: W });
+  const risingTs = [...spread(6, 95_000, 70_000), ...spread(12, 48_000, 4_000)];
+  const events: LedgerEvent[] = risingTs.map((o, i) =>
+    taskEvent({ ts: new Date(o.ts).toISOString(), task_id: `f-${i}`, laneId: 'codex-cli' }),
+  );
+  const f = laneDepletionForecast(events, l, NOW);
+  assert.equal(f?.axis, 'window');
+  assert.ok(Math.abs((f?.etaMs ?? 0) - (30_000 + 2.6 / 1.8e-4)) < 0.01);
+  // No quota config ⇒ no forecast.
+  assert.equal(laneDepletionForecast(events, lane({ id: 'codex-cli' }), NOW), undefined);
+});

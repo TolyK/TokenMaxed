@@ -8597,6 +8597,125 @@ function windowLevel(usedFraction) {
 
 // ../core/src/quota.ts
 var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+function laneObservations(events, laneId, weightTokens) {
+  const out = [];
+  for (const e of events) {
+    if (e.event_type !== "task" || e.laneId !== laneId || e.status === "native") continue;
+    const ts = Date.parse(e.ts);
+    if (!Number.isFinite(ts)) continue;
+    out.push({ ts, amount: weightTokens ? e.tokens_in + e.tokens_out : 1 });
+  }
+  return out;
+}
+function amountInWindow(observations, now, windowMs) {
+  let sum = 0;
+  for (const o of observations) {
+    if (o.ts > now || o.ts <= now - windowMs) continue;
+    if (!(Number.isFinite(o.amount) && o.amount > 0)) continue;
+    sum += o.amount;
+  }
+  return sum;
+}
+function axisState(count, limit) {
+  const used = windowUsedFraction(count, limit);
+  return { count, limit, used, level: windowLevel(used) };
+}
+function laneQuotaState(events, lane, now) {
+  const axes = [];
+  const state = { headroom: 1 };
+  const hasWindow = typeof lane.requests_per_window === "number" && lane.requests_per_window > 0;
+  const hasWeekRequests = typeof lane.requests_per_week === "number" && lane.requests_per_week > 0;
+  const hasWeekTokens = typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
+  if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
+  const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
+  if (hasWindow) {
+    const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
+    const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
+    state.window = axisState(count, lane.requests_per_window);
+    axes.push(state.window);
+  }
+  if (hasWeekRequests) {
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week);
+    axes.push(state.weekRequests);
+  }
+  if (hasWeekTokens) {
+    const tokens = laneObservations(events, lane.id, true);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week);
+    axes.push(state.weekTokens);
+  }
+  let headroom = 1;
+  for (const a of axes) headroom = Math.min(headroom, Math.max(0, 1 - a.used));
+  state.headroom = headroom;
+  return state;
+}
+var MIN_SAMPLES = 8;
+var MIN_SPAN_FRACTION = 0.25;
+var MAX_HALF_RATE_RATIO = 3;
+var MODERATE_SPAN_FRACTION = 0.5;
+var MODERATE_HALF_RATE_RATIO = 2;
+function projectOccupancy(observations, limit, windowMs, now) {
+  if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return void 0;
+  const inWindow = observations.filter((o) => Number.isFinite(o.ts) && o.ts > now - windowMs && o.ts <= now && Number.isFinite(o.amount) && o.amount > 0).sort((a, b) => a.ts - b.ts);
+  if (inWindow.length < MIN_SAMPLES) return void 0;
+  const span = inWindow[inWindow.length - 1].ts - inWindow[0].ts;
+  const spanFraction = span / windowMs;
+  if (spanFraction < MIN_SPAN_FRACTION) return void 0;
+  const mid = now - windowMs / 2;
+  let firstHalf = 0;
+  let secondHalf = 0;
+  for (const o of inWindow) {
+    if (o.ts <= mid) firstHalf += o.amount;
+    else secondHalf += o.amount;
+  }
+  if (!(firstHalf > 0) || !(secondHalf > 0)) return void 0;
+  const ratio = Math.max(firstHalf, secondHalf) / Math.min(firstHalf, secondHalf);
+  if (ratio >= MAX_HALF_RATE_RATIO) return void 0;
+  const total = firstHalf + secondHalf;
+  const lambda = total / windowMs;
+  let occupancy = total;
+  if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
+  const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
+  let t = now;
+  let idx = 0;
+  const horizonEnd = now + windowMs;
+  while (t < horizonEnd) {
+    const nextExpiry = idx < expirations.length ? Math.min(expirations[idx].at, horizonEnd) : horizonEnd;
+    if (lambda > 0) {
+      const tCross = t + (limit - occupancy) / lambda;
+      if (tCross < nextExpiry) return { etaMs: tCross - now, confidence: confidenceOf(spanFraction, ratio) };
+    }
+    if (nextExpiry >= horizonEnd) break;
+    occupancy += lambda * (nextExpiry - t) - expirations[idx].amount;
+    t = nextExpiry;
+    idx += 1;
+  }
+  return void 0;
+}
+function confidenceOf(spanFraction, ratio) {
+  return spanFraction >= MODERATE_SPAN_FRACTION && ratio <= MODERATE_HALF_RATE_RATIO ? "moderate" : "low";
+}
+function laneDepletionForecast(events, lane, now) {
+  const axes = [
+    {
+      axis: "window",
+      limit: lane.requests_per_window,
+      windowMs: typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS,
+      weighted: false
+    },
+    { axis: "weekRequests", limit: lane.requests_per_week, windowMs: WEEK_MS, weighted: false },
+    { axis: "weekTokens", limit: lane.tokens_per_week, windowMs: WEEK_MS, weighted: true }
+  ];
+  let best;
+  let requests;
+  let tokens;
+  for (const a of axes) {
+    if (!(typeof a.limit === "number" && a.limit > 0)) continue;
+    const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
+    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
+  }
+  return best;
+}
 
 // ../mcp/src/availability.ts
 import { accessSync, constants, statSync } from "node:fs";
@@ -8820,6 +8939,22 @@ function selectManagerLane(lanes, policy, gateReady, available = null) {
 // ../mcp/src/summary.ts
 var DAY_MS = 24 * 60 * 60 * 1e3;
 var FIVE_HOUR_MS2 = 5 * 60 * 60 * 1e3;
+function fmtWindow(ms) {
+  if (ms >= 36e5) {
+    const hours = ms / 36e5;
+    const rounded = Math.round(hours * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded}h`;
+  }
+  return `${Math.max(1, Math.round(ms / 6e4))}m`;
+}
+function fmtEta(ms) {
+  const minutes = ms / 6e4;
+  if (minutes < 0.75) return "now";
+  if (minutes < 90) return `~${Math.max(1, Math.round(minutes))}m`;
+  const hours = minutes / 60;
+  if (hours < 36) return `~${Math.round(hours)}h`;
+  return `~${Math.round(hours / 24)}d`;
+}
 function buildSummaryData(input) {
   const { events, lanes, policy, availableLaneIds: availableLaneIds2, gateReady, enabled, now, core, selectManager } = input;
   const availableSet = new Set(availableLaneIds2);
@@ -8880,6 +9015,15 @@ function buildSummaryData(input) {
     const requestsIn5h = core.requestsInWindow(routedTsByLane.get(l.id) ?? [], now, windowMs);
     const limit = l.requests_per_window;
     const requestWindowLevel = limit !== void 0 ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : void 0;
+    const weekState = core.laneQuotaState?.(input.events, l, now);
+    const weekLevels = [weekState?.weekRequests?.level, weekState?.weekTokens?.level];
+    const weekLevel = weekLevels.includes("critical") ? "critical" : weekLevels.includes("warn") ? "warn" : void 0;
+    const weekDetail = weekState ? [
+      ...weekState.weekRequests ? [`7d ${weekState.weekRequests.count}/${weekState.weekRequests.limit} req`] : [],
+      ...weekState.weekTokens ? [`7d ${Math.round(weekState.weekTokens.count).toLocaleString("en-US")}/${weekState.weekTokens.limit.toLocaleString("en-US")} tok`] : []
+    ].join(" \xB7 ") : "";
+    const anyPressure = requestWindowLevel === "warn" || requestWindowLevel === "critical" || weekLevel !== void 0;
+    const forecast = core.laneDepletionForecast && anyPressure ? core.laneDepletionForecast(input.events, l, now) : void 0;
     return {
       id: l.id,
       kind: l.kind,
@@ -8890,6 +9034,8 @@ function buildSummaryData(input) {
       requestsIn5h,
       ...windowMs !== FIVE_HOUR_MS2 ? { windowHours: windowMs / 36e5 } : {},
       ...limit !== void 0 ? { requestsPerWindow: limit, requestWindowLevel } : {},
+      ...weekLevel && weekDetail ? { weekLevel, weekDetail } : {},
+      ...forecast ? forecast.confidence === "moderate" ? { forecastEtaMs: forecast.etaMs } : { forecastLow: true } : {},
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}
@@ -8950,7 +9096,7 @@ ${METERED_KEY_WARNING}` : off;
     const hidden = shown.length - visible.length;
     const width = Math.max(...visible.map((l) => vendorName(l).length));
     const laneLine = (l) => {
-      const windowLabel = l.windowHours !== void 0 ? `${l.windowHours}h` : "5h";
+      const windowLabel = l.windowHours !== void 0 ? fmtWindow(l.windowHours * 36e5) : "5h";
       const routed5h = l.requestsIn5h > 0 || l.requestsPerWindow !== void 0 ? ` \xB7 routed ${windowLabel}: ${l.requestsIn5h}` : "";
       return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` \xB7 ${l.tokensRouted.toLocaleString("en-US")} tok` : ""}${routed5h}${l.stale ? " \u26A0 stale" : ""}`;
     };
@@ -8983,10 +9129,18 @@ ${METERED_KEY_WARNING}` : off;
     (x) => x.requestsPerWindow !== void 0 && (x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
   )) {
     const tag = l.requestWindowLevel === "critical" ? "near limit" : "filling up";
-    const windowLabel = l.windowHours !== void 0 ? `${l.windowHours}h` : "5h";
+    const windowLabel = l.windowHours !== void 0 ? fmtWindow(l.windowHours * 36e5) : "5h";
+    const forecast = l.forecastEtaMs !== void 0 ? ` \u2014 est. ${fmtEta(l.forecastEtaMs)} at routed pace` : l.forecastLow ? " \u2014 approaching cap (routed)" : "";
     lines.push(
-      `   \u26A0 ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)`
+      `   \u26A0 ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} \u2014 ledger count only, not your full session)${forecast}`
     );
+  }
+  for (const l of visible.filter(
+    (x) => x.weekLevel !== void 0 && !(x.requestWindowLevel === "warn" || x.requestWindowLevel === "critical")
+  )) {
+    const tag = l.weekLevel === "critical" ? "near limit" : "filling up";
+    const forecast = l.forecastEtaMs !== void 0 ? ` \u2014 est. ${fmtEta(l.forecastEtaMs)} at routed pace` : l.forecastLow ? " \u2014 approaching cap (routed)" : "";
+    lines.push(`   \u26A0 ${vendorName(l)} routed ${l.weekDetail} (${tag} \u2014 ledger count only, not your full session)${forecast}`);
   }
   for (const l of visible.filter((l2) => l2.stale)) {
     lines.push(
@@ -9151,7 +9305,7 @@ function makeSummaryFromEnv(env) {
       gateReady,
       enabled: globallyDisabled ? false : readEnabled(store, projectKey),
       now,
-      core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel },
+      core: { summarize, tokenStats, filterEventsSince, requestsInWindow, windowUsedFraction, windowLevel, laneDepletionForecast, laneQuotaState },
       selectManager: selectManagerLane,
       staleness,
       laneReview,

@@ -169,3 +169,23 @@ test('buildStatuslineData: a native-only ledger still renders the empty state', 
   assert.equal(formatStatusline(d), 'tmax · no routed tasks yet');
 });
 
+
+// --- B3: statusline depletion eta ---------------------------------------------
+
+test('statusline: warn/critical + moderate evidence appends the routed-only eta; ok level never does', () => {
+  // Rising fixture (plan §1.4 math): 6 obs then 12 obs across a 100s window,
+  // limit 20 ⇒ occupancy 18 (critical) and a moderate-confidence eta ≈ 44.4s.
+  const l = lane({ id: 'codex-cli', requests_per_window: 20, window_ms: 100_000 });
+  const events: LedgerEvent[] = [];
+  const mk = (agoList: number[]) => {
+    for (const ago of agoList) events.push(taskEvent({ ts: new Date(NOW - ago).toISOString(), task_id: `s-${seq}` }));
+  };
+  const first = Array.from({ length: 6 }, (_, i) => 95_000 - i * 5_000);
+  const second = Array.from({ length: 12 }, (_, i) => 48_000 - i * 4_000);
+  mk(first);
+  mk(second);
+  const d = buildStatuslineData(events, [l], NOW);
+  assert.equal(d.window?.level, 'critical'); // 18/20
+  assert.ok(d.window?.etaMs !== undefined);
+  assert.match(formatStatusline(d), /2m codex-cli 18\/20 routed 🛑 → est\. now \(routed-only\)$/);
+});

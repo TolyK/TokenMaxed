@@ -227,3 +227,65 @@ test('escalation-path outcome also carries the preferred-override note (plan §1
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --- B3/B4: quota alerts + overflow plan -----------------------------------------
+
+test('quotaAlerts: warn/critical lane gets an alert with routed detail and a category-attributed overflow plan', async () => {
+  const { dir, env } = setupDir([taskEvent(), taskEvent()]); // strong at 2/2 ⇒ critical
+  try {
+    const deps = makeServerDeps(env);
+    const alerts = await deps.quotaAlerts!();
+    assert.equal(alerts.length, 1);
+    // Detail + overflow: bugfix (strong's only routed category) re-routes to cheap.
+    assert.match(alerts[0]!, /^⚠ strong: 5h 2\/2 routed · overflow: bugfix → cheap$/);
+    // router_status renders the alert under the honesty header.
+    const st = await dispatch(TOOLS, deps, 'router_status', {});
+    assert.match(st.content[0]!.text, /Quota \(routed share only — not your total subscription usage\):/);
+    assert.match(st.content[0]!.text, /⚠ strong: 5h 2\/2 routed/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('quotaAlerts: no capped lane ⇒ no alerts, and status stays silent', async () => {
+  const { dir, env } = setupDir([taskEvent()]); // 1/2 ⇒ ok
+  try {
+    const deps = makeServerDeps(env);
+    assert.deepEqual(await deps.quotaAlerts!(), []);
+    const st = await dispatch(TOOLS, deps, 'router_status', {});
+    assert.doesNotMatch(st.content[0]!.text, /Quota \(routed share/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('quotaAlerts: with no alternative lane the overflow honestly says none (host)', async () => {
+  const soleYaml = LANES_YAML.replace(/ {2}- id: cheap[\s\S]*$/m, '');
+  const { dir, env } = setupDir([taskEvent(), taskEvent()], soleYaml);
+  try {
+    const alerts = await makeServerDeps(env).quotaAlerts!();
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0]!, /overflow: bugfix → none \(host\)$/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('quotaAlerts: a historically-routed category the lane can no longer serve is EXCLUDED from overflow', async () => {
+  // strong opted OUT of docs (capability 0) but the ledger carries old docs
+  // history; the overflow plan must not advertise docs (plan: "its categories"
+  // = currently eligible with positive effective capability).
+  const optOutYaml = LANES_YAML.replace('      bugfix: 0.85', '      bugfix: 0.85\n      docs: 0');
+  const { dir, env } = setupDir(
+    [taskEvent({ category: 'docs' }), taskEvent({ category: 'docs' })], // 2/2 window ⇒ critical
+    optOutYaml,
+  );
+  try {
+    const alerts = await makeServerDeps(env).quotaAlerts!();
+    assert.equal(alerts.length, 1);
+    assert.doesNotMatch(alerts[0]!, /docs/);
+    assert.doesNotMatch(alerts[0]!, /overflow/); // no eligible categories remain
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

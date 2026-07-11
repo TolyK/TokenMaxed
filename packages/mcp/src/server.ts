@@ -36,7 +36,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -53,7 +53,7 @@ import {
 } from '@tokenmaxed/core/node';
 
 import { makeAvailabilityProbe } from './availability.ts';
-import { loadCapabilityPriorState } from './capability-prior-load.ts';
+import { loadCapabilityPriorState, loadCapabilitySnapshotState, priorStateFromSnapshot } from './capability-prior-load.ts';
 import { effectiveEnv, settingsReport, writeSetting } from './settings.ts';
 import { reportFreshness, reportModelIdMismatches } from './freshness-report.ts';
 import { readRepoFiles } from './read-files.ts';
@@ -62,6 +62,7 @@ import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { REVIEW_BUDGET_MS, makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
+import { fmtEta, fmtWindow } from './summary.ts';
 import { runReviewWithBudget } from './review-budget.ts';
 import { runSetup } from './setup.ts';
 import { createTools, dispatch } from './tools.ts';
@@ -286,7 +287,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       const parts: string[] = [];
       // Honest labeling: say the CONFIGURED window, not "5h", when overridden.
       const windowMs = typeof lane.window_ms === 'number' && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
-      const windowLabel = windowMs === FIVE_HOUR_MS ? '5h' : `${windowMs / 3_600_000}h`;
+      const windowLabel = windowMs === FIVE_HOUR_MS ? '5h' : fmtWindow(windowMs);
       if (s.window) parts.push(`${windowLabel} ${s.window.count}/${s.window.limit} routed`);
       if (s.weekRequests) parts.push(`7d ${s.weekRequests.count}/${s.weekRequests.limit} req routed`);
       if (s.weekTokens) parts.push(`7d ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok routed`);
@@ -383,6 +384,127 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // Drop any STILL-unresolved alias (no priced family member) regardless of cost
       // basis, so a literal "@latest" can never reach execution; then priceability.
       .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
+  };
+
+  // B3/B4 — quota alerts with an overflow plan (plan §1.5 context contract):
+  // one line per warn/critical lane: routed-share detail, an omit-first
+  // projection, and the per-category overflow winners computed by re-running
+  // routeDecide with the capped lane EXCLUDED under the EXACT preview posture
+  // (same policy/gates/overlays/prior/tiered/headroom; preference dropped only
+  // when it names the excluded lane; ONE availability probe reused across
+  // categories). Pure preview — nothing executes. Fail-open to [].
+  const buildQuotaAlerts = async (): Promise<string[]> => {
+    try {
+      if (!existsSync(lanesPath)) return [];
+      const registry = loadLaneConfig(lanesPath);
+      const events = new JsonlLedger(ledgerPath).readAll();
+      const now = Date.now();
+      const policy = loadPolicySafe();
+      const preferred = readPreferredLane();
+      const alerts: string[] = [];
+      for (const cappedLane of registry.lanes) {
+        const state = laneQuotaState(events, cappedLane, now);
+        const levels = [state.window?.level, state.weekRequests?.level, state.weekTokens?.level];
+        if (!levels.some((l) => l === 'warn' || l === 'critical')) continue;
+        const detail = quotaDetailFor(cappedLane) ?? 'near cap';
+        const forecast = laneDepletionForecast(events, cappedLane, now);
+        const forecastText = forecast
+          ? forecast.confidence === 'moderate'
+            ? ` — est. ${fmtEta(forecast.etaMs)} at routed pace`
+            : ' — approaching cap (routed)'
+          : '';
+        // ONE posture snapshot shared by eligibility, the availability probe, and
+        // every routeDecide (plan §1.5 contract — the probe and the winners must
+        // never be computed under different postures).
+        const snapshot = {
+          yolo: readYoloState(),
+          observedByModel: buildObservedByModel(),
+          observedByModelDifficulty: buildObservedByModelDifficulty(),
+          priceTable: loadPriceTable(pricesPath),
+          // The prior snapshot FILE is read once; per-set overlays derive purely.
+          prior: loadCapabilitySnapshotState(env),
+        };
+        const ctxFor = (candidates: Lane[]): RouteContext => ({
+          lanes: candidates,
+          gateReady,
+          readerEgress,
+          policyContext: {},
+          access_need: 'worker-ok',
+          ...(snapshot.yolo ? { yolo: true } : {}),
+          ...(snapshot.observedByModel ? { observedCapabilityByModel: snapshot.observedByModel } : {}),
+          ...(snapshot.observedByModelDifficulty ? { observedCapabilityByModelDifficulty: snapshot.observedByModelDifficulty } : {}),
+          ...((): Partial<RouteContext> => {
+            const p = priorStateFromSnapshot(snapshot.prior, candidates); // pure over the captured snapshot
+            return p.state === 'on' ? { capabilityPrior: p.overlay, ...(p.stale ? { capabilityPriorStale: true } : {}) } : {};
+          })(),
+          ...((): Partial<RouteContext> => {
+            const m = quotaHeadroomMap(events, candidates, now); // same events snapshot
+            return Object.keys(m).length > 0 ? { capHeadroom: m } : {};
+          })(),
+          ...(tieredStrategy === 'tiered'
+            ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(candidates, snapshot.priceTable) }
+            : {}),
+          ...(preferred && preferred !== cappedLane.id ? { preferLaneId: preferred } : {}),
+        });
+        // Top routed categories for THIS lane (ledger counts; deterministic
+        // tiebreak), then FILTERED to categories where the capped lane is
+        // CURRENTLY eligible under the same posture (plan: "its categories" =
+        // eligible with positive effective capability NOW — candidateLanes
+        // already excludes declared-0, and no overlay can resurrect a 0).
+        const catCounts = new Map<TaskCategory, number>();
+        for (const e of events) {
+          if (e.event_type === 'task' && e.laneId === cappedLane.id && e.status !== 'native') {
+            catCounts.set(e.category, (catCounts.get(e.category) ?? 0) + 1);
+          }
+        }
+        const topCats = [...catCounts.entries()]
+          .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+          .map(([c]) => c)
+          .filter((category) => {
+            // The REAL preview posture, including the escalation reviewer
+            // reservation — a lane reserved as the review manager is not an
+            // initial-routing candidate, so it acquires no overflow categories.
+            let full = usableCandidates(category);
+            if (escalateEnabled) full = full.filter((l) => !reservedForReview(l));
+            return (
+              full.some((l) => l.id === cappedLane.id) &&
+              eligibleLanes({ category }, ctxFor(full), policy).some((e) => e.lane.id === cappedLane.id)
+            );
+          })
+          .slice(0, 4);
+        let overflowText = '';
+        if (topCats.length > 0) {
+          // Build each reduced per-category context ONCE and reuse it for both
+          // the eligibility union and the final decide (contract).
+          const perCat = topCats.map((category) => {
+            let candidates = usableCandidates(category).filter((l) => l.id !== cappedLane.id);
+            if (escalateEnabled) candidates = candidates.filter((l) => !reservedForReview(l));
+            return { category, ctx: ctxFor(candidates) };
+          });
+          // ONE availability probe over the union of eligible lanes (contract).
+          const eligibleUnion = new Map<string, Lane>();
+          for (const { category, ctx } of perCat) {
+            for (const e of eligibleLanes({ category }, ctx, policy)) eligibleUnion.set(e.lane.id, e.lane);
+          }
+          const available = await probeAvailable([...eligibleUnion.values()]);
+          const winnerByCat = new Map<string, TaskCategory[]>();
+          for (const { category, ctx } of perCat) {
+            let winner: string;
+            try {
+              winner = routeDecide({ category }, { ...ctx, availableLaneIds: available }, policy).laneId;
+            } catch {
+              winner = 'none (host)';
+            }
+            (winnerByCat.get(winner) ?? winnerByCat.set(winner, []).get(winner)!).push(category);
+          }
+          overflowText = ` · overflow: ${[...winnerByCat.entries()].map(([w, cats]) => `${cats.join('/')} → ${w}`).join(', ')}`;
+        }
+        alerts.push(`⚠ ${cappedLane.id}: ${detail}${forecastText}${overflowText}`);
+      }
+      return alerts;
+    } catch {
+      return []; // fail open — alerts are advisory, never load-bearing
+    }
   };
 
   const delegate = async (request: DelegateRequest): Promise<DelegateOutcome> => {
@@ -639,6 +761,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // so /tokenmaxed:why shows the identical quota pressure (parity law).
     capHeadroom: buildCapHeadroom,
     quotaDetail: quotaDetailFor,
+    // B3/B4: warn/critical alerts + omit-first projection + the overflow plan,
+    // rendered by router_status and appended to router_summary.
+    quotaAlerts: buildQuotaAlerts,
     // A4: persistent settings (env always wins). NOTE the flag consts above were
     // captured from the wrapped env at server start, so a /config edit reaches
     // ROUTING at the next session; hooks/statusline read settings on every run.

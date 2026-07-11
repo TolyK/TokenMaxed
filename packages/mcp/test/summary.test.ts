@@ -8,6 +8,7 @@ import { test } from 'node:test';
 
 import {
   filterEventsSince,
+  laneQuotaState,
   requestsInWindow,
   summarize,
   tokenStats,
@@ -396,4 +397,43 @@ test('clampBanner keeps the FULL metered warning intact under a tight maxChars b
   const out = clampBanner(banner, { maxLines: 999, maxChars: banner.length - 20 });
   assert.ok(out.includes(METERED_KEY_WARNING), 'warning line must survive ellipsize intact');
   assert.doesNotMatch(out, new RegExp(`${METERED_KEY_WARNING.slice(0, -1)}…`)); // not ellipsized
+});
+
+test('B3: warn-line forecast rendering — moderate shows a relative time, low shows a timeless notice', () => {
+  const base = {
+    lanes: [lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', requests_per_window: 1 })],
+    availableLaneIds: ['codex-cli'],
+  };
+  const moderate = build({
+    ...base,
+    core: { ...core, laneDepletionForecast: () => ({ etaMs: 2 * 86_400_000, confidence: 'moderate' as const }) },
+  });
+  assert.match(formatSummaryBanner(moderate), /near limit — ledger count only, not your full session\) — est\. ~2d at routed pace/);
+  const low = build({
+    ...base,
+    core: { ...core, laneDepletionForecast: () => ({ etaMs: 60_000, confidence: 'low' as const }) },
+  });
+  const banner = formatSummaryBanner(low);
+  assert.match(banner, /— approaching cap \(routed\)/);
+  assert.doesNotMatch(banner, /est\. ~/); // low NEVER renders a time
+});
+
+test('B3: weekly-only caps alert and forecast too; eta 0 renders "now" (never "~1m")', () => {
+  const weeklyLane = lane({ id: 'codex-cli', provenance: 'openai', command: 'codex', tokens_per_week: 200 });
+  const d = build({
+    lanes: [weeklyLane],
+    availableLaneIds: ['codex-cli'],
+    core: {
+      ...core,
+      laneQuotaState: (evts, l, n) => laneQuotaState(evts, l, n),
+      laneDepletionForecast: () => ({ etaMs: 0, confidence: 'moderate' as const }),
+    },
+  });
+  // 150 of 200 weekly tokens used (the 1h-ago event) ⇒ warn on the weekly axis only.
+  const row = d.lanes.find((l) => l.id === 'codex-cli')!;
+  assert.equal(row.weekLevel, 'warn');
+  assert.equal(row.forecastEtaMs, 0);
+  const banner = formatSummaryBanner(d);
+  assert.match(banner, /routed 7d 150\/200 tok \(filling up — ledger count only, not your full session\) — est\. now at routed pace/);
+  assert.doesNotMatch(banner, /~1m/);
 });

@@ -20,12 +20,13 @@
 
 import { existsSync } from 'node:fs';
 
-import { FIVE_HOUR_MS, filterEventsSince, requestsInWindow, summarize, windowLevel, windowUsedFraction } from '@tokenmaxed/core';
+import { FIVE_HOUR_MS, filterEventsSince, laneDepletionForecast, requestsInWindow, summarize, windowLevel, windowUsedFraction } from '@tokenmaxed/core';
 import type { Lane, LedgerEvent, WindowLevel } from '@tokenmaxed/core';
 import { JsonlLedger, loadLaneConfig } from '@tokenmaxed/core/node';
 
 import { homeFile } from './config.ts';
 import { effectiveEnv } from './settings.ts';
+import { fmtEta, fmtWindow } from './summary.ts';
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -34,7 +35,15 @@ export interface StatuslineData {
   /** Estimated metered $ avoided over the trailing 7 days. */
   avoided7dUsd: number;
   /** The tightest configured rolling window (highest used fraction), if any lane declares one. */
-  window?: { laneId: string; count: number; limit: number; level: WindowLevel; windowHours?: number };
+  window?: {
+    laneId: string;
+    count: number;
+    limit: number;
+    level: WindowLevel;
+    windowHours?: number;
+    /** B3: projected ms to depletion at routed pace — set ONLY at warn/critical + moderate confidence. */
+    etaMs?: number;
+  };
   /** True when the ledger has no task events yet. */
   empty: boolean;
 }
@@ -56,6 +65,7 @@ export function buildStatuslineData(events: readonly LedgerEvent[], lanes: reado
   }
 
   let window: StatuslineData['window'];
+  let worstLane: Lane | undefined;
   let worstFraction = -1;
   for (const lane of lanes) {
     const limit = lane.requests_per_window;
@@ -66,6 +76,7 @@ export function buildStatuslineData(events: readonly LedgerEvent[], lanes: reado
     const fraction = windowUsedFraction(count, limit);
     if (fraction > worstFraction) {
       worstFraction = fraction;
+      worstLane = lane;
       window = {
         laneId: lane.id,
         count,
@@ -74,6 +85,12 @@ export function buildStatuslineData(events: readonly LedgerEvent[], lanes: reado
         ...(windowMs !== FIVE_HOUR_MS ? { windowHours: windowMs / 3_600_000 } : {}),
       };
     }
+  }
+  // B3: a time renders ONLY at warn/critical + moderate confidence (plan §1.4);
+  // low-confidence projections stay silent here — the ⚠/🛑 marker already warns.
+  if (window && worstLane && (window.level === 'warn' || window.level === 'critical')) {
+    const forecast = laneDepletionForecast(events, worstLane, now);
+    if (forecast?.confidence === 'moderate') window.etaMs = forecast.etaMs;
   }
 
   return { avoided7dUsd: summary.savings.metered_avoided, ...(window ? { window } : {}), empty };
@@ -85,8 +102,9 @@ export function formatStatusline(d: StatuslineData): string {
   const parts = [`tmax · est. $${d.avoided7dUsd.toFixed(2)} metered avoided (7d)`];
   if (d.window) {
     const marker = d.window.level === 'critical' ? ' 🛑' : d.window.level === 'warn' ? ' ⚠' : '';
-    const label = d.window.windowHours !== undefined ? `${d.window.windowHours}h` : '5h';
-    parts.push(`${label} ${d.window.laneId} ${d.window.count}/${d.window.limit} routed${marker}`);
+    const label = d.window.windowHours !== undefined ? fmtWindow(d.window.windowHours * 3_600_000) : '5h';
+    const eta = d.window.etaMs !== undefined ? ` → est. ${fmtEta(d.window.etaMs)} (routed-only)` : '';
+    parts.push(`${label} ${d.window.laneId} ${d.window.count}/${d.window.limit} routed${marker}${eta}`);
   }
   return parts.join(' · ');
 }

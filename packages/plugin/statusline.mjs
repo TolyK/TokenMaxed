@@ -7449,6 +7449,84 @@ function windowLevel(usedFraction) {
 
 // ../core/src/quota.ts
 var WEEK_MS = 7 * 24 * 60 * 60 * 1e3;
+function laneObservations(events, laneId, weightTokens) {
+  const out = [];
+  for (const e of events) {
+    if (e.event_type !== "task" || e.laneId !== laneId || e.status === "native") continue;
+    const ts = Date.parse(e.ts);
+    if (!Number.isFinite(ts)) continue;
+    out.push({ ts, amount: weightTokens ? e.tokens_in + e.tokens_out : 1 });
+  }
+  return out;
+}
+var MIN_SAMPLES = 8;
+var MIN_SPAN_FRACTION = 0.25;
+var MAX_HALF_RATE_RATIO = 3;
+var MODERATE_SPAN_FRACTION = 0.5;
+var MODERATE_HALF_RATE_RATIO = 2;
+function projectOccupancy(observations, limit, windowMs, now) {
+  if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return void 0;
+  const inWindow = observations.filter((o) => Number.isFinite(o.ts) && o.ts > now - windowMs && o.ts <= now && Number.isFinite(o.amount) && o.amount > 0).sort((a, b) => a.ts - b.ts);
+  if (inWindow.length < MIN_SAMPLES) return void 0;
+  const span = inWindow[inWindow.length - 1].ts - inWindow[0].ts;
+  const spanFraction = span / windowMs;
+  if (spanFraction < MIN_SPAN_FRACTION) return void 0;
+  const mid = now - windowMs / 2;
+  let firstHalf = 0;
+  let secondHalf = 0;
+  for (const o of inWindow) {
+    if (o.ts <= mid) firstHalf += o.amount;
+    else secondHalf += o.amount;
+  }
+  if (!(firstHalf > 0) || !(secondHalf > 0)) return void 0;
+  const ratio = Math.max(firstHalf, secondHalf) / Math.min(firstHalf, secondHalf);
+  if (ratio >= MAX_HALF_RATE_RATIO) return void 0;
+  const total = firstHalf + secondHalf;
+  const lambda = total / windowMs;
+  let occupancy = total;
+  if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
+  const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
+  let t = now;
+  let idx = 0;
+  const horizonEnd = now + windowMs;
+  while (t < horizonEnd) {
+    const nextExpiry = idx < expirations.length ? Math.min(expirations[idx].at, horizonEnd) : horizonEnd;
+    if (lambda > 0) {
+      const tCross = t + (limit - occupancy) / lambda;
+      if (tCross < nextExpiry) return { etaMs: tCross - now, confidence: confidenceOf(spanFraction, ratio) };
+    }
+    if (nextExpiry >= horizonEnd) break;
+    occupancy += lambda * (nextExpiry - t) - expirations[idx].amount;
+    t = nextExpiry;
+    idx += 1;
+  }
+  return void 0;
+}
+function confidenceOf(spanFraction, ratio) {
+  return spanFraction >= MODERATE_SPAN_FRACTION && ratio <= MODERATE_HALF_RATE_RATIO ? "moderate" : "low";
+}
+function laneDepletionForecast(events, lane, now) {
+  const axes = [
+    {
+      axis: "window",
+      limit: lane.requests_per_window,
+      windowMs: typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS,
+      weighted: false
+    },
+    { axis: "weekRequests", limit: lane.requests_per_week, windowMs: WEEK_MS, weighted: false },
+    { axis: "weekTokens", limit: lane.tokens_per_week, windowMs: WEEK_MS, weighted: true }
+  ];
+  let best;
+  let requests;
+  let tokens;
+  for (const a of axes) {
+    if (!(typeof a.limit === "number" && a.limit > 0)) continue;
+    const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
+    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
+  }
+  return best;
+}
 
 // ../core/src/registry.ts
 var import_yaml2 = __toESM(require_dist(), 1);
@@ -8148,6 +8226,26 @@ function effectiveEnv(env) {
   return out;
 }
 
+// ../mcp/src/summary.ts
+var DAY_MS = 24 * 60 * 60 * 1e3;
+var FIVE_HOUR_MS2 = 5 * 60 * 60 * 1e3;
+function fmtWindow(ms) {
+  if (ms >= 36e5) {
+    const hours = ms / 36e5;
+    const rounded = Math.round(hours * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded}h`;
+  }
+  return `${Math.max(1, Math.round(ms / 6e4))}m`;
+}
+function fmtEta(ms) {
+  const minutes = ms / 6e4;
+  if (minutes < 0.75) return "now";
+  if (minutes < 90) return `~${Math.max(1, Math.round(minutes))}m`;
+  const hours = minutes / 60;
+  if (hours < 36) return `~${Math.round(hours)}h`;
+  return `~${Math.round(hours / 24)}d`;
+}
+
 // ../mcp/src/statusline.ts
 var SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1e3;
 function buildStatuslineData(events, lanes, now) {
@@ -8161,6 +8259,7 @@ function buildStatuslineData(events, lanes, now) {
     (tsByLane.get(e.laneId) ?? tsByLane.set(e.laneId, []).get(e.laneId)).push(ts);
   }
   let window;
+  let worstLane;
   let worstFraction = -1;
   for (const lane of lanes) {
     const limit = lane.requests_per_window;
@@ -8170,6 +8269,7 @@ function buildStatuslineData(events, lanes, now) {
     const fraction = windowUsedFraction(count, limit);
     if (fraction > worstFraction) {
       worstFraction = fraction;
+      worstLane = lane;
       window = {
         laneId: lane.id,
         count,
@@ -8179,6 +8279,10 @@ function buildStatuslineData(events, lanes, now) {
       };
     }
   }
+  if (window && worstLane && (window.level === "warn" || window.level === "critical")) {
+    const forecast = laneDepletionForecast(events, worstLane, now);
+    if (forecast?.confidence === "moderate") window.etaMs = forecast.etaMs;
+  }
   return { avoided7dUsd: summary.savings.metered_avoided, ...window ? { window } : {}, empty };
 }
 function formatStatusline(d) {
@@ -8186,8 +8290,9 @@ function formatStatusline(d) {
   const parts = [`tmax \xB7 est. $${d.avoided7dUsd.toFixed(2)} metered avoided (7d)`];
   if (d.window) {
     const marker = d.window.level === "critical" ? " \u{1F6D1}" : d.window.level === "warn" ? " \u26A0" : "";
-    const label = d.window.windowHours !== void 0 ? `${d.window.windowHours}h` : "5h";
-    parts.push(`${label} ${d.window.laneId} ${d.window.count}/${d.window.limit} routed${marker}`);
+    const label = d.window.windowHours !== void 0 ? fmtWindow(d.window.windowHours * 36e5) : "5h";
+    const eta = d.window.etaMs !== void 0 ? ` \u2192 est. ${fmtEta(d.window.etaMs)} (routed-only)` : "";
+    parts.push(`${label} ${d.window.laneId} ${d.window.count}/${d.window.limit} routed${marker}${eta}`);
   }
   return parts.join(" \xB7 ");
 }

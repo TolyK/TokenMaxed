@@ -19,6 +19,27 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 /** Mirrors {@link FIVE_HOUR_MS} in core — kept local so this module stays runtime-core-free. */
 const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
 
+/** B: humanize a window length for labels ("5h", "2h", "90m"). */
+export function fmtWindow(ms: number): string {
+  if (ms >= 3_600_000) {
+    const hours = ms / 3_600_000;
+    const rounded = Math.round(hours * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded}h`;
+  }
+  return `${Math.max(1, Math.round(ms / 60_000))}m`;
+}
+
+/** B3: humanize a projected duration — relative, coarse, never a calendar time. */
+export function fmtEta(ms: number): string {
+  const minutes = ms / 60_000;
+  // Already at/over the cap: say so honestly rather than "~1m away".
+  if (minutes < 0.75) return 'now';
+  if (minutes < 90) return `~${Math.max(1, Math.round(minutes))}m`;
+  const hours = minutes / 60;
+  if (hours < 36) return `~${Math.round(hours)}h`;
+  return `~${Math.round(hours / 24)}d`;
+}
+
 /** Core aggregate functions, injected so this module needs no runtime core import. */
 export interface SummaryCorePort {
   summarize: (events: readonly LedgerEvent[]) => LedgerSummary;
@@ -28,6 +49,28 @@ export interface SummaryCorePort {
   requestsInWindow: (timestampsMs: readonly number[], now: number, windowMs?: number) => number;
   windowUsedFraction: (count: number, limit: number) => number;
   windowLevel: (usedFraction: number) => WindowLevel;
+  /**
+   * B3: earliest projected depletion across a lane's configured quota axes
+   * (routed-share only; omit-first evidence gates). Optional — absent ⇒ no
+   * forecasts anywhere in the summary.
+   */
+  laneDepletionForecast?: (
+    events: readonly LedgerEvent[],
+    lane: Lane,
+    now: number,
+  ) => { etaMs: number; confidence: 'low' | 'moderate' } | undefined;
+  /**
+   * B: full quota state (all axes) so weekly-only caps also gate forecasts and
+   * render alerts. Optional — absent ⇒ window-axis behavior only.
+   */
+  laneQuotaState?: (
+    events: readonly LedgerEvent[],
+    lane: Lane,
+    now: number,
+  ) => {
+    weekRequests?: { count: number; limit: number; level: WindowLevel };
+    weekTokens?: { count: number; limit: number; level: WindowLevel };
+  };
 }
 
 /** Everything the builder needs; all I/O is resolved by the caller. */
@@ -99,6 +142,14 @@ export interface LaneSummary {
   requestsIn5h: number;
   /** B: hours of a non-default window (lane window_ms override); absent ⇒ the 5h default. */
   windowHours?: number;
+  /** B3: projected ms until a quota axis depletes at the current ROUTED pace (moderate confidence only). */
+  forecastEtaMs?: number;
+  /** B3: true ⇒ a projection exists but only at low confidence (render no time). */
+  forecastLow?: boolean;
+  /** B: worst weekly-axis level, when a weekly cap is configured and warn/critical. */
+  weekLevel?: 'warn' | 'critical';
+  /** B: compact weekly-axis detail ("7d 8/10 req · 7d 10,500/15,000 tok"). */
+  weekDetail?: string;
   /** Configured per-5h request limit, when set on the lane. */
   requestsPerWindow?: number;
   /** Quota level vs {@link requestsPerWindow}, when configured. */
@@ -202,6 +253,24 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
     const limit = l.requests_per_window;
     const requestWindowLevel =
       limit !== undefined ? core.windowLevel(core.windowUsedFraction(requestsIn5h, limit)) : undefined;
+    // B: weekly axes (requests_per_week / tokens_per_week) so weekly-only caps
+    // alert and gate forecasts too — not just the rolling window.
+    const weekState = core.laneQuotaState?.(input.events, l, now);
+    const weekLevels = [weekState?.weekRequests?.level, weekState?.weekTokens?.level];
+    const weekLevel = weekLevels.includes('critical') ? 'critical' : weekLevels.includes('warn') ? 'warn' : undefined;
+    const weekDetail = weekState
+      ? [
+          ...(weekState.weekRequests ? [`7d ${weekState.weekRequests.count}/${weekState.weekRequests.limit} req`] : []),
+          ...(weekState.weekTokens
+            ? [`7d ${Math.round(weekState.weekTokens.count).toLocaleString('en-US')}/${weekState.weekTokens.limit.toLocaleString('en-US')} tok`]
+            : []),
+        ].join(' · ')
+      : '';
+    // B3: project depletion ONLY for lanes at warn/critical on ANY configured
+    // axis (the quiet majority get no forecast churn).
+    const anyPressure =
+      requestWindowLevel === 'warn' || requestWindowLevel === 'critical' || weekLevel !== undefined;
+    const forecast = core.laneDepletionForecast && anyPressure ? core.laneDepletionForecast(input.events, l, now) : undefined;
     return {
       id: l.id,
       kind: l.kind,
@@ -212,6 +281,8 @@ export function buildSummaryData(input: SummaryInput): SummaryData {
       requestsIn5h,
       ...(windowMs !== FIVE_HOUR_MS ? { windowHours: windowMs / 3_600_000 } : {}),
       ...(limit !== undefined ? { requestsPerWindow: limit, requestWindowLevel } : {}),
+      ...(weekLevel && weekDetail ? { weekLevel, weekDetail } : {}),
+      ...(forecast ? (forecast.confidence === 'moderate' ? { forecastEtaMs: forecast.etaMs } : { forecastLow: true }) : {}),
       isActiveReviewer: !!reviewer && l.id === reviewer.id,
       available: !!l.native || availableSet.has(l.id),
       ...(s ? { stale: { newest: s.newest, newestPriced: s.newestPriced } } : {}),
@@ -293,7 +364,7 @@ export function formatSummaryBanner(data: SummaryData): string {
     // Per-lane counts are often small, so show the EXACT count (grouped) rather than
     // tok()'s thousands-rounding, which would render e.g. 150 tokens as a misleading "0k".
     const laneLine = (l: LaneSummary): string => {
-      const windowLabel = l.windowHours !== undefined ? `${l.windowHours}h` : '5h';
+      const windowLabel = l.windowHours !== undefined ? fmtWindow(l.windowHours * 3_600_000) : '5h';
       const routed5h =
         l.requestsIn5h > 0 || l.requestsPerWindow !== undefined ? ` · routed ${windowLabel}: ${l.requestsIn5h}` : '';
       return `     ${vendorName(l).padEnd(width)}  ${l.model}${l.tokensRouted > 0 ? ` · ${l.tokensRouted.toLocaleString('en-US')} tok` : ''}${routed5h}${l.stale ? ' ⚠ stale' : ''}`;
@@ -330,10 +401,34 @@ export function formatSummaryBanner(data: SummaryData): string {
     (x) => x.requestsPerWindow !== undefined && (x.requestWindowLevel === 'warn' || x.requestWindowLevel === 'critical'),
   )) {
     const tag = l.requestWindowLevel === 'critical' ? 'near limit' : 'filling up';
-    const windowLabel = l.windowHours !== undefined ? `${l.windowHours}h` : '5h';
+    const windowLabel = l.windowHours !== undefined ? fmtWindow(l.windowHours * 3_600_000) : '5h';
+    // B3: confidence controls WHETHER and HOW time renders — moderate ⇒ a
+    // relative duration; low ⇒ a timeless notice; neither ⇒ nothing extra.
+    const forecast =
+      l.forecastEtaMs !== undefined
+        ? ` — est. ${fmtEta(l.forecastEtaMs)} at routed pace`
+        : l.forecastLow
+          ? ' — approaching cap (routed)'
+          : '';
     lines.push(
-      `   ⚠ ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} — ledger count only, not your full session)`,
+      `   ⚠ ${vendorName(l)} routed ${windowLabel}: ${l.requestsIn5h}/${l.requestsPerWindow} (${tag} — ledger count only, not your full session)${forecast}`,
     );
+  }
+  // B: weekly-only quota alerts — lanes whose WEEKLY axes are warn/critical while
+  // the rolling window (if any) is not; the window loop above already carries the
+  // forecast when both are hot, so these never double-render.
+  for (const l of visible.filter(
+    (x) =>
+      x.weekLevel !== undefined && !(x.requestWindowLevel === 'warn' || x.requestWindowLevel === 'critical'),
+  )) {
+    const tag = l.weekLevel === 'critical' ? 'near limit' : 'filling up';
+    const forecast =
+      l.forecastEtaMs !== undefined
+        ? ` — est. ${fmtEta(l.forecastEtaMs)} at routed pace`
+        : l.forecastLow
+          ? ' — approaching cap (routed)'
+          : '';
+    lines.push(`   ⚠ ${vendorName(l)} routed ${l.weekDetail} (${tag} — ledger count only, not your full session)${forecast}`);
   }
   // Spell out stale models, but only for the VISIBLE (capped) lanes — so the spell-out
   // count is bounded by MAX_LANES, never the full set. Offline/blocked lanes are
