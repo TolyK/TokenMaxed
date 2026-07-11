@@ -30,13 +30,15 @@
  * deliberately lists `opencode`.
  */
 
-import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { PRETOOLUSE_DENY_REASON, preToolUseDecision } from './hook.ts';
-import { REVIEW_BUDGET_MS } from './host-review.ts';
-import type { OpencodeReviewAction } from './opencode-review-main.ts';
+import { fileLoopCounter, spawnReviewChild } from './review-child.ts';
+import type { LoopCounterStore } from './review-child.ts';
+import type { ReviewChildAction } from './review-child-main.ts';
 import { reviewLoopEnabled } from './reviewer.ts';
 import { homeFile } from './config.ts';
 import { effectiveEnv } from './settings.ts';
@@ -102,6 +104,27 @@ export function opencodePluginEnv(processEnv: NodeJS.ProcessEnv, directory: stri
 }
 
 /**
+ * IN-PROCESS banner budget: the summary reads the WHOLE ledger synchronously
+ * (JsonlLedger.readAll), which is fine in a hook subprocess but blocks the
+ * host's shared event loop when a plugin runs in-process (OpenCode/OpenClaw).
+ * Skip the banner once the ledger outgrows this budget — routing/receipts are
+ * unaffected; only the courtesy banner degrades (and says nothing, honestly,
+ * rather than lagging every first prompt).
+ */
+export const BANNER_LEDGER_MAX_BYTES = 5 * 1024 * 1024;
+
+/** True when the ledger is small enough to summarize on the host's event loop. */
+export function bannerWithinBudget(env: NodeJS.ProcessEnv): boolean {
+  try {
+    const path = env.TOKENMAXED_LEDGER ?? join(homedir(), '.tokenmaxed', 'ledger.jsonl');
+    if (!existsSync(path)) return true; // no ledger ⇒ trivial summary
+    return statSync(path).size <= BANNER_LEDGER_MAX_BYTES;
+  } catch {
+    return true; // fail open — the summary itself fails soft on a bad ledger
+  }
+}
+
+/**
  * The same deterministic gate the Claude/Codex PreToolUse hooks apply, as a
  * throwable reason: null ⇒ allow; string ⇒ deny with that reason (OpenCode
  * blocks a tool call by THROWING from tool.execute.before). Fail OPEN like the
@@ -138,10 +161,14 @@ export interface IdleReviewDeps {
   env: () => NodeJS.ProcessEnv;
   /**
    * Run the review for a session and return the terminal action. The real impl
-   * spawns the bundled tokenmaxed-review.mjs child (counter machinery lives
-   * there); throws ⇒ the review could not RUN (surfaced, never silent).
+   * spawns the bundled tokenmaxed-review.mjs child — a PURE computation: the
+   * parent owns the loop counter and passes the prior round count in via
+   * env.TOKENMAXED_REVIEW_PRIOR_BLOCKS. Throws ⇒ the review could not RUN
+   * (surfaced, never silent).
    */
-  runReview: (sessionID: string, env: NodeJS.ProcessEnv) => Promise<OpencodeReviewAction>;
+  runReview: (sessionID: string, env: NodeJS.ProcessEnv) => Promise<ReviewChildAction>;
+  /** The per-session loop counter (parent-owned). Defaults to the tmp-file store. */
+  counter?: LoopCounterStore;
   /** Send a rework prompt back into the session; absent ⇒ this host client can't. */
   promptBack?: (sessionID: string, text: string) => Promise<unknown>;
   /** Best-effort user-visible notice (toast). Must never throw. */
@@ -156,29 +183,45 @@ export interface IdleReviewDeps {
  */
 export function makeIdleReviewHandler(deps: IdleReviewDeps): (sessionID: string) => Promise<void> {
   const reviewing = new Set<string>();
+  const counter = deps.counter ?? fileLoopCounter;
   return async (sessionID: string): Promise<void> => {
     if (reviewing.has(sessionID)) return;
     const env = deps.env();
     if (!reviewLoopEnabled(env)) return;
     reviewing.add(sessionID);
     try {
-      let action: OpencodeReviewAction;
+      // The PARENT owns the loop counter: the prior count rides into the pure
+      // child via env, and rounds are banked HERE, only at the moment we act —
+      // a killed/abandoned child can never bank a phantom round.
+      const priorBlocks = counter.read(sessionID);
+      let action: ReviewChildAction;
       try {
-        action = await deps.runReview(sessionID, env);
+        action = await deps.runReview(sessionID, { ...env, TOKENMAXED_REVIEW_PRIOR_BLOCKS: String(priorBlocks) });
       } catch (e) {
         // The review could not RUN (child missing/crashed) — surface it rather
         // than silently skipping the protection (Protection C analogue).
         await deps.toast(`⚠ TokenMaxed: turn review could not run (${e instanceof Error ? e.message : String(e)}).`);
         return;
       }
-      if (action.kind === 'allow') return;
+      if (action.kind === 'allow') {
+        counter.write(sessionID, 0);
+        return;
+      }
       if (action.kind === 'notify') {
+        counter.write(sessionID, 0);
         await deps.toast(action.message);
         return;
       }
-      // 'block' — the honest OpenCode analogue is a rework prompt-back. A
-      // missing prompt API must NOT look like success (the child already
-      // incremented the loop counter): surface the notes instead.
+      // 'block' — bank the round BEFORE acting; if it can't persist, we must
+      // not iterate (the loop guard would be defeated) — surface instead.
+      if (!counter.write(sessionID, priorBlocks + 1)) {
+        await deps.toast(
+          '⚠ TokenMaxed: review wanted rework but the loop-state file could not be written; not re-prompting to avoid a loop. Notes: ' +
+            action.reason,
+        );
+        return;
+      }
+      // A missing prompt API must NOT look like success: surface the notes.
       if (!deps.promptBack) {
         await deps.toast('⚠ TokenMaxed review (rework requested; this client cannot re-prompt): ' + action.reason);
         return;
@@ -192,58 +235,6 @@ export function makeIdleReviewHandler(deps: IdleReviewDeps): (sessionID: string)
       reviewing.delete(sessionID);
     }
   };
-}
-
-/** Hard parent-side backstop over the child's own internal budget. */
-const REVIEW_CHILD_KILL_MS = REVIEW_BUDGET_MS + 30_000;
-
-/** Spawn the bundled review child and parse its single-line JSON action. */
-function spawnReviewChild(scriptPath: string, sessionID: string, env: NodeJS.ProcessEnv): Promise<OpencodeReviewAction> {
-  return new Promise((resolve, reject) => {
-    if (!existsSync(scriptPath)) {
-      reject(new Error(`review bundle not found next to the plugin: ${scriptPath} — copy plugin/tokenmaxed-review.mjs alongside plugin/tokenmaxed.js`));
-      return;
-    }
-    const child = spawn(process.execPath, [scriptPath, sessionID], {
-      env: env as Record<string, string>,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    let out = '';
-    let settled = false;
-    const settle = (fn: () => void): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(killTimer);
-      fn();
-    };
-    const killTimer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already gone */
-      }
-      settle(() => reject(new Error('review child exceeded its budget')));
-    }, REVIEW_CHILD_KILL_MS);
-    child.stdout.on('data', (d: Buffer) => {
-      out += d.toString('utf8');
-    });
-    child.on('error', (e) => settle(() => reject(e)));
-    child.on('close', () =>
-      settle(() => {
-        try {
-          const line = out.trim().split('\n').pop() ?? '';
-          const parsed = JSON.parse(line) as OpencodeReviewAction;
-          if (parsed.kind === 'allow' || parsed.kind === 'notify' || parsed.kind === 'block') {
-            resolve(parsed);
-            return;
-          }
-          reject(new Error('review child returned an unknown action'));
-        } catch {
-          reject(new Error('review child produced no parseable action'));
-        }
-      }),
-    );
-  });
 }
 
 /** How many session ids the banner / prune sets retain (the plugin is long-lived). */
@@ -298,6 +289,7 @@ export const TokenMaxed = async (input: OpencodePluginInput): Promise<OpencodeHo
         remember(sessionID);
         const env = pluginEnv();
         if (env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true') return;
+        if (!bannerWithinBudget(env)) return; // never block the host's event loop on a huge ledger
         const banner = clampBanner(formatSummaryBanner(await makeSummaryFromEnv(env)()));
         if (banner.trim()) output.parts.push({ type: 'text', text: banner });
       } catch {

@@ -516,6 +516,39 @@ round limit); a finished turn can be *continued* but never *vetoed*, and if
 the prompt-back fails or isn't available the notes surface as a toast instead.
 Opt out with `TOKENMAXED_REVIEW_ON_STOP=false`.
 
+## Use in OpenClaw (plugin)
+
+The same brain in [OpenClaw](https://openclaw.ai) as a native Gateway plugin:
+a bundled MCP server (tools appear as `tokenmaxed__router_delegate` etc.), the
+session banner, a real routing-gate veto (`before_tool_call`), and — unlike
+OpenCode — a real turn-end review gate: OpenClaw's `before_agent_finalize`
+hook can force a rework pass (`action: revise`), so the review loop iterates
+natively, bounded by the same per-session round cap as the other hosts. All
+thirteen skills ship in OpenClaw's native AgentSkills format (manual-only
+skills keep `disable-model-invocation`).
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git && cd TokenMaxed
+npm install
+npm run build:openclaw-plugin   # bundle server + plugin + review child + skills
+openclaw plugins install --link "$PWD/packages/openclaw-plugin"
+# then merge packages/openclaw-plugin/openclaw.example.json into ~/.openclaw/openclaw.json
+```
+
+Two config blocks in the example are load-bearing:
+
+- `mcp.servers.tokenmaxed.env.TOKENMAXED_HOST: "openclaw"` — the host identity
+  for [per-host lane permissions](#per-host-lane-permissions-hosts). The
+  claude-CLI lanes stay blocked here by default: OpenClaw's own `claude-cli`
+  backend is tolerated-but-not-formally-sanctioned (the situation reversed
+  once already in April 2026), so listing `openclaw` on such a lane is your
+  deliberate acknowledgement.
+- `plugins.entries.tokenmaxed.hooks` — the turn-end review needs
+  `allowConversationAccess: true` (OpenClaw gates conversation-reading hooks)
+  and a raised `timeouts.before_agent_finalize` (the review takes up to ~330s;
+  the 15s default would time the hook out and proceed with the natural answer
+  — fail-open, but no review).
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
@@ -630,7 +663,8 @@ per host — each host controlling which lanes are even allowed to run inside it
 | **Claude Code plugin** | available | `claude --plugin-dir packages/plugin`, then `/tokenmaxed:setup` |
 | **Codex CLI plugin** | available | `packages/codex-plugin` — bundled MCP server + skills + hooks (see [Use in Codex CLI](#use-in-codex-cli-plugin)) |
 | **OpenCode plugin** | available | `packages/opencode-plugin` — bundled MCP server + in-process plugin + commands (see [Use in OpenCode](#use-in-opencode-plugin)) |
-| Pi · OpenClaw · Cline · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
+| **OpenClaw plugin** | available | `packages/openclaw-plugin` — native Gateway plugin + MCP server + skills, with a real finalize review gate (see [Use in OpenClaw](#use-in-openclaw-plugin)) |
+| Pi · Cline · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.
