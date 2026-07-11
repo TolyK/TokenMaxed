@@ -7366,7 +7366,7 @@ var require_dist = __commonJS({
 });
 
 // ../mcp/src/statusline.ts
-import { existsSync as existsSync2 } from "node:fs";
+import { existsSync as existsSync3 } from "node:fs";
 
 // ../core/src/types.ts
 var TRUST_MODES = ["full", "worker", "reader", "blocked"];
@@ -8065,6 +8065,75 @@ function homeFile(name) {
   return join2(HOME_TM, name);
 }
 
+// ../mcp/src/settings.ts
+import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+var SETTING_KEYS = {
+  gate_ready: "TOKENMAXED_GATE_READY",
+  escalate: "TOKENMAXED_ESCALATE",
+  learn_capability: "TOKENMAXED_LEARN_CAPABILITY",
+  capability_prior: "TOKENMAXED_CAPABILITY_PRIOR",
+  reader_egress: "TOKENMAXED_READER_EGRESS",
+  tiered: "TOKENMAXED_TIERED",
+  /** number in [0,1] */
+  tier_floor: "TOKENMAXED_TIER_FLOOR",
+  review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
+  /** positive integer */
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+};
+var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
+var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
+function settingsPath(env) {
+  return env.TOKENMAXED_SETTINGS ?? homeFile("settings.json");
+}
+function validValue(key, raw) {
+  if (NUMERIC_KEYS.has(key)) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return void 0;
+    if (key === "tier_floor" && (raw < 0 || raw > 1)) return void 0;
+    if (key === "review_max_rounds" && (!Number.isInteger(raw) || raw < 1)) return void 0;
+    return raw;
+  }
+  return typeof raw === "boolean" ? raw : void 0;
+}
+function loadSettings(env) {
+  const path = settingsPath(env);
+  if (!existsSync2(path)) return { values: {}, present: false, invalid: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync2(path, "utf8"));
+  } catch (err) {
+    return { values: {}, present: true, invalid: [], warning: `settings unreadable (${path}): ${err.message}` };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { values: {}, present: true, invalid: [], warning: `settings must be a JSON object (${path})` };
+  }
+  const obj = parsed;
+  const values = {};
+  const invalid = [];
+  for (const key of SETTING_KEY_LIST) {
+    if (!(key in obj)) continue;
+    const v = validValue(key, obj[key]);
+    if (v === void 0) invalid.push(key);
+    else values[key] = v;
+  }
+  return { values, present: true, invalid };
+}
+var SEEDED_KEYS = /* @__PURE__ */ new WeakMap();
+function effectiveEnv(env) {
+  const { values } = loadSettings(env);
+  const out = { ...env };
+  const seeded = new Set(SEEDED_KEYS.get(env) ?? []);
+  for (const key of SETTING_KEY_LIST) {
+    const envVar = SETTING_KEYS[key];
+    if (out[envVar] !== void 0) continue;
+    const v = values[key];
+    if (v === void 0) continue;
+    out[envVar] = String(v);
+    seeded.add(key);
+  }
+  if (seeded.size > 0) SEEDED_KEYS.set(out, seeded);
+  return out;
+}
+
 // ../mcp/src/statusline.ts
 var SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1e3;
 function buildStatuslineData(events, lanes, now) {
@@ -8102,12 +8171,12 @@ function formatStatusline(d) {
 }
 function statuslineFromEnv(env, now = Date.now()) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
-  const lanes = existsSync2(lanesPath) ? loadLaneConfig(lanesPath).lanes : [];
+  const lanes = existsSync3(lanesPath) ? loadLaneConfig(lanesPath).lanes : [];
   const events = new JsonlLedger(env.TOKENMAXED_LEDGER).readAll();
   return formatStatusline(buildStatuslineData(events, lanes, now));
 }
 async function statuslineMain() {
-  const env = process.env;
+  const env = effectiveEnv(process.env);
   if (env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true") return;
   let line;
   try {

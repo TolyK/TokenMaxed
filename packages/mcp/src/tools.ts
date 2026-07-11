@@ -42,6 +42,7 @@ import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshn
 import type { ModelIdMismatchWarning, StalenessWarning } from './freshness-report.ts';
 import { formatLaneSetup } from './lane-setup.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
+import type { SettingKey, SettingsReport } from './settings.ts';
 import { formatSummaryBanner } from './summary.ts';
 import type { SummaryData } from './summary.ts';
 
@@ -169,6 +170,14 @@ export interface ToolDeps {
   tierFloor?: number;
   /** Per-lane cost signal (price-derived) for tiered ranking; optional. */
   laneCost?: (lanes: readonly Lane[]) => Record<string, number>;
+  /**
+   * A4: the persistent-settings report (per key: effective value + which layer —
+   * env/settings/default — supplied it). Powers /tokenmaxed:config. Optional so
+   * fakes/old hosts can omit the whole surface.
+   */
+  settings?: () => SettingsReport;
+  /** A4: write (value) or clear (null) ONE known setting in settings.json. */
+  setSetting?: (key: SettingKey, value: boolean | number | null) => void;
   /** Whether routing/offloading is enabled for the current project (A-4 toggle). */
   getEnabled: () => boolean;
   /**
@@ -259,6 +268,8 @@ export interface SetupReport {
     | { state: 'off' }
     | { state: 'error'; warning: string }
     | { state: 'on'; stale: boolean; source: string; generated: string; categories: string[]; unrankedCount: number };
+  /** A4: settings-file state — present ONLY when ~/.tokenmaxed/settings.json exists (byte-compat when absent). */
+  settings?: { path: string; applied: string[]; warning?: string };
   /** F-2: whether reader-egress is enabled (TOKENMAXED_READER_EGRESS). */
   readerEgress: boolean;
   /** MODEL-TIERS: whether tiered routing is enabled (TOKENMAXED_TIERED). */
@@ -487,6 +498,13 @@ const ACCESS_NEEDS: readonly AccessNeedInput[] = ['worker-ok', 'repo-tight', 'au
 // Local value list (tools.ts imports core types ONLY — see the module banner);
 // kept in sync with core's DIFFICULTY_BUCKETS by the type annotation.
 const DIFFICULTIES: readonly DifficultyBucket[] = ['easy', 'moderate', 'hard'];
+// A4: settable keys for router_config — typed against settings.ts (types only;
+// the value module imports node:fs, which this file must not pull in).
+const SETTING_KEYS_UI: readonly SettingKey[] = [
+  'gate_ready', 'escalate', 'learn_capability', 'capability_prior', 'reader_egress',
+  'tiered', 'tier_floor', 'review_on_stop', 'review_max_rounds',
+];
+const NUMERIC_SETTING_KEYS: ReadonlySet<SettingKey> = new Set(['tier_floor', 'review_max_rounds'] as const);
 
 // --- render helpers ------------------------------------------------------------
 
@@ -1070,6 +1088,16 @@ export function createTools(core: CorePort): ToolDef[] {
           `  review loop: ${r.reviewOnStop ? `ON (default — reviews every finishing turn when a reviewer exists; up to ${r.reviewMaxRounds ?? 5} rework round(s))` : 'off'} (opt out with TOKENMAXED_REVIEW_ON_STOP=false; tune rounds with TOKENMAXED_REVIEW_MAX_ROUNDS)`,
           `  quality escalation: ${r.escalate ? 'on' : 'off'} (enable with TOKENMAXED_ESCALATE=true — offloads a failed cheap result up to a stronger lane)`,
           `  learned capability: ${r.learnCapability ? 'on' : 'off'} (enable with TOKENMAXED_LEARN_CAPABILITY=true — review outcomes adjust routing over time)`,
+          // A4: rendered ONLY when the settings file exists (byte-compat when absent).
+          ...(r.settings
+            ? [
+                `  settings: ${r.settings.path}${
+                  r.settings.warning
+                    ? ` — ⚠ ${r.settings.warning}`
+                    : ` (${r.settings.applied.length ? `applies: ${r.settings.applied.join(', ')}` : 'no flags stored'}; /tokenmaxed:config to view/edit)`
+                }`,
+              ]
+            : []),
           // P2: rendered ONLY when on/error — the default-off setup output stays
           // byte-identical to pre-P2 (the A1 gate; discoverability moves to the
           // A4 settings surface). The report FIELD is always present for hosts.
@@ -1108,7 +1136,63 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool];
+  const configTool: ToolDef = {
+    name: 'router_config',
+    description:
+      'Show or persist TokenMaxed feature settings (~/.tokenmaxed/settings.json) — the durable alternative to launch-time env flags. A real environment variable ALWAYS overrides a stored setting. The kill-switch (TOKENMAXED_DISABLE), YOLO mode, and API keys are deliberately NOT settable here. Powers /tokenmaxed:config.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        key: {
+          type: 'string',
+          enum: [...SETTING_KEYS_UI],
+          description: 'OPTIONAL setting to show or change. Omit to list every setting with its effective value and source.',
+        },
+        value: {
+          type: 'string',
+          description:
+            'OPTIONAL new value: "true"/"false" for the boolean flags, a number for tier_floor (0..1) / review_max_rounds (integer ≥ 1), or "clear" to remove the stored key. Omit to just show the key.',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guardedAsync(async () => {
+        if (!deps.settings) throw new ToolInputError('settings are not available on this host.');
+        const key = optEnum(args, 'key', SETTING_KEYS_UI);
+        const rawValue = optString(args, 'value');
+        if (rawValue !== undefined && key === undefined) throw new ToolInputError('"value" requires "key".');
+
+        if (key !== undefined && rawValue !== undefined) {
+          if (!deps.setSetting) throw new ToolInputError('this host cannot write settings.');
+          let parsed: boolean | number | null;
+          if (rawValue === 'clear') parsed = null;
+          else if (rawValue === 'true' || rawValue === 'false') parsed = rawValue === 'true';
+          else if (NUMERIC_SETTING_KEYS.has(key) && Number.isFinite(Number(rawValue))) parsed = Number(rawValue);
+          else throw new ToolInputError(`invalid value "${rawValue}" for "${key}" — use true/false${NUMERIC_SETTING_KEYS.has(key) ? ', a number,' : ''} or "clear".`);
+          deps.setSetting(key, parsed); // throws with a clear message on invalid range/unwritable file
+        }
+
+        const report = deps.settings();
+        const rows = key !== undefined && rawValue === undefined ? report.rows.filter((r) => r.key === key) : report.rows;
+        const renderRow = (r: SettingsReport['rows'][number]): string => {
+          const value = r.source === 'default' ? '(default)' : r.effective;
+          const src = r.source === 'env' ? ` — env ${r.envVar} overrides` : r.source === 'settings' ? ' — from settings' : '';
+          return `  ${r.key} = ${value}${src}`;
+        };
+        const lines = [
+          `TokenMaxed settings (${report.path}${report.present ? '' : ' — not created yet'}):`,
+          ...(report.warning ? [`  ⚠ ${report.warning}`] : []),
+          ...(report.invalid.length ? [`  ⚠ ignored invalid value(s) for: ${report.invalid.join(', ')}`] : []),
+          ...rows.map(renderRow),
+          '',
+          'Precedence: env var > settings.json > default. Set with /tokenmaxed:config <key> <value>; "clear" removes a stored key. The kill-switch, YOLO, and API keys stay env-only by design. When they apply: hooks and the statusline read settings on every run; the MCP server reads them at session start, so routing flags apply from your NEXT Claude Code session.',
+        ];
+        return ok(lines.join('\n'), { path: report.path, present: report.present, ...(report.warning ? { warning: report.warning } : {}), rows: rows as unknown as Record<string, unknown>[] });
+      }),
+  };
+
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

@@ -7,9 +7,9 @@
  * ROUTED share of the window, never claimed as total subscription usage).
  *
  * FAST BY CONSTRUCTION — statuslines refresh constantly, so unlike the
- * SessionStart banner this reads ONLY the two small local files (lanes.yaml +
- * ledger.jsonl): no availability probes, no freshness calls, no network, no
- * stdin read. Fails OPEN (prints nothing, exit 0) on any error and stays
+ * SessionStart banner this reads ONLY small local files (lanes.yaml +
+ * ledger.jsonl + settings.json defaults): no availability probes, no freshness
+ * calls, no network, no stdin read. Fails OPEN (prints nothing, exit 0) on any error and stays
  * SILENT under the kill-switch, so a broken config can never wedge the host's
  * status bar. Content-free output: lane ids + numbers only.
  *
@@ -25,6 +25,7 @@ import type { Lane, LedgerEvent, WindowLevel } from '@tokenmaxed/core';
 import { JsonlLedger, loadLaneConfig } from '@tokenmaxed/core/node';
 
 import { homeFile } from './config.ts';
+import { effectiveEnv } from './settings.ts';
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -91,7 +92,10 @@ export function statuslineFromEnv(env: NodeJS.ProcessEnv, now: number = Date.now
 
 /** Entry body (called by statusline-main.ts, the bundled entrypoint). */
 export async function statuslineMain(): Promise<void> {
-  const env = process.env;
+  // A4 entrypoint wrap: settings.json fills unset flag vars (a third tiny local
+  // file read — still no probes/network), so /tokenmaxed:config claims hold for
+  // this surface too. Kill-switch stays env-only by design.
+  const env = effectiveEnv(process.env);
   if (env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true') return; // silent under kill-switch
   let line: string;
   try {

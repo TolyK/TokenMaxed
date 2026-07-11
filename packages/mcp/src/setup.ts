@@ -22,6 +22,7 @@ import type { LaneSetupRow } from './lane-setup.ts';
 import { laneSetFingerprint, markLanesSeen, readLaneReviewState, writeLaneReviewState } from './lane-state.ts';
 import { selectManagerLane } from './manager-select.ts';
 import { parseMaxRounds, reviewLoopEnabled } from './reviewer.ts';
+import { settingsReport } from './settings.ts';
 import type { SetupReport } from './tools.ts';
 
 const LANES_STARTER = fileURLToPath(new URL('../lanes.starter.yaml', import.meta.url));
@@ -120,6 +121,19 @@ export async function runSetup(env: NodeJS.ProcessEnv): Promise<SetupReport> {
     // F-1 learned capability; also disabled by the global kill-switch.
     learnCapability:
       env.TOKENMAXED_LEARN_CAPABILITY === 'true' && !(env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true'),
+    // A4: settings-file state — reported only when the file exists, so a
+    // settings-less setup output stays byte-identical.
+    ...((): { settings?: SetupReport['settings'] } => {
+      const rep = settingsReport(env);
+      if (!rep.present) return {};
+      return {
+        settings: {
+          path: rep.path,
+          applied: rep.rows.filter((r) => r.source === 'settings').map((r) => r.key),
+          ...(rep.warning ? { warning: rep.warning } : {}),
+        },
+      };
+    })(),
     // P2 rankings prior — same loader the routing paths use, run over the RAW
     // registry lanes with the price table so @latest resolves like everywhere else.
     // Meta only (the overlay itself never enters the report).

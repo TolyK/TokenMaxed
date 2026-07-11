@@ -14227,8 +14227,8 @@ var require_dist2 = __commonJS({
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync8, mkdirSync as mkdirSync5, readFileSync as readFileSync6, realpathSync, statSync as statSync2, writeFileSync as writeFileSync4 } from "node:fs";
-import { dirname as dirname7, join as join7 } from "node:path";
+import { existsSync as existsSync9, mkdirSync as mkdirSync6, readFileSync as readFileSync7, realpathSync, statSync as statSync2, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname as dirname8, join as join7 } from "node:path";
 import { fileURLToPath as fileURLToPath6 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
@@ -25938,9 +25938,118 @@ function loadCapabilityPriorState(env, lanes, opts = {}) {
   };
 }
 
-// ../mcp/src/model-cache.ts
+// ../mcp/src/settings.ts
 import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
 import { dirname as dirname3 } from "node:path";
+var SETTING_KEYS = {
+  gate_ready: "TOKENMAXED_GATE_READY",
+  escalate: "TOKENMAXED_ESCALATE",
+  learn_capability: "TOKENMAXED_LEARN_CAPABILITY",
+  capability_prior: "TOKENMAXED_CAPABILITY_PRIOR",
+  reader_egress: "TOKENMAXED_READER_EGRESS",
+  tiered: "TOKENMAXED_TIERED",
+  /** number in [0,1] */
+  tier_floor: "TOKENMAXED_TIER_FLOOR",
+  review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
+  /** positive integer */
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+};
+var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
+var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
+function settingsPath(env) {
+  return env.TOKENMAXED_SETTINGS ?? homeFile("settings.json");
+}
+function validValue(key, raw) {
+  if (NUMERIC_KEYS.has(key)) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return void 0;
+    if (key === "tier_floor" && (raw < 0 || raw > 1)) return void 0;
+    if (key === "review_max_rounds" && (!Number.isInteger(raw) || raw < 1)) return void 0;
+    return raw;
+  }
+  return typeof raw === "boolean" ? raw : void 0;
+}
+function loadSettings(env) {
+  const path = settingsPath(env);
+  if (!existsSync3(path)) return { values: {}, present: false, invalid: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync3(path, "utf8"));
+  } catch (err) {
+    return { values: {}, present: true, invalid: [], warning: `settings unreadable (${path}): ${err.message}` };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { values: {}, present: true, invalid: [], warning: `settings must be a JSON object (${path})` };
+  }
+  const obj = parsed;
+  const values = {};
+  const invalid = [];
+  for (const key of SETTING_KEY_LIST) {
+    if (!(key in obj)) continue;
+    const v = validValue(key, obj[key]);
+    if (v === void 0) invalid.push(key);
+    else values[key] = v;
+  }
+  return { values, present: true, invalid };
+}
+var SEEDED_KEYS = /* @__PURE__ */ new WeakMap();
+function effectiveEnv(env) {
+  const { values } = loadSettings(env);
+  const out = { ...env };
+  const seeded = new Set(SEEDED_KEYS.get(env) ?? []);
+  for (const key of SETTING_KEY_LIST) {
+    const envVar = SETTING_KEYS[key];
+    if (out[envVar] !== void 0) continue;
+    const v = values[key];
+    if (v === void 0) continue;
+    out[envVar] = String(v);
+    seeded.add(key);
+  }
+  if (seeded.size > 0) SEEDED_KEYS.set(out, seeded);
+  return out;
+}
+function settingsReport(env) {
+  const loaded = loadSettings(env);
+  const seeded = SEEDED_KEYS.get(env);
+  const seededByFile = (key, envValue) => seeded !== void 0 && seeded.has(key) && loaded.values[key] !== void 0 && String(loaded.values[key]) === envValue;
+  const rows = SETTING_KEY_LIST.map((key) => {
+    const envVar = SETTING_KEYS[key];
+    if (env[envVar] !== void 0) {
+      return { key, envVar, effective: env[envVar], source: seededByFile(key, env[envVar]) ? "settings" : "env" };
+    }
+    const v = loaded.values[key];
+    if (v !== void 0) return { key, envVar, effective: String(v), source: "settings" };
+    return { key, envVar, effective: "", source: "default" };
+  });
+  return { path: settingsPath(env), present: loaded.present, ...loaded.warning ? { warning: loaded.warning } : {}, invalid: loaded.invalid, rows };
+}
+function writeSetting(env, key, value) {
+  const path = settingsPath(env);
+  let obj = {};
+  if (existsSync3(path)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync3(path, "utf8"));
+    } catch {
+      throw new Error(`refusing to overwrite unreadable settings at ${path} \u2014 fix or delete it first`);
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new Error(`refusing to overwrite non-object settings at ${path} \u2014 fix or delete it first`);
+    }
+    obj = parsed;
+  }
+  if (value === null) delete obj[key];
+  else {
+    const valid = validValue(key, value);
+    if (valid === void 0) throw new Error(`invalid value for "${key}": ${JSON.stringify(value)}`);
+    obj[key] = valid;
+  }
+  mkdirSync2(dirname3(path), { recursive: true });
+  writeFileSync2(path, JSON.stringify(obj, null, 2) + "\n", "utf8");
+}
+
+// ../mcp/src/model-cache.ts
+import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname4 } from "node:path";
 var CACHE_VERSION = 1;
 function emptyCache() {
   return { version: CACHE_VERSION, endpoints: /* @__PURE__ */ Object.create(null) };
@@ -25980,15 +26089,15 @@ function putEntry(cache, endpoint, models, now) {
 }
 function readFreshnessCache(path) {
   try {
-    return existsSync3(path) ? coerceCache(JSON.parse(readFileSync3(path, "utf8"))) : emptyCache();
+    return existsSync4(path) ? coerceCache(JSON.parse(readFileSync4(path, "utf8"))) : emptyCache();
   } catch {
     return emptyCache();
   }
 }
 function writeFreshnessCache(path, cache) {
   try {
-    mkdirSync2(dirname3(path), { recursive: true });
-    writeFileSync2(path, JSON.stringify(cache, null, 2) + "\n", "utf8");
+    mkdirSync3(dirname4(path), { recursive: true });
+    writeFileSync3(path, JSON.stringify(cache, null, 2) + "\n", "utf8");
   } catch {
   }
 }
@@ -26213,14 +26322,14 @@ async function fetchModelList(lane, deps) {
 }
 
 // ../mcp/src/summary-deps.ts
-import { existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
-import { dirname as dirname5, join as join5 } from "node:path";
+import { existsSync as existsSync6, readFileSync as readFileSync6 } from "node:fs";
+import { dirname as dirname6, join as join5 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // ../mcp/src/lane-state.ts
 import { createHash as createHash2 } from "node:crypto";
-import { existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname4 } from "node:path";
+import { existsSync as existsSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync5, writeFileSync as writeFileSync4 } from "node:fs";
+import { dirname as dirname5 } from "node:path";
 var STATE_VERSION = 1;
 function canonicalLane(l) {
   return {
@@ -26274,15 +26383,15 @@ function coerceLaneReviewState(raw) {
 }
 function readLaneReviewState(path) {
   try {
-    return existsSync4(path) ? coerceLaneReviewState(JSON.parse(readFileSync4(path, "utf8"))) : emptyLaneReviewState();
+    return existsSync5(path) ? coerceLaneReviewState(JSON.parse(readFileSync5(path, "utf8"))) : emptyLaneReviewState();
   } catch {
     return emptyLaneReviewState();
   }
 }
 function writeLaneReviewState(path, state) {
   try {
-    mkdirSync3(dirname4(path), { recursive: true });
-    writeFileSync3(path, JSON.stringify(state, null, 2) + "\n", "utf8");
+    mkdirSync4(dirname5(path), { recursive: true });
+    writeFileSync4(path, JSON.stringify(state, null, 2) + "\n", "utf8");
   } catch {
   }
 }
@@ -26518,7 +26627,7 @@ function readOnlyToggleStore(statePath) {
   return {
     read: () => {
       try {
-        return existsSync5(statePath) ? JSON.parse(readFileSync5(statePath, "utf8")) : {};
+        return existsSync6(statePath) ? JSON.parse(readFileSync6(statePath, "utf8")) : {};
       } catch {
         return {};
       }
@@ -26539,16 +26648,16 @@ function makeSummaryFromEnv(env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const store = readOnlyToggleStore(statePath);
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath3(new URL("../prices.seed.json", import.meta.url));
-  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname5(statePath), "model-freshness.json");
+  const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join5(dirname6(statePath), "model-freshness.json");
   const reviewProjectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname5(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join5(dirname6(statePath), "lane-review.json");
   const meteredKeyWarning = !!(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
   return async () => {
-    const lanes = existsSync5(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
+    const lanes = existsSync6(lanesPath) ? [...loadLaneConfig(lanesPath).lanes] : [];
     const available = await probeAvailable(lanes);
     const now = Date.now();
     let priceTable;
-    if (existsSync5(pricesPath)) {
+    if (existsSync6(pricesPath)) {
       try {
         priceTable = loadPriceTable(pricesPath);
       } catch {
@@ -26612,7 +26721,7 @@ function makeSummaryFromEnv(env) {
 // ../mcp/src/host-review.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { existsSync as existsSync6 } from "node:fs";
+import { existsSync as existsSync7 } from "node:fs";
 import { fileURLToPath as fileURLToPath4 } from "node:url";
 
 // ../mcp/src/reviewer.ts
@@ -26779,7 +26888,7 @@ function makeHostReviewDeps(env) {
       return { diff: out, incomplete, ...incompleteReason ? { incompleteReason } : {} };
     },
     loadLanes: () => {
-      if (!existsSync6(lanesPath)) return null;
+      if (!existsSync7(lanesPath)) return null;
       const raw = [...loadLaneConfig(lanesPath).lanes];
       let table;
       try {
@@ -26838,8 +26947,8 @@ async function runReviewWithBudget(runner, newId, opts) {
 }
 
 // ../mcp/src/setup.ts
-import { copyFileSync, existsSync as existsSync7, mkdirSync as mkdirSync4 } from "node:fs";
-import { dirname as dirname6, join as join6 } from "node:path";
+import { copyFileSync, existsSync as existsSync8, mkdirSync as mkdirSync5 } from "node:fs";
+import { dirname as dirname7, join as join6 } from "node:path";
 import { fileURLToPath as fileURLToPath5 } from "node:url";
 
 // ../mcp/src/cli-plugins.ts
@@ -26875,14 +26984,14 @@ var DEFAULT_PRICES = fileURLToPath5(new URL("../prices.seed.json", import.meta.u
 async function runSetup(env) {
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
-  const lanesExisted = existsSync7(lanesPath);
+  const lanesExisted = existsSync8(lanesPath);
   if (!lanesExisted) {
-    mkdirSync4(dirname6(lanesPath), { recursive: true });
+    mkdirSync5(dirname7(lanesPath), { recursive: true });
     copyFileSync(LANES_STARTER, lanesPath);
   }
-  const policyExisted = existsSync7(policyPath);
+  const policyExisted = existsSync8(policyPath);
   if (!policyExisted) {
-    mkdirSync4(dirname6(policyPath), { recursive: true });
+    mkdirSync5(dirname7(policyPath), { recursive: true });
     copyFileSync(POLICY_STARTER, policyPath);
   }
   const registry2 = loadLaneConfig(lanesPath);
@@ -26914,7 +27023,7 @@ async function runSetup(env) {
   });
   const projectKey = env.TOKENMAXED_PROJECT ?? env.CLAUDE_PROJECT_DIR ?? "default";
   const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join6(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
-  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join6(dirname6(statePath), "lane-review.json");
+  const laneStatePath = env.TOKENMAXED_LANE_STATE ?? join6(dirname7(statePath), "lane-review.json");
   const fingerprint = laneSetFingerprint(registry2.lanes);
   const reviewState = readLaneReviewState(laneStatePath);
   const prior = Object.hasOwn(reviewState.byProject, projectKey) ? reviewState.byProject[projectKey].fingerprint : void 0;
@@ -26939,6 +27048,19 @@ async function runSetup(env) {
     escalate: env.TOKENMAXED_ESCALATE === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
     // F-1 learned capability; also disabled by the global kill-switch.
     learnCapability: env.TOKENMAXED_LEARN_CAPABILITY === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true"),
+    // A4: settings-file state — reported only when the file exists, so a
+    // settings-less setup output stays byte-identical.
+    ...(() => {
+      const rep = settingsReport(env);
+      if (!rep.present) return {};
+      return {
+        settings: {
+          path: rep.path,
+          applied: rep.rows.filter((r) => r.source === "settings").map((r) => r.key),
+          ...rep.warning ? { warning: rep.warning } : {}
+        }
+      };
+    })(),
     // P2 rankings prior — same loader the routing paths use, run over the RAW
     // registry lanes with the price table so @latest resolves like everywhere else.
     // Meta only (the overlay itself never enters the report).
@@ -27080,6 +27202,18 @@ var REPO_CLASSES2 = ["public", "private", "unknown"];
 var SENSITIVITIES2 = ["normal", "sensitive", "unknown"];
 var ACCESS_NEEDS = ["worker-ok", "repo-tight", "auto"];
 var DIFFICULTIES = ["easy", "moderate", "hard"];
+var SETTING_KEYS_UI = [
+  "gate_ready",
+  "escalate",
+  "learn_capability",
+  "capability_prior",
+  "reader_egress",
+  "tiered",
+  "tier_floor",
+  "review_on_stop",
+  "review_max_rounds"
+];
+var NUMERIC_SETTING_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
 function renderSavings(summary, tokens, period) {
   const s = summary.savings;
   const scope = period && period !== "all" ? ` (last ${period})` : "";
@@ -27526,6 +27660,10 @@ ${r.notes}` : "";
         `  review loop: ${r.reviewOnStop ? `ON (default \u2014 reviews every finishing turn when a reviewer exists; up to ${r.reviewMaxRounds ?? 5} rework round(s))` : "off"} (opt out with TOKENMAXED_REVIEW_ON_STOP=false; tune rounds with TOKENMAXED_REVIEW_MAX_ROUNDS)`,
         `  quality escalation: ${r.escalate ? "on" : "off"} (enable with TOKENMAXED_ESCALATE=true \u2014 offloads a failed cheap result up to a stronger lane)`,
         `  learned capability: ${r.learnCapability ? "on" : "off"} (enable with TOKENMAXED_LEARN_CAPABILITY=true \u2014 review outcomes adjust routing over time)`,
+        // A4: rendered ONLY when the settings file exists (byte-compat when absent).
+        ...r.settings ? [
+          `  settings: ${r.settings.path}${r.settings.warning ? ` \u2014 \u26A0 ${r.settings.warning}` : ` (${r.settings.applied.length ? `applies: ${r.settings.applied.join(", ")}` : "no flags stored"}; /tokenmaxed:config to view/edit)`}`
+        ] : [],
         // P2: rendered ONLY when on/error — the default-off setup output stays
         // byte-identical to pre-P2 (the A1 gate; discoverability moves to the
         // A4 settings surface). The report FIELD is always present for hosts.
@@ -27553,7 +27691,57 @@ ${r.notes}` : "";
       return ok(lines.join("\n"), { ...r });
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool];
+  const configTool = {
+    name: "router_config",
+    description: "Show or persist TokenMaxed feature settings (~/.tokenmaxed/settings.json) \u2014 the durable alternative to launch-time env flags. A real environment variable ALWAYS overrides a stored setting. The kill-switch (TOKENMAXED_DISABLE), YOLO mode, and API keys are deliberately NOT settable here. Powers /tokenmaxed:config.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        key: {
+          type: "string",
+          enum: [...SETTING_KEYS_UI],
+          description: "OPTIONAL setting to show or change. Omit to list every setting with its effective value and source."
+        },
+        value: {
+          type: "string",
+          description: 'OPTIONAL new value: "true"/"false" for the boolean flags, a number for tier_floor (0..1) / review_max_rounds (integer \u2265 1), or "clear" to remove the stored key. Omit to just show the key.'
+        }
+      }
+    },
+    handler: (deps, args) => guardedAsync(async () => {
+      if (!deps.settings) throw new ToolInputError("settings are not available on this host.");
+      const key = optEnum(args, "key", SETTING_KEYS_UI);
+      const rawValue = optString(args, "value");
+      if (rawValue !== void 0 && key === void 0) throw new ToolInputError('"value" requires "key".');
+      if (key !== void 0 && rawValue !== void 0) {
+        if (!deps.setSetting) throw new ToolInputError("this host cannot write settings.");
+        let parsed;
+        if (rawValue === "clear") parsed = null;
+        else if (rawValue === "true" || rawValue === "false") parsed = rawValue === "true";
+        else if (NUMERIC_SETTING_KEYS.has(key) && Number.isFinite(Number(rawValue))) parsed = Number(rawValue);
+        else throw new ToolInputError(`invalid value "${rawValue}" for "${key}" \u2014 use true/false${NUMERIC_SETTING_KEYS.has(key) ? ", a number," : ""} or "clear".`);
+        deps.setSetting(key, parsed);
+      }
+      const report = deps.settings();
+      const rows = key !== void 0 && rawValue === void 0 ? report.rows.filter((r) => r.key === key) : report.rows;
+      const renderRow = (r) => {
+        const value = r.source === "default" ? "(default)" : r.effective;
+        const src = r.source === "env" ? ` \u2014 env ${r.envVar} overrides` : r.source === "settings" ? " \u2014 from settings" : "";
+        return `  ${r.key} = ${value}${src}`;
+      };
+      const lines = [
+        `TokenMaxed settings (${report.path}${report.present ? "" : " \u2014 not created yet"}):`,
+        ...report.warning ? [`  \u26A0 ${report.warning}`] : [],
+        ...report.invalid.length ? [`  \u26A0 ignored invalid value(s) for: ${report.invalid.join(", ")}`] : [],
+        ...rows.map(renderRow),
+        "",
+        'Precedence: env var > settings.json > default. Set with /tokenmaxed:config <key> <value>; "clear" removes a stored key. The kill-switch, YOLO, and API keys stay env-only by design. When they apply: hooks and the statusline read settings on every run; the MCP server reads them at session start, so routing flags apply from your NEXT Claude Code session.'
+      ];
+      return ok(lines.join("\n"), { path: report.path, present: report.present, ...report.warning ? { warning: report.warning } : {}, rows });
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
 }
 function receiptLine(r) {
   const int2 = (n) => Math.round(n).toLocaleString("en-US");
@@ -27750,32 +27938,32 @@ function escToOutcome(esc2, modelOf, recordingFailed) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync8(statePath)) return {};
+      if (!existsSync9(statePath)) return {};
       try {
-        return JSON.parse(readFileSync6(statePath, "utf8"));
+        return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
         return {};
       }
     },
     write: (state) => {
-      mkdirSync5(dirname7(statePath), { recursive: true });
-      writeFileSync4(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+      mkdirSync6(dirname8(statePath), { recursive: true });
+      writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
 }
 function filePreferStore(statePath) {
   return {
     read: () => {
-      if (!existsSync8(statePath)) return {};
+      if (!existsSync9(statePath)) return {};
       try {
-        return JSON.parse(readFileSync6(statePath, "utf8"));
+        return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
         return {};
       }
     },
     write: (state) => {
-      mkdirSync5(dirname7(statePath), { recursive: true });
-      writeFileSync4(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+      mkdirSync6(dirname8(statePath), { recursive: true });
+      writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
 }
@@ -27837,11 +28025,11 @@ function makeServerDeps(env = process.env) {
   };
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local");
   const store = fileToggleStore(statePath);
-  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname7(statePath), "prefer.json");
+  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname8(statePath), "prefer.json");
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
   const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
-  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join7(dirname7(statePath), "yolo.json");
+  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join7(dirname8(statePath), "yolo.json");
   const yoloStore = fileToggleStore(yoloStatePath);
   const yoloEnvDefault = (env.TOKENMAXED_YOLO === "true" || env.TOKENMAXED_YOLO === "1") && !globallyDisabled;
   const readYoloState = () => globallyDisabled ? false : readYolo(yoloStore, projectKey, yoloEnvDefault);
@@ -27849,7 +28037,7 @@ function makeServerDeps(env = process.env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync8(lanesPath)) {
+    if (!existsSync9(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
@@ -27857,7 +28045,7 @@ function makeServerDeps(env = process.env) {
     return loadLaneConfig(lanesPath).candidateLanes(category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
   };
   const delegate = async (request) => {
-    if (!existsSync8(lanesPath)) {
+    if (!existsSync9(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -27927,7 +28115,7 @@ function makeServerDeps(env = process.env) {
     const fileResult = request.files?.length ? readRepoFiles(request.files, {
       projectDir: env.CLAUDE_PROJECT_DIR,
       realpath: realpathSync,
-      readFile: (p) => readFileSync6(p, "utf8"),
+      readFile: (p) => readFileSync7(p, "utf8"),
       stat: (p) => {
         const s = statSync2(p);
         return { isFile: s.isFile(), size: s.size };
@@ -28015,6 +28203,12 @@ function makeServerDeps(env = process.env) {
     // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
     // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
     capabilityPrior: capabilityPriorFor,
+    // A4: persistent settings (env always wins). NOTE the flag consts above were
+    // captured from the wrapped env at server start, so a /config edit reaches
+    // ROUTING at the next session; hooks/statusline read settings on every run.
+    // The report is honest about that (see the tool's footer text).
+    settings: () => settingsReport(env),
+    setSetting: (key, value) => writeSetting(env, key, value),
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
@@ -28046,12 +28240,12 @@ function makeServerDeps(env = process.env) {
     // Gated egress — only non-blocked, gate-open, keyed api lanes get a /models call
     // (key only, no content); never when routing is globally disabled. Caches results.
     freshness: async () => {
-      if (globallyDisabled || !gateReady || !existsSync8(lanesPath)) return [];
+      if (globallyDisabled || !gateReady || !existsSync9(lanesPath)) return [];
       const registry2 = loadLaneConfig(lanesPath);
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname7(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname8(statePath), "model-freshness.json");
       return reportFreshness(
         eligible,
         {
@@ -28069,12 +28263,12 @@ function makeServerDeps(env = process.env) {
     // (wrong casing / absent) — so a bad id can't silently ship for any provider.
     // CACHE-ONLY (no extra egress); reads the list freshness() just wrote.
     idMismatch: async () => {
-      if (globallyDisabled || !gateReady || !existsSync8(lanesPath)) return [];
+      if (globallyDisabled || !gateReady || !existsSync9(lanesPath)) return [];
       const registry2 = loadLaneConfig(lanesPath);
       const eligible = registry2.lanes.filter(
         (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
       );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname7(statePath), "model-freshness.json");
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname8(statePath), "model-freshness.json");
       return reportModelIdMismatches(eligible, {
         table: loadPriceTable(pricesPath),
         now: Date.now(),
@@ -28115,7 +28309,7 @@ function createServer(deps) {
   return server;
 }
 async function startStdioServer() {
-  const server = createServer(makeServerDeps());
+  const server = createServer(makeServerDeps(effectiveEnv(process.env)));
   await server.connect(new StdioServerTransport());
 }
 

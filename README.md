@@ -120,6 +120,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:why <category>` | preview which lane would handle a category — nothing runs |
 | `/tokenmaxed:review` | manager review of your current working-tree changes |
 | `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
+| `/tokenmaxed:config [key] [value\|clear]` | show or persist the feature settings (`~/.tokenmaxed/settings.json`) — the durable alternative to launch-time env flags. An env var always overrides a stored setting; the kill-switch, YOLO, and API keys stay env-only. Hooks/statusline apply changes on their next run; routing flags apply at the next session. |
 | `/tokenmaxed:prefer <lane>` · `/tokenmaxed:prefer off` | temporarily favor one configured lane (any vendor, CLI or API) over normal routing — e.g. to push a sprint's work to a cheaper subscription while another's credits run low; clears with `off`. Honored only when that lane is eligible, available, and capable for the task (else it falls back to normal routing). Persisted per project; no relaunch. |
 | `/tokenmaxed:yolo` · `/tokenmaxed:yolo off` | **⚠️ dangerous** — turn YOLO mode on/off for this project (the `--dangerously-skip-permissions` analogue); see **YOLO mode** under optional features below. |
 
@@ -210,9 +211,12 @@ gate is needed only for API/BYOK egress.
 Typing the env flags and `--plugin-dir` every launch gets old. Two pieces make
 it a one-word command:
 
-**1. Persist the env flags in your Claude Code settings** (`~/.claude/settings.json`)
-so they're always on and never typed. This file is **strict JSON** — no comments —
-so add just the `env` keys:
+**1. Persist the flags.** The simplest way is TokenMaxed's own settings file —
+run `/tokenmaxed:config gate_ready true` (and any other flag) once and it's
+stored in `~/.tokenmaxed/settings.json`; env vars still override per launch.
+Alternatively, persist them as env vars in your Claude Code settings
+(`~/.claude/settings.json`). That file is **strict JSON** — no comments — so
+add just the `env` keys:
 
 ```json
 {

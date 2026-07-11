@@ -54,6 +54,7 @@ import {
 
 import { makeAvailabilityProbe } from './availability.ts';
 import { loadCapabilityPriorState } from './capability-prior-load.ts';
+import { effectiveEnv, settingsReport, writeSetting } from './settings.ts';
 import { reportFreshness, reportModelIdMismatches } from './freshness-report.ts';
 import { readRepoFiles } from './read-files.ts';
 import { readFreshnessCache, writeFreshnessCache } from './model-cache.ts';
@@ -577,6 +578,12 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // P2: same rankings-prior loader delegate routes with, so /tokenmaxed:why and
     // /tokenmaxed:status report the exact posture (off / error+warning / on+stale).
     capabilityPrior: capabilityPriorFor,
+    // A4: persistent settings (env always wins). NOTE the flag consts above were
+    // captured from the wrapped env at server start, so a /config edit reaches
+    // ROUTING at the next session; hooks/statusline read settings on every run.
+    // The report is honest about that (see the tool's footer text).
+    settings: () => settingsReport(env),
+    setSetting: (key, value) => writeSetting(env, key, value),
     loadPolicy: loadPolicySafe,
     // Expose the server's effective gate posture so router_preview defaults to the
     // SAME gate state router_delegate routes with — keeping /tokenmaxed:why honest.
@@ -692,6 +699,8 @@ export function createServer(deps: ToolDeps): Server {
 
 /** Start the server over stdio. Called by the bin entry. */
 export async function startStdioServer(): Promise<void> {
-  const server = createServer(makeServerDeps());
+  // A4: settings.json fills unset flag vars at the PROCESS entrypoint only —
+  // an injected test env is never silently mixed with a developer's real file.
+  const server = createServer(makeServerDeps(effectiveEnv(process.env)));
   await server.connect(new StdioServerTransport());
 }

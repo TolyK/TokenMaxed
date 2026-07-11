@@ -7367,7 +7367,7 @@ var require_dist = __commonJS({
 
 // ../mcp/src/hook-stop.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";
 import { tmpdir as tmpdir2 } from "node:os";
 import { join as join4 } from "node:path";
 
@@ -9012,10 +9012,79 @@ async function runReviewWithBudget(runner, newId, opts) {
   return { reviewed: false, errored: true, reason: lastReason };
 }
 
+// ../mcp/src/settings.ts
+import { existsSync as existsSync4, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+var SETTING_KEYS = {
+  gate_ready: "TOKENMAXED_GATE_READY",
+  escalate: "TOKENMAXED_ESCALATE",
+  learn_capability: "TOKENMAXED_LEARN_CAPABILITY",
+  capability_prior: "TOKENMAXED_CAPABILITY_PRIOR",
+  reader_egress: "TOKENMAXED_READER_EGRESS",
+  tiered: "TOKENMAXED_TIERED",
+  /** number in [0,1] */
+  tier_floor: "TOKENMAXED_TIER_FLOOR",
+  review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
+  /** positive integer */
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+};
+var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
+var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
+function settingsPath(env) {
+  return env.TOKENMAXED_SETTINGS ?? homeFile("settings.json");
+}
+function validValue(key, raw) {
+  if (NUMERIC_KEYS.has(key)) {
+    if (typeof raw !== "number" || !Number.isFinite(raw)) return void 0;
+    if (key === "tier_floor" && (raw < 0 || raw > 1)) return void 0;
+    if (key === "review_max_rounds" && (!Number.isInteger(raw) || raw < 1)) return void 0;
+    return raw;
+  }
+  return typeof raw === "boolean" ? raw : void 0;
+}
+function loadSettings(env) {
+  const path = settingsPath(env);
+  if (!existsSync4(path)) return { values: {}, present: false, invalid: [] };
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync2(path, "utf8"));
+  } catch (err) {
+    return { values: {}, present: true, invalid: [], warning: `settings unreadable (${path}): ${err.message}` };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { values: {}, present: true, invalid: [], warning: `settings must be a JSON object (${path})` };
+  }
+  const obj = parsed;
+  const values = {};
+  const invalid = [];
+  for (const key of SETTING_KEY_LIST) {
+    if (!(key in obj)) continue;
+    const v = validValue(key, obj[key]);
+    if (v === void 0) invalid.push(key);
+    else values[key] = v;
+  }
+  return { values, present: true, invalid };
+}
+var SEEDED_KEYS = /* @__PURE__ */ new WeakMap();
+function effectiveEnv(env) {
+  const { values } = loadSettings(env);
+  const out = { ...env };
+  const seeded = new Set(SEEDED_KEYS.get(env) ?? []);
+  for (const key of SETTING_KEY_LIST) {
+    const envVar = SETTING_KEYS[key];
+    if (out[envVar] !== void 0) continue;
+    const v = values[key];
+    if (v === void 0) continue;
+    out[envVar] = String(v);
+    seeded.add(key);
+  }
+  if (seeded.size > 0) SEEDED_KEYS.set(out, seeded);
+  return out;
+}
+
 // ../mcp/src/hook-stop.ts
 function readCounter(file) {
   try {
-    const n = Number.parseInt(readFileSync2(file, "utf8"), 10);
+    const n = Number.parseInt(readFileSync3(file, "utf8"), 10);
     return Number.isFinite(n) && n > 0 ? n : 0;
   } catch {
     return 0;
@@ -9023,19 +9092,19 @@ function readCounter(file) {
 }
 function writeCounter(file, n) {
   try {
-    mkdirSync2(join4(file, ".."), { recursive: true });
-    writeFileSync2(file, String(n), "utf8");
+    mkdirSync3(join4(file, ".."), { recursive: true });
+    writeFileSync3(file, String(n), "utf8");
     return true;
   } catch {
     return false;
   }
 }
 async function main() {
-  const env = process.env;
+  const env = effectiveEnv(process.env);
   if (!reviewLoopEnabled(env)) return;
   let input = {};
   try {
-    input = JSON.parse(readFileSync2(0, "utf8") || "{}");
+    input = JSON.parse(readFileSync3(0, "utf8") || "{}");
   } catch {
   }
   const sessionId = (typeof input.session_id === "string" ? input.session_id : "default").replace(/[^A-Za-z0-9_.-]/g, "_");

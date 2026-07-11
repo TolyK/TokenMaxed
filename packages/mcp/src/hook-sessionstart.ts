@@ -29,11 +29,12 @@
  * Contract: exit 0 always; emit nothing, or {"systemMessage":...,"hookSpecificOutput":{...}} JSON.
  */
 
+import { effectiveEnv } from './settings.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
 import { clampBanner, formatSummaryBanner } from './summary.ts';
 
 async function main(): Promise<void> {
-  const env = process.env;
+  const env = effectiveEnv(process.env);
   // Kill-switch ⇒ stay completely silent (no banner at all).
   if (env.TOKENMAXED_DISABLE === '1' || env.TOKENMAXED_DISABLE === 'true') return;
 

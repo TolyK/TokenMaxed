@@ -141,6 +141,7 @@ test('builds the expected tool set with object input schemas', () => {
   assert.deepEqual(
     TOOLS.map((t) => t.name).sort(),
     [
+      'router_config',
       'router_delegate',
       'router_preview',
       'router_review',
