@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { PRETOOLUSE_DENY_REASON } from '../src/hook.ts';
+import { denyReasonForHost } from '../src/opencode-plugin.ts';
 import {
   OPENCODE_DELEGATE_TOOL,
   REWORK_PROMPT_PREFIX,
@@ -72,7 +73,8 @@ test('tool.execute.before: throws the deny reason for router_delegate only when 
     // The gated tool throws with the shared reason…
     await assert.rejects(
       hooks['tool.execute.before']!({ tool: OPENCODE_DELEGATE_TOOL, sessionID: 's', callID: 'c' }, { args: {} }),
-      (e: Error) => e.message === PRETOOLUSE_DENY_REASON,
+      // The reason speaks OpenCode's command dialect (/tokenmaxed-x).
+      (e: Error) => e.message === denyReasonForHost(PRETOOLUSE_DENY_REASON, '-'),
     );
     // …every other tool passes untouched.
     await hooks['tool.execute.before']!({ tool: 'read', sessionID: 's', callID: 'c' }, { args: {} });

@@ -1,0 +1,11 @@
+{
+  "name": "@tokenmaxed/cline-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TokenMaxed for Cline (CLI + VS Code): bundled MCP server, PreToolUse gate, TaskStart banner, and generated skills.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}

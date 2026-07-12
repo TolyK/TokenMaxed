@@ -9490,6 +9490,9 @@ function bannerWithinBudget(env) {
     return true;
   }
 }
+function denyReasonForHost(reason, separator) {
+  return reason.replaceAll(/\/tokenmaxed:([a-z-]+)/g, (_, name) => `/tokenmaxed${separator}${separator === "_" ? name.replaceAll("-", "_") : name}`);
+}
 function delegateDenyReason(env) {
   try {
     const statePath = env.TOKENMAXED_STATE ?? homeFile("state.json");
@@ -9632,7 +9635,7 @@ var tokenMaxedOpenclawPlugin = {
       try {
         if (payload.toolName !== OPENCLAW_DELEGATE_TOOL) return void 0;
         const reason = delegateDenyReason(pluginEnv());
-        return reason ? { block: true, blockReason: reason } : void 0;
+        return reason ? { block: true, blockReason: denyReasonForHost(reason, "_") } : void 0;
       } catch {
         return void 0;
       }

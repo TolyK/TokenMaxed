@@ -41,7 +41,7 @@
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { bannerWithinBudget, delegateDenyReason, REWORK_PROMPT_PREFIX } from './opencode-plugin.ts';
+import { bannerWithinBudget, delegateDenyReason, denyReasonForHost, REWORK_PROMPT_PREFIX } from './opencode-plugin.ts';
 import { REVIEW_CHILD_KILL_MS, fileLoopCounter, spawnReviewChild } from './review-child.ts';
 import type { LoopCounterStore } from './review-child.ts';
 import type { ReviewChildAction } from './review-child-main.ts';
@@ -255,7 +255,8 @@ export const tokenMaxedOpenclawPlugin = {
         if (payload.toolName !== OPENCLAW_DELEGATE_TOOL) return undefined;
         // delegateDenyReason defaults the state file to ~/.tokenmaxed itself.
         const reason = delegateDenyReason(pluginEnv());
-        return reason ? { block: true, blockReason: reason } : undefined;
+        // OpenClaw command names sanitize to [a-z0-9_] ⇒ /tokenmaxed_x refs.
+        return reason ? { block: true, blockReason: denyReasonForHost(reason, '_') } : undefined;
       } catch {
         return undefined; // fail open — core still enforces
       }

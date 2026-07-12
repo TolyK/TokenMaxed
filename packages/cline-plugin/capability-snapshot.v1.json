@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "generated": "2026-06-20",
+  "_note": "SEED PLACEHOLDER values pending hosted Mercor APEX feed. Not ground truth.",
+  "sources": ["mercor-apex-v1"],
+  "mapping": {
+    "docs": "mercor-apex-v1",
+    "explain": "mercor-apex-v1"
+  },
+  "aliases": {
+    "claude-opus-4-7": "claude-opus-4-7",
+    "claude-opus-4-8": "claude-opus-4-8",
+    "gpt-5.5": "gpt-5.5",
+    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "kimi-k2": "kimi-k2"
+  },
+  "entries": [
+    {
+      "model": "claude-opus-4-8",
+      "chart": "mercor-apex-v1",
+      "category": "docs",
+      "value": 0.68,
+      "source": "mercor-apex-v1",
+      "rank": 4,
+      "score": 0.68,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "claude-opus-4-8",
+      "chart": "mercor-apex-v1",
+      "category": "explain",
+      "value": 0.68,
+      "source": "mercor-apex-v1",
+      "rank": 4,
+      "score": 0.68,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "claude-opus-4-7",
+      "chart": "mercor-apex-v1",
+      "category": "docs",
+      "value": 0.65,
+      "source": "mercor-apex-v1",
+      "rank": 6,
+      "score": 0.65,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "claude-opus-4-7",
+      "chart": "mercor-apex-v1",
+      "category": "explain",
+      "value": 0.65,
+      "source": "mercor-apex-v1",
+      "rank": 6,
+      "score": 0.65,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "gpt-5.5",
+      "chart": "mercor-apex-v1",
+      "category": "docs",
+      "value": 0.72,
+      "source": "mercor-apex-v1",
+      "rank": 2,
+      "score": 0.72,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "gpt-5.5",
+      "chart": "mercor-apex-v1",
+      "category": "explain",
+      "value": 0.72,
+      "source": "mercor-apex-v1",
+      "rank": 2,
+      "score": 0.72,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "chart": "mercor-apex-v1",
+      "category": "docs",
+      "value": 0.58,
+      "source": "mercor-apex-v1",
+      "rank": 10,
+      "score": 0.58,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "claude-sonnet-4-6",
+      "chart": "mercor-apex-v1",
+      "category": "explain",
+      "value": 0.58,
+      "source": "mercor-apex-v1",
+      "rank": 10,
+      "score": 0.58,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "kimi-k2",
+      "chart": "mercor-apex-v1",
+      "category": "docs",
+      "value": 0.42,
+      "source": "mercor-apex-v1",
+      "rank": 18,
+      "score": 0.42,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    },
+    {
+      "model": "kimi-k2",
+      "chart": "mercor-apex-v1",
+      "category": "explain",
+      "value": 0.42,
+      "source": "mercor-apex-v1",
+      "rank": 18,
+      "score": 0.42,
+      "date": "2026-06-01",
+      "n": 400,
+      "confidence": "low"
+    }
+  ],
+  "hash": "5e5371dad62a163f9390f66beb6356d14972959682c5d89bbe93006f3074e957"
+}

@@ -18,7 +18,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "build:codex-plugin": "npm run build && npm run build -w @tokenmaxed/codex-plugin",
     "build:opencode-plugin": "npm run build && npm run build -w @tokenmaxed/opencode-plugin",
-    "build:openclaw-plugin": "npm run build && npm run build -w @tokenmaxed/openclaw-plugin"
+    "build:openclaw-plugin": "npm run build && npm run build -w @tokenmaxed/openclaw-plugin",
+    "build:cline-plugin": "npm run build && npm run build -w @tokenmaxed/cline-plugin"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
