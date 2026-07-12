@@ -27041,7 +27041,10 @@ var UNTRACKED_FILE_TIMEOUT_MS = 5e3;
 var UNTRACKED_FILE_MAXBUF = 4 * 1024 * 1024;
 var REVIEW_BUDGET_MS = 3e5;
 var DIFF_ACQUISITION_HEADROOM_MS = GIT_TIMEOUT_MS + GIT_TIMEOUT_MS + UNTRACKED_BUDGET_MS + UNTRACKED_FILE_TIMEOUT_MS;
-var REVIEW_CLI_TIMEOUT_MS = REVIEW_BUDGET_MS - DIFF_ACQUISITION_HEADROOM_MS;
+function reviewCliTimeoutFor(totalBudgetMs) {
+  return Math.max(3e4, totalBudgetMs - DIFF_ACQUISITION_HEADROOM_MS);
+}
+var REVIEW_CLI_TIMEOUT_MS = reviewCliTimeoutFor(REVIEW_BUDGET_MS);
 function readUntrackedDiff(cwd) {
   const list = spawnSync3("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
     cwd,
@@ -27073,14 +27076,14 @@ function readUntrackedDiff(cwd) {
   }
   return { diff: parts.join("\n"), omitted: Math.max(0, all.length - included), enumerationFailed: false };
 }
-function makeHostReviewDeps(env) {
+function makeHostReviewDeps(env, opts = {}) {
   const cwd = env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR ?? process.cwd();
   const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
   const ledgerPath = env.TOKENMAXED_LEDGER;
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath4(new URL("../prices.seed.json", import.meta.url));
   const resolveAuth = makeResolveAuth(env);
   const executor = makeTrustedExecutor({
-    cli: makeCliExecutor(makeCliSpawn(REVIEW_CLI_TIMEOUT_MS)),
+    cli: makeCliExecutor(makeCliSpawn(opts.totalBudgetMs !== void 0 ? reviewCliTimeoutFor(opts.totalBudgetMs) : REVIEW_CLI_TIMEOUT_MS)),
     api: makeTrustedApiExecutor({ resolveAuth })
   });
   return {
