@@ -11,7 +11,8 @@
 process.env.TOKENMAXED_HOST ??= 'cli';
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
@@ -28,6 +29,17 @@ import {
 import { JsonlLedger, loadLaneConfig } from '@tokenmaxed/core/node';
 
 import { mergeShareSnapshots, shareSnapshotFromRows } from '@tokenmaxed/core';
+import { loadPriceTable } from '@tokenmaxed/core/node';
+import {
+  buildSharePayload,
+  formatSharePreview,
+  isoWeekStartMs,
+  readOrCreateContributor,
+  recordRevision,
+  rotateContributor,
+  uploadSnapshot,
+} from './share.ts';
+import type { ContributorStore } from './share.ts';
 import { buildDashboardData, renderDashboardHtml } from './dashboard.ts';
 import { renderLeaderboardPage } from './leaderboard-page.ts';
 
@@ -63,6 +75,11 @@ Usage:
   tokenmaxed tokens   [--period <p>] [--by model|lane] [--ledger <path>]
   tokenmaxed outcomes    [--period <p>] [--ledger <path>]
   tokenmaxed leaderboard [--period <p>] [--by performance|tokens|difficulty] [--json] [--html [--out <path>] [--open]] [--ledger <path>]
+  tokenmaxed share [--yes] [--rotate-id] [--ledger <path>]
+                 OPT-IN: show this ISO week's anonymized aggregate payload
+                 (default sends NOTHING); --yes uploads exactly that payload
+                 to TOKENMAXED_SHARE_URL (unset until the hosted leaderboard
+                 launches); --rotate-id mints a fresh contributor UUID
   tokenmaxed lanes       [--lanes <path>]
   tokenmaxed dashboard   [--out <path>] [--open] [--ledger <path>] [--lanes <path>]
   tokenmaxed help
@@ -131,6 +148,75 @@ function main(): void {
       writeFileSync(outPath, html, 'utf8');
       process.stdout.write(`dashboard written: ${outPath}\n(local-first — one self-contained file, no network; regenerate any time)\n`);
       if (args.open) openFile(outPath);
+      return;
+    }
+
+    if (args.command === 'share') {
+      const contributorPath = process.env.TOKENMAXED_CONTRIBUTOR ?? join(homedir(), '.tokenmaxed', 'contributor.json');
+      const store: ContributorStore = {
+        read: () => (existsSync(contributorPath) ? readFileSync(contributorPath, 'utf8') : undefined),
+        write: (text) => {
+          mkdirSync(dirname(contributorPath), { recursive: true });
+          writeFileSync(contributorPath, text, 'utf8');
+        },
+      };
+      if (args.rotateId) {
+        const rotated = rotateContributor(store, () => randomUUID(), () => new Date().toISOString());
+        process.stdout.write(`new contributor id: ${rotated.contributor_id}\n(past uploads stay under the old id; future uploads use this one)\n`);
+        return;
+      }
+      const now = Date.now();
+      const state = readOrCreateContributor(store, () => randomUUID(), () => new Date().toISOString());
+      // THIS ISO week's events only — the payload's window claim must be true.
+      const weekEvents = filterEventsSince(new JsonlLedger(args.ledgerPath).readAll(), new Date(isoWeekStartMs(now)).toISOString());
+      const rows = sortLeaderboard(buildLeaderboard(weekEvents), 'performance');
+      if (rows.length === 0) {
+        process.stdout.write('nothing to share yet — no routed work with review verdicts this ISO week.\n');
+        return;
+      }
+      // The trusted model catalog: the price table's ids ∪ configured lane
+      // models (the SAME membership rule the server enforces) — a real check
+      // that REFUSES unknown models client-side. Only when NO price table is
+      // loadable does the client skip its check (catalog = own rows) and SAY
+      // so; the server still enforces its own catalog either way.
+      const catalog = new Set<string>();
+      let catalogChecked = false;
+      try {
+        for (const id of Object.keys(loadPriceTable(join(homedir(), '.tokenmaxed', 'prices.seed.json')).models)) catalog.add(id);
+        catalogChecked = true;
+      } catch {
+        /* no local price table */
+      }
+      const userLanesPath = join(homedir(), '.tokenmaxed', 'lanes.yaml');
+      if (existsSync(userLanesPath)) {
+        try {
+          for (const lane of loadLaneConfig(userLanesPath).lanes) catalog.add(lane.model);
+        } catch {
+          /* unreadable lanes ⇒ price-table-only catalog */
+        }
+      }
+      if (!catalogChecked) for (const r of rows) catalog.add(r.model);
+      const payload = buildSharePayload(rows, state, now, catalog);
+      const endpoint = process.env.TOKENMAXED_SHARE_URL?.trim() || undefined;
+      const catalogNote = catalogChecked
+        ? undefined
+        : 'note: no local price table found, so the client-side model-catalog check was skipped — the server still enforces its own catalog.';
+      if (!args.yes) {
+        process.stdout.write(formatSharePreview(payload, { endpoint, ...(catalogNote ? { catalogNote } : {}) }) + '\n');
+        return;
+      }
+      if (!endpoint) {
+        fail('no share endpoint configured — the hosted leaderboard has not launched yet (TOKENMAXED_SHARE_URL will be announced at launch).');
+      }
+      void (async () => {
+        const result = await uploadSnapshot(fetch as unknown as Parameters<typeof uploadSnapshot>[0], endpoint, payload.serialized);
+        if (result.ok) {
+          recordRevision(store, state, payload.windowId, payload.revision);
+          process.stdout.write(`uploaded ${payload.windowId} revision ${payload.revision} (${payload.snapshot.rows.length} cells). Thank you — contributors keep the data feed free.\n`);
+        } else {
+          fail(result.message);
+        }
+      })();
       return;
     }
 

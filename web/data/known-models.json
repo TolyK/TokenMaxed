@@ -1,0 +1,23 @@
+{
+  "generated": "2026-07-12",
+  "models": [
+    "MiniMax-M2",
+    "MiniMax-M3",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku@latest",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus@latest",
+    "claude-sonnet-4-6",
+    "claude-sonnet@latest",
+    "gemini-3-pro",
+    "gemini-3.5-flash",
+    "glm-5.1",
+    "glm@latest",
+    "gpt-5.5",
+    "grok-code-fast-1",
+    "kimi-k2",
+    "llama3.1:8b",
+    "minimax@latest"
+  ]
+}
