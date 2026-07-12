@@ -10,7 +10,7 @@ export type GroupBy = 'model' | 'lane';
 export type LeaderboardSortBy = 'performance' | 'tokens' | 'difficulty';
 
 export interface CliArgs {
-  command: 'savings' | 'tokens' | 'outcomes' | 'lanes' | 'leaderboard' | 'dashboard' | 'help';
+  command: 'savings' | 'tokens' | 'outcomes' | 'lanes' | 'leaderboard' | 'dashboard' | 'share' | 'help';
   /** 'all' or a relative window like '7d' / '24h'. */
   period: string;
   by: GroupBy;
@@ -28,6 +28,10 @@ export interface CliArgs {
   open: boolean;
   /** leaderboard: emit the standalone static HTML page instead of text. */
   html: boolean;
+  /** share: actually upload (default shows the exact payload and sends NOTHING). */
+  yes: boolean;
+  /** share: mint a fresh contributor id (past uploads stay under the old one). */
+  rotateId: boolean;
 }
 
 /** A flattened view of a lane's trust config, for the `lanes` command. */
@@ -59,7 +63,7 @@ function takeValue(argv: readonly string[], i: number, flag: string): string {
 
 /** Parse argv (already sliced past `node script`). */
 export function parseArgs(argv: readonly string[]): CliArgs {
-  const COMMANDS = ['savings', 'tokens', 'outcomes', 'lanes', 'leaderboard', 'dashboard', 'help'] as const;
+  const COMMANDS = ['savings', 'tokens', 'outcomes', 'lanes', 'leaderboard', 'dashboard', 'share', 'help'] as const;
   let command: CliArgs['command'] | undefined;
   let period = 'all';
   let by: GroupBy = 'model';
@@ -71,13 +75,15 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   let outPath: string | undefined;
   let open = false;
   let html = false;
+  let yes = false;
+  let rotateId = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     switch (arg) {
       case '-h':
       case '--help':
-        return { command: 'help', period, by, leaderboardBy, json, open, html };
+        return { command: 'help', period, by, leaderboardBy, json, open, html, yes, rotateId };
       case '--period':
         period = takeValue(argv, i, '--period');
         i++;
@@ -106,6 +112,12 @@ export function parseArgs(argv: readonly string[]): CliArgs {
         break;
       case '--html':
         html = true;
+        break;
+      case '--yes':
+        yes = true;
+        break;
+      case '--rotate-id':
+        rotateId = true;
         break;
       default:
         if (arg.startsWith('-')) {
@@ -155,6 +167,8 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     json,
     open,
     html,
+    yes,
+    rotateId,
     ...(ledgerPath ? { ledgerPath } : {}),
     ...(lanesPath ? { lanesPath } : {}),
     ...(outPath ? { outPath } : {}),

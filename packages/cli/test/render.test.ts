@@ -26,6 +26,8 @@ test('parseArgs defaults to help with no args', () => {
     json: false,
     open: false,
     html: false,
+    yes: false,
+    rotateId: false,
   });
 });
 
@@ -38,6 +40,8 @@ test('parseArgs reads command, period, by, and ledger', () => {
     json: false,
     open: false,
     html: false,
+    yes: false,
+    rotateId: false,
     ledgerPath: '/tmp/l.jsonl',
   });
 });
@@ -52,6 +56,8 @@ test('parseArgs accepts the outcomes and lanes commands (+ --lanes)', () => {
     json: false,
     open: false,
     html: false,
+    yes: false,
+    rotateId: false,
     lanesPath: '/tmp/lanes.yaml',
   });
 });
@@ -65,6 +71,8 @@ test('parseArgs accepts leaderboard sort axis and --json', () => {
     json: true,
     open: false,
     html: false,
+    yes: false,
+    rotateId: false,
   });
   assert.throws(() => parseArgs(['leaderboard', '--by', 'lane']), { message: /--by must be/ });
 });

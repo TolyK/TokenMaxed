@@ -673,6 +673,25 @@ Keep the `env.TOKENMAXED_HOST: "crush"` — it is the host identity for
 lanes (the claude-CLI lanes) fail closed without it, and stay blocked under
 Crush unless you deliberately add `crush` to a lane's `hosts:` list.
 
+## Share your results (opt-in, launch-ready)
+
+**We never see your code or your prompts.** Sharing sends exactly one thing:
+the success rate of each model you routed work to, broken down by the task's
+category and difficulty — one aggregate table per ISO week, ids/enums/integers
+only, under a rotatable random contributor UUID that is never published.
+
+```bash
+tokenmaxed share             # shows the EXACT payload + consent — sends NOTHING
+tokenmaxed share --yes       # uploads exactly that payload (once; no background sharing)
+tokenmaxed share --rotate-id # mint a fresh contributor id any time
+```
+
+Published cells are k-anonymous (≥ 5 distinct contributors and ≥ 10 verdicts;
+thinner cells are withheld). Contributing keeps the community data feed free
+for you. The hosted endpoint launches with the site — until then
+`TOKENMAXED_SHARE_URL` is unset and `--yes` refuses loudly; `web/` holds the
+launch-ready Vercel functions and the deploy runbook (`web/README.md`).
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
