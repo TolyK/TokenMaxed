@@ -644,6 +644,35 @@ about pi + Codex, not an OpenAI endorsement of TokenMaxed. Note
 resolves one level above it, so register by path (or copy the whole
 `pi-extension` package directory, preserving layout).
 
+## Use in Crush (MCP recipe)
+
+[Crush](https://github.com/charmbracelet/crush) has no plugin/hook system, so
+TokenMaxed there is **tools-only**: the router tools work (delegate, preview,
+status, savings, …), but there is no session banner, no PreToolUse gate, and
+no review loop — the core boundary still enforces trust/egress rules; only the
+host-side conveniences are absent. Reuse ANY committed server bundle (the
+explicit `env` below beats the bundle's built-in host default) — merge into
+your `crush.json`:
+
+```json
+{
+  "$schema": "https://charm.land/crush.json",
+  "mcp": {
+    "tokenmaxed": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/TokenMaxed/packages/plugin/server/index.mjs"],
+      "env": { "TOKENMAXED_HOST": "crush" }
+    }
+  }
+}
+```
+
+Keep the `env.TOKENMAXED_HOST: "crush"` — it is the host identity for
+[per-host lane permissions](#per-host-lane-permissions-hosts): `hosts:`-scoped
+lanes (the claude-CLI lanes) fail closed without it, and stay blocked under
+Crush unless you deliberately add `crush` to a lane's `hosts:` list.
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
@@ -762,7 +791,7 @@ per host — each host controlling which lanes are even allowed to run inside it
 | **Cline (CLI + VS Code)** | available | `packages/cline-plugin` — bundled MCP server + PreToolUse gate + TaskStart banner + skills (see [Use in Cline](#use-in-cline-cli--vs-code)) |
 | **Hermes** | available | `packages/hermes-plugin` — MCP server + shell hooks (gate, banner, `pre_verify` review) + skills (see [Use in Hermes](#use-in-hermes-nous-research)) |
 | **pi (native extension)** | available | `packages/pi-extension` — native tools + gate + banner + review + **statusline gauge** (see [Use in pi](#use-in-pi-native-extension)) |
-| Crush · others | planned | MCP-recipe / thin adapters, per-host lane permissions |
+| **Crush** | recipe | tools-only via MCP — no hooks exist there (see [Use in Crush](#use-in-crush-mcp-recipe)) |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.
