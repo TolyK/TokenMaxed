@@ -579,6 +579,36 @@ TaskStart output); `/tokenmaxed-summary` covers the CLI. Cline's skill
 frontmatter has no manual-only flag, so state-changing skills carry an
 explicit MANUAL-ONLY preamble instead.
 
+## Use in Hermes (Nous Research)
+
+The same brain in [Hermes](https://github.com/NousResearch/hermes-agent)
+(≥ 0.18.0 for the review hook): a bundled MCP server (tools appear as
+`mcp_tokenmaxed_router_delegate` etc.), three shell hooks — the routing gate
+(`pre_tool_call` veto), the session banner (`pre_llm_call` context injection,
+once per session), and a real turn-end review via `pre_verify`, which can
+force another agent iteration with the reviewer notes (capped host-side by
+`agent.max_verify_nudges`) — plus all thirteen skills, loaded in place via
+`skills.external_dirs` (each auto-becomes `/tokenmaxed-<name>`).
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git && cd TokenMaxed
+npm install
+npm run build:hermes-plugin     # bundle server + hooks + generate skills
+# then merge packages/hermes-plugin/hermes.config.example.yaml into
+# ~/.hermes/config.yaml (absolute paths; keep env.TOKENMAXED_HOST="hermes")
+```
+
+**Scope notes, honestly:** Hermes fires `pre_verify` only on turns where the
+agent **edited code**, so non-coding turns are never auto-reviewed (narrower
+than Claude Code's Stop hook); the review runs inside Hermes's 300s hook
+clamp (a 270s internal budget). Hermes hooks **fail open** by design (an
+erroring/timed-out hook warns and proceeds) — every TokenMaxed hook is a
+convenience backstop; the core boundary still enforces. Headless/Gateway runs
+silently skip unaccepted hooks — the recipe sets `hooks_auto_accept: true`.
+The claude-CLI lanes stay `hosts:`-blocked here by default (Hermes documents
+spawning Claude Code as a pattern, but Anthropic hasn't formally sanctioned
+subprocess use — adding `hermes` to a lane's `hosts:` is your acknowledgement).
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
@@ -695,7 +725,8 @@ per host — each host controlling which lanes are even allowed to run inside it
 | **OpenCode plugin** | available | `packages/opencode-plugin` — bundled MCP server + in-process plugin + commands (see [Use in OpenCode](#use-in-opencode-plugin)) |
 | **OpenClaw plugin** | available | `packages/openclaw-plugin` — native Gateway plugin + MCP server + skills, with a real finalize review gate (see [Use in OpenClaw](#use-in-openclaw-plugin)) |
 | **Cline (CLI + VS Code)** | available | `packages/cline-plugin` — bundled MCP server + PreToolUse gate + TaskStart banner + skills (see [Use in Cline](#use-in-cline-cli--vs-code)) |
-| Pi · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
+| **Hermes** | available | `packages/hermes-plugin` — MCP server + shell hooks (gate, banner, `pre_verify` review) + skills (see [Use in Hermes](#use-in-hermes-nous-research)) |
+| Pi · others | planned | same core, thin per-host adapters, per-host lane permissions |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.

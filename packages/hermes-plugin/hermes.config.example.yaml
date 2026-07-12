@@ -1,0 +1,50 @@
+# TokenMaxed in Hermes — merge into ~/.hermes/config.yaml. Requires
+# hermes-agent >= 0.18.0 for the pre_verify review hook (the gate + banner
+# work on any shell-hook-capable version and simply do less).
+#
+# Replace /ABSOLUTE/PATH/TO/TokenMaxed with your checkout path throughout.
+
+mcp_servers:
+  tokenmaxed:
+    command: "node"
+    args: ["/ABSOLUTE/PATH/TO/TokenMaxed/packages/hermes-plugin/server/index.mjs"]
+    # REQUIRED — the host identity for per-lane `hosts:` allowlists. Hermes
+    # passes ONLY this map (plus a small safe baseline) to the child, so
+    # hosts:-scoped lanes (e.g. the claude-CLI lanes) fail closed without it —
+    # and STAY blocked here unless you deliberately add `hermes` to a lane's
+    # hosts: list (your acknowledgement of that vendor's terms, per README).
+    env:
+      TOKENMAXED_HOST: "hermes"
+
+hooks:
+  pre_tool_call:
+    - matcher: "^mcp_tokenmaxed_router_delegate$"
+      command: "node /ABSOLUTE/PATH/TO/TokenMaxed/packages/hermes-plugin/hooks/pre-tool-call.cjs"
+      timeout: 10
+  pre_llm_call:
+    - command: "node /ABSOLUTE/PATH/TO/TokenMaxed/packages/hermes-plugin/hooks/pre-llm-call.cjs"
+      timeout: 30
+  pre_verify:
+    # The turn-end review. timeout 300 is Hermes's clamp maximum and MUST stay
+    # >= 300: the review's internal budget is 260s (diff acquisition + the CLI
+    # reviewer), plus a ~700ms-capped availability probe and small config/JSON
+    # I/O outside it. NOTE the honest scope:
+    # Hermes fires pre_verify only on turns where the agent EDITED CODE, so
+    # non-coding turns are never auto-reviewed (narrower than Claude Code's
+    # Stop hook). agent.max_verify_nudges (default 3) caps the loop host-side;
+    # the TokenMaxed hook aligns its own round cap to
+    # min(TOKENMAXED_REVIEW_MAX_ROUNDS, host nudge limit) so its explicit yield
+    # notice is always reachable. The hook can't read agent.max_verify_nudges,
+    # so if you RAISE it, mirror the number in the hook's env:
+    # TOKENMAXED_HERMES_VERIFY_NUDGES=<same value>.
+    - command: "node /ABSOLUTE/PATH/TO/TokenMaxed/packages/hermes-plugin/hooks/pre-verify.cjs"
+      timeout: 300
+
+# Headless/Gateway runs skip UNACCEPTED hooks silently — accept once in the
+# TUI, or set this (or HERMES_ACCEPT_HOOKS=1):
+hooks_auto_accept: true
+
+skills:
+  external_dirs:
+    # Loads all 13 /tokenmaxed-* skills in place — no copying needed.
+    - "/ABSOLUTE/PATH/TO/TokenMaxed/packages/hermes-plugin/skills"
