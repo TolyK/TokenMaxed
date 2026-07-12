@@ -7865,6 +7865,13 @@ function hostAllowsLane(lane, ctx) {
   if (!lane.hosts || lane.hosts.length === 0) return true;
   return typeof ctx.host === "string" && ctx.host !== "" && lane.hosts.includes(ctx.host);
 }
+function modelMatchesPin(laneModel, pin) {
+  const m = laneModel.toLowerCase();
+  const p = pin.trim().toLowerCase();
+  if (p === "") return false;
+  if (m === p) return true;
+  return m.startsWith(p) && ["-", ".", ":", "@", "/"].includes(m[p.length] ?? "");
+}
 function eligibleLanes(task, ctx, policy) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
@@ -10293,6 +10300,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           type: "string",
           enum: [...DIFFICULTIES],
           description: "OPTIONAL difficulty to preview \u2014 shows the pick a difficulty-tagged delegate would make when learned difficulty evidence exists. Omit for the category-level pick."
+        },
+        model: {
+          type: "string",
+          description: "OPTIONAL exact-model pin to preview \u2014 shows what a model-pinned delegate would do (the pinned lane, or WHY the pin cannot run). Same matching as router_delegate's model param."
         }
       }
     },
@@ -10303,6 +10314,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
+      const pinnedModel = optString(args, "model")?.trim() || void 0;
       const task = { category, ...difficulty ? { difficulty } : {} };
       const resolvedAccessNeed = access_need === "repo-tight" ? "repo-tight" : "worker-ok";
       if (!deps.getEnabled()) {
@@ -10317,8 +10329,19 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
       };
-      const lanes = deps.candidateLanes(category);
+      let lanes = deps.candidateLanes(category, pinnedModel ? { includeReserved: true } : void 0);
       const policy = deps.loadPolicy();
+      if (pinnedModel) {
+        const pinnedLanes = lanes.filter((l) => core.modelMatchesPin(l.model, pinnedModel));
+        if (pinnedLanes.length === 0) {
+          const connected = [...new Set(lanes.map((l) => l.model))].sort();
+          return ok(
+            `requested model "${pinnedModel}" is not connected to TokenMaxed for category "${category}" \u2014 a model-pinned delegate would come back native (no substitution). Connected models: ${connected.join(", ") || "(none)"}.`,
+            { category, gateReady, decision: null, native: true, pinnedModel, connectedModels: connected }
+          );
+        }
+        lanes = pinnedLanes;
+      }
       const observedCapability = deps.observedCapability();
       const observedCapabilityByModel = deps.observedCapabilityByModel?.();
       const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
@@ -10372,6 +10395,12 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       try {
         decision = core.routeDecide(task, ctx, policy);
       } catch {
+        if (pinnedModel) {
+          return ok(
+            `requested model "${pinnedModel}" cannot run right now (its lane is blocked or unavailable under current gates) \u2014 a model-pinned delegate would come back native, NOT substitute another model.`,
+            { category, gateReady, policyContext, decision: null, native: true, pinnedModel }
+          );
+        }
         return ok(
           `category "${category}": no eligible lane (gate_ready=${gateReady}) \u2014 would run on the host (native).`,
           { category, gateReady, policyContext, decision: null, native: true }
@@ -10426,6 +10455,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       );
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
+        ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
         `  why: ${decision.reason}`,
@@ -10591,6 +10621,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           type: "string",
           enum: [...DIFFICULTIES],
           description: `OPTIONAL expected difficulty. When set and learned difficulty-specific evidence exists (TOKENMAXED_LEARN_CAPABILITY), routing conditions capability on that difficulty's real pass record \u2014 e.g. "hard" favors models that keep passing hard reviews. Omit when unsure (category-level routing, unchanged).`
+        },
+        model: {
+          type: "string",
+          description: 'OPTIONAL exact-model pin. Set ONLY when the USER explicitly named a model in their prompt (e.g. "use minimax for this", "route this to gpt-5.5") \u2014 never infer it. Routing is restricted to the connected lane(s) serving that model (case-insensitive; a family name like "minimax" pins its concrete resolution). If that model is not connected or cannot run right now, the task returns native with the reason \u2014 TokenMaxed never substitutes a different model for an explicit pin. Omit for normal cheapest-capable routing.'
         }
       }
     },
@@ -10603,6 +10637,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
+      const model = optString(args, "model");
       if (!deps.getEnabled()) {
         return ok(
           "TokenMaxed routing is DISABLED for this project \u2014 handle this task yourself (native). Run /tokenmaxed:on to re-enable.",
@@ -10620,7 +10655,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...Object.keys(policyContext).length ? { policyContext } : {},
         ...files && files.length ? { files } : {},
         ...access_need ? { access_need } : {},
-        ...difficulty ? { difficulty } : {}
+        ...difficulty ? { difficulty } : {},
+        ...model ? { model } : {}
       });
       const finalOutcome = resolution.categoryInferred ? {
         ...outcome,
@@ -10838,6 +10874,7 @@ var PURE_CORE = {
   routeDecide,
   eligibleLanes,
   hostAllowsLane,
+  modelMatchesPin,
   evaluate,
   taskCategories: TASK_CATEGORIES,
   classifyTask,

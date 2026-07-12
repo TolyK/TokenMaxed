@@ -59,6 +59,8 @@ export interface CorePort {
   evaluate: (task: Task, lane: Lane, ctx: PolicyContext, policy: Policy) => PolicyDecision;
   /** F: the host-gating predicate (route.ts) — /why uses the SAME predicate to name host-blocked lanes. */
   hostAllowsLane: (lane: Lane, ctx: Pick<RouteContext, 'host'>) => boolean;
+  /** Per-request model-pin matcher (route.ts) — REQUIRED: an advertised `model` param that a port silently ignored would break the no-substitution contract. */
+  modelMatchesPin: (laneModel: string, pin: string) => boolean;
   /** Canonical task categories (core's TASK_CATEGORIES). */
   taskCategories: readonly TaskCategory[];
   classifyTask: (text: string) => { category: TaskCategory; confidence: number; scores: Partial<Record<TaskCategory, number>> };
@@ -120,7 +122,7 @@ export interface ToolDeps {
    * category (capability 0). Routing over the full lane set would let an
    * opted-out lane win, so preview must use this, matching the real run path.
    */
-  candidateLanes: (category: TaskCategory) => Lane[];
+  candidateLanes: (category: TaskCategory, opts?: { includeReserved?: boolean }) => Lane[];
   /**
    * The learned capability overlay (F-1), or `undefined` when learning is off
    * (TOKENMAXED_LEARN_CAPABILITY) — in which case routing uses declared scores
@@ -352,6 +354,15 @@ export interface DelegateRequest {
    * hard reviews). Absent ⇒ category-level routing, unchanged.
    */
   difficulty?: DifficultyBucket;
+  /**
+   * OPTIONAL per-request model PIN — set ONLY when the USER explicitly named a
+   * model in their prompt ("use minimax for this"). Routing is restricted to
+   * the configured lane(s) serving that model (case-insensitive; a family name
+   * pins its resolution). If no connected lane serves it — or the lane can't
+   * run under current gates — the task comes back native with the reason:
+   * TokenMaxed never substitutes another model for an explicit pin.
+   */
+  model?: string;
 }
 
 /** The outcome of an offload (content-free; the host decides what to do with it). */
@@ -665,6 +676,11 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL difficulty to preview — shows the pick a difficulty-tagged delegate would make when learned difficulty evidence exists. Omit for the category-level pick.',
         },
+        model: {
+          type: 'string',
+          description:
+            'OPTIONAL exact-model pin to preview — shows what a model-pinned delegate would do (the pinned lane, or WHY the pin cannot run). Same matching as router_delegate\'s model param.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -675,6 +691,7 @@ export function createTools(core: CorePort): ToolDef[] {
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
         const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
         const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
+        const pinnedModel = optString(args, 'model')?.trim() || undefined;
         // The Task both ctx builds route on — difficulty rides it so the preview
         // matches what a difficulty-tagged router_delegate would decide.
         const task: Task = { category, ...(difficulty ? { difficulty } : {}) };
@@ -708,8 +725,25 @@ export function createTools(core: CorePort): ToolDef[] {
         };
         // Route over the category's candidate lanes (capability-0 opt-outs excluded),
         // matching the documented run path — never the full lane set.
-        const lanes = deps.candidateLanes(category);
+        // Per-request model PIN (delegate parity): a pinned lane is NEVER
+        // reserved away as a reviewer (delegate keeps it executing), so the pin
+        // must look at the UNRESERVED candidate set — otherwise /why would call
+        // a review-eligible pinned model "not connected" while delegate runs it.
+        let lanes = deps.candidateLanes(category, pinnedModel ? { includeReserved: true } : undefined);
         const policy = deps.loadPolicy();
+        // Restrict to lanes serving the named model; none connected ⇒ say so —
+        // never preview a substitute.
+        if (pinnedModel) {
+          const pinnedLanes = lanes.filter((l) => core.modelMatchesPin(l.model, pinnedModel));
+          if (pinnedLanes.length === 0) {
+            const connected = [...new Set(lanes.map((l) => l.model))].sort();
+            return ok(
+              `requested model "${pinnedModel}" is not connected to TokenMaxed for category "${category}" — a model-pinned delegate would come back native (no substitution). Connected models: ${connected.join(', ') || '(none)'}.`,
+              { category, gateReady, decision: null, native: true, pinnedModel, connectedModels: connected },
+            );
+          }
+          lanes = pinnedLanes;
+        }
         // Apply the learned overlay (F-1) so /tokenmaxed:why reflects the same
         // effective capability router_delegate routes with. Undefined ⇒ declared.
         const observedCapability = deps.observedCapability();
@@ -789,6 +823,12 @@ export function createTools(core: CorePort): ToolDef[] {
           decision = core.routeDecide(task, ctx, policy);
         } catch {
           // No selectable lane (all gated/blocked/unavailable) ⇒ the host does it.
+          if (pinnedModel) {
+            return ok(
+              `requested model "${pinnedModel}" cannot run right now (its lane is blocked or unavailable under current gates) — a model-pinned delegate would come back native, NOT substitute another model.`,
+              { category, gateReady, policyContext, decision: null, native: true, pinnedModel },
+            );
+          }
           return ok(
             `category "${category}": no eligible lane (gate_ready=${gateReady}) — would run on the host (native).`,
             { category, gateReady, policyContext, decision: null, native: true },
@@ -873,6 +913,7 @@ export function createTools(core: CorePort): ToolDef[] {
         );
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
+          ...(pinnedModel ? [`  model pinned by request: "${pinnedModel}" — only lanes serving it were considered (no substitution on failure).`] : []),
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
           `  why: ${decision.reason}`,
@@ -1073,6 +1114,11 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL expected difficulty. When set and learned difficulty-specific evidence exists (TOKENMAXED_LEARN_CAPABILITY), routing conditions capability on that difficulty\'s real pass record — e.g. "hard" favors models that keep passing hard reviews. Omit when unsure (category-level routing, unchanged).',
         },
+        model: {
+          type: 'string',
+          description:
+            'OPTIONAL exact-model pin. Set ONLY when the USER explicitly named a model in their prompt (e.g. "use minimax for this", "route this to gpt-5.5") — never infer it. Routing is restricted to the connected lane(s) serving that model (case-insensitive; a family name like "minimax" pins its concrete resolution). If that model is not connected or cannot run right now, the task returns native with the reason — TokenMaxed never substitutes a different model for an explicit pin. Omit for normal cheapest-capable routing.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -1085,6 +1131,7 @@ export function createTools(core: CorePort): ToolDef[] {
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
         const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
         const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
+        const model = optString(args, 'model');
 
         // Respect the per-project toggle: when off, never offload — tell the host
         // to do it itself (no config load, no execution).
@@ -1108,6 +1155,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(files && files.length ? { files } : {}),
           ...(access_need ? { access_need } : {}),
           ...(difficulty ? { difficulty } : {}),
+          ...(model ? { model } : {}),
         });
 
         const finalOutcome = resolution.categoryInferred

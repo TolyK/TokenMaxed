@@ -450,6 +450,20 @@ export function hostAllowsLane(lane: Lane, ctx: Pick<RouteContext, 'host'>): boo
   return typeof ctx.host === 'string' && ctx.host !== '' && lane.hosts.includes(ctx.host);
 }
 
+/**
+ * Does a lane's (resolved) model id satisfy a user's per-request model pin?
+ * Case-insensitive; exact, or a boundary-aware prefix so a family name pins
+ * its concrete resolution ("minimax" ⇒ minimax-m3, "claude-haiku" ⇒
+ * claude-haiku-4-5, "gpt-5" ⇒ gpt-5.5) without "gpt" matching everything.
+ */
+export function modelMatchesPin(laneModel: string, pin: string): boolean {
+  const m = laneModel.toLowerCase();
+  const p = pin.trim().toLowerCase();
+  if (p === '') return false;
+  if (m === p) return true;
+  return m.startsWith(p) && ['-', '.', ':', '@', '/'].includes(m[p.length] ?? '');
+}
+
 export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): EligibleLane[] {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
