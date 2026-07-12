@@ -21815,6 +21815,13 @@ function hostAllowsLane(lane, ctx) {
   if (!lane.hosts || lane.hosts.length === 0) return true;
   return typeof ctx.host === "string" && ctx.host !== "" && lane.hosts.includes(ctx.host);
 }
+function modelMatchesPin(laneModel, pin) {
+  const m = laneModel.toLowerCase();
+  const p = pin.trim().toLowerCase();
+  if (p === "") return false;
+  if (m === p) return true;
+  return m.startsWith(p) && ["-", ".", ":", "@", "/"].includes(m[p.length] ?? "");
+}
 function eligibleLanes(task, ctx, policy) {
   const disabled = new Set(policy.disabledLaneIds ?? []);
   const policyContext = ctx.policyContext ?? {};
@@ -25689,6 +25696,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           type: "string",
           enum: [...DIFFICULTIES],
           description: "OPTIONAL difficulty to preview \u2014 shows the pick a difficulty-tagged delegate would make when learned difficulty evidence exists. Omit for the category-level pick."
+        },
+        model: {
+          type: "string",
+          description: "OPTIONAL exact-model pin to preview \u2014 shows what a model-pinned delegate would do (the pinned lane, or WHY the pin cannot run). Same matching as router_delegate's model param."
         }
       }
     },
@@ -25699,6 +25710,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
+      const pinnedModel = optString(args, "model")?.trim() || void 0;
       const task = { category, ...difficulty ? { difficulty } : {} };
       const resolvedAccessNeed = access_need === "repo-tight" ? "repo-tight" : "worker-ok";
       if (!deps.getEnabled()) {
@@ -25713,8 +25725,19 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
       };
-      const lanes = deps.candidateLanes(category);
+      let lanes = deps.candidateLanes(category, pinnedModel ? { includeReserved: true } : void 0);
       const policy = deps.loadPolicy();
+      if (pinnedModel) {
+        const pinnedLanes = lanes.filter((l) => core.modelMatchesPin(l.model, pinnedModel));
+        if (pinnedLanes.length === 0) {
+          const connected = [...new Set(lanes.map((l) => l.model))].sort();
+          return ok(
+            `requested model "${pinnedModel}" is not connected to TokenMaxed for category "${category}" \u2014 a model-pinned delegate would come back native (no substitution). Connected models: ${connected.join(", ") || "(none)"}.`,
+            { category, gateReady, decision: null, native: true, pinnedModel, connectedModels: connected }
+          );
+        }
+        lanes = pinnedLanes;
+      }
       const observedCapability = deps.observedCapability();
       const observedCapabilityByModel = deps.observedCapabilityByModel?.();
       const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
@@ -25768,6 +25791,12 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       try {
         decision = core.routeDecide(task, ctx, policy);
       } catch {
+        if (pinnedModel) {
+          return ok(
+            `requested model "${pinnedModel}" cannot run right now (its lane is blocked or unavailable under current gates) \u2014 a model-pinned delegate would come back native, NOT substitute another model.`,
+            { category, gateReady, policyContext, decision: null, native: true, pinnedModel }
+          );
+        }
         return ok(
           `category "${category}": no eligible lane (gate_ready=${gateReady}) \u2014 would run on the host (native).`,
           { category, gateReady, policyContext, decision: null, native: true }
@@ -25822,6 +25851,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       );
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
+        ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
         `  why: ${decision.reason}`,
@@ -25987,6 +26017,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           type: "string",
           enum: [...DIFFICULTIES],
           description: `OPTIONAL expected difficulty. When set and learned difficulty-specific evidence exists (TOKENMAXED_LEARN_CAPABILITY), routing conditions capability on that difficulty's real pass record \u2014 e.g. "hard" favors models that keep passing hard reviews. Omit when unsure (category-level routing, unchanged).`
+        },
+        model: {
+          type: "string",
+          description: 'OPTIONAL exact-model pin. Set ONLY when the USER explicitly named a model in their prompt (e.g. "use minimax for this", "route this to gpt-5.5") \u2014 never infer it. Routing is restricted to the connected lane(s) serving that model (case-insensitive; a family name like "minimax" pins its concrete resolution). If that model is not connected or cannot run right now, the task returns native with the reason \u2014 TokenMaxed never substitutes a different model for an explicit pin. Omit for normal cheapest-capable routing.'
         }
       }
     },
@@ -25999,6 +26033,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
+      const model = optString(args, "model");
       if (!deps.getEnabled()) {
         return ok(
           "TokenMaxed routing is DISABLED for this project \u2014 handle this task yourself (native). Run /tokenmaxed:on to re-enable.",
@@ -26016,7 +26051,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...Object.keys(policyContext).length ? { policyContext } : {},
         ...files && files.length ? { files } : {},
         ...access_need ? { access_need } : {},
-        ...difficulty ? { difficulty } : {}
+        ...difficulty ? { difficulty } : {},
+        ...model ? { model } : {}
       });
       const finalOutcome = resolution.categoryInferred ? {
         ...outcome,
@@ -26370,7 +26406,7 @@ function filePreferStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
 function receiptFromEvents(events) {
   const legs = events.filter((e) => e.status !== "native");
   if (legs.length === 0) return void 0;
@@ -26571,7 +26607,22 @@ function makeServerDeps(env = process.env) {
     const policy = loadPolicySafe();
     const priceTable = loadPriceTable(pricesPath);
     const ledger = new JsonlLedger(ledgerPath);
-    const lanes = registry2.candidateLanes(request.category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
+    let lanes = registry2.candidateLanes(request.category).map((lane) => resolveLaneModel(lane, priceTable)).filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
+    const pinnedModel = request.model?.trim() || void 0;
+    if (pinnedModel) {
+      const pinnedLanes = lanes.filter((l) => modelMatchesPin(l.model, pinnedModel));
+      if (pinnedLanes.length === 0) {
+        const configuredMatch = registry2.candidateLanes(request.category).some((l) => modelMatchesPin(l.model, pinnedModel) || modelMatchesPin(resolveLaneModel(l, priceTable).model, pinnedModel));
+        const connected = [...new Set(lanes.map((l) => l.model))].sort();
+        return {
+          laneId: "native",
+          status: "ok",
+          native: true,
+          reason: configuredMatch ? `requested model "${pinnedModel}" is configured but currently unusable (its @latest alias didn't resolve against the price table, or it's a metered lane without pricing) \u2014 not substituting another model. Fix the lane or omit the model to route normally.` : `requested model "${pinnedModel}" is not connected to TokenMaxed for this category \u2014 not substituting another model. Connected models: ${connected.join(", ") || "(none)"}. Omit the model to route normally.`
+        };
+      }
+      lanes = pinnedLanes;
+    }
     const modelOf = (laneId) => lanes.find((l) => l.id === laneId)?.model ?? registry2.byId(laneId)?.model;
     const observedCapabilityByModel = buildObservedByModel();
     const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
@@ -26649,6 +26700,17 @@ function makeServerDeps(env = process.env) {
       ...fileResult.attachments.length ? { attachments: fileResult.attachments } : {}
     };
     const skippedNote = fileResult.skipped.length > 0 ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join("; ")})` : "";
+    const withPinNote = (outcome, ranButGivenBack = false) => {
+      if (!pinnedModel) return outcome;
+      if (outcome.native) {
+        return {
+          ...outcome,
+          reason: ranButGivenBack ? `${outcome.reason ?? "manager review gave the result back"} \u2014 model "${pinnedModel}" was pinned by your request and DID run; its output was given back by review. Not substituting another model.` : `requested model "${pinnedModel}" did not complete this task (${outcome.reason ?? "no eligible/available lane under current gates"}) \u2014 not substituting another model. Omit the model to route normally.`
+        };
+      }
+      const note = ` \u2014 model "${pinnedModel}" pinned by your request`;
+      return { ...outcome, reason: outcome.reason ? `${outcome.reason}${note}` : note.trimStart() };
+    };
     const preferOverrideNoteFor = (laneId, decision) => {
       if (readPreferredLane() !== laneId) return "";
       const capPenalty = decision?.scores.find((s) => s.laneId === laneId)?.factors.capPenalty ?? 0;
@@ -26667,8 +26729,13 @@ function makeServerDeps(env = process.env) {
         ...runDeps,
         runManager: (lane, prompt) => runDeps.executeTrusted(lane, prompt).then((res) => res.resultText)
       };
-      const offloadLanes = lanes.filter((lane) => !reservedForReview(lane));
-      const esc2 = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes }, policy, escDeps, { candidates: lanes });
+      const offloadLanes = pinnedModel ? lanes : lanes.filter((lane) => !reservedForReview(lane));
+      const managerPool = pinnedModel ? [...new Map([...usableCandidates(request.category), ...lanes].map((l) => [l.id, l])).values()] : lanes;
+      const escAvailable = pinnedModel ? [.../* @__PURE__ */ new Set([...ctx.availableLaneIds, ...await probeAvailable(managerPool)])] : ctx.availableLaneIds;
+      const esc2 = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes, availableLaneIds: escAvailable }, policy, escDeps, {
+        candidates: managerPool,
+        ...pinnedModel ? { maxEscalations: 0 } : {}
+      });
       let escRecordingFailed = false;
       try {
         for (const ev of esc2.events) {
@@ -26680,9 +26747,12 @@ function makeServerDeps(env = process.env) {
       }
       const escReceipt = receiptFromEvents(esc2.events.flatMap((e) => e.kind === "task" ? [e.event] : []));
       return withSkippedNote(
-        withPreferOverrideNote(
-          { ...escToOutcome(esc2, modelOf, escRecordingFailed), ...escReceipt ? { receipt: escReceipt } : {} },
-          esc2.result.decision
+        withPinNote(
+          withPreferOverrideNote(
+            { ...escToOutcome(esc2, modelOf, escRecordingFailed), ...escReceipt ? { receipt: escReceipt } : {} },
+            esc2.result.decision
+          ),
+          esc2.final_action === "give_back" && esc2.result.failureKind !== "insufficient_context"
         ),
         skippedNote
       );
@@ -26696,23 +26766,25 @@ function makeServerDeps(env = process.env) {
     }
     const resultModel = modelOf(result.laneId);
     return withSkippedNote(
-      withPreferOverrideNote(
-        {
-          laneId: result.laneId,
-          status: result.status,
-          ...result.native ? { native: true } : {},
-          ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
-          ...resultModel ? { model: resultModel } : {},
-          ...result.failureKind ? { failureKind: result.failureKind } : {},
-          ...result.failureKind === "insufficient_context" ? { reason: `worker handed back (insufficient context): ${result.resultText ?? "needs repo/tool access"} \u2014 host should complete` } : result.decision?.reason ? { reason: result.decision.reason } : {},
-          ...result.readerDerived ? { readerDerived: true } : {},
-          ...recordingFailed ? { recordingFailed: true } : {},
-          ...(() => {
-            const receipt = receiptFromEvents(result.events);
-            return receipt ? { receipt } : {};
-          })()
-        },
-        result.decision
+      withPinNote(
+        withPreferOverrideNote(
+          {
+            laneId: result.laneId,
+            status: result.status,
+            ...result.native ? { native: true } : {},
+            ...result.resultText !== void 0 ? { resultText: result.resultText } : {},
+            ...resultModel ? { model: resultModel } : {},
+            ...result.failureKind ? { failureKind: result.failureKind } : {},
+            ...result.failureKind === "insufficient_context" ? { reason: `worker handed back (insufficient context): ${result.resultText ?? "needs repo/tool access"} \u2014 host should complete` } : result.decision?.reason ? { reason: result.decision.reason } : {},
+            ...result.readerDerived ? { readerDerived: true } : {},
+            ...recordingFailed ? { recordingFailed: true } : {},
+            ...(() => {
+              const receipt = receiptFromEvents(result.events);
+              return receipt ? { receipt } : {};
+            })()
+          },
+          result.decision
+        )
       ),
       skippedNote
     );
@@ -26723,9 +26795,9 @@ function makeServerDeps(env = process.env) {
     // unpriceable metered lanes. When escalation is on, ALSO reserve manager-
     // eligible lanes (as delegate does), so /tokenmaxed:why mirrors the initial
     // offload routing exactly. Lazy per call.
-    candidateLanes: (category) => {
+    candidateLanes: (category, opts) => {
       const c = usableCandidates(category);
-      return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
+      return escalateEnabled && !opts?.includeReserved ? c.filter((lane) => !reservedForReview(lane)) : c;
     },
     // Same availability probe delegate routes with, so /tokenmaxed:why never
     // advertises a lane that can't run (e.g. a free local lane whose server is down).

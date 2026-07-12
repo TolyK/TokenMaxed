@@ -37,7 +37,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
-  hostAllowsLane, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -194,7 +194,7 @@ function filePreferStore(statePath: string): PreferStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -534,11 +534,35 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const ledger = new JsonlLedger(ledgerPath);
     // Same usable set preview sees: unpriceable metered lanes are already excluded,
     // so runTask never picks one and can't throw on cost after paying for it.
-    const lanes = registry
+    let lanes = registry
       .candidateLanes(request.category)
       .map((lane) => resolveLaneModel(lane, priceTable)) // <family>@latest ⇒ concrete priced id
       // Drop a still-unresolved alias (any cost basis) so literal "@latest" never runs.
       .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
+    // Per-request model PIN (the user named a model in their prompt): restrict
+    // routing to the lane(s) serving it. An explicit pin is NEVER substituted —
+    // not connected / can't run ⇒ the task comes back native with the reason.
+    const pinnedModel = request.model?.trim() || undefined;
+    if (pinnedModel) {
+      const pinnedLanes = lanes.filter((l) => modelMatchesPin(l.model, pinnedModel));
+      if (pinnedLanes.length === 0) {
+        // Distinguish honestly: configured-but-dropped (unresolved @latest /
+        // unpriceable metered) vs simply not connected for this category.
+        const configuredMatch = registry
+          .candidateLanes(request.category)
+          .some((l) => modelMatchesPin(l.model, pinnedModel) || modelMatchesPin(resolveLaneModel(l, priceTable).model, pinnedModel));
+        const connected = [...new Set(lanes.map((l) => l.model))].sort();
+        return {
+          laneId: 'native',
+          status: 'ok',
+          native: true,
+          reason: configuredMatch
+            ? `requested model "${pinnedModel}" is configured but currently unusable (its @latest alias didn't resolve against the price table, or it's a metered lane without pricing) — not substituting another model. Fix the lane or omit the model to route normally.`
+            : `requested model "${pinnedModel}" is not connected to TokenMaxed for this category — not substituting another model. Connected models: ${connected.join(', ') || '(none)'}. Omit the model to route normally.`,
+        };
+      }
+      lanes = pinnedLanes;
+    }
     // Display/outcome must show the RESOLVED model (e.g. minimax-m3), not the alias —
     // the resolved lane set wins; fall back to the registry for ids not in it (native).
     const modelOf = (laneId: string): string | undefined =>
@@ -654,6 +678,26 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         ? ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join('; ')})`
         : '';
 
+    // Model-pin honesty: a pinned run that degraded to native must say WHY in
+    // pin terms (never look like a normal routing miss), and a pinned success
+    // carries the pin note so the receipt explains the non-default choice.
+    const withPinNote = (outcome: DelegateOutcome, ranButGivenBack = false): DelegateOutcome => {
+      if (!pinnedModel) return outcome;
+      if (outcome.native) {
+        // Two HONESTLY different native cases: the pinned lane RAN and review
+        // gave its output back (say that), vs it never completed (gates,
+        // availability, failures). Both refuse substitution.
+        return {
+          ...outcome,
+          reason: ranButGivenBack
+            ? `${outcome.reason ?? 'manager review gave the result back'} — model "${pinnedModel}" was pinned by your request and DID run; its output was given back by review. Not substituting another model.`
+            : `requested model "${pinnedModel}" did not complete this task (${outcome.reason ?? 'no eligible/available lane under current gates'}) — not substituting another model. Omit the model to route normally.`,
+        };
+      }
+      const note = ` — model "${pinnedModel}" pinned by your request`;
+      return { ...outcome, reason: outcome.reason ? `${outcome.reason}${note}` : note.trimStart() };
+    };
+
     // B (plan §1.3): preference deliberately OVERRIDES quota pressure — make the
     // override loud rather than silent, on BOTH the plain and escalation paths.
     // Detection mirrors core exactly by reading the decision's ACTUAL capPenalty
@@ -687,8 +731,30 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // the initial pass leaving nothing to escalate to. A metered manager stays an
       // offload candidate. The full set is still the escalation + manager pool. If
       // every candidate is reserved, routing degrades to native — a safe give-back.
-      const offloadLanes = lanes.filter((lane) => !reservedForReview(lane));
-      const esc = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes }, policy, escDeps, { candidates: lanes });
+      // Under a model PIN the pinned lane must EXECUTE — reserving it as the
+      // reviewer would refuse the pin for a non-gate reason (review still gets
+      // an independent manager from managerPool below; selectReviewManager
+      // excludes the subject lane by id).
+      const offloadLanes = pinnedModel ? lanes : lanes.filter((lane) => !reservedForReview(lane));
+      // Under a model pin, escalating to a DIFFERENT lane would be a silent
+      // substitution — maxEscalations: 0 downgrades escalate to give_back while
+      // same-lane rework (and independent review) stay fully active. The manager
+      // pool stays the full usable set so review is never starved by the pin.
+      // ID-keyed dedupe (Set would compare object identity across the two
+      // loads); RESOLVED lane objects win the collision.
+      const managerPool = pinnedModel
+        ? [...new Map([...usableCandidates(request.category), ...lanes].map((l) => [l.id, l])).values()]
+        : lanes;
+      // Under a pin, availability was probed over the PINNED lanes only — the
+      // manager pool must be probed too, or every reviewer looks unavailable
+      // and pinned work would ship reviewUnavailable.
+      const escAvailable = pinnedModel
+        ? [...new Set([...ctx.availableLaneIds, ...(await probeAvailable(managerPool))])]
+        : ctx.availableLaneIds;
+      const esc = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes, availableLaneIds: escAvailable }, policy, escDeps, {
+        candidates: managerPool,
+        ...(pinnedModel ? { maxEscalations: 0 } : {}),
+      });
       let escRecordingFailed = false;
       try {
         for (const ev of esc.events) {
@@ -700,9 +766,12 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       }
       const escReceipt = receiptFromEvents(esc.events.flatMap((e) => (e.kind === 'task' ? [e.event] : [])));
       return withSkippedNote(
-        withPreferOverrideNote(
-          { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
-          esc.result.decision,
+        withPinNote(
+          withPreferOverrideNote(
+            { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
+            esc.result.decision,
+          ),
+          esc.final_action === 'give_back' && esc.result.failureKind !== 'insufficient_context',
         ),
         skippedNote,
       );
@@ -717,7 +786,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     }
     const resultModel = modelOf(result.laneId);
     return withSkippedNote(
-      withPreferOverrideNote(
+      withPinNote(
+        withPreferOverrideNote(
         {
         laneId: result.laneId,
         status: result.status,
@@ -738,6 +808,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         })(),
         },
         result.decision,
+        ),
       ),
       skippedNote,
     );
@@ -749,9 +820,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // unpriceable metered lanes. When escalation is on, ALSO reserve manager-
     // eligible lanes (as delegate does), so /tokenmaxed:why mirrors the initial
     // offload routing exactly. Lazy per call.
-    candidateLanes: (category) => {
+    candidateLanes: (category, opts) => {
       const c = usableCandidates(category);
-      return escalateEnabled ? c.filter((lane) => !reservedForReview(lane)) : c;
+      // includeReserved: the preview's model-pin path — a pinned lane is never
+      // reserved away from execution, so its pin check must see the full set.
+      return escalateEnabled && !opts?.includeReserved ? c.filter((lane) => !reservedForReview(lane)) : c;
     },
     // Same availability probe delegate routes with, so /tokenmaxed:why never
     // advertises a lane that can't run (e.g. a free local lane whose server is down).

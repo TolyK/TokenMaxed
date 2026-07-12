@@ -675,6 +675,24 @@ Keep the `env.TOKENMAXED_HOST: "crush"` — it is the host identity for
 lanes (the claude-CLI lanes) fail closed without it, and stay blocked under
 Crush unless you deliberately add `crush` to a lane's `hosts:` list.
 
+## Pin an exact model from your prompt
+
+Name a connected model right in your task prompt and TokenMaxed routes to it —
+your agent passes it through as `router_delegate`'s `model` parameter:
+
+> *"Add pagination to the users endpoint — **use minimax** for this."*
+> *"Write the migration docs, **route it to gpt-5.5**."*
+
+Matching is case-insensitive and family-aware ("minimax" pins whatever your
+`minimax@latest` lane resolves to). The pin is honored or honestly refused —
+**never silently substituted**: if that model isn't connected to TokenMaxed,
+the task comes back to your main agent with the reason and the list of
+connected models; if it's connected but can't run under current
+trust/host/availability gates, it comes back with the gate reason. Same-lane review/rework still applies to pinned work; automatic
+escalation to a *different* lane is disabled while a pin is active. Preview it
+any time: `/tokenmaxed:why` accepts the same `model` argument. For a sticky
+(rather than per-task) override, `/tokenmaxed:prefer <lane>` remains the tool.
+
 ## Share your results (opt-in, launch-ready)
 
 **We never see your code or your prompts.** Sharing sends exactly one thing:
