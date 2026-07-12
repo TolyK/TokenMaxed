@@ -170,12 +170,19 @@ export const REVIEW_BUDGET_MS = 300_000;
  * + the untracked per-file wall-clock budget + a final per-file diff started just under
  * that budget (UNTRACKED_FILE_TIMEOUT_MS overrun).
  */
-const DIFF_ACQUISITION_HEADROOM_MS =
+export const DIFF_ACQUISITION_HEADROOM_MS =
   GIT_TIMEOUT_MS + GIT_TIMEOUT_MS + UNTRACKED_BUDGET_MS + UNTRACKED_FILE_TIMEOUT_MS;
 // The CLI lane's OS-level spawn timeout (spawnSync is synchronous — Promise.race can't
-// preempt it, so this is the real backstop). Strictly LESS than REVIEW_BUDGET_MS by the
-// full diff-acquisition headroom, so diff-read + CLI ≤ REVIEW_BUDGET_MS always.
-const REVIEW_CLI_TIMEOUT_MS = REVIEW_BUDGET_MS - DIFF_ACQUISITION_HEADROOM_MS;
+// preempt it, so this is the real backstop). Strictly LESS than the total budget by the
+// full diff-acquisition headroom, so diff-read + CLI ≤ budget always. Parameterized so a
+// host with a SMALLER hook clamp (Hermes: 300s) can shrink the whole chain — passing a
+// smaller totalBudgetMs to runReviewWithBudget alone would NOT bound the spawnSync.
+export function reviewCliTimeoutFor(totalBudgetMs: number): number {
+  // Never below 30s: a reviewer that can't get 30s is better surfaced as a
+  // timeout than silently strangled into instant failures.
+  return Math.max(30_000, totalBudgetMs - DIFF_ACQUISITION_HEADROOM_MS);
+}
+const REVIEW_CLI_TIMEOUT_MS = reviewCliTimeoutFor(REVIEW_BUDGET_MS);
 
 /**
  * REVIEW-LOOP — "review ALL changed code": synthesize add-style diffs for
@@ -236,8 +243,12 @@ function readUntrackedDiff(cwd: string): { diff: string; omitted: number; enumer
   return { diff: parts.join('\n'), omitted: Math.max(0, all.length - included), enumerationFailed: false };
 }
 
-/** Build the real host-review deps from the environment (git + executor + ledger). */
-export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
+/**
+ * Build the real host-review deps from the environment (git + executor +
+ * ledger). `opts.totalBudgetMs` shrinks the CLI spawn timeout in step (see
+ * reviewCliTimeoutFor) for hosts whose hook clamp is below REVIEW_BUDGET_MS.
+ */
+export function makeHostReviewDeps(env: NodeJS.ProcessEnv, opts: { totalBudgetMs?: number } = {}): HostReviewDeps {
   // A REAL path is required for git's cwd: TOKENMAXED_PROJECT_DIR (host-neutral,
   // set by non-Claude adapters like the OpenCode plugin) wins, then Claude's
   // CLAUDE_PROJECT_DIR. TOKENMAXED_PROJECT is only the toggle KEY (may be a
@@ -250,7 +261,7 @@ export function makeHostReviewDeps(env: NodeJS.ProcessEnv): HostReviewDeps {
   const pricesPath = env.TOKENMAXED_PRICES ?? fileURLToPath(new URL('../prices.seed.json', import.meta.url));
   const resolveAuth = makeResolveAuth(env);
   const executor = makeTrustedExecutor({
-    cli: makeCliExecutor(makeCliSpawn(REVIEW_CLI_TIMEOUT_MS)),
+    cli: makeCliExecutor(makeCliSpawn(opts.totalBudgetMs !== undefined ? reviewCliTimeoutFor(opts.totalBudgetMs) : REVIEW_CLI_TIMEOUT_MS)),
     api: makeTrustedApiExecutor({ resolveAuth }),
   });
 

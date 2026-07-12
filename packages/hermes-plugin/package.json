@@ -1,0 +1,11 @@
+{
+  "name": "@tokenmaxed/hermes-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TokenMaxed for Hermes (Nous Research): bundled MCP server, shell hooks (gate, banner, pre_verify review), and generated skills.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}
