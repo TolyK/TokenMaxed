@@ -125,6 +125,16 @@ export function bannerWithinBudget(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
+ * Rewrite the shared deny reason's Claude-format command refs (/tokenmaxed:x)
+ * into a host's own command dialect, so the remediation it names is actually
+ * invocable on that host (e.g. /tokenmaxed-on in OpenCode/Cline, /tokenmaxed_on
+ * in OpenClaw). Only the separator differs; the lane/task semantics don't.
+ */
+export function denyReasonForHost(reason: string, separator: '-' | '_'): string {
+  return reason.replaceAll(/\/tokenmaxed:([a-z-]+)/g, (_, name: string) => `/tokenmaxed${separator}${separator === '_' ? name.replaceAll('-', '_') : name}`);
+}
+
+/**
  * The same deterministic gate the Claude/Codex PreToolUse hooks apply, as a
  * throwable reason: null ⇒ allow; string ⇒ deny with that reason (OpenCode
  * blocks a tool call by THROWING from tool.execute.before). Fail OPEN like the
@@ -302,7 +312,7 @@ export const TokenMaxed = async (input: OpencodePluginInput): Promise<OpencodeHo
     'tool.execute.before': async (toolInput) => {
       if (toolInput.tool !== OPENCODE_DELEGATE_TOOL) return;
       const reason = delegateDenyReason(pluginEnv());
-      if (reason) throw new Error(reason);
+      if (reason) throw new Error(denyReasonForHost(reason, '-')); // OpenCode commands are /tokenmaxed-x
     },
 
     // Review loop on session.idle — see the module doc for the honest mapping.

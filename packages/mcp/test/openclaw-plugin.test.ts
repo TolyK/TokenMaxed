@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { PRETOOLUSE_DENY_REASON } from '../src/hook.ts';
-import { REWORK_PROMPT_PREFIX } from '../src/opencode-plugin.ts';
+import { denyReasonForHost, REWORK_PROMPT_PREFIX } from '../src/opencode-plugin.ts';
 import {
   FINALIZE_HOOK_TIMEOUT_MS,
   OPENCLAW_DELEGATE_TOOL,
@@ -121,7 +121,8 @@ test('before_tool_call: vetoes router_delegate with the shared reason when routi
     const h = handlers.get('before_tool_call')!;
     const decision = (await h({ toolName: OPENCLAW_DELEGATE_TOOL })) as { block?: boolean; blockReason?: string };
     assert.equal(decision.block, true);
-    assert.equal(decision.blockReason, PRETOOLUSE_DENY_REASON);
+    // The reason speaks OpenClaw's command dialect (/tokenmaxed_x, [a-z0-9_]).
+    assert.equal(decision.blockReason, denyReasonForHost(PRETOOLUSE_DENY_REASON, '_'));
     assert.equal(await h({ toolName: 'exec' }), undefined);
     // Routing back on ⇒ allow (undefined).
     writeFileSync(statePath, JSON.stringify({ proj: true }), 'utf8');

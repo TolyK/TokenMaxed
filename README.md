@@ -549,6 +549,36 @@ Two config blocks in the example are load-bearing:
   the 15s default would time the hook out and proceed with the natural answer
   — fail-open, but no review).
 
+## Use in Cline (CLI & VS Code)
+
+The same brain in [Cline](https://cline.bot), both surfaces: a bundled MCP
+server (tools appear as `tokenmaxed__router_delegate` on the CLI, or via
+`use_mcp_tool` in the VS Code extension), the PreToolUse routing gate (the one
+blocking file hook Cline offers — it handles both surfaces' payload shapes),
+the TaskStart session banner, and all thirteen skills in Cline's native
+SKILL.md format.
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git && cd TokenMaxed
+npm install
+npm run build:cline-plugin      # bundle server + hooks + generate skills
+# MCP: merge packages/cline-plugin/cline_mcp_settings.example.json into your
+#   cline_mcp_settings.json (or use `cline mcp install`), keeping
+#   env.TOKENMAXED_HOST="cline" — the per-host lane-permission identity.
+# Hooks: copy packages/cline-plugin/hooks/* into .cline/hooks/ (CLI) or
+#   .clinerules/hooks/ / ~/Documents/Cline/Hooks (VS Code).
+# Skills: copy packages/cline-plugin/skills/* into .cline/skills/ or ~/.cline/skills/.
+```
+
+**Reduced protection — honest notes:** Cline has **no turn-end blocking
+primitive** on either surface (its task-complete events are observational), so
+there is deliberately no automatic review-iterate loop here — run
+`/tokenmaxed-review` on demand instead. The TaskStart banner renders in the
+VS Code extension (which injects hook context) but not the CLI (which ignores
+TaskStart output); `/tokenmaxed-summary` covers the CLI. Cline's skill
+frontmatter has no manual-only flag, so state-changing skills carry an
+explicit MANUAL-ONLY preamble instead.
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
@@ -664,7 +694,8 @@ per host — each host controlling which lanes are even allowed to run inside it
 | **Codex CLI plugin** | available | `packages/codex-plugin` — bundled MCP server + skills + hooks (see [Use in Codex CLI](#use-in-codex-cli-plugin)) |
 | **OpenCode plugin** | available | `packages/opencode-plugin` — bundled MCP server + in-process plugin + commands (see [Use in OpenCode](#use-in-opencode-plugin)) |
 | **OpenClaw plugin** | available | `packages/openclaw-plugin` — native Gateway plugin + MCP server + skills, with a real finalize review gate (see [Use in OpenClaw](#use-in-openclaw-plugin)) |
-| Pi · Cline · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
+| **Cline (CLI + VS Code)** | available | `packages/cline-plugin` — bundled MCP server + PreToolUse gate + TaskStart banner + skills (see [Use in Cline](#use-in-cline-cli--vs-code)) |
+| Pi · Hermes · others | planned | same core, thin per-host adapters, per-host lane permissions |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.

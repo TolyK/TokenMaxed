@@ -1,0 +1,12 @@
+{
+  "$comment": "TokenMaxed in Cline — merge into cline_mcp_settings.json (CLI: ~/.cline/data/settings/, VS Code: the extension's globalStorage settings dir; or use `cline mcp install`). The env.TOKENMAXED_HOST is REQUIRED: it is the host identity for per-lane hosts: allowlists — hosts:-scoped lanes (e.g. the claude-CLI lanes) fail closed without it, and stay blocked here unless you deliberately add 'cline' to a lane's hosts: list.",
+  "mcpServers": {
+    "tokenmaxed": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/TokenMaxed/packages/cline-plugin/server/index.mjs"],
+      "env": { "TOKENMAXED_HOST": "cline" },
+      "disabled": false,
+      "autoApprove": ["router_preview", "router_status", "router_savings", "router_summary"]
+    }
+  }
+}
