@@ -1,0 +1,5 @@
+{
+  "$comment": "TokenMaxed in pi — merge into ~/.pi/agent/settings.json (absolute paths). Registering BY PATH keeps reference data resolvable ('../' from the bundle) — no copying. Host identity is built in (the extension threads TOKENMAXED_HOST=pi itself); hosts:-scoped lanes (the claude-CLI lanes) stay blocked here unless you deliberately add 'pi' to a lane's hosts: list. Verified against pi v0.80.x — pi's extension API changes often; re-run the TokenMaxed build after a pi upgrade if anything misbehaves.",
+  "extensions": ["/ABSOLUTE/PATH/TO/TokenMaxed/packages/pi-extension/extension/index.ts"],
+  "skills": ["/ABSOLUTE/PATH/TO/TokenMaxed/packages/pi-extension/skills"]
+}

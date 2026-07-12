@@ -1,0 +1,11 @@
+{
+  "name": "@tokenmaxed/pi-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TokenMaxed for pi (earendil-works): native in-process extension — router tools, gate, banner, review, and the statusline quota gauge.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "license": "MIT"
+}

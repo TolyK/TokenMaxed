@@ -20,7 +20,8 @@
     "build:opencode-plugin": "npm run build && npm run build -w @tokenmaxed/opencode-plugin",
     "build:openclaw-plugin": "npm run build && npm run build -w @tokenmaxed/openclaw-plugin",
     "build:cline-plugin": "npm run build && npm run build -w @tokenmaxed/cline-plugin",
-    "build:hermes-plugin": "npm run build && npm run build -w @tokenmaxed/hermes-plugin"
+    "build:hermes-plugin": "npm run build && npm run build -w @tokenmaxed/hermes-plugin",
+    "build:pi-extension": "npm run build && npm run build -w @tokenmaxed/pi-extension"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

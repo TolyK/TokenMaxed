@@ -8794,7 +8794,10 @@ var UNTRACKED_FILE_TIMEOUT_MS = 5e3;
 var UNTRACKED_FILE_MAXBUF = 4 * 1024 * 1024;
 var REVIEW_BUDGET_MS = 3e5;
 var DIFF_ACQUISITION_HEADROOM_MS = GIT_TIMEOUT_MS + GIT_TIMEOUT_MS + UNTRACKED_BUDGET_MS + UNTRACKED_FILE_TIMEOUT_MS;
-var REVIEW_CLI_TIMEOUT_MS = REVIEW_BUDGET_MS - DIFF_ACQUISITION_HEADROOM_MS;
+function reviewCliTimeoutFor(totalBudgetMs) {
+  return Math.max(3e4, totalBudgetMs - DIFF_ACQUISITION_HEADROOM_MS);
+}
+var REVIEW_CLI_TIMEOUT_MS = reviewCliTimeoutFor(REVIEW_BUDGET_MS);
 
 // ../mcp/src/hook-stop-main.ts
 import { mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "node:fs";

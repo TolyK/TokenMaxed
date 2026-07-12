@@ -609,6 +609,41 @@ The claude-CLI lanes stay `hosts:`-blocked here by default (Hermes documents
 spawning Claude Code as a pattern, but Anthropic hasn't formally sanctioned
 subprocess use — adding `hermes` to a lane's `hosts:` is your acknowledgement).
 
+## Use in pi (native extension)
+
+The same brain in [pi](https://github.com/earendil-works/pi) — as a **native
+extension** (pi has no built-in MCP, and doesn't need it here): every router
+tool registers first-class (`tokenmaxed_router_delegate`, …), the routing gate
+is a real `tool_call` veto, the session banner injects once per session, and —
+unique among hosts — **the statusline quota gauge is back**: pi's push-based
+status API shows the same `tmax · …` rolling-window gauge the Claude Code
+statusline renders, updated every turn.
+
+```bash
+git clone https://github.com/TolyK/TokenMaxed.git && cd TokenMaxed
+npm install
+npm run build:pi-extension      # bundle extension + children + generate skills
+# then merge packages/pi-extension/pi.settings.example.json into
+# ~/.pi/agent/settings.json (absolute paths — registering by path means
+# nothing to copy; skills load from the package dir too)
+```
+
+**Notes:** every tool call executes in a child process (the trusted CLI
+executor is synchronous by design and must never block pi's TUI). pi has no
+turn-end veto, so the review loop is the reduced OpenCode-style mapping: on
+`agent_settled` the review runs in a child and rework comes back as a
+follow-up message, bounded by the shared round counter. Skills keep
+`disable-model-invocation` (pi honors it natively) and invoke as
+`/skill:tokenmaxed-<name>`. pi's extension API changes often — this adapter is
+verified against pi v0.80.x; rebuild after a pi upgrade if anything misbehaves.
+The claude-CLI lanes stay `hosts:`-blocked here by default. pi is named in
+OpenAI's Codex for OSS program (plan-based Codex CLI use inside pi is
+sanctioned there), so the `codex-cli` lane ships unrestricted — that's a claim
+about pi + Codex, not an OpenAI endorsement of TokenMaxed. Note
+`packages/pi-extension/extension/` is **not standalone** — reference data
+resolves one level above it, so register by path (or copy the whole
+`pi-extension` package directory, preserving layout).
+
 ## Getting started (CLI & core)
 
 > Prefer the command line or your own integration? The steps below cover the
@@ -726,7 +761,8 @@ per host — each host controlling which lanes are even allowed to run inside it
 | **OpenClaw plugin** | available | `packages/openclaw-plugin` — native Gateway plugin + MCP server + skills, with a real finalize review gate (see [Use in OpenClaw](#use-in-openclaw-plugin)) |
 | **Cline (CLI + VS Code)** | available | `packages/cline-plugin` — bundled MCP server + PreToolUse gate + TaskStart banner + skills (see [Use in Cline](#use-in-cline-cli--vs-code)) |
 | **Hermes** | available | `packages/hermes-plugin` — MCP server + shell hooks (gate, banner, `pre_verify` review) + skills (see [Use in Hermes](#use-in-hermes-nous-research)) |
-| Pi · others | planned | same core, thin per-host adapters, per-host lane permissions |
+| **pi (native extension)** | available | `packages/pi-extension` — native tools + gate + banner + review + **statusline gauge** (see [Use in pi](#use-in-pi-native-extension)) |
+| Crush · others | planned | MCP-recipe / thin adapters, per-host lane permissions |
 
 Setup is intentionally minimal: in Claude Code run `/tokenmaxed:setup`; for the
 CLI, copy `config/lanes.example.yaml` and edit it.
