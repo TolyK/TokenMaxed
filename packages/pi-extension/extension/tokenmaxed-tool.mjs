@@ -26020,7 +26020,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         },
         model: {
           type: "string",
-          description: 'OPTIONAL exact-model pin. Set ONLY when the USER explicitly named a model in their prompt (e.g. "use minimax for this", "route this to gpt-5.5") \u2014 never infer it. Routing is restricted to the connected lane(s) serving that model (case-insensitive; a family name like "minimax" pins its concrete resolution). If that model is not connected or cannot run right now, the task returns native with the reason \u2014 TokenMaxed never substitutes a different model for an explicit pin. Omit for normal cheapest-capable routing.'
+          description: `OPTIONAL exact-model pin. Set ONLY when the USER explicitly named a model in their prompt (e.g. "use minimax for this", "route this to gpt-5.5") \u2014 never infer it. Pass the VENDOR MODEL ID, normalizing obvious colloquial names first ("ChatGPT 5.5" \u2192 gpt-5.5, "Haiku" \u2192 claude-haiku); both exact versioned ids (gpt-5.5) and family names (minimax \u2192 its concrete resolution) match, case-insensitively. If the pin is refused as not connected, the reply lists the connected models: retry ONCE with the listed id when the user's intent maps to it unambiguously, otherwise relay the list and ask. TokenMaxed never substitutes a different model for an explicit pin. Omit for normal cheapest-capable routing.`
         }
       }
     },

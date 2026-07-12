@@ -683,8 +683,12 @@ your agent passes it through as `router_delegate`'s `model` parameter:
 > *"Add pagination to the users endpoint — **use minimax** for this."*
 > *"Write the migration docs, **route it to gpt-5.5**."*
 
-Matching is case-insensitive and family-aware ("minimax" pins whatever your
-`minimax@latest` lane resolves to). The pin is honored or honestly refused —
+Both exact versioned ids ("gpt-5.5") and family names work — matching is
+case-insensitive and family-aware ("minimax" pins whatever your
+`minimax@latest` lane resolves to), and your agent normalizes colloquial
+names ("ChatGPT 5.5" → `gpt-5.5`) before pinning. Naming a version you're
+not connected to (say `gpt-5.6` while your lane serves 5.5) is refused with
+the connected list — update the lane, don't expect a silent downgrade. The pin is honored or honestly refused —
 **never silently substituted**: if that model isn't connected to TokenMaxed,
 the task comes back to your main agent with the reason and the list of
 connected models; if it's connected but can't run under current

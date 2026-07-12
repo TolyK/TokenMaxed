@@ -33,11 +33,16 @@ How to offload:
    - **Honor an explicit model choice.** When the USER names a model in their
      prompt ("use minimax for this", "route this to gpt-5.5", "have haiku do
      it"), pass it as **`model`** — routing then pins to the connected lane(s)
-     serving that model (case-insensitive; a family name like "minimax" pins
-     its concrete resolution). If the model isn't connected or can't run under
-     current gates, the task comes back native with the reason — TokenMaxed
-     never substitutes a different model for an explicit pin, so relay that
-     reason to the user rather than silently picking another lane. Only set
+     serving that model. Pass the **vendor model id**, normalizing obvious
+     colloquial names first ("ChatGPT 5.5" → `gpt-5.5`, "Haiku" →
+     `claude-haiku`); both exact versioned ids and family names match,
+     case-insensitively (a family name pins its concrete resolution). If the
+     pin is refused as not connected, the reply lists the connected models —
+     retry ONCE with the listed id when the user's intent maps to it
+     unambiguously; otherwise relay the list and ask. If the model can't run
+     under current gates, the task comes back native with the reason —
+     TokenMaxed never substitutes a different model for an explicit pin, so
+     relay that reason rather than silently picking another lane. Only set
      `model` when the user actually named one; never infer it.
    - **Set `access_need` when you already know the task needs full access.** Leave
      it unset (or `auto`) for ordinary bounded subtasks — they try a worker, and a
