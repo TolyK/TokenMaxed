@@ -19,9 +19,11 @@ before you hit a cap (with honest depletion estimates and an overflow plan),
 and falls back to metered APIs only when it has to.
 
 It **meets you where you work**: TokenMaxed is not another app — it rides
-inside your agent as a plugin. Claude Code today, Codex CLI next, more hosts
-(Pi, OpenCode, OpenClaw, Hermes, …) on the roadmap — each with per-host
-control over which lanes are even allowed to run there.
+inside your agent as a plugin, on **nine surfaces today**: Claude Code,
+Codex CLI, OpenCode, OpenClaw, Cline (CLI + VS Code), Hermes, pi, Crush, and
+its own CLI — each with per-host control over which lanes are even allowed to
+run there, and each host's protections mapped honestly (real review gates
+where the host supports them, documented reductions where it doesn't).
 
 It is **local-first and honest**: the routing brain, your prompts, and your
 code stay on your machine; every count is labeled for exactly what it is
