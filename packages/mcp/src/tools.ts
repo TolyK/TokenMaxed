@@ -36,6 +36,7 @@ import type {
   TaskCategory,
   TaskStatus,
   TokenStats,
+  QuotaEstimate,
 } from '@tokenmaxed/core';
 
 import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshness-report.ts';
@@ -71,6 +72,8 @@ export interface CorePort {
   CLASSIFY_FALLBACK_CATEGORY: TaskCategory;
   /** B: calculate quota state for a lane. */
   laneQuotaState?: (events: readonly LedgerEvent[], lane: Lane, now: number) => any;
+  /** Pure confidence-bounded quota estimate fusion. */
+  quotaEstimate?: (lane: Lane, events: readonly LedgerEvent[], opts: { calibrationFraction?: number; routedShare?: number } | undefined, now: number) => QuotaEstimate;
   /**
    * P2: resolve a lane×category's rankings prior (provenance + clamping) so
    * router_preview can explain the winner's prior source. Pure; optional so
@@ -254,6 +257,10 @@ export interface ToolDeps {
   getCalibrations?: () => Record<string, number>;
   /** Set (lane/model, fraction) or clear manual calibrations. */
   setCalibration?: (lane: string | undefined, fraction: number | undefined) => void;
+  /** Read the project's manual routed shares. */
+  getRoutedShares?: () => Record<string, number>;
+  /** Set (lane/model, fraction) or clear manual routed shares. */
+  setRoutedShare?: (lane: string | undefined, fraction: number | undefined) => void;
   /** Read the project's Reader -> Full-Access Grants list (including environment fallbacks). */
   getFullAccess?: (lanes?: readonly Lane[]) => string[];
   /** Grant a model name/id full access to the repository. */
@@ -613,6 +620,66 @@ function renderTokens(tokens: TokenStats, by: 'model' | 'lane', period: string |
   return [head, `by ${by}:`, ...rows].join('\n');
 }
 
+function resolveCalibrationFractionLocal(core: CorePort, lane: Lane, calibrations: Record<string, number>): number | undefined {
+  const laneIdLower = lane.id.toLowerCase();
+  const laneModelLower = lane.model.toLowerCase();
+  for (const [key, fraction] of Object.entries(calibrations)) {
+    if (key.toLowerCase() === laneIdLower) return fraction;
+  }
+  for (const [key, fraction] of Object.entries(calibrations)) {
+    if (key.toLowerCase() === laneModelLower) return fraction;
+  }
+  for (const [key, fraction] of Object.entries(calibrations)) {
+    if (core.modelMatchesPin(lane.model, key)) return fraction;
+  }
+  return undefined;
+}
+
+function resolveRoutedShareFractionLocal(core: CorePort, lane: Lane, routedShares: Record<string, number>): number | undefined {
+  const laneIdLower = lane.id.toLowerCase();
+  const laneModelLower = lane.model.toLowerCase();
+  for (const [key, fraction] of Object.entries(routedShares)) {
+    if (key.toLowerCase() === laneIdLower) return fraction;
+  }
+  for (const [key, fraction] of Object.entries(routedShares)) {
+    if (key.toLowerCase() === laneModelLower) return fraction;
+  }
+  for (const [key, fraction] of Object.entries(routedShares)) {
+    if (core.modelMatchesPin(lane.model, key)) return fraction;
+  }
+  return undefined;
+}
+
+function formatQuotaEstimateText(
+  modelOrId: string,
+  est: QuotaEstimate,
+  routedShare: number | undefined,
+): string {
+  const routedPct = Math.round(est.routedFraction * 100);
+  const lowerBoundPct = Math.round(est.lowerBound * 100);
+  const pointEstimatePct = Math.round(est.pointEstimate * 100);
+
+  if (est.confidence === 'unknown') {
+    return `${modelOrId}: no quota cap configured`;
+  }
+
+  if (est.dominantSource === 'routed') {
+    if (est.reportedFraction === undefined && est.inferredFraction === undefined) {
+      return `${modelOrId}: ≥${routedPct}% used (routed share only — a floor, not your total; total unknown)`;
+    }
+    return `${modelOrId}: ≥${routedPct}% used (routed, ${est.confidence})`;
+  }
+
+  if (est.dominantSource === 'inferred') {
+    const sharePct = routedShare !== undefined ? Math.round(routedShare * 100) : 100;
+    return `${modelOrId}: ${routedPct}% routed ÷ ~${sharePct}% routed-share ⇒ est. ~${pointEstimatePct}% used (inferred, ${est.confidence})`;
+  }
+
+  // est.dominantSource === 'reported'
+  const calPct = est.reportedFraction !== undefined ? Math.round(est.reportedFraction * 100) : 0;
+  return `${modelOrId}: ≥${routedPct}% routed; you reported ${calPct}%; est. ${lowerBoundPct}–100% used (calibrated, ${est.confidence})`;
+}
+
 // --- tool factory --------------------------------------------------------------
 
 /**
@@ -930,27 +997,25 @@ export function createTools(core: CorePort): ToolDef[] {
             quotaLines.push(`  ⚠ preferred lane overrides quota pressure${detail ? ` (${detail})` : ''} — /tokenmaxed:prefer off to release it.`);
           }
         }
-        const resolveCalibrationFractionLocal = (lane: Lane, calibrations: Record<string, number>): number | undefined => {
-          const laneIdLower = lane.id.toLowerCase();
-          const laneModelLower = lane.model.toLowerCase();
-          for (const [key, fraction] of Object.entries(calibrations)) {
-            if (key.toLowerCase() === laneIdLower) return fraction;
+        const calibrations = deps.getCalibrations?.() ?? {};
+        const routedShares = deps.getRoutedShares?.() ?? {};
+        if (lane && core.quotaEstimate && (Object.keys(calibrations).length > 0 || Object.keys(routedShares).length > 0)) {
+          const calOverride = resolveCalibrationFractionLocal(core, lane, calibrations);
+          const shareOverride = resolveRoutedShareFractionLocal(core, lane, routedShares);
+          const events = deps.readLedger?.() ?? [];
+          const est = core.quotaEstimate(lane, events, { calibrationFraction: calOverride, routedShare: shareOverride }, deps.now());
+          if (est.confidence !== 'unknown') {
+            const displayName = lane.model ? lane.model.charAt(0).toUpperCase() + lane.model.slice(1) : lane.id;
+            const estText = formatQuotaEstimateText(displayName, est, shareOverride);
+            quotaLines.push(`  quota estimate: ${estText}`);
           }
-          for (const [key, fraction] of Object.entries(calibrations)) {
-            if (key.toLowerCase() === laneModelLower) return fraction;
-          }
-          for (const [key, fraction] of Object.entries(calibrations)) {
-            if (core.modelMatchesPin(lane.model, key)) return fraction;
-          }
-          return undefined;
-        };
+        }
 
         const getDeprioritizedLabel = (laneId: string): string => {
           const l = lanes.find((x) => x.id === laneId);
           if (!l || !core.laneQuotaState) return `${laneId} (routed-share near cap)`;
           
-          const calibrations = deps.getCalibrations?.() ?? {};
-          const calOverride = resolveCalibrationFractionLocal(l, calibrations);
+          const calOverride = resolveCalibrationFractionLocal(core, l, calibrations);
           if (calOverride === undefined) {
             return `${laneId} (routed-share near cap)`;
           }
@@ -1143,6 +1208,17 @@ export function createTools(core: CorePort): ToolDef[] {
         if (calibrationLines.length > 0) {
           lines.push('', 'Manual quota calibrations (project override):', ...calibrationLines);
         }
+        const routedShares = deps.getRoutedShares?.() ?? {};
+        const shareLines: string[] = [];
+        for (const [key, val] of Object.entries(routedShares)) {
+          if (typeof val === 'number' && Number.isFinite(val) && val > 0 && val <= 1) {
+            const pct = Math.round(val * 100);
+            shareLines.push(`  ${key}: estimated routed share ${pct}%`);
+          }
+        }
+        if (shareLines.length > 0) {
+          lines.push('', 'Estimated routed shares (project override):', ...shareLines);
+        }
         const targets = deps.getTargets?.() ?? {};
         const targetLines: string[] = [];
         for (const [key, val] of Object.entries(targets)) {
@@ -1152,6 +1228,32 @@ export function createTools(core: CorePort): ToolDef[] {
         }
         if (targetLines.length > 0) {
           lines.push('', 'Pacing targets (project override):', ...targetLines);
+        }
+        if (enabled && core.quotaEstimate && (Object.keys(calibrations).length > 0 || Object.keys(routedShares).length > 0)) {
+          const allLanes = deps.allLanes?.() ?? [];
+          const quotaLanes = allLanes.filter(
+            (l) =>
+              (typeof l.requests_per_window === 'number' && l.requests_per_window > 0) ||
+              (typeof l.requests_per_week === 'number' && l.requests_per_week > 0) ||
+              (typeof l.tokens_per_week === 'number' && l.tokens_per_week > 0)
+          );
+          if (quotaLanes.length > 0) {
+            const estLines: string[] = [];
+            const events = deps.readLedger?.() ?? [];
+            const now = deps.now();
+            for (const l of quotaLanes) {
+              const calOverride = resolveCalibrationFractionLocal(core, l, calibrations);
+              const shareOverride = resolveRoutedShareFractionLocal(core, l, routedShares);
+              const est = core.quotaEstimate(l, events, { calibrationFraction: calOverride, routedShare: shareOverride }, now);
+              if (est.confidence !== 'unknown') {
+                const displayName = l.model ? l.model.charAt(0).toUpperCase() + l.model.slice(1) : l.id;
+                estLines.push(`  ${formatQuotaEstimateText(displayName, est, shareOverride)}`);
+              }
+            }
+            if (estLines.length > 0) {
+              lines.push('', 'Quota Estimates:', ...estLines);
+            }
+          }
         }
         const healthLines: string[] = [];
         if (enabled && deps.healthDetail) {
@@ -1880,7 +1982,95 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool];
+  const setRoutedShareTool: ToolDef = {
+    name: 'router_set_routed_share',
+    description:
+      'Set or clear the estimated fraction of your work for a lane or model name that is routed through TokenMaxed. When set, this share is used to infer your total subscription usage. Use a percentage (0<..100) or a decimal (0<..1). If lane is empty, clears all routed shares for the project. Powers /tokenmaxed:routed-share.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: 'string',
+          description:
+            'The lane ID or model name to set routed share for (e.g. claude-native or opus). If empty, clears all routed shares for this project.',
+        },
+        share: {
+          type: 'string',
+          description:
+            'The estimated routed share fraction (e.g. "30%" or "0.3"). Use "off", "none", or "clear" to remove the routed share for this lane.',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const rawLane = optString(args, 'lane');
+        const lane = typeof rawLane === 'string' ? rawLane.trim() : undefined;
+        const rawShare = optString(args, 'share');
+        const shareStr = typeof rawShare === 'string' ? rawShare.trim().toLowerCase() : undefined;
+
+        if (!lane) {
+          deps.setRoutedShare?.(undefined, undefined);
+          return ok(
+            'All estimated routed shares CLEARED for this project.',
+            { shares: null }
+          );
+        }
+
+        if (!shareStr || ['off', 'none', 'clear'].includes(shareStr)) {
+          deps.setRoutedShare?.(lane, undefined);
+          return ok(
+            `Estimated routed share CLEARED for lane/model "${lane}" in this project.`,
+            { lane, share: null }
+          );
+        }
+
+        const numRegex = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+        let value: number;
+        if (shareStr.endsWith('%')) {
+          const numPart = shareStr.slice(0, -1);
+          if (!numRegex.test(numPart)) {
+            throw new ToolInputError(`Invalid percentage value: "${rawShare}". Must be a number in 0<..100%.`);
+          }
+          const parsed = Number(numPart);
+          if (parsed <= 0 || parsed > 100) {
+            throw new ToolInputError(`Invalid percentage value: "${rawShare}". Must be in range 0<..100%.`);
+          }
+          value = parsed / 100;
+        } else {
+          if (!numRegex.test(shareStr)) {
+            throw new ToolInputError(`Invalid share value: "${rawShare}". Must be a percentage (0<..100) or decimal (0<..1).`);
+          }
+          const parsed = Number(shareStr);
+          if (parsed > 0 && parsed <= 1) {
+            value = parsed;
+          } else if (parsed > 1 && parsed <= 100) {
+            value = parsed / 100;
+          } else {
+            throw new ToolInputError(`Invalid share value: "${rawShare}". Must be a percentage in 0<..100 or decimal in 0<..1.`);
+          }
+        }
+
+        const allLanes = deps.allLanes?.() ?? [];
+        const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+        if (matchedLanes.length === 0) {
+          const connectable = allLanes.map((l) => l.model).sort();
+          throw new ToolInputError(
+            `No connected lanes match "${lane}". Connected models: ${connectable.join(', ') || '(none)'}`
+          );
+        }
+
+        deps.setRoutedShare?.(lane, value);
+        const pct = Math.round(value * 100);
+        const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(', ');
+        return ok(
+          `Estimated routed share of ${pct}% set for: ${resolvedNames} in this project.`,
+          { lane, share: value, matchedLanes: matchedLanes.map((l) => l.id) }
+        );
+      }),
+  };
+
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

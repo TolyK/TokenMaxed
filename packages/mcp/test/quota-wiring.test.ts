@@ -27,6 +27,8 @@ import {
   CLASSIFY_FALLBACK_CATEGORY,
   SCHEMA_VERSION,
   serializeEvent,
+  quotaEstimate,
+  laneQuotaState,
 } from '../../core/src/index.ts';
 import type { LedgerEvent, TaskEvent } from '../../core/src/index.ts';
 
@@ -47,6 +49,8 @@ const CORE: CorePort = {
   classifyTask,
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
+  quotaEstimate,
+  laneQuotaState,
 };
 const TOOLS = createTools(CORE);
 
@@ -293,3 +297,149 @@ test('quotaAlerts: a historically-routed category the lane can no longer serve i
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('unified quota: status and preview output show estimate range and confidence', async () => {
+  const { dir, env } = setupDir([taskEvent()]); // strong has 1 task (1/2 requests)
+  try {
+    const deps = makeServerDeps(env);
+    
+    // 1. Initially with no calibration/routed-share, status and preview do not show unified quota estimates
+    const st0 = await dispatch(TOOLS, deps, 'router_status', {});
+    assert.doesNotMatch(st0.content[0]!.text, /Quota Estimates:/);
+    const pr0 = await dispatch(TOOLS, deps, 'router_preview', { category: 'bugfix' });
+    assert.doesNotMatch(pr0.content[0]!.text, /quota estimate:/);
+
+    // 2. Set routed share to 50%
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong-m', share: '50%' });
+
+    // 3. Status should show estimated routed share and the unified quota estimate
+    const st1 = await dispatch(TOOLS, deps, 'router_status', {});
+    assert.match(st1.content[0]!.text, /Estimated routed shares \(project override\):/);
+    assert.match(st1.content[0]!.text, /strong-m: estimated routed share 50%/);
+    assert.match(st1.content[0]!.text, /Quota Estimates:/);
+    // strong-m resolves to Strong-m. 1 event out of 2 limit = 50% routed.
+    // 50% routed / 50% routed-share => 100% pointEstimate. Inferred source.
+    assert.match(st1.content[0]!.text, /Strong-m: 50% routed ÷ ~50% routed-share ⇒ est. ~100% used \(inferred, low\)/);
+
+    // 4. Preview should show the quota estimate line
+    const pr1 = await dispatch(TOOLS, deps, 'router_preview', { category: 'bugfix' });
+    assert.match(pr1.content[0]!.text, /quota estimate: Strong-m: 50% routed ÷ ~50% routed-share ⇒ est. ~100% used \(inferred, low\)/);
+
+    // 5. Clear routed share and set calibration to 75%
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong-m', share: 'off' });
+    await dispatch(TOOLS, deps, 'router_set_calibration', { lane: 'strong', fraction: '75%' });
+ 
+    // 6. Status and Preview should reflect calibrated estimate
+    const st2 = await dispatch(TOOLS, deps, 'router_status', {});
+    assert.match(st2.content[0]!.text, /Strong-m: ≥50% routed; you reported 75%; est. 75–100% used \(calibrated, medium\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('unified quota: routing is byte-identical (RouteDecision structure is unchanged)', async () => {
+  const { dir, env } = setupDir([taskEvent()]);
+  try {
+    const deps = makeServerDeps(env);
+    
+    // Preview decision with no routed-share
+    const prWithout = await dispatch(TOOLS, deps, 'router_preview', { category: 'bugfix' });
+    const decWithout = prWithout.structuredContent!.decision;
+
+    // Set routed share to 30%
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong', share: '30%' });
+
+    // Preview decision with routed-share
+    const prWith = await dispatch(TOOLS, deps, 'router_preview', { category: 'bugfix' });
+    const decWith = prWith.structuredContent!.decision;
+
+    // The core RouteDecision structure must be deep-equal (byte-identical routing decision)
+    assert.equal(JSON.stringify(decWith), JSON.stringify(decWithout));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('unified quota: display matches dominantSource and confidence - routed-dominant three-source combo', async () => {
+  // Setup a three-source combo where routed is dominant.
+  // strong requests limit = 2.
+  // taskEvent count = 2 (routed fraction = 1.0).
+  // calibration = 75% (0.75).
+  // routed-share = 100% (1.0) => inferred = 1.0 / 1.0 = 1.0.
+  // Since routed (1.0) >= reported (0.75) and routed (1.0) >= inferred (1.0),
+  // dominantSource is 'routed', confidence is 'medium' (due to calibration being present).
+  const { dir, env } = setupDir([taskEvent(), taskEvent()]);
+  try {
+    const deps = makeServerDeps(env);
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong-m', share: '100%' });
+    await dispatch(TOOLS, deps, 'router_set_calibration', { lane: 'strong', fraction: '75%' });
+
+    const st = await dispatch(TOOLS, deps, 'router_status', {});
+    assert.match(st.content[0]!.text, /Strong-m: ≥100% used \(routed, medium\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('unified quota: display matches dominantSource and confidence - reported==inferred tie', async () => {
+  // reported == inferred tie.
+  // strong requests limit = 2.
+  // taskEvent count = 1 (routed fraction = 0.5).
+  // calibration = 100% (1.0).
+  // routed-share = 50% (0.5) => inferred = 0.5 / 0.5 = 1.0.
+  // Since repVal (1.0) >= rVal (0.5) and repVal (1.0) >= infVal (1.0),
+  // dominantSource should be 'reported' (core quotaEstimate tie-breaker), confidence is 'medium'.
+  const { dir, env } = setupDir([taskEvent()]);
+  try {
+    const deps = makeServerDeps(env);
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong-m', share: '50%' });
+    await dispatch(TOOLS, deps, 'router_set_calibration', { lane: 'strong', fraction: '100%' });
+
+    const st = await dispatch(TOOLS, deps, 'router_status', {});
+    assert.match(st.content[0]!.text, /Strong-m: ≥50% routed; you reported 100%; est. 100–100% used \(calibrated, medium\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('unified quota: resolveRoutedShareFraction precedence (exact lane id > exact model) with reversed JSON order', async () => {
+  const { dir, env } = setupDir([taskEvent()]);
+  try {
+    const deps = makeServerDeps(env);
+    
+    // We set both: exact model (20%) and exact lane ID (30%).
+    // Precedence dictates exact lane ID (30%) wins.
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong-m', share: '20%' });
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong', share: '30%' });
+
+    const st1 = await dispatch(TOOLS, deps, 'router_status', {});
+    // Divisor must be 30% (exact lane ID wins)
+    assert.match(st1.content[0]!.text, /Strong-m: 50% routed ÷ ~30% routed-share/);
+
+    // Now remove exact lane ID (30%) override. Exact model (20%) should win.
+    await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong', share: 'off' });
+    const st2 = await dispatch(TOOLS, deps, 'router_status', {});
+    // Divisor must be 20% (exact model wins)
+    assert.match(st2.content[0]!.text, /Strong-m: 50% routed ÷ ~20% routed-share/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('router_set_routed_share validation checks', async () => {
+  const { dir, env } = setupDir([]);
+  try {
+    const deps = makeServerDeps(env);
+    
+    const invalidInputs = ["0", ">1", "150%", "70%junk", "0.7oops", "-0.5", "NaN", "Infinity", "0.0", "-10%"];
+    for (const bad of invalidInputs) {
+      const res = await dispatch(TOOLS, deps, 'router_set_routed_share', { lane: 'strong-m', share: bad });
+      assert.equal(res.isError, true, `Expected error for share value: ${bad}`);
+      assert.match(res.content[0]!.text, /Invalid/);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+

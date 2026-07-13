@@ -344,3 +344,140 @@ export function quotaHeadroomMap(
   return out;
 }
 
+export interface QuotaEstimate {
+  routedFraction: number;
+  reportedFraction?: number;
+  inferredFraction?: number;
+  lowerBound: number;
+  pointEstimate: number;
+  confidence: 'high' | 'medium' | 'low' | 'unknown';
+  dominantSource: 'routed' | 'reported' | 'inferred';
+}
+
+/**
+ * Pure confidence-bounded quota estimate fusion. Fuses routed, calibration (reported),
+ * and inferred (routed-share) signals for the lane's binding/most-used axis.
+ */
+export function quotaEstimate(
+  lane: Lane,
+  events: readonly LedgerEvent[],
+  opts: { calibrationFraction?: number; routedShare?: number } | undefined,
+  now: number,
+): QuotaEstimate {
+  const laneCopy = {
+    ...lane,
+    reserve_fraction: 0,
+    calibration_fraction: 0,
+  };
+  const s = laneQuotaState(events, laneCopy, now);
+
+  const axes: QuotaAxisState[] = [];
+  if (s.window) axes.push(s.window);
+  if (s.weekRequests) axes.push(s.weekRequests);
+  if (s.weekTokens) axes.push(s.weekTokens);
+
+  if (axes.length === 0) {
+    return {
+      routedFraction: 0,
+      lowerBound: 0,
+      pointEstimate: 0,
+      confidence: 'unknown',
+      dominantSource: 'routed',
+    };
+  }
+
+  // Find the axis with the highest count/limit (raw used)
+  let bindingAxis = axes[0]!;
+  for (let i = 1; i < axes.length; i++) {
+    if (axes[i]!.used > bindingAxis.used) {
+      bindingAxis = axes[i]!;
+    }
+  }
+
+  let routedFraction = bindingAxis.used; // count/limit since reserve=0 and calibration=0
+  if (typeof routedFraction !== 'number' || !Number.isFinite(routedFraction) || Number.isNaN(routedFraction)) {
+    routedFraction = 0;
+  }
+
+  let reportedFraction: number | undefined;
+  if (
+    opts &&
+    typeof opts.calibrationFraction === 'number' &&
+    Number.isFinite(opts.calibrationFraction) &&
+    !Number.isNaN(opts.calibrationFraction) &&
+    opts.calibrationFraction >= 0 &&
+    opts.calibrationFraction <= 1
+  ) {
+    reportedFraction = opts.calibrationFraction;
+  }
+  if (reportedFraction !== undefined && (typeof reportedFraction !== 'number' || !Number.isFinite(reportedFraction) || Number.isNaN(reportedFraction))) {
+    reportedFraction = undefined;
+  }
+
+  let inferredFraction: number | undefined;
+  if (
+    opts &&
+    typeof opts.routedShare === 'number' &&
+    Number.isFinite(opts.routedShare) &&
+    !Number.isNaN(opts.routedShare) &&
+    opts.routedShare > 0 &&
+    opts.routedShare <= 1
+  ) {
+    const rawInferred = routedFraction / opts.routedShare;
+    if (Number.isFinite(rawInferred) && !Number.isNaN(rawInferred)) {
+      inferredFraction = Math.max(0, Math.min(1, rawInferred));
+    }
+  }
+
+  let lowerBound = Math.max(routedFraction, reportedFraction !== undefined ? reportedFraction : 0);
+  if (typeof lowerBound !== 'number' || !Number.isFinite(lowerBound) || Number.isNaN(lowerBound)) {
+    lowerBound = 0;
+  }
+
+  let pointEstimate = Math.max(
+    routedFraction,
+    reportedFraction !== undefined ? reportedFraction : 0,
+    inferredFraction !== undefined ? inferredFraction : 0
+  );
+  if (typeof pointEstimate !== 'number' || !Number.isFinite(pointEstimate) || Number.isNaN(pointEstimate)) {
+    pointEstimate = 0;
+  }
+
+  let confidence: 'high' | 'medium' | 'low' | 'unknown';
+  let dominantSource: 'routed' | 'reported' | 'inferred';
+
+  if (reportedFraction === undefined && inferredFraction === undefined) {
+    // NOTE: Confidence is "high" only for the observed routed usage (which is a strict lower bound / floor).
+    // It does NOT represent high confidence in the overall subscription total (which is unknown since
+    // no calibration or routed-share was provided to estimate total usage).
+    confidence = 'high';
+    dominantSource = 'routed';
+  } else {
+    const rVal = routedFraction;
+    const repVal = reportedFraction !== undefined ? reportedFraction : -1;
+    const infVal = inferredFraction !== undefined ? inferredFraction : -1;
+
+    if (infVal > rVal && infVal > repVal) {
+      confidence = 'low';
+      dominantSource = 'inferred';
+    } else if (repVal >= rVal && repVal >= infVal) {
+      confidence = 'medium';
+      dominantSource = 'reported';
+    } else {
+      confidence = 'medium';
+      dominantSource = 'routed';
+    }
+  }
+
+  return {
+    routedFraction,
+    ...(reportedFraction !== undefined ? { reportedFraction } : {}),
+    ...(inferredFraction !== undefined ? { inferredFraction } : {}),
+    lowerBound,
+    pointEstimate,
+    confidence,
+    dominantSource,
+  };
+}
+
+
