@@ -40,6 +40,7 @@ export const SETTING_KEYS = {
   review_on_stop: 'TOKENMAXED_REVIEW_ON_STOP',
   /** positive integer */
   review_max_rounds: 'TOKENMAXED_REVIEW_MAX_ROUNDS',
+  lane_health: 'TOKENMAXED_LANE_HEALTH',
 } as const;
 
 export type SettingKey = keyof typeof SETTING_KEYS;

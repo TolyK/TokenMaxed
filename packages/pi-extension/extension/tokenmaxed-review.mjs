@@ -9084,7 +9084,8 @@ var SETTING_KEYS = {
   tier_floor: "TOKENMAXED_TIER_FLOOR",
   review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
   /** positive integer */
-  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS",
+  lane_health: "TOKENMAXED_LANE_HEALTH"
 };
 var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
 var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);

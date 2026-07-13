@@ -476,6 +476,11 @@ export interface RouteContext {
    * normal gated routing, identical to before this feature.
    */
   yolo?: boolean;
+  /**
+   * Optional health penalty per lane id, subtracted from the score.
+   * Sparse: only lanes with failure evidence get an entry.
+   */
+  healthPenalty?: Record<string, number>;
 }
 
 /**
@@ -550,6 +555,8 @@ export interface LaneScore {
     costPenalty: number;
     /** Weekly-cap penalty (0 when healthy; larger as the lane nears/exceeds its cap). */
     capPenalty: number;
+    /** Health penalty (0 when healthy; larger when lane has recent failures). */
+    healthPenalty?: number;
     /** The declared (config-prior) capability, before any learned adjustment. */
     declared: number;
     /** Decay-weighted review evidence behind the adjustment (0 ⇒ no evidence; capability == declared). */
