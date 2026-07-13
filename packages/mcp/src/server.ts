@@ -77,6 +77,8 @@ import { readReserves, writeReserve } from './reserve.ts';
 import type { ReserveStore } from './reserve.ts';
 import { readCalibrations, writeCalibration } from './calibration.ts';
 import type { CalibrationStore } from './calibration.ts';
+import { readTargets, writeTarget } from './target.ts';
+import type { TargetStore } from './target.ts';
 import { readYolo, writeYolo } from './yolo.ts';
 import { readFullAccess, grantFullAccess, revokeFullAccess } from './full-access.ts';
 import type { FullAccessStore } from './full-access.ts';
@@ -236,6 +238,25 @@ function fileCalibrationStore(statePath: string): CalibrationStore {
   };
 }
 
+/** A JSON-file-backed {@link TargetStore} (object-valued); tolerant of a missing/corrupt file. */
+function fileTargetStore(statePath: string): TargetStore {
+  return {
+    read: () => {
+      if (!existsSync(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync(statePath, 'utf8'));
+      } catch {
+        return {}; // corrupt file ⇒ treat as empty
+      }
+    },
+    write: (state) => {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    },
+  };
+}
+
+
 /** A JSON-file-backed {@link FullAccessStore} (string-array-valued); tolerant of a missing/corrupt file. */
 function fileFullAccessStore(statePath: string): FullAccessStore {
   return {
@@ -338,6 +359,39 @@ export function resolveCalibrationFraction(lane: Lane, calibrations: Record<stri
   return undefined;
 }
 
+export function resolveTargetIso(lane: Lane, targets: Record<string, string>): string | undefined {
+  const laneIdLower = lane.id.toLowerCase();
+  const laneModelLower = lane.model.toLowerCase();
+
+  // 1. Exact lane.id match
+  for (const [key, iso] of Object.entries(targets)) {
+    if (key.toLowerCase() === laneIdLower) {
+      return iso;
+    }
+  }
+
+  // 2. Exact lane.model match
+  for (const [key, iso] of Object.entries(targets)) {
+    if (key.toLowerCase() === laneModelLower) {
+      return iso;
+    }
+  }
+
+  // 3. Family/prefix (modelMatchesPin) match: pick the longest matching key (most specific)
+  let bestKey: string | undefined;
+  let bestIso: string | undefined;
+  for (const [key, iso] of Object.entries(targets)) {
+    if (modelMatchesPin(lane.model, key)) {
+      if (bestKey === undefined || key.length > bestKey.length) {
+        bestKey = key;
+        bestIso = iso;
+      }
+    }
+  }
+  return bestIso;
+}
+
+
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
@@ -352,6 +406,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const calibrationStatePath = env.TOKENMAXED_CALIBRATION_STATE ?? join(dirname(statePath), 'calibration.json');
   const calibrationStore = fileCalibrationStore(calibrationStatePath);
   const readCalibrationsMap = (): Record<string, number> => readCalibrations(calibrationStore, projectKey);
+  const targetStatePath = env.TOKENMAXED_TARGET_STATE ?? join(dirname(statePath), 'target.json');
+  const targetStore = fileTargetStore(targetStatePath);
+  const readTargetsMap = (): Record<string, string> => readTargets(targetStore, projectKey);
   // Gate CLOSED by default: trusted CLI/local/native lanes (the common, safe
   // offloads) always work, but UNTRUSTED worker (BYOK API) lanes stay off until
   // explicitly enabled with TOKENMAXED_GATE_READY=true. Opening the gate is an
@@ -400,6 +457,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     try {
       const reserves = readReservesMap();
       const calibrations = readCalibrationsMap();
+      const targets = readTargetsMap();
       const lanesWithOverrides = lanes.map((lane) => {
         let laneOverride = lane;
         const override = resolveReserveFraction(lane, reserves);
@@ -412,7 +470,18 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         }
         return laneOverride;
       });
-      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanesWithOverrides, Date.now());
+      const resolvedTargets: Record<string, number> = {};
+      const now = Date.now();
+      for (const lane of lanes) {
+        const iso = resolveTargetIso(lane, targets);
+        if (iso) {
+          const ms = Date.parse(iso);
+          if (Number.isFinite(ms) && ms > now) {
+            resolvedTargets[lane.id] = ms;
+          }
+        }
+      }
+      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanesWithOverrides, now, resolvedTargets);
       return Object.keys(map).length > 0 ? map : undefined;
     } catch {
       return undefined;
@@ -488,6 +557,29 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         }
         parts.push(`7d ${text}`);
       }
+
+      const targets = readTargetsMap();
+      const targetIso = resolveTargetIso(lane, targets);
+      if (targetIso) {
+        const targetMs = Date.parse(targetIso);
+        const now = Date.now();
+        if (Number.isFinite(targetMs) && targetMs > now) {
+          const forecast = laneDepletionForecast(new JsonlLedger(ledgerPath).readAll(), laneWithOverrides, now);
+          if (forecast && forecast.confidence === 'moderate') {
+            const etaTimeMs = now + forecast.etaMs;
+            if (etaTimeMs < targetMs) {
+              const diffMs = targetMs - etaTimeMs;
+              const diffText = fmtEta(diffMs);
+              parts.push(`target: last until ${targetIso} — ahead of pace (${diffText} early) at routed pace, conserving`);
+            } else {
+              parts.push(`target: last until ${targetIso} — on pace at routed pace`);
+            }
+          } else {
+            parts.push(`target: last until ${targetIso} — routed-pace forecast unavailable / too uncertain to pace`);
+          }
+        }
+      }
+
       return parts.length > 0 ? parts.join(' · ') : undefined;
     } catch {
       return undefined;
@@ -632,6 +724,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       const preferred = readPreferredLane();
       const reserves = readReservesMap();
       const calibrations = readCalibrationsMap();
+      const targets = readTargetsMap();
       const alerts: string[] = [];
       for (const rawCappedLane of registry.lanes) {
         const override = resolveReserveFraction(rawCappedLane, reserves);
@@ -716,7 +809,17 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
               }
               return withOver;
             });
-            const m = quotaHeadroomMap(events, resolvedCandidates, now); // same events snapshot
+            const resolvedTargets: Record<string, number> = {};
+            for (const c of candidates) {
+              const iso = resolveTargetIso(c, targets);
+              if (iso) {
+                const ms = Date.parse(iso);
+                if (Number.isFinite(ms) && ms > now) {
+                  resolvedTargets[c.id] = ms;
+                }
+              }
+            }
+            const m = quotaHeadroomMap(events, resolvedCandidates, now, resolvedTargets); // same events snapshot
             return Object.keys(m).length > 0 ? { capHeadroom: m } : {};
           })(),
           ...(tieredStrategy === 'tiered'
@@ -1206,6 +1309,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     },
     getReserves: readReservesMap,
     setReserve: (lane, fraction) => writeReserve(reserveStore, projectKey, lane, fraction),
+    getTargets: readTargetsMap,
+    setTarget: (lane, until) => writeTarget(targetStore, projectKey, lane, until),
     getCalibrations: readCalibrationsMap,
     setCalibration: (lane, fraction) => writeCalibration(calibrationStore, projectKey, lane, fraction),
     getFullAccess: readFullAccessGrants,

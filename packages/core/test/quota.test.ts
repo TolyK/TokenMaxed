@@ -9,7 +9,7 @@ import { test } from 'node:test';
 
 import { SCHEMA_VERSION } from '../src/ledger.ts';
 import type { LedgerEvent, TaskEvent } from '../src/ledger.ts';
-import { laneObservations, laneQuotaState, quotaHeadroomMap, WEEK_MS } from '../src/quota.ts';
+import { laneObservations, laneQuotaState, quotaHeadroomMap, WEEK_MS, computePacePressure, adjustHeadroomForPace, laneDepletionForecast, projectOccupancy } from '../src/quota.ts';
 import { parseLaneConfig } from '../src/registry.ts';
 import type { Lane } from '../src/types.ts';
 import { FIVE_HOUR_MS } from '../src/window-quota.ts';
@@ -143,7 +143,6 @@ test('quotaHeadroomMap: only quota-configured lanes appear (empty map when none)
 
 // --- B3: depletion projection ----------------------------------------------------
 
-import { laneDepletionForecast, projectOccupancy } from '../src/quota.ts';
 import type { QuotaObservation } from '../src/quota.ts';
 
 const W = 100_000; // test window (ms)
@@ -269,4 +268,128 @@ test('laneQuotaState: absent-calibration byte-identical including used > 1', () 
   assert.ok(Math.abs(s.window.used - 1.5) < 1e-9);
   assert.ok(Math.abs(s.headroom - 0.0) < 1e-9); // headroom is floored at 0
 });
+
+test('computePacePressure and adjustHeadroomForPace pure logic', () => {
+  const now = 1000;
+  // Case 1: No target
+  assert.equal(computePacePressure({ etaMs: 200 }, undefined, now), 0);
+  // Case 2: Target in past
+  assert.equal(computePacePressure({ etaMs: 200 }, 500, now), 0);
+  // Case 3: No forecast
+  assert.equal(computePacePressure(undefined, 2000, now), 0);
+  // Case 4: ETA is on/after target
+  assert.equal(computePacePressure({ etaMs: 1500 }, 2000, now), 0); // etaTime = 2500 >= 2000
+  // Case 5: ETA is before target (shortfall exists)
+  // total = 2000 - 1000 = 1000.
+  // etaMs = 200 -> etaTime = 1200.
+  // shortfall = 2000 - 1200 = 800.
+  // pressure = 800 / 1000 = 0.8.
+  assert.equal(computePacePressure({ etaMs: 200 }, 2000, now), 0.8);
+
+  // adjustHeadroomForPace
+  // Case A: No pressure
+  assert.equal(adjustHeadroomForPace(0.7, undefined, 2000, now), 0.7);
+  // Case B: Some pressure
+  assert.equal(adjustHeadroomForPace(0.7, { etaMs: 200 }, 2000, now), 0.0); // 0.7 - 0.8 = -0.1 -> floored at 0
+  assert.ok(Math.abs(adjustHeadroomForPace(0.9, { etaMs: 500 }, 2000, now) - 0.4) < 1e-9); // 0.9 - 0.5 = 0.4
+});
+
+test('computePacePressure and adjustHeadroomForPace boundary cases', () => {
+  const now = 1000;
+  // target == now
+  assert.equal(computePacePressure({ etaMs: 200 }, now, now), 0);
+  // eta == target (etaMs = targetMs - now)
+  assert.equal(computePacePressure({ etaMs: 1000 }, 2000, now), 0);
+
+  // NaN values
+  assert.equal(computePacePressure({ etaMs: NaN }, 2000, now), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, NaN, now), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, 2000, NaN), 0);
+
+  // +Infinity / -Infinity values
+  assert.equal(computePacePressure({ etaMs: Infinity }, 2000, now), 0);
+  assert.equal(computePacePressure({ etaMs: -Infinity }, 2000, now), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, Infinity, now), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, -Infinity, now), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, 2000, Infinity), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, 2000, -Infinity), 0);
+
+  // unsafe-large ms (> 2**53)
+  const unsafeMs = Number.MAX_SAFE_INTEGER + 10;
+  assert.equal(computePacePressure({ etaMs: unsafeMs }, 2000, now), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, unsafeMs, now), 0);
+  assert.equal(computePacePressure({ etaMs: 200 }, 2000, unsafeMs), 0);
+
+  // negative etaMs
+  assert.equal(computePacePressure({ etaMs: -100 }, 2000, now), 0);
+
+  // adjustHeadroomForPace with invalid/negative headroom
+  assert.equal(adjustHeadroomForPace(-0.5, { etaMs: 200 }, 2000, now), 0);
+  assert.equal(adjustHeadroomForPace(NaN, { etaMs: 200 }, 2000, now), 0);
+  assert.equal(adjustHeadroomForPace(Infinity, { etaMs: 200 }, 2000, now), 0);
+  assert.equal(adjustHeadroomForPace(-Infinity, { etaMs: 200 }, 2000, now), 0);
+});
+
+test('lane with reserve_fraction or calibration_fraction = NaN -> headroom stays finite', () => {
+  const l = lane({
+    id: 'test-nan',
+    requests_per_window: 10,
+    window_ms: 2 * 60 * 60 * 1000,
+    reserve_fraction: NaN,
+    calibration_fraction: NaN,
+  });
+  const map = quotaHeadroomMap([], [l], NOW);
+  assert.equal(map['test-nan'], 1); // fallback to 1 (full headroom)
+});
+
+test('calibration composition direct numeric agreement', () => {
+  const windowMs = 120 * 60 * 1000; // 2 hours
+  const limit = 20;
+  const now = Date.now();
+  const l = lane({
+    id: 'test-calib-composition',
+    requests_per_window: limit,
+    window_ms: windowMs,
+    calibration_fraction: 0.72,
+    reserve_fraction: 0.1,
+  });
+
+  // 8 events in the window -> raw used is 8/20 = 40%
+  const events = [
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 64 * 60 * 1000).toISOString() }),
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 63 * 60 * 1000).toISOString() }),
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 62 * 60 * 1000).toISOString() }),
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 61 * 60 * 1000).toISOString() }),
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 50 * 60 * 1000).toISOString() }),
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 40 * 60 * 1000).toISOString() }),
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 30 * 60 * 1000).toISOString() }),
+    taskEvent({ laneId: 'test-calib-composition', ts: new Date(now - 20 * 60 * 1000).toISOString() }),
+  ];
+
+  // 1. Check laneQuotaState used fraction & headroom
+  const qState = laneQuotaState(events, l, now);
+  assert.ok(qState.window);
+  // floorUsed = Math.max(8/20, 0.72) = 0.72
+  // used = floorUsed / (1 - 0.1) = 0.8
+  assert.ok(Math.abs(qState.window.used - 0.8) < 1e-9);
+  assert.ok(Math.abs(qState.headroom - 0.2) < 1e-9);
+
+  // 2. Check laneDepletionForecast starts from the same effective occupancy
+  // usable limit = 20 * 0.9 = 18.
+  // startingOccupancy = Math.max(8, 14.4) = 14.4.
+  // lambda = 8 / windowMs = 8 / 7200000 ms.
+  // Remaining headroom = 18 - 14.4 = 3.6.
+  // etaMs = 3.6 / lambda = 3.6 * 900000 = 3240000 ms (54 minutes).
+  const forecast = laneDepletionForecast(events, l, now);
+  assert.ok(forecast);
+  assert.equal(forecast.axis, 'window');
+  assert.ok(Math.abs(forecast.etaMs - 3240000) < 1e-9);
+
+  // 3. Check quotaHeadroomMap headroom agrees
+  const map = quotaHeadroomMap(events, [l], now);
+  assert.ok(Math.abs((map['test-calib-composition'] ?? 0) - 0.2) < 1e-9);
+});
+
+
+
 
