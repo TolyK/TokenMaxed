@@ -75,6 +75,8 @@ import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
 import { readReserves, writeReserve } from './reserve.ts';
 import type { ReserveStore } from './reserve.ts';
+import { readCalibrations, writeCalibration } from './calibration.ts';
+import type { CalibrationStore } from './calibration.ts';
 import { readYolo, writeYolo } from './yolo.ts';
 import { readFullAccess, grantFullAccess, revokeFullAccess } from './full-access.ts';
 import type { FullAccessStore } from './full-access.ts';
@@ -216,6 +218,24 @@ function fileReserveStore(statePath: string): ReserveStore {
   };
 }
 
+/** A JSON-file-backed {@link CalibrationStore} (object-valued); tolerant of a missing/corrupt file. */
+function fileCalibrationStore(statePath: string): CalibrationStore {
+  return {
+    read: () => {
+      if (!existsSync(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync(statePath, 'utf8'));
+      } catch {
+        return {}; // corrupt file ⇒ treat as empty
+      }
+    },
+    write: (state) => {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    },
+  };
+}
+
 /** A JSON-file-backed {@link FullAccessStore} (string-array-valued); tolerant of a missing/corrupt file. */
 function fileFullAccessStore(statePath: string): FullAccessStore {
   return {
@@ -235,7 +255,7 @@ function fileFullAccessStore(statePath: string): FullAccessStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -290,6 +310,34 @@ export function resolveReserveFraction(lane: Lane, reserves: Record<string, numb
   return undefined;
 }
 
+export function resolveCalibrationFraction(lane: Lane, calibrations: Record<string, number>): number | undefined {
+  const laneIdLower = lane.id.toLowerCase();
+  const laneModelLower = lane.model.toLowerCase();
+
+  // 1. Exact lane.id match
+  for (const [key, fraction] of Object.entries(calibrations)) {
+    if (key.toLowerCase() === laneIdLower) {
+      return fraction;
+    }
+  }
+
+  // 2. Exact lane.model match
+  for (const [key, fraction] of Object.entries(calibrations)) {
+    if (key.toLowerCase() === laneModelLower) {
+      return fraction;
+    }
+  }
+
+  // 3. Family/prefix (modelMatchesPin) match
+  for (const [key, fraction] of Object.entries(calibrations)) {
+    if (modelMatchesPin(lane.model, key)) {
+      return fraction;
+    }
+  }
+
+  return undefined;
+}
+
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
@@ -301,6 +349,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const reserveStatePath = env.TOKENMAXED_RESERVE_STATE ?? join(dirname(statePath), 'reserve.json');
   const reserveStore = fileReserveStore(reserveStatePath);
   const readReservesMap = (): Record<string, number> => readReserves(reserveStore, projectKey);
+  const calibrationStatePath = env.TOKENMAXED_CALIBRATION_STATE ?? join(dirname(statePath), 'calibration.json');
+  const calibrationStore = fileCalibrationStore(calibrationStatePath);
+  const readCalibrationsMap = (): Record<string, number> => readCalibrations(calibrationStore, projectKey);
   // Gate CLOSED by default: trusted CLI/local/native lanes (the common, safe
   // offloads) always work, but UNTRUSTED worker (BYOK API) lanes stay off until
   // explicitly enabled with TOKENMAXED_GATE_READY=true. Opening the gate is an
@@ -348,14 +399,20 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const buildCapHeadroom = (lanes: readonly Lane[]): Record<string, number> | undefined => {
     try {
       const reserves = readReservesMap();
-      const lanesWithReserves = lanes.map((lane) => {
+      const calibrations = readCalibrationsMap();
+      const lanesWithOverrides = lanes.map((lane) => {
+        let laneOverride = lane;
         const override = resolveReserveFraction(lane, reserves);
         if (override !== undefined) {
-          return { ...lane, reserve_fraction: override };
+          laneOverride = { ...laneOverride, reserve_fraction: override };
         }
-        return lane;
+        const calOverride = resolveCalibrationFraction(lane, calibrations);
+        if (calOverride !== undefined) {
+          laneOverride = { ...laneOverride, calibration_fraction: calOverride };
+        }
+        return laneOverride;
       });
-      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanesWithReserves, Date.now());
+      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanesWithOverrides, Date.now());
       return Object.keys(map).length > 0 ? map : undefined;
     } catch {
       return undefined;
@@ -363,38 +420,72 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   };
   // B: one compact, content-free detail string per quota-configured lane (counts
   // are the ROUTED share — the label says so) for /why and the override warning.
-  const quotaDetailFor = (lane: Lane): string | undefined => {
+  const quotaDetailFor = (lane: Lane, forceRouted = false, allowedAxes?: ('window' | 'weekRequests' | 'weekTokens')[]): string | undefined => {
     try {
       const reserves = readReservesMap();
       const override = resolveReserveFraction(lane, reserves);
       const laneWithReserve = override !== undefined ? { ...lane, reserve_fraction: override } : lane;
-      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), laneWithReserve, Date.now());
+
+      const calibrations = readCalibrationsMap();
+      const calOverride = resolveCalibrationFraction(lane, calibrations);
+      const laneWithOverrides = calOverride !== undefined ? { ...laneWithReserve, calibration_fraction: calOverride } : laneWithReserve;
+
+      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), laneWithOverrides, Date.now());
       const parts: string[] = [];
       // Honest labeling: say the CONFIGURED window, not "5h", when overridden.
       const windowMs = typeof lane.window_ms === 'number' && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
       const windowLabel = windowMs === FIVE_HOUR_MS ? '5h' : fmtWindow(windowMs);
-      const reserve = laneWithReserve.reserve_fraction ?? 0;
-      const pct = Math.round(reserve * 100);
+      const reserve = laneWithOverrides.reserve_fraction ?? 0;
+      const calibration = laneWithOverrides.calibration_fraction ?? 0;
+      const reservePct = Math.round(reserve * 100);
+      const calPct = Math.round(calibration * 100);
 
-      if (s.window) {
+      if (s.window && (!allowedAxes || allowedAxes.includes('window'))) {
         const usable = reserve > 0 ? Math.round(s.window.limit * (1 - reserve)) : s.window.limit;
-        const text = reserve > 0
-          ? `reserved ${pct}% — ${s.window.count}/${usable} usable routed`
-          : `${s.window.count}/${s.window.limit} routed`;
+        let text = '';
+        const isCalBinding = !forceRouted && calibration > 0 && calibration >= s.window.count / s.window.limit;
+        if (isCalBinding) {
+          text = `calibrated: you reported ${calPct}% used (routed share ${s.window.count}/${s.window.limit})`;
+          if (reserve > 0) {
+            text = `calibrated: you reported ${calPct}% used (reserved ${reservePct}% — routed share ${s.window.count}/${usable} usable)`;
+          }
+        } else {
+          text = reserve > 0
+            ? `reserved ${reservePct}% — ${s.window.count}/${usable} usable routed`
+            : `${s.window.count}/${s.window.limit} routed`;
+        }
         parts.push(`${windowLabel} ${text}`);
       }
-      if (s.weekRequests) {
+      if (s.weekRequests && (!allowedAxes || allowedAxes.includes('weekRequests'))) {
         const usable = reserve > 0 ? Math.round(s.weekRequests.limit * (1 - reserve)) : s.weekRequests.limit;
-        const text = reserve > 0
-          ? `reserved ${pct}% — ${s.weekRequests.count}/${usable} req usable routed`
-          : `${s.weekRequests.count}/${s.weekRequests.limit} req routed`;
+        let text = '';
+        const isCalBinding = !forceRouted && calibration > 0 && calibration >= s.weekRequests.count / s.weekRequests.limit;
+        if (isCalBinding) {
+          text = `calibrated: you reported ${calPct}% used (routed share ${s.weekRequests.count}/${s.weekRequests.limit} req)`;
+          if (reserve > 0) {
+            text = `calibrated: you reported ${calPct}% used (reserved ${reservePct}% — routed share ${s.weekRequests.count}/${usable} req usable)`;
+          }
+        } else {
+          text = reserve > 0
+            ? `reserved ${reservePct}% — ${s.weekRequests.count}/${usable} req usable routed`
+            : `${s.weekRequests.count}/${s.weekRequests.limit} req routed`;
+        }
         parts.push(`7d ${text}`);
       }
-      if (s.weekTokens) {
+      if (s.weekTokens && (!allowedAxes || allowedAxes.includes('weekTokens'))) {
         const usable = reserve > 0 ? Math.round(s.weekTokens.limit * (1 - reserve)) : s.weekTokens.limit;
-        const text = reserve > 0
-          ? `reserved ${pct}% — ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${usable.toLocaleString('en-US')} tok usable routed`
-          : `${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok routed`;
+        let text = '';
+        const isCalBinding = !forceRouted && calibration > 0 && calibration >= s.weekTokens.count / s.weekTokens.limit;
+        if (isCalBinding) {
+          text = `calibrated: you reported ${calPct}% used (routed share ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok)`;
+          if (reserve > 0) {
+            text = `calibrated: you reported ${calPct}% used (reserved ${reservePct}% — routed share ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${usable.toLocaleString('en-US')} tok usable)`;
+          }
+        } else {
+          text = reserve > 0
+            ? `reserved ${reservePct}% — ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${usable.toLocaleString('en-US')} tok usable routed`
+            : `${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok routed`;
+        }
         parts.push(`7d ${text}`);
       }
       return parts.length > 0 ? parts.join(' · ') : undefined;
@@ -540,14 +631,50 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       const policy = loadPolicySafe();
       const preferred = readPreferredLane();
       const reserves = readReservesMap();
+      const calibrations = readCalibrationsMap();
       const alerts: string[] = [];
       for (const rawCappedLane of registry.lanes) {
         const override = resolveReserveFraction(rawCappedLane, reserves);
-        const cappedLane = override !== undefined ? { ...rawCappedLane, reserve_fraction: override } : rawCappedLane;
+        const calOverride = resolveCalibrationFraction(rawCappedLane, calibrations);
+        let cappedLane = override !== undefined ? { ...rawCappedLane, reserve_fraction: override } : rawCappedLane;
+        if (calOverride !== undefined) {
+          cappedLane = { ...cappedLane, calibration_fraction: calOverride };
+        }
         const state = laneQuotaState(events, cappedLane, now);
         const levels = [state.window?.level, state.weekRequests?.level, state.weekTokens?.level];
         if (!levels.some((l) => l === 'warn' || l === 'critical')) continue;
-        const detail = quotaDetailFor(cappedLane) ?? 'near cap';
+
+        const calTriggeredAxes: ('window' | 'weekRequests' | 'weekTokens')[] = [];
+        const routedTriggeredAxes: ('window' | 'weekRequests' | 'weekTokens')[] = [];
+
+        if (state.window && (state.window.level === 'warn' || state.window.level === 'critical')) {
+          const limit = cappedLane.requests_per_window ?? 1;
+          const routedFraction = state.window.count / limit;
+          if (calOverride !== undefined && calOverride >= routedFraction) {
+            calTriggeredAxes.push('window');
+          } else {
+            routedTriggeredAxes.push('window');
+          }
+        }
+        if (state.weekRequests && (state.weekRequests.level === 'warn' || state.weekRequests.level === 'critical')) {
+          const limit = cappedLane.requests_per_week ?? 1;
+          const routedFraction = state.weekRequests.count / limit;
+          if (calOverride !== undefined && calOverride >= routedFraction) {
+            calTriggeredAxes.push('weekRequests');
+          } else {
+            routedTriggeredAxes.push('weekRequests');
+          }
+        }
+        if (state.weekTokens && (state.weekTokens.level === 'warn' || state.weekTokens.level === 'critical')) {
+          const limit = cappedLane.tokens_per_week ?? 1;
+          const routedFraction = state.weekTokens.count / limit;
+          if (calOverride !== undefined && calOverride >= routedFraction) {
+            calTriggeredAxes.push('weekTokens');
+          } else {
+            routedTriggeredAxes.push('weekTokens');
+          }
+        }
+
         const forecast = laneDepletionForecast(events, cappedLane, now);
         const forecastText = forecast
           ? forecast.confidence === 'moderate'
@@ -580,7 +707,16 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
             return p.state === 'on' ? { capabilityPrior: p.overlay, ...(p.stale ? { capabilityPriorStale: true } : {}) } : {};
           })(),
           ...((): Partial<RouteContext> => {
-            const m = quotaHeadroomMap(events, candidates, now); // same events snapshot
+            const resolvedCandidates = candidates.map((c) => {
+              const over = resolveReserveFraction(c, reserves);
+              const calOver = resolveCalibrationFraction(c, calibrations);
+              let withOver = over !== undefined ? { ...c, reserve_fraction: over } : c;
+              if (calOver !== undefined) {
+                withOver = { ...withOver, calibration_fraction: calOver };
+              }
+              return withOver;
+            });
+            const m = quotaHeadroomMap(events, resolvedCandidates, now); // same events snapshot
             return Object.keys(m).length > 0 ? { capHeadroom: m } : {};
           })(),
           ...(tieredStrategy === 'tiered'
@@ -641,7 +777,14 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
           }
           overflowText = ` · overflow: ${[...winnerByCat.entries()].map(([w, cats]) => `${cats.join('/')} → ${w}`).join(', ')}`;
         }
-        alerts.push(`⚠ ${cappedLane.id}: ${detail}${forecastText}${overflowText}`);
+        if (calTriggeredAxes.length > 0) {
+          const detail = quotaDetailFor(cappedLane, false, calTriggeredAxes) ?? 'near cap';
+          alerts.push(`⚠ ${cappedLane.id}: ${detail}${forecastText}${overflowText}`);
+        }
+        if (routedTriggeredAxes.length > 0) {
+          const detail = quotaDetailFor(cappedLane, true, routedTriggeredAxes) ?? 'near cap';
+          alerts.push(`⚠ ${cappedLane.id}: ${detail}${forecastText}${overflowText}`);
+        }
       }
       return alerts;
     } catch {
@@ -1063,6 +1206,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     },
     getReserves: readReservesMap,
     setReserve: (lane, fraction) => writeReserve(reserveStore, projectKey, lane, fraction),
+    getCalibrations: readCalibrationsMap,
+    setCalibration: (lane, fraction) => writeCalibration(calibrationStore, projectKey, lane, fraction),
     getFullAccess: readFullAccessGrants,
     grantFullAccess: (laneId) => grantFullAccess(fullAccessStore, projectKey, laneId),
     revokeFullAccess: (laneId) => revokeFullAccess(fullAccessStore, projectKey, laneId),

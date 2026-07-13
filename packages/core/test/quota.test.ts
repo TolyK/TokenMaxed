@@ -215,3 +215,58 @@ test('laneDepletionForecast: earliest axis wins; respects window_ms override', (
   // No quota config ⇒ no forecast.
   assert.equal(laneDepletionForecast(events, lane({ id: 'codex-cli' }), NOW), undefined);
 });
+
+test('laneQuotaState: calibrated floor raises a low-routed lane\'s used', () => {
+  const l = lane({ id: 'codex-cli', requests_per_window: 10, window_ms: 2 * HOUR, calibration_fraction: 0.7 });
+  // Routed used is 0 (no events). Calibrated floor is 0.7.
+  const s = laneQuotaState([], l, NOW);
+  assert.ok(s.window);
+  assert.ok(Math.abs(s.window.used - 0.7) < 1e-9);
+  assert.ok(Math.abs(s.headroom - 0.3) < 1e-9);
+});
+
+test('laneQuotaState: routed ABOVE the floor still wins', () => {
+  // 8 requests out of 10 limit = 0.8 used. Calibration is 0.3.
+  // Routed (0.8) > calibration (0.3).
+  const l = lane({ id: 'codex-cli', requests_per_window: 10, window_ms: 2 * HOUR, calibration_fraction: 0.3 });
+  const events = Array.from({ length: 8 }, () => taskEvent({ laneId: 'codex-cli' }));
+  const s = laneQuotaState(events, l, NOW);
+  assert.ok(s.window);
+  assert.ok(Math.abs(s.window.used - 0.8) < 1e-9);
+  assert.ok(Math.abs(s.headroom - 0.2) < 1e-9);
+});
+
+test('laneQuotaState: composition with a reservation on the same lane', () => {
+  // Limit = 10, routed = 0, calibration = 0.5, reserve = 0.5.
+  // floorUsed = max(0, 0.5) = 0.5.
+  // reserve = 0.5 -> mult = 1 / (1 - 0.5) = 2.
+  // effectiveUsedFraction = floorUsed * mult = 0.5 * 2 = 1.0.
+  const l = lane({ id: 'codex-cli', requests_per_window: 10, window_ms: 2 * HOUR, calibration_fraction: 0.5, reserve_fraction: 0.5 });
+  const s = laneQuotaState([], l, NOW);
+  assert.ok(s.window);
+  assert.ok(Math.abs(s.window.used - 1.0) < 1e-9);
+  assert.ok(Math.abs(s.headroom - 0.0) < 1e-9);
+});
+
+test('laneQuotaState: reserve=1 and calibration=1 safety', () => {
+  // reserve = 1 is clamped to 0.9999 -> mult = 10000.
+  // floorUsed = 1.0.
+  // used = 10000.
+  const l = lane({ id: 'codex-cli', requests_per_window: 10, window_ms: 2 * HOUR, calibration_fraction: 1.0, reserve_fraction: 1.0 });
+  const s = laneQuotaState([], l, NOW);
+  assert.ok(s.window);
+  assert.ok(Number.isFinite(s.window.used));
+  assert.ok(Math.abs(s.window.used - 10000) < 1e-6);
+  assert.ok(Math.abs(s.headroom - 0.0) < 1e-9); // headroom is floored at 0
+});
+
+test('laneQuotaState: absent-calibration byte-identical including used > 1', () => {
+  // 15 requests out of 10 limit = 1.5 used. Calibration is absent (0).
+  const l = lane({ id: 'codex-cli', requests_per_window: 10, window_ms: 2 * HOUR });
+  const events = Array.from({ length: 15 }, () => taskEvent({ laneId: 'codex-cli' }));
+  const s = laneQuotaState(events, l, NOW);
+  assert.ok(s.window);
+  assert.ok(Math.abs(s.window.used - 1.5) < 1e-9);
+  assert.ok(Math.abs(s.headroom - 0.0) < 1e-9); // headroom is floored at 0
+});
+

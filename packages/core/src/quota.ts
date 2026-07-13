@@ -79,11 +79,12 @@ function amountInWindow(observations: readonly QuotaObservation[], now: number, 
   return sum;
 }
 
-function axisState(count: number, limit: number, reserve = 0): QuotaAxisState {
+function axisState(count: number, limit: number, reserve = 0, calibration = 0): QuotaAxisState {
   const rawUsed = windowUsedFraction(count, limit);
+  const floorUsed = Math.max(rawUsed, calibration);
   const r = Math.max(0, Math.min(0.9999, reserve));
   const mult = 1 / (1 - r);
-  const used = rawUsed === 0 ? 0 : rawUsed * mult;
+  const used = floorUsed === 0 ? 0 : floorUsed * mult;
   return { count, limit, used, level: windowLevel(used) };
 }
 
@@ -101,6 +102,7 @@ export function laneQuotaState(events: readonly LedgerEvent[], lane: Lane, now: 
   if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
 
   const reserve = lane.reserve_fraction ?? 0;
+  const calibration = lane.calibration_fraction ?? 0;
   const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
 
   if (hasWindow) {
@@ -108,16 +110,16 @@ export function laneQuotaState(events: readonly LedgerEvent[], lane: Lane, now: 
     // requestsInWindow shares boundary semantics with amountInWindow; reuse the
     // canonical helper for the count so the summary and this state always agree.
     const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
-    state.window = axisState(count, lane.requests_per_window!, reserve);
+    state.window = axisState(count, lane.requests_per_window!, reserve, calibration);
     axes.push(state.window);
   }
   if (hasWeekRequests) {
-    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week!, reserve);
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week!, reserve, calibration);
     axes.push(state.weekRequests);
   }
   if (hasWeekTokens) {
     const tokens = laneObservations(events, lane.id, true);
-    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week!, reserve);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week!, reserve, calibration);
     axes.push(state.weekTokens);
   }
 

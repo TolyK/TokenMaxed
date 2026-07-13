@@ -68,6 +68,8 @@ export interface CorePort {
   classifyTask: (text: string) => { category: TaskCategory; confidence: number; scores: Partial<Record<TaskCategory, number>> };
   MIN_CLASSIFY_CONFIDENCE: number;
   CLASSIFY_FALLBACK_CATEGORY: TaskCategory;
+  /** B: calculate quota state for a lane. */
+  laneQuotaState?: (events: readonly LedgerEvent[], lane: Lane, now: number) => any;
   /**
    * P2: resolve a lane×category's rankings prior (provenance + clamping) so
    * router_preview can explain the winner's prior source. Pure; optional so
@@ -239,6 +241,10 @@ export interface ToolDeps {
   getReserves?: () => Record<string, number>;
   /** Set (lane/model, fraction) or clear capacity reservations. */
   setReserve?: (lane: string | undefined, fraction: number | undefined) => void;
+  /** Read the project's manual calibrations. */
+  getCalibrations?: () => Record<string, number>;
+  /** Set (lane/model, fraction) or clear manual calibrations. */
+  setCalibration?: (lane: string | undefined, fraction: number | undefined) => void;
   /** Read the project's Reader -> Full-Access Grants list (including environment fallbacks). */
   getFullAccess?: (lanes?: readonly Lane[]) => string[];
   /** Grant a model name/id full access to the repository. */
@@ -911,11 +917,91 @@ export function createTools(core: CorePort): ToolDef[] {
             quotaLines.push(`  ⚠ preferred lane overrides quota pressure${detail ? ` (${detail})` : ''} — /tokenmaxed:prefer off to release it.`);
           }
         }
+        const resolveCalibrationFractionLocal = (lane: Lane, calibrations: Record<string, number>): number | undefined => {
+          const laneIdLower = lane.id.toLowerCase();
+          const laneModelLower = lane.model.toLowerCase();
+          for (const [key, fraction] of Object.entries(calibrations)) {
+            if (key.toLowerCase() === laneIdLower) return fraction;
+          }
+          for (const [key, fraction] of Object.entries(calibrations)) {
+            if (key.toLowerCase() === laneModelLower) return fraction;
+          }
+          for (const [key, fraction] of Object.entries(calibrations)) {
+            if (core.modelMatchesPin(lane.model, key)) return fraction;
+          }
+          return undefined;
+        };
+
+        const getDeprioritizedLabel = (laneId: string): string => {
+          const l = lanes.find((x) => x.id === laneId);
+          if (!l || !core.laneQuotaState) return `${laneId} (routed-share near cap)`;
+          
+          const calibrations = deps.getCalibrations?.() ?? {};
+          const calOverride = resolveCalibrationFractionLocal(l, calibrations);
+          if (calOverride === undefined) {
+            return `${laneId} (routed-share near cap)`;
+          }
+
+          const events = deps.readLedger?.() ?? [];
+          const now = deps.now();
+          const laneWithCal = { ...l, calibration_fraction: calOverride };
+          const s = core.laneQuotaState(events, laneWithCal, now);
+          const sRaw = core.laneQuotaState(events, l, now);
+          
+          const hasWindow = typeof l.requests_per_window === 'number' && l.requests_per_window > 0;
+          const hasWeekRequests = typeof l.requests_per_week === 'number' && l.requests_per_week > 0;
+          const hasWeekTokens = typeof l.tokens_per_week === 'number' && l.tokens_per_week > 0;
+
+          const r = Math.max(0, Math.min(0.9999, l.reserve_fraction ?? 0));
+          const mult = 1 / (1 - r);
+          let isCalDerived = false;
+          const maxCalPct = Math.round(calOverride * 100);
+
+          let maxUsedValue = -Infinity;
+          let bindingAxis: 'window' | 'weekRequests' | 'weekTokens' | undefined = undefined;
+
+          if (hasWindow && s.window) {
+            if (s.window.used > maxUsedValue) {
+              maxUsedValue = s.window.used;
+              bindingAxis = 'window';
+            }
+          }
+          if (hasWeekRequests && s.weekRequests) {
+            if (s.weekRequests.used > maxUsedValue) {
+              maxUsedValue = s.weekRequests.used;
+              bindingAxis = 'weekRequests';
+            }
+          }
+          if (hasWeekTokens && s.weekTokens) {
+            if (s.weekTokens.used > maxUsedValue) {
+              maxUsedValue = s.weekTokens.used;
+              bindingAxis = 'weekTokens';
+            }
+          }
+
+          if (bindingAxis === 'window' && s.window && sRaw.window) {
+            const rawUsed = sRaw.window.used / mult;
+            if (calOverride >= rawUsed) isCalDerived = true;
+          } else if (bindingAxis === 'weekRequests' && s.weekRequests && sRaw.weekRequests) {
+            const rawUsed = sRaw.weekRequests.used / mult;
+            if (calOverride >= rawUsed) isCalDerived = true;
+          } else if (bindingAxis === 'weekTokens' && s.weekTokens && sRaw.weekTokens) {
+            const rawUsed = sRaw.weekTokens.used / mult;
+            if (calOverride >= rawUsed) isCalDerived = true;
+          }
+
+          if (isCalDerived) {
+            return `${laneId} (you reported ~${maxCalPct}% used)`;
+          }
+          return `${laneId} (routed-share near cap)`;
+        };
+
         const pressuredLosers = decision.scores
           .filter((s) => s.laneId !== decision.laneId && s.factors.capPenalty > 0)
           .map((s) => s.laneId);
         if (pressuredLosers.length > 0) {
-          quotaLines.push(`  quota-deprioritized: ${pressuredLosers.join(', ')} (routed-share near cap)`);
+          const labels = pressuredLosers.map(getDeprioritizedLabel);
+          quotaLines.push(`  quota-deprioritized: ${labels.join(', ')}`);
         }
         // P2: say where the winner's capability PRIOR came from (rankings overlay vs
         // declared config), and describe the active snapshot — or its load error —
@@ -1014,6 +1100,17 @@ export function createTools(core: CorePort): ToolDef[] {
         if (reserveLines.length > 0) {
           lines.push('', 'Capacity reservations (project override):', ...reserveLines);
         }
+        const calibrations = deps.getCalibrations?.() ?? {};
+        const calibrationLines: string[] = [];
+        for (const [key, val] of Object.entries(calibrations)) {
+          if (typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= 1) {
+            const pct = Math.round(val * 100);
+            calibrationLines.push(`  ${key}: calibrated (you reported ${pct}% used)`);
+          }
+        }
+        if (calibrationLines.length > 0) {
+          lines.push('', 'Manual quota calibrations (project override):', ...calibrationLines);
+        }
         // P2: the rankings-prior posture. Lanes aren't loaded on this read-only
         // path, so the meta line reports the snapshot itself (per-category lane
         // detail lives in /tokenmaxed:why). Rendered ONLY when on/error — the
@@ -1031,7 +1128,14 @@ export function createTools(core: CorePort): ToolDef[] {
         // B3/B4: quota alerts (warn/critical lanes only ⇒ silent by default).
         const quotaAlerts = enabled && deps.quotaAlerts ? await deps.quotaAlerts() : [];
         if (quotaAlerts.length > 0) {
-          lines.push('', 'Quota (routed share only — not your total subscription usage):', ...quotaAlerts.map((a) => `  ${a}`));
+          const calibrationAlerts = quotaAlerts.filter((a) => a.includes('calibrated:'));
+          const routedAlerts = quotaAlerts.filter((a) => !a.includes('calibrated:'));
+          if (routedAlerts.length > 0) {
+            lines.push('', 'Quota (routed share only — not your total subscription usage):', ...routedAlerts.map((a) => `  ${a}`));
+          }
+          if (calibrationAlerts.length > 0) {
+            lines.push('', 'Quota (based on your manual calibrations):', ...calibrationAlerts.map((a) => `  ${a}`));
+          }
         }
         if (mismatches.length > 0) {
           lines.push('', 'Model ids the vendor will REJECT (fix before offloading):', ...renderModelIdMismatchWarnings(mismatches));
@@ -1217,6 +1321,94 @@ export function createTools(core: CorePort): ToolDef[] {
         const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(', ');
         return ok(
           `Capacity reservation of ${pct}% set for: ${resolvedNames} in this project.`,
+          { lane, fraction: value, matchedLanes: matchedLanes.map((l) => l.id) }
+        );
+      }),
+  };
+
+  const setCalibrationTool: ToolDef = {
+    name: 'router_set_calibration',
+    description:
+      'Set or clear a manual used-fraction calibration for a lane or model name in this project. When set, this used fraction acts as a floor for the lane\'s quota. Use a percentage (0–100) or a decimal (0–1). If lane is empty, clears all calibrations for the project. Powers /tokenmaxed:calibrate.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: 'string',
+          description:
+            'The lane ID or model name to calibrate (e.g. claude-native or opus). If empty, clears all calibrations for this project.',
+        },
+        fraction: {
+          type: 'string',
+          description:
+            'The calibration fraction (e.g. "70%" or "0.7"). Use "off", "none", or "clear" to remove the calibration for this lane.',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const rawLane = optString(args, 'lane');
+        const lane = typeof rawLane === 'string' ? rawLane.trim() : undefined;
+        const rawFraction = optString(args, 'fraction');
+        const fractionStr = typeof rawFraction === 'string' ? rawFraction.trim().toLowerCase() : undefined;
+
+        if (!lane) {
+          deps.setCalibration?.(undefined, undefined);
+          return ok(
+            'All manual quota calibrations CLEARED for this project.',
+            { calibrations: null }
+          );
+        }
+
+        if (!fractionStr || ['off', 'none', 'clear'].includes(fractionStr)) {
+          deps.setCalibration?.(lane, undefined);
+          return ok(
+            `Manual quota calibration CLEARED for lane/model "${lane}" in this project.`,
+            { lane, fraction: null }
+          );
+        }
+
+        const numRegex = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+        let value: number;
+        if (fractionStr.endsWith('%')) {
+          const numPart = fractionStr.slice(0, -1);
+          if (!numRegex.test(numPart)) {
+            throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be a number in 0–100%.`);
+          }
+          const parsed = Number(numPart);
+          if (parsed < 0 || parsed > 100) {
+            throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be in range 0–100%.`);
+          }
+          value = parsed / 100;
+        } else {
+          if (!numRegex.test(fractionStr)) {
+            throw new ToolInputError(`Invalid calibration value: "${rawFraction}". Must be a percentage (0–100) or decimal (0–1).`);
+          }
+          const parsed = Number(fractionStr);
+          if (parsed >= 0 && parsed <= 1) {
+            value = parsed;
+          } else if (parsed > 1 && parsed <= 100 && !fractionStr.includes('.')) {
+            value = parsed / 100;
+          } else {
+            throw new ToolInputError(`Invalid calibration value: "${rawFraction}". Must be a percentage in 0–100 or decimal in 0–1.`);
+          }
+        }
+
+        const allLanes = deps.allLanes?.() ?? [];
+        const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+        if (matchedLanes.length === 0) {
+          const connectable = allLanes.map((l) => l.model).sort();
+          throw new ToolInputError(
+            `No connected lanes match "${lane}". Connected models: ${connectable.join(', ') || '(none)'}`
+          );
+        }
+
+        deps.setCalibration?.(lane, value);
+        const pct = Math.round(value * 100);
+        const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(', ');
+        return ok(
+          `Manual quota calibration of ${pct}% set for: ${resolvedNames} in this project.`,
           { lane, fraction: value, matchedLanes: matchedLanes.map((l) => l.id) }
         );
       }),
@@ -1547,7 +1739,7 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, delegateTool, reviewTool, setupTool, configTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, delegateTool, reviewTool, setupTool, configTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */
