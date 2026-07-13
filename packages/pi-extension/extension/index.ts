@@ -10428,6 +10428,15 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       required: ["category"],
       properties: {
         category: { type: "string", enum: [...core.taskCategories], description: "Task category to route." },
+        instruction: {
+          type: "string",
+          description: "OPTIONAL instruction text to forecast input tokens and cost."
+        },
+        files: {
+          type: "array",
+          items: { type: "string" },
+          description: "OPTIONAL repo-relative file paths to include in the forecast."
+        },
         repo_class: { type: "string", enum: [...REPO_CLASSES2], description: "Repository class for policy (default unknown)." },
         sensitivity: { type: "string", enum: [...SENSITIVITIES2], description: "Content sensitivity for policy (default unknown)." },
         gate_ready: {
@@ -10462,6 +10471,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
     handler: (deps, args) => guardedAsync(async () => {
       const category = optEnum(args, "category", core.taskCategories);
       if (category === void 0) throw new ToolInputError('"category" is required.');
+      const instruction = optString(args, "instruction");
+      const files = optStringArray(args, "files");
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
@@ -10720,6 +10731,38 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       if (healthDeprioritizedLosers.length > 0) {
         healthLines.push(`  health-deprioritized: ${healthDeprioritizedLosers.join(", ")}`);
       }
+      let forecastLine = "";
+      let forecastData = void 0;
+      if (instruction) {
+        let combinedText = instruction;
+        let skippedNote = "";
+        if (files && files.length && deps.readRepoFiles) {
+          const fileResult = deps.readRepoFiles(files);
+          for (const att of fileResult.attachments) {
+            combinedText += "\n" + att.content;
+          }
+          if (fileResult.skipped.length > 0) {
+            skippedNote = ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join("; ")})`;
+          }
+        }
+        if (lane && core.forecastCost) {
+          const priceTable = deps.loadPriceTable ? deps.loadPriceTable() : void 0;
+          const forecast = core.forecastCost(combinedText, lane, priceTable);
+          forecastData = forecast;
+          const int = (n) => Math.round(n).toLocaleString("en-US");
+          let costStr = "";
+          if (forecast.estCostUsd !== void 0) {
+            if (forecast.estCostUsd === 0) {
+              costStr = " \xB7 $0";
+            } else if (forecast.estCostUsd > 0 && forecast.estCostUsd < 1e-4) {
+              costStr = " \xB7 ~<$0.0001 metered";
+            } else {
+              costStr = ` \xB7 ~$${forecast.estCostUsd.toFixed(4)} metered`;
+            }
+          }
+          forecastLine = `  forecast: ~${int(forecast.estTokensIn)} input tok${costStr} (${forecast.note})${skippedNote}`;
+        }
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
@@ -10727,6 +10770,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
         `  why: ${decision.reason}`,
+        ...forecastLine ? [forecastLine] : [],
         ...difficulty ? [
           `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
         ] : [],
@@ -10737,7 +10781,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
     })
   };
   const statusTool = {

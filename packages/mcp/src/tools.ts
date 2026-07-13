@@ -37,10 +37,14 @@ import type {
   TaskStatus,
   TokenStats,
   QuotaEstimate,
+  CostForecast,
+  CostBasis,
+  PriceTable,
 } from '@tokenmaxed/core';
 
 import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshness-report.ts';
 import type { ModelIdMismatchWarning, StalenessWarning } from './freshness-report.ts';
+import type { RepoFileResult } from './read-files.ts';
 import { formatLaneSetup } from './lane-setup.ts';
 import type { LaneSetupRow } from './lane-setup.ts';
 import type { SettingKey, SettingsReport } from './settings.ts';
@@ -82,6 +86,7 @@ export interface CorePort {
    * fakes/hosts without the prior surface can omit it.
    */
   resolvedPriorFor?: (lane: Lane, category: TaskCategory, priorOverlay?: CapabilityPriorOverlay, opts?: ResolvedPriorOptions) => ResolvedPrior;
+  forecastCost?: (promptText: string, lane: { model: string; costBasis: CostBasis }, priceTable?: PriceTable) => CostForecast;
 }
 
 /** P2: metadata about the active rankings snapshot, for /why + /status + setup. */
@@ -298,6 +303,10 @@ export interface ToolDeps {
    * a lane that isn't runnable. Absent ⇒ availability is not checked.
    */
   availableLaneIds?: (lanes: readonly Lane[]) => Promise<string[]>;
+  /** Loaded price table for cost forecasting. */
+  loadPriceTable?: () => PriceTable;
+  /** Read repo relative files verbatim. */
+  readRepoFiles?: (paths: readonly string[]) => RepoFileResult;
   /**
    * Build the session summary (windows + lane/role/availability + savings) for
    * router_summary / the /tokenmaxed:summary skill. The server wires the real
@@ -779,6 +788,15 @@ function policyExplanation(
       required: ['category'],
       properties: {
         category: { type: 'string', enum: [...core.taskCategories], description: 'Task category to route.' },
+        instruction: {
+          type: 'string',
+          description: 'OPTIONAL instruction text to forecast input tokens and cost.',
+        },
+        files: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'OPTIONAL repo-relative file paths to include in the forecast.',
+        },
         repo_class: { type: 'string', enum: [...REPO_CLASSES], description: 'Repository class for policy (default unknown).' },
         sensitivity: { type: 'string', enum: [...SENSITIVITIES], description: 'Content sensitivity for policy (default unknown).' },
         gate_ready: {
@@ -819,6 +837,8 @@ function policyExplanation(
       guardedAsync(async () => {
         const category = optEnum(args, 'category', core.taskCategories);
         if (category === undefined) throw new ToolInputError('"category" is required.');
+        const instruction = optString(args, 'instruction');
+        const files = optStringArray(args, 'files');
         const repo_class = optEnum(args, 'repo_class', REPO_CLASSES);
         const sensitivity = optEnum(args, 'sensitivity', SENSITIVITIES);
         const access_need = optEnum(args, 'access_need', ACCESS_NEEDS);
@@ -1173,6 +1193,41 @@ function policyExplanation(
           healthLines.push(`  health-deprioritized: ${healthDeprioritizedLosers.join(', ')}`);
         }
 
+        let forecastLine = '';
+        let forecastData: any = undefined;
+        if (instruction) {
+          let combinedText = instruction;
+          let skippedNote = '';
+          if (files && files.length && deps.readRepoFiles) {
+            const fileResult = deps.readRepoFiles(files);
+            for (const att of fileResult.attachments) {
+              combinedText += '\n' + att.content;
+            }
+            if (fileResult.skipped.length > 0) {
+              skippedNote = ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join('; ')})`;
+            }
+          }
+          if (lane && core.forecastCost) {
+            const priceTable = deps.loadPriceTable ? deps.loadPriceTable() : undefined;
+            const forecast = core.forecastCost(combinedText, lane, priceTable);
+            forecastData = forecast;
+
+            const int = (n: number): string => Math.round(n).toLocaleString('en-US');
+
+            let costStr = '';
+            if (forecast.estCostUsd !== undefined) {
+              if (forecast.estCostUsd === 0) {
+                costStr = ' · $0';
+              } else if (forecast.estCostUsd > 0 && forecast.estCostUsd < 0.0001) {
+                costStr = ' · ~<$0.0001 metered';
+              } else {
+                costStr = ` · ~$${forecast.estCostUsd.toFixed(4)} metered`;
+              }
+            }
+            forecastLine = `  forecast: ~${int(forecast.estTokensIn)} input tok${costStr} (${forecast.note})${skippedNote}`;
+          }
+        }
+
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
           ...(explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : []),
@@ -1180,6 +1235,7 @@ function policyExplanation(
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
           `  why: ${decision.reason}`,
+          ...(forecastLine ? [forecastLine] : []),
           ...(difficulty
             ? [
                 `  difficulty: ${difficulty} — learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`,
@@ -1192,7 +1248,7 @@ function policyExplanation(
           ...(yoloNote ? [yoloNote] : []),
           ...(preferNote ? [preferNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}), ...(hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}) });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}), ...(hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}), ...(forecastData ? { forecast: forecastData } : {}) });
       }),
   };
 

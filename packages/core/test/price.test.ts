@@ -7,6 +7,7 @@ import {
   PriceError,
   priceForModel,
   validatePriceTable,
+  forecastCost,
 } from '../src/price.ts';
 import type { CostPrimitives, PriceTable } from '../src/price.ts';
 import { loadPriceTable } from '../src/node.ts';
@@ -203,4 +204,106 @@ test('loadPriceTable gives a clear error for a missing file', () => {
     name: 'PriceError',
     message: /Could not read price table/,
   });
+});
+
+test('forecastCost: metered lane with price entry computes correct input cost', () => {
+  const prompt = 'hello world'; // 11 chars -> 3 tokens
+  const f = forecastCost(prompt, { model: 'gpt-5.5', costBasis: 'metered' }, TABLE);
+  assert.equal(f.estTokensIn, 3);
+  assert.equal(f.estCostUsd, (3 * 10) / 1_000_000);
+  assert.equal(f.basis, 'metered');
+  assert.equal(f.note, 'input only, output extra');
+});
+
+test('forecastCost: subscription lane has $0 cost and correct note', () => {
+  const prompt = 'hello world';
+  const f = forecastCost(prompt, { model: 'claude-opus-4-7', costBasis: 'subscription' }, TABLE);
+  assert.equal(f.estTokensIn, 3);
+  assert.equal(f.estCostUsd, 0);
+  assert.equal(f.basis, 'subscription');
+  assert.equal(f.note, 'flat-rate subscription');
+});
+
+test('forecastCost: local lane has $0 cost and correct note', () => {
+  const prompt = 'hello world';
+  const f = forecastCost(prompt, { model: 'llama3.1:8b', costBasis: 'local' }, TABLE);
+  assert.equal(f.estTokensIn, 3);
+  assert.equal(f.estCostUsd, 0);
+  assert.equal(f.basis, 'local');
+  assert.equal(f.note, 'local — no metered cost');
+});
+
+test('forecastCost: metered lane with missing/invalid price table entry omits estCostUsd', () => {
+  const prompt = 'hello world';
+  // Missing model
+  const f1 = forecastCost(prompt, { model: 'mystery-model', costBasis: 'metered' }, TABLE);
+  assert.equal(f1.estTokensIn, 3);
+  assert.equal(f1.estCostUsd, undefined);
+  assert.equal(f1.basis, 'metered');
+  assert.match(f1.note, /missing price entry/);
+
+  // Missing price table entirely
+  const f2 = forecastCost(prompt, { model: 'gpt-5.5', costBasis: 'metered' }, undefined);
+  assert.equal(f2.estTokensIn, 3);
+  assert.equal(f2.estCostUsd, undefined);
+  assert.equal(f2.basis, 'metered');
+  assert.match(f2.note, /missing price entry/);
+});
+
+test('forecastCost: additional finite-safety cases', () => {
+  // 1. empty text
+  const fEmpty = forecastCost('', { model: 'gpt-5.5', costBasis: 'metered' }, TABLE);
+  assert.equal(fEmpty.estTokensIn, 0);
+  assert.equal(fEmpty.estCostUsd, 0);
+
+  // 2. very large text
+  const largeText = 'a'.repeat(4000000); // 4M chars -> 1M tokens
+  const fLarge = forecastCost(largeText, { model: 'gpt-5.5', costBasis: 'metered' }, TABLE);
+  assert.equal(fLarge.estTokensIn, 1_000_000);
+  assert.equal(fLarge.estCostUsd, 10);
+
+  // 3. zero price
+  const zeroTable: PriceTable = {
+    schema_version: 1,
+    frontier_model: 'gpt-5.5',
+    models: {
+      'gpt-5.5': { inputPer1M: 0, outputPer1M: 0 },
+    },
+  };
+  const fZero = forecastCost('hello world', { model: 'gpt-5.5', costBasis: 'metered' }, zeroTable);
+  assert.equal(fZero.estTokensIn, 3);
+  assert.equal(fZero.estCostUsd, 0);
+
+  // 4. NEGATIVE price
+  const negativeTable: PriceTable = {
+    schema_version: 1,
+    frontier_model: 'gpt-5.5',
+    models: {
+      'gpt-5.5': { inputPer1M: -5, outputPer1M: 0 },
+    },
+  };
+  const fNegative = forecastCost('hello world', { model: 'gpt-5.5', costBasis: 'metered' }, negativeTable);
+  assert.equal(fNegative.estTokensIn, 3);
+  assert.equal(fNegative.estCostUsd, undefined);
+  assert.match(fNegative.note, /missing price entry/);
+
+  // 5. overflow (inputPer1M: Number.MAX_VALUE)
+  const overflowTable: PriceTable = {
+    schema_version: 1,
+    frontier_model: 'gpt-5.5',
+    models: {
+      'gpt-5.5': { inputPer1M: Number.MAX_VALUE, outputPer1M: 0 },
+    },
+  };
+  const fOverflow = forecastCost('hello world', { model: 'gpt-5.5', costBasis: 'metered' }, overflowTable);
+  assert.equal(fOverflow.estTokensIn, 3);
+  assert.equal(fOverflow.estCostUsd, undefined);
+  assert.match(fOverflow.note, /missing price entry/);
+
+  // 6. huge-text case asserting a finite estTokensIn and finite/sane cost.
+  // The non-finite guard is defensive since estimateTokens always returns a finite number for any string.
+  const hugeText = 'a'.repeat(8000000); // 8M chars -> 2M tokens
+  const fHuge = forecastCost(hugeText, { model: 'gpt-5.5', costBasis: 'metered' }, TABLE);
+  assert.equal(fHuge.estTokensIn, 2_000_000);
+  assert.equal(fHuge.estCostUsd, 20);
 });

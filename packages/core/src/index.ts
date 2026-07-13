@@ -67,8 +67,9 @@ export {
   priceForModel,
   computeCostPrimitives,
   aggregateSavings,
+  forecastCost,
 } from './price.ts';
-export type { ModelPrice, PriceTable, CostPrimitives, SavingsSummary } from './price.ts';
+export type { ModelPrice, PriceTable, CostPrimitives, SavingsSummary, CostForecast } from './price.ts';
 export {
   parseModelAlias,
   compareModelVersion,

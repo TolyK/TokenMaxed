@@ -37,8 +37,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
-  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor, quotaEstimate } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent, QuotaEstimate } from '@tokenmaxed/core';
+  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor, quotaEstimate, forecastCost } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent, QuotaEstimate, CostForecast } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -317,7 +317,7 @@ function fileFullAccessStore(statePath: string): FullAccessStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate };
+export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -1460,6 +1460,17 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     tieredStrategy,
     ...(tierFloor !== undefined ? { tierFloor } : {}),
     laneCost: (lanes: readonly Lane[]) => laneCostMap(lanes, loadPriceTable(pricesPath)),
+    loadPriceTable: () => loadPriceTable(pricesPath),
+    readRepoFiles: (paths: readonly string[]) =>
+      readRepoFiles(paths, {
+        projectDir: env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR,
+        realpath: realpathSync,
+        readFile: (p) => readFileSync(p, 'utf8'),
+        stat: (p) => {
+          const s = statSync(p);
+          return { isFile: s.isFile(), size: s.size };
+        },
+      }),
     // TOKENMAXED_DISABLE forces routing off (kill-switch + recursion guard),
     // overriding the per-project toggle.
     getEnabled: () => (globallyDisabled ? false : readEnabled(store, projectKey)),
