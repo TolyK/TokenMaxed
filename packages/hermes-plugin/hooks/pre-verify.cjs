@@ -8868,11 +8868,15 @@ async function availableLaneIds(lanes, deps) {
   const results = await Promise.all(lanes.map(async (lane) => await isLaneAvailable(lane, deps) ? lane.id : null));
   return results.filter((id) => id !== null);
 }
-function makeAvailabilityProbe(env) {
+function makeAvailabilityDeps(env) {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch;
   const path = spawnPath(process.execPath, env.PATH);
-  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
+  return { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} };
+}
+function makeAvailabilityProbe(env) {
+  const deps = makeAvailabilityDeps(env);
+  return (lanes) => availableLaneIds(lanes, deps);
 }
 
 // ../mcp/src/manager-select.ts

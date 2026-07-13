@@ -14230,8 +14230,8 @@ import { readFileSync as readFileSync8 } from "node:fs";
 
 // ../mcp/src/server.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
-import { existsSync as existsSync9, mkdirSync as mkdirSync6, readFileSync as readFileSync7, realpathSync, statSync as statSync2, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname as dirname8, join as join7 } from "node:path";
+import { existsSync as existsSync10, mkdirSync as mkdirSync6, readFileSync as readFileSync7, realpathSync as realpathSync2, statSync as statSync2, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname as dirname9, join as join8 } from "node:path";
 import { fileURLToPath as fileURLToPath6 } from "node:url";
 
 // ../../node_modules/zod/v4/core/core.js
@@ -24561,11 +24561,15 @@ async function availableLaneIds(lanes, deps) {
   const results = await Promise.all(lanes.map(async (lane) => await isLaneAvailable(lane, deps) ? lane.id : null));
   return results.filter((id) => id !== null);
 }
-function makeAvailabilityProbe(env) {
+function makeAvailabilityDeps(env) {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch;
   const path = spawnPath(process.execPath, env.PATH);
-  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
+  return { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} };
+}
+function makeAvailabilityProbe(env) {
+  const deps = makeAvailabilityDeps(env);
+  return (lanes) => availableLaneIds(lanes, deps);
 }
 
 // ../mcp/src/capability-prior-load.ts
@@ -25823,6 +25827,425 @@ async function runSetup(env) {
     // CLI plugin (subscription, $0 metered), nudge them toward the plugin with a link.
     pluginSuggestions: pluginSuggestionsFor(registry2.lanes)
   };
+}
+
+// ../mcp/src/doctor.ts
+import { dirname as dirname8, join as join7 } from "node:path";
+import { existsSync as existsSync9, readdirSync as readdirSync2, realpathSync } from "node:fs";
+function checkDuplicatePlugins(env) {
+  const pluginRoot = env.CLAUDE_PLUGIN_ROOT;
+  if (!pluginRoot) return null;
+  try {
+    const parentDir = dirname8(pluginRoot);
+    if (existsSync9(parentDir)) {
+      const entries = readdirSync2(parentDir, { withFileTypes: true });
+      const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+      if (dirs.length > 1) {
+        const activeResolved = realpathSync(pluginRoot);
+        const inactivePaths = [];
+        const infoLines = [];
+        for (const dir of dirs) {
+          const fullPath = join7(parentDir, dir);
+          let resolved = "";
+          try {
+            resolved = realpathSync(fullPath);
+          } catch {
+            resolved = fullPath;
+          }
+          const isActive = resolved === activeResolved;
+          infoLines.push(`  - ${dir} (${isActive ? "ACTIVE" : "INACTIVE"})`);
+          if (!isActive) {
+            inactivePaths.push(fullPath);
+          }
+        }
+        if (inactivePaths.length > 0) {
+          return {
+            title: "Multiple TokenMaxed plugin installations detected",
+            detail: `Found ${dirs.length} versioned/installation directories in the plugin cache under "${parentDir}":
+` + infoLines.join("\n"),
+            fix: `Remove the inactive directories to avoid running stale bundle code. Run:
+` + inactivePaths.map((p) => `  rm -rf "${p}"`).join("\n")
+          };
+        }
+      }
+    }
+  } catch {
+    throw new Error("plugin check failed");
+  }
+  return null;
+}
+async function runDoctor(env, deps) {
+  const findings = [];
+  try {
+    const dup = checkDuplicatePlugins(env);
+    if (dup) {
+      findings.push({ severity: "warn", ...dup });
+    }
+  } catch {
+    findings.push({
+      severity: "warn",
+      title: "Couldn't determine duplicate plugin status",
+      detail: "duplicate plugin directory check failed",
+      fix: "Verify the plugin directory permissions."
+    });
+  }
+  try {
+    const rep = settingsReport(env);
+    if (rep.present) {
+      if (rep.warning) {
+        findings.push({
+          severity: "warn",
+          title: "Settings configuration is malformed",
+          detail: "settings.json failed to parse (invalid JSON) \u2014 check syntax",
+          fix: "Fix the JSON syntax of settings.json or delete it to reset."
+        });
+      }
+      if (rep.invalid && rep.invalid.length > 0) {
+        findings.push({
+          severity: "warn",
+          title: "Invalid keys in settings configuration",
+          detail: "One or more keys in settings.json have invalid types or values.",
+          fix: "Check the values in settings.json and ensure they have the correct types."
+        });
+      }
+    }
+  } catch {
+    findings.push({
+      severity: "warn",
+      title: "Couldn't determine settings status",
+      detail: "settings check failed",
+      fix: "Verify the settings.json file permissions."
+    });
+  }
+  let gitleaksAvailable = false;
+  let availabilityDeps;
+  try {
+    availabilityDeps = makeAvailabilityDeps(env);
+    gitleaksAvailable = commandOnPath("gitleaks", availabilityDeps.path);
+    if (!gitleaksAvailable) {
+      findings.push({
+        severity: "warn",
+        title: "Secret scanner (gitleaks) not installed",
+        detail: "gitleaks is not found on your system or is not executable. This is required for untrusted worker/reader gates to scan files for secrets before routing.",
+        fix: 'Install gitleaks (e.g., via "brew install gitleaks") and ensure it is in your PATH.'
+      });
+    }
+  } catch {
+    findings.push({
+      severity: "warn",
+      title: "Couldn't determine secret scanner status",
+      detail: "gitleaks presence check failed",
+      fix: "Check your PATH settings."
+    });
+  }
+  const lanesPath = env.TOKENMAXED_LANES ?? homeFile("lanes.yaml");
+  const policyPath = env.TOKENMAXED_POLICY ?? homeFile("policy.yaml");
+  let registry2;
+  try {
+    if (!existsSync9(lanesPath)) {
+      findings.push({
+        severity: "error",
+        title: "Lanes configuration file missing",
+        detail: `Lanes config file not found at local config path.`,
+        fix: "Run /tokenmaxed:setup to generate lanes.yaml from the starter template."
+      });
+    } else {
+      registry2 = loadLaneConfig(lanesPath);
+      if (!registry2.lanes || registry2.lanes.length === 0) {
+        findings.push({
+          severity: "error",
+          title: "No lanes configured",
+          detail: "The lanes registry contains zero lanes.",
+          fix: "Add at least one lane definition to your lanes.yaml."
+        });
+      } else {
+        const enabledLanes = registry2.lanes.filter((l) => l.trust_mode !== "blocked");
+        if (enabledLanes.length === 0) {
+          findings.push({
+            severity: "error",
+            title: "No enabled lanes",
+            detail: 'All configured lanes in lanes.yaml are set to trust_mode: "blocked".',
+            fix: 'Set trust_mode to "full", "worker", or "reader" on at least one lane in lanes.yaml.'
+          });
+        }
+        const hasManager = registry2.lanes.some((l) => isManagerEligible(l));
+        if (!hasManager) {
+          findings.push({
+            severity: "warn",
+            title: "No manager/reviewer lane configured",
+            detail: 'No lane in lanes.yaml is configured as eligible to act as a manager (requires trust_mode: "full" and manager_allowed: true).',
+            fix: "Set manager_allowed: true on a trusted local or CLI lane (e.g., claude-native) in lanes.yaml."
+          });
+        }
+      }
+    }
+  } catch {
+    findings.push({
+      severity: "error",
+      title: "Lanes configuration is malformed",
+      detail: "lanes.yaml failed to parse (invalid YAML) \u2014 check syntax",
+      fix: "Fix the YAML syntax or fields in your lanes.yaml file."
+    });
+  }
+  try {
+    if (!existsSync9(policyPath)) {
+      findings.push({
+        severity: "error",
+        title: "Policy configuration file missing",
+        detail: "Policy config file not found at local config path.",
+        fix: "Run /tokenmaxed:setup to generate policy.yaml from the starter template."
+      });
+    } else {
+      loadPolicyConfig(policyPath);
+    }
+  } catch {
+    findings.push({
+      severity: "error",
+      title: "Policy configuration is malformed",
+      detail: "policy.yaml failed to parse (invalid YAML) \u2014 check syntax",
+      fix: "Fix the YAML syntax or fields in your policy.yaml file."
+    });
+  }
+  if (registry2) {
+    const gateReady = env.TOKENMAXED_GATE_READY === "true";
+    const readerEgress = env.TOKENMAXED_READER_EGRESS === "true" && !(env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true");
+    const workerLanes = registry2.lanes.filter((l) => l.trust_mode === "worker");
+    if (workerLanes.length > 0 && !gateReady) {
+      findings.push({
+        severity: "warn",
+        title: "Worker lanes unusable because worker gate is closed",
+        detail: "Worker lanes are configured but the worker gate is closed.",
+        fix: 'Enable the worker gate by running "/tokenmaxed:config gate_ready true" or setting TOKENMAXED_GATE_READY=true in your environment.'
+      });
+    }
+    const readerLanes = registry2.lanes.filter((l) => l.trust_mode === "reader");
+    if (readerLanes.length > 0) {
+      if (!readerEgress) {
+        findings.push({
+          severity: "warn",
+          title: "Reader lanes unusable because reader egress is disabled",
+          detail: "Reader lanes are configured but reader egress is disabled.",
+          fix: 'Enable reader egress by running "/tokenmaxed:config reader_egress true" or setting TOKENMAXED_READER_EGRESS=true in your environment.'
+        });
+      }
+      for (const lane of readerLanes) {
+        if (lane.repo_read_attestation !== true) {
+          findings.push({
+            severity: "warn",
+            title: `Reader lane "${lane.id}" lacks attestation`,
+            detail: 'Reader lane requires "repo_read_attestation: true" in lanes.yaml to receive repo-read content.',
+            fix: `Add "repo_read_attestation: true" to lane "${lane.id}" in lanes.yaml.`
+          });
+        }
+      }
+    }
+    try {
+      if (!availabilityDeps) {
+        availabilityDeps = makeAvailabilityDeps(env);
+      }
+      const lanesToProbe = registry2.lanes.filter((l) => !l.native && l.trust_mode !== "blocked");
+      const probeResults = await Promise.all(
+        lanesToProbe.map(async (lane) => {
+          try {
+            const isAvailable = await isLaneAvailable(lane, availabilityDeps);
+            if (!isAvailable) {
+              let detail = "";
+              let fix = "";
+              if (lane.kind === "cli") {
+                const cmd = lane.command ?? "";
+                const hasCommand = commandOnPath(cmd, availabilityDeps.path);
+                if (!hasCommand) {
+                  detail = "CLI command is not executable or not found on PATH.";
+                  fix = "Install the CLI tool or check your PATH environment variable.";
+                } else {
+                  const base = cmd.split("/").pop();
+                  if (base === "node") {
+                    detail = "Node script referenced by CLI lane was not found.";
+                    fix = "Check if the script file exists at the configured path in lanes.yaml.";
+                  } else {
+                    detail = "CLI command failed the execution check.";
+                    fix = "Check the command path and arguments in lanes.yaml.";
+                  }
+                }
+              } else if (lane.kind === "local") {
+                detail = "Local server endpoint is unreachable.";
+                fix = "Start your local server and verify it is running.";
+              } else if (lane.kind === "api") {
+                detail = "BYOK API key is missing or empty for the configured auth handle.";
+                fix = `Set the environment variable TOKENMAXED_KEY_${lane.authHandle ?? ""} to a valid API key.`;
+              } else {
+                detail = "Lane kind is unknown or unsupported.";
+                fix = 'Change the lane kind in lanes.yaml to "cli", "local", or "api".';
+              }
+              return {
+                laneId: lane.id,
+                finding: {
+                  severity: "warn",
+                  title: `Lane "${lane.id}" is unavailable`,
+                  detail,
+                  fix
+                }
+              };
+            }
+            return { laneId: lane.id, available: true };
+          } catch {
+            return {
+              laneId: lane.id,
+              finding: {
+                severity: "warn",
+                title: `Couldn't determine availability for lane "${lane.id}"`,
+                detail: "lane availability probe failed",
+                fix: "Check the lane settings in lanes.yaml."
+              }
+            };
+          }
+        })
+      );
+      const unavailableLaneIds = /* @__PURE__ */ new Set();
+      const nonNativeEnabledLanes = registry2.lanes.filter((l) => !l.native && l.trust_mode !== "blocked");
+      for (const res of probeResults) {
+        if (res && res.finding) {
+          findings.push(res.finding);
+          unavailableLaneIds.add(res.laneId);
+        }
+      }
+      if (nonNativeEnabledLanes.length > 0 && unavailableLaneIds.size === nonNativeEnabledLanes.length) {
+        findings.push({
+          severity: "error",
+          title: "No runnable non-native lanes available",
+          detail: "All configured non-native lanes are unavailable for routing.",
+          fix: "Fix the individual lane errors reported below."
+        });
+      }
+    } catch {
+      findings.push({
+        severity: "warn",
+        title: "Couldn't determine lane availability",
+        detail: "lane availability probe failed",
+        fix: "Verify that node and environment PATH are configured correctly."
+      });
+    }
+    const statePath = env.TOKENMAXED_STATE ?? (env.CLAUDE_PLUGIN_DATA ? join7(env.CLAUDE_PLUGIN_DATA, "state.json") : homeFile("state.json"));
+    const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname8(statePath), "model-freshness.json");
+    const keyedApiLanes = registry2.lanes.filter(
+      (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle
+    );
+    if (deps.freshness) {
+      try {
+        const freshnessWarnings = await deps.freshness();
+        let missingEndpointLanes = [];
+        let staleOrMissingCacheLanes = [];
+        if (keyedApiLanes.length > 0) {
+          const cache = readFreshnessCache(cachePath);
+          const now = Date.now();
+          const ID_MISMATCH_TTL_MS2 = 10 * 6e4;
+          for (const lane of keyedApiLanes) {
+            if (!lane.endpoint) {
+              missingEndpointLanes.push(lane.id);
+              continue;
+            }
+            const entry = getEntry(cache, lane.endpoint);
+            if (!entry || !isFresh(entry, now, ID_MISMATCH_TTL_MS2)) {
+              staleOrMissingCacheLanes.push(lane.id);
+            }
+          }
+        }
+        for (const laneId of missingEndpointLanes) {
+          findings.push({
+            severity: "warn",
+            title: `Lane "${laneId}" has no endpoint`,
+            detail: `api lane ${laneId} has no endpoint \u2014 cannot verify model freshness / it can't run`,
+            fix: `Define a valid endpoint URL for lane "${laneId}" in lanes.yaml.`
+          });
+        }
+        for (const laneId of staleOrMissingCacheLanes) {
+          findings.push({
+            severity: "warn",
+            title: `Model freshness not verified for lane "${laneId}"`,
+            detail: `model freshness not verified for lane "${laneId}" \u2014 no/stale cache; run /tokenmaxed:status to populate it`,
+            fix: "Run /tokenmaxed:status to populate and refresh the model cache."
+          });
+        }
+        const warningMap = new Map(freshnessWarnings.map((w) => [w.laneId, w]));
+        for (const lane of registry2.lanes) {
+          const w = warningMap.get(lane.id);
+          if (w) {
+            findings.push({
+              severity: "warn",
+              title: `Stale model ID pinned for lane "${w.laneId}"`,
+              detail: "pinned model is stale; newer model available in the same family.",
+              fix: w.newestPriced ? "Update the lane's model in lanes.yaml to use @latest or pin the new version." : "A newer model exists but is not priced in TokenMaxed yet. Add it to the price table to route to it."
+            });
+          }
+        }
+      } catch {
+        findings.push({
+          severity: "warn",
+          title: "Couldn't determine model freshness",
+          detail: "model freshness validation failed",
+          fix: "Check your internet connection."
+        });
+      }
+    }
+    if (deps.idMismatch) {
+      try {
+        const mismatchWarnings = await deps.idMismatch();
+        let missingEndpointLanes = [];
+        let staleOrMissingCacheLanes = [];
+        if (keyedApiLanes.length > 0) {
+          const cache = readFreshnessCache(cachePath);
+          const now = Date.now();
+          const ID_MISMATCH_TTL_MS2 = 10 * 6e4;
+          for (const lane of keyedApiLanes) {
+            if (!lane.endpoint) {
+              missingEndpointLanes.push(lane.id);
+              continue;
+            }
+            const entry = getEntry(cache, lane.endpoint);
+            if (!entry || !isFresh(entry, now, ID_MISMATCH_TTL_MS2)) {
+              staleOrMissingCacheLanes.push(lane.id);
+            }
+          }
+        }
+        for (const laneId of missingEndpointLanes) {
+          findings.push({
+            severity: "warn",
+            title: `Lane "${laneId}" has no endpoint`,
+            detail: `api lane ${laneId} has no endpoint \u2014 cannot verify model ID casing / it can't run`,
+            fix: `Define a valid endpoint URL for lane "${laneId}" in lanes.yaml.`
+          });
+        }
+        for (const laneId of staleOrMissingCacheLanes) {
+          findings.push({
+            severity: "warn",
+            title: `Model ID casing validation not verified for lane "${laneId}"`,
+            detail: `model ID casing validation could not be evaluated for lane "${laneId}" \u2014 no/stale cache; run /tokenmaxed:status to populate it`,
+            fix: "Run /tokenmaxed:status to populate and refresh the model cache."
+          });
+        }
+        const warningMap = new Map(mismatchWarnings.map((w) => [w.laneId, w]));
+        for (const lane of registry2.lanes) {
+          const w = warningMap.get(lane.id);
+          if (w) {
+            findings.push({
+              severity: "warn",
+              title: `Model ID casing/existence mismatch for lane "${w.laneId}"`,
+              detail: "Model ID sent to provider is not recognized or expects different casing.",
+              fix: "Fix the model ID casing in lanes.yaml or the price table."
+            });
+          }
+        }
+      } catch {
+        findings.push({
+          severity: "warn",
+          title: "Couldn't determine model ID casing status",
+          detail: "model ID casing validation failed",
+          fix: "Verify the model cache."
+        });
+      }
+    }
+  }
+  return { findings };
 }
 
 // ../mcp/src/lane-setup.ts
@@ -27394,7 +27817,30 @@ ${r.notes}` : "";
       );
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool];
+  const doctorTool = {
+    name: "router_doctor",
+    description: "Run the TokenMaxed doctor diagnostic command to check config, lanes, availability, gates, and freshness. Reports a prioritized list of actionable problems with fixes.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    handler: (deps) => guardedAsync(async () => {
+      if (!deps.doctor) {
+        throw new ToolInputError("Doctor diagnostic not supported by this host.");
+      }
+      const report = await deps.doctor();
+      const severityOrder = { error: 0, warn: 1, info: 2 };
+      const sorted = [...report.findings].sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
+      if (sorted.length === 0) {
+        return ok("\u2713 no problems found", { findings: [] });
+      }
+      const lines = sorted.map((f) => {
+        const prefix = f.severity === "error" ? "\u2717" : f.severity === "warn" ? "\u26A0" : "\u2139";
+        return `${prefix} [${f.severity.toUpperCase()}] ${f.title}
+  Detail: ${f.detail}
+  Fix: ${f.fix}`;
+      });
+      return ok(lines.join("\n\n"), { findings: sorted });
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool];
 }
 function receiptLine(r) {
   const int2 = (n) => Math.round(n).toLocaleString("en-US");
@@ -27819,7 +28265,7 @@ function escToOutcome(esc2, modelOf, recordingFailed) {
 function fileToggleStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27827,7 +28273,7 @@ function fileToggleStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -27835,7 +28281,7 @@ function fileToggleStore(statePath) {
 function filePreferStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27843,7 +28289,7 @@ function filePreferStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -27851,7 +28297,7 @@ function filePreferStore(statePath) {
 function filePolicyStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27859,7 +28305,7 @@ function filePolicyStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -27867,7 +28313,7 @@ function filePolicyStore(statePath) {
 function fileReserveStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27875,7 +28321,7 @@ function fileReserveStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -27883,7 +28329,7 @@ function fileReserveStore(statePath) {
 function fileCalibrationStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27891,7 +28337,7 @@ function fileCalibrationStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -27899,7 +28345,7 @@ function fileCalibrationStore(statePath) {
 function fileRoutedShareStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27907,7 +28353,7 @@ function fileRoutedShareStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -27915,7 +28361,7 @@ function fileRoutedShareStore(statePath) {
 function fileTargetStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27923,7 +28369,7 @@ function fileTargetStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -27931,7 +28377,7 @@ function fileTargetStore(statePath) {
 function fileFullAccessStore(statePath) {
   return {
     read: () => {
-      if (!existsSync9(statePath)) return {};
+      if (!existsSync10(statePath)) return {};
       try {
         return JSON.parse(readFileSync7(statePath, "utf8"));
       } catch {
@@ -27939,7 +28385,7 @@ function fileFullAccessStore(statePath) {
       }
     },
     write: (state) => {
-      mkdirSync6(dirname8(statePath), { recursive: true });
+      mkdirSync6(dirname9(statePath), { recursive: true });
       writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
     }
   };
@@ -28032,16 +28478,16 @@ function makeServerDeps(env = process.env) {
   const statePath = env.TOKENMAXED_STATE ?? homeFile("state.json");
   const projectKey = env.TOKENMAXED_PROJECT ?? "default";
   const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES2;
-  const reserveStatePath = env.TOKENMAXED_RESERVE_STATE ?? join7(dirname8(statePath), "reserve.json");
+  const reserveStatePath = env.TOKENMAXED_RESERVE_STATE ?? join8(dirname9(statePath), "reserve.json");
   const reserveStore = fileReserveStore(reserveStatePath);
   const readReservesMap = () => readReserves(reserveStore, projectKey);
-  const calibrationStatePath = env.TOKENMAXED_CALIBRATION_STATE ?? join7(dirname8(statePath), "calibration.json");
+  const calibrationStatePath = env.TOKENMAXED_CALIBRATION_STATE ?? join8(dirname9(statePath), "calibration.json");
   const calibrationStore = fileCalibrationStore(calibrationStatePath);
   const readCalibrationsMap = () => readCalibrations(calibrationStore, projectKey);
-  const routedShareStatePath = env.TOKENMAXED_ROUTED_SHARE_STATE ?? join7(dirname8(statePath), "routed-share.json");
+  const routedShareStatePath = env.TOKENMAXED_ROUTED_SHARE_STATE ?? join8(dirname9(statePath), "routed-share.json");
   const routedShareStore = fileRoutedShareStore(routedShareStatePath);
   const readRoutedSharesMap = () => readRoutedShares(routedShareStore, projectKey);
-  const targetStatePath = env.TOKENMAXED_TARGET_STATE ?? join7(dirname8(statePath), "target.json");
+  const targetStatePath = env.TOKENMAXED_TARGET_STATE ?? join8(dirname9(statePath), "target.json");
   const targetStore = fileTargetStore(targetStatePath);
   const readTargetsMap = () => readTargets(targetStore, projectKey);
   const gateReady = env.TOKENMAXED_GATE_READY === "true";
@@ -28257,18 +28703,18 @@ function makeServerDeps(env = process.env) {
   const hostId = hostFromEnv(env);
   const reservedForReview = (lane) => isManagerEligible(lane) && (lane.costBasis === "subscription" || lane.costBasis === "local") && hostAllowsLane(lane, { host: hostId });
   const store = fileToggleStore(statePath);
-  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join7(dirname8(statePath), "prefer.json");
+  const preferStatePath = env.TOKENMAXED_PREFER_STATE ?? join8(dirname9(statePath), "prefer.json");
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
   const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
-  const policyStatePath = env.TOKENMAXED_POLICY_STATE ?? join7(dirname8(statePath), "policy.json");
+  const policyStatePath = env.TOKENMAXED_POLICY_STATE ?? join8(dirname9(statePath), "policy.json");
   const policyStore = filePolicyStore(policyStatePath);
   const policyEnvFallback = isValidRoutingPolicy(env.TOKENMAXED_ROUTING_POLICY?.trim()) ? env.TOKENMAXED_ROUTING_POLICY.trim() : void 0;
   const readRoutingPolicy = () => {
     const projectPolicy = readPolicy(policyStore, projectKey);
     return projectPolicy ?? policyEnvFallback ?? (tieredStrategy === "tiered" ? "cheapest" : "balanced");
   };
-  const fullAccessStatePath = env.TOKENMAXED_FULL_ACCESS_STATE ?? join7(dirname8(statePath), "full-access.json");
+  const fullAccessStatePath = env.TOKENMAXED_FULL_ACCESS_STATE ?? join8(dirname9(statePath), "full-access.json");
   const fullAccessStore = fileFullAccessStore(fullAccessStatePath);
   const fullAccessEnvFallback = env.TOKENMAXED_FULL_ACCESS ? env.TOKENMAXED_FULL_ACCESS.split(",").map((x) => x.trim()).filter((x) => x.length > 0) : [];
   const readFullAccessGrants = (allLanes) => {
@@ -28289,7 +28735,7 @@ function makeServerDeps(env = process.env) {
     }
     return [...projectGrants, ...fullAccessEnvFallback];
   };
-  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join7(dirname8(statePath), "yolo.json");
+  const yoloStatePath = env.TOKENMAXED_YOLO_STATE ?? join8(dirname9(statePath), "yolo.json");
   const yoloStore = fileToggleStore(yoloStatePath);
   const yoloEnvDefault = (env.TOKENMAXED_YOLO === "true" || env.TOKENMAXED_YOLO === "1") && !globallyDisabled;
   const readYoloState = () => globallyDisabled ? false : readYolo(yoloStore, projectKey, yoloEnvDefault);
@@ -28297,7 +28743,7 @@ function makeServerDeps(env = process.env) {
   const probeAvailable = makeAvailabilityProbe(env);
   const loadPolicySafe = makeLoadPolicy(env);
   const usableCandidates = (category) => {
-    if (!existsSync9(lanesPath)) {
+    if (!existsSync10(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
@@ -28306,7 +28752,7 @@ function makeServerDeps(env = process.env) {
   };
   const buildQuotaAlerts = async () => {
     try {
-      if (!existsSync9(lanesPath)) return [];
+      if (!existsSync10(lanesPath)) return [];
       const registry2 = loadLaneConfig(lanesPath);
       const events = new JsonlLedger(ledgerPath).readAll();
       const now = Date.now();
@@ -28465,7 +28911,7 @@ function makeServerDeps(env = process.env) {
     }
     const requestPolicy = typeof request.policy === "string" ? request.policy.trim().toLowerCase() : void 0;
     const routingPolicy = requestPolicy ?? readRoutingPolicy();
-    if (!existsSync9(lanesPath)) {
+    if (!existsSync10(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
         laneId: "native",
@@ -28580,7 +29026,7 @@ function makeServerDeps(env = process.env) {
     };
     const fileResult = request.files?.length ? readRepoFiles(request.files, {
       projectDir: env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR,
-      realpath: realpathSync,
+      realpath: realpathSync2,
       readFile: (p) => readFileSync7(p, "utf8"),
       stat: (p) => {
         const s = statSync2(p);
@@ -28701,6 +29147,63 @@ function makeServerDeps(env = process.env) {
       fullAccessLaneIds
     };
   };
+  const freshness = async () => {
+    if (globallyDisabled || !gateReady || !existsSync10(lanesPath)) return [];
+    const registry2 = loadLaneConfig(lanesPath);
+    const eligible = registry2.lanes.filter(
+      (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
+    );
+    const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join8(dirname9(statePath), "model-freshness.json");
+    return reportFreshness(
+      eligible,
+      {
+        fetchList: (lane) => fetchModelList(lane, { resolveAuth }),
+        table: loadPriceTable(pricesPath),
+        now: Date.now(),
+        readCache: () => readFreshnessCache(cachePath),
+        writeCache: (c) => writeFreshnessCache(cachePath, c)
+      },
+      { refresh: true }
+    );
+  };
+  const idMismatch = async () => {
+    if (globallyDisabled || !gateReady || !existsSync10(lanesPath)) return [];
+    const registry2 = loadLaneConfig(lanesPath);
+    const eligible = registry2.lanes.filter(
+      (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
+    );
+    const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join8(dirname9(statePath), "model-freshness.json");
+    return reportModelIdMismatches(eligible, {
+      table: loadPriceTable(pricesPath),
+      now: Date.now(),
+      ttlMs: ID_MISMATCH_TTL_MS,
+      readCache: () => readFreshnessCache(cachePath)
+    });
+  };
+  const freshnessCacheOnly = async () => {
+    if (globallyDisabled || !gateReady || !existsSync10(lanesPath)) return [];
+    const registry2 = loadLaneConfig(lanesPath);
+    const eligible = registry2.lanes.filter(
+      (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
+    );
+    const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join8(dirname9(statePath), "model-freshness.json");
+    return reportFreshness(
+      eligible,
+      {
+        fetchList: () => {
+          throw new Error("egress not allowed");
+        },
+        table: loadPriceTable(pricesPath),
+        now: Date.now(),
+        readCache: () => readFreshnessCache(cachePath),
+        writeCache: () => {
+        }
+        // NO-OP
+      },
+      { refresh: false }
+    );
+  };
+  const doctor = () => runDoctor(env, { freshness: freshnessCacheOnly, idMismatch });
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
     // The documented route input (capability-0 opt-outs excluded) minus
@@ -28759,7 +29262,7 @@ function makeServerDeps(env = process.env) {
     loadPriceTable: () => loadPriceTable(pricesPath),
     readRepoFiles: (paths) => readRepoFiles(paths, {
       projectDir: env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR,
-      realpath: realpathSync,
+      realpath: realpathSync2,
       readFile: (p) => readFileSync7(p, "utf8"),
       stat: (p) => {
         const s = statSync2(p);
@@ -28782,7 +29285,7 @@ function makeServerDeps(env = process.env) {
     },
     // Reader Full-Access Grants
     readerLanes: () => {
-      if (!existsSync9(lanesPath)) return [];
+      if (!existsSync10(lanesPath)) return [];
       try {
         const registry2 = loadLaneConfig(lanesPath);
         return registry2.lanes.filter((l) => l.trust_mode === "reader");
@@ -28791,7 +29294,7 @@ function makeServerDeps(env = process.env) {
       }
     },
     allLanes: () => {
-      if (!existsSync9(lanesPath)) return [];
+      if (!existsSync10(lanesPath)) return [];
       try {
         const registry2 = loadLaneConfig(lanesPath);
         return [...registry2.lanes];
@@ -28818,46 +29321,8 @@ function makeServerDeps(env = process.env) {
     // local sources the SessionStart hook uses via the shared makeSummaryFromEnv —
     // one source of truth. Read-only.
     summary: makeSummaryFromEnv(env),
-    // MODEL-FRESHNESS: check enabled API lanes for a stale pinned model (router_status).
-    // Gated egress — only non-blocked, gate-open, keyed api lanes get a /models call
-    // (key only, no content); never when routing is globally disabled. Caches results.
-    freshness: async () => {
-      if (globallyDisabled || !gateReady || !existsSync9(lanesPath)) return [];
-      const registry2 = loadLaneConfig(lanesPath);
-      const eligible = registry2.lanes.filter(
-        (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
-      );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname8(statePath), "model-freshness.json");
-      return reportFreshness(
-        eligible,
-        {
-          fetchList: (lane) => fetchModelList(lane, { resolveAuth }),
-          table: loadPriceTable(pricesPath),
-          now: Date.now(),
-          readCache: () => readFreshnessCache(cachePath),
-          writeCache: (c) => writeFreshnessCache(cachePath, c)
-        },
-        { refresh: true }
-      );
-    },
-    // UNIVERSAL id guard (router_status): after the freshness refresh populated the
-    // cache, flag any keyed api lane whose RESOLVED model id the vendor would reject
-    // (wrong casing / absent) — so a bad id can't silently ship for any provider.
-    // CACHE-ONLY (no extra egress); reads the list freshness() just wrote.
-    idMismatch: async () => {
-      if (globallyDisabled || !gateReady || !existsSync9(lanesPath)) return [];
-      const registry2 = loadLaneConfig(lanesPath);
-      const eligible = registry2.lanes.filter(
-        (l) => l.kind === "api" && l.trust_mode !== "blocked" && !!l.authHandle && resolveAuth(l.authHandle).length > 0
-      );
-      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join7(dirname8(statePath), "model-freshness.json");
-      return reportModelIdMismatches(eligible, {
-        table: loadPriceTable(pricesPath),
-        now: Date.now(),
-        ttlMs: ID_MISMATCH_TTL_MS,
-        readCache: () => readFreshnessCache(cachePath)
-      });
-    },
+    freshness,
+    idMismatch,
     delegate,
     // Manual manager review of the turn's diff (A-7); the Stop gate reuses the same
     // path independently. Honor the global kill-switch so a recursion-guarded child
@@ -28871,6 +29336,7 @@ function makeServerDeps(env = process.env) {
     }),
     // Create/validate user config + report status (A-8).
     setup: () => runSetup(env),
+    doctor,
     now: () => Date.now()
   };
 }

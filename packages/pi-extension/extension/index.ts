@@ -9244,11 +9244,15 @@ async function availableLaneIds(lanes, deps) {
   const results = await Promise.all(lanes.map(async (lane) => await isLaneAvailable(lane, deps) ? lane.id : null));
   return results.filter((id) => id !== null);
 }
-function makeAvailabilityProbe(env) {
+function makeAvailabilityDeps(env) {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch;
   const path = spawnPath(process.execPath, env.PATH);
-  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} });
+  return { path, resolveAuth, ...fetchImpl ? { fetchImpl } : {} };
+}
+function makeAvailabilityProbe(env) {
+  const deps = makeAvailabilityDeps(env);
+  return (lanes) => availableLaneIds(lanes, deps);
 }
 
 // ../mcp/src/manager-select.ts
@@ -11611,7 +11615,30 @@ ${r.notes}` : "";
       );
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool];
+  const doctorTool = {
+    name: "router_doctor",
+    description: "Run the TokenMaxed doctor diagnostic command to check config, lanes, availability, gates, and freshness. Reports a prioritized list of actionable problems with fixes.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    handler: (deps) => guardedAsync(async () => {
+      if (!deps.doctor) {
+        throw new ToolInputError("Doctor diagnostic not supported by this host.");
+      }
+      const report = await deps.doctor();
+      const severityOrder = { error: 0, warn: 1, info: 2 };
+      const sorted = [...report.findings].sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
+      if (sorted.length === 0) {
+        return ok("\u2713 no problems found", { findings: [] });
+      }
+      const lines = sorted.map((f) => {
+        const prefix = f.severity === "error" ? "\u2717" : f.severity === "warn" ? "\u26A0" : "\u2139";
+        return `${prefix} [${f.severity.toUpperCase()}] ${f.title}
+  Detail: ${f.detail}
+  Fix: ${f.fix}`;
+      });
+      return ok(lines.join("\n\n"), { findings: sorted });
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool];
 }
 function receiptLine(r) {
   const int = (n) => Math.round(n).toLocaleString("en-US");
