@@ -30,6 +30,11 @@ import {
   forecastCost,
   contributingOutcomes,
   analyzePlan,
+  capabilityInterval,
+  evidenceFreshnessDays,
+  resolveLaneModelKey,
+  declaredCapabilityFor,
+  effectiveCapabilityFor,
 } from '../../core/src/index.ts';
 import type { Lane, LedgerEvent, Policy, RouteDecision, OutcomeEventInput, OutcomeEvent, PriceTable } from '../../core/src/index.ts';
 
@@ -60,6 +65,11 @@ const CORE: CorePort = {
   forecastCost,
   contributingOutcomes,
   analyzePlan,
+  capabilityInterval,
+  evidenceFreshnessDays,
+  resolveLaneModelKey,
+  declaredCapabilityFor,
+  effectiveCapabilityFor,
 };
 const TOOLS = createTools(CORE);
 
@@ -928,6 +938,132 @@ test('preview applies the model-keyed overlay (P6 F-1); absent overlay is identi
   assert.equal(consulted, 1);
   assert.equal((on.structuredContent!.decision as { laneId: string }).laneId, 'cheap');
   assert.match(on.content[0]!.text, /learned/);
+});
+
+test('preview/status renders calibrated evidence and thin evidence notes correctly', async () => {
+  const lanes = [
+    lane({ id: 'cheap', model: 'cheap-m', capability: { bugfix: 0.6 }, costBasis: 'local' }),
+    lane({ id: 'strong', model: 'strong-m', capability: { bugfix: 0.85 }, costBasis: 'subscription' }),
+  ];
+
+  let seq = 0;
+  const outcome = (ts: string, model: string, verdict: 'pass' | 'fail', voter: 'reviewer_model' | 'user' = 'reviewer_model', laneId = 'cheap'): LedgerEvent => ({
+    event_type: 'outcome',
+    schema_version: 1,
+    id: `o-${seq}`,
+    seq: seq++,
+    ts,
+    subject_id: 't-0',
+    subject_type: 'router_task',
+    task_id: `t-${seq}`,
+    review_id: `r-${seq}`,
+    attempt: 0,
+    category: 'bugfix',
+    subject_lane_id: laneId,
+    subject_provenance: 'openai',
+    subject_model: model,
+    subject_model_resolved: model,
+    reviewer_lane_id: 'claude-native',
+    reviewer_model: 'claude-opus-4-7',
+    reviewer_trust_mode: 'full',
+    reviewer_provenance: 'anthropic',
+    verdict,
+    voter,
+    policy_verdict: 'allow',
+  } as any);
+
+  const now = Date.parse('2026-06-02T12:00:00.000Z');
+  const twoDaysAgo = new Date(now - 2 * 24 * 3600 * 1000).toISOString();
+
+  const events: LedgerEvent[] = [];
+  for (let i = 0; i < 50; i++) {
+    events.push(outcome(twoDaysAgo, 'cheap-m', 'pass'));
+  }
+
+  const overlay = { 'cheap-m': { bugfix: { rate: 1.0, n: 50 } } };
+
+  const dOn = deps({
+    candidateLanes: () => lanes,
+    allLanes: () => lanes,
+    observedCapabilityByModel: () => overlay,
+    readLedger: () => events,
+    now: () => now,
+  });
+
+  const previewOn = await call('router_preview', dOn, { category: 'bugfix' });
+  assert.notEqual(previewOn.isError, true);
+  assert.match(previewOn.content[0]!.text, /learned:\s*blended\s*0\.94,\s*observed\s*1\.00\s*\[0\.9[2-3]\d*–1\.00\]\s*\(95%\s*CI\),\s*n=50,\s*freshness\s*2d/);
+
+  const statusOn = await call('router_status', dOn);
+  assert.notEqual(statusOn.isError, true);
+  assert.match(statusOn.content[0]!.text, /cheap\s*\(cheap-m\)\s*bugfix:\s*capability\s*0\.94\s*\(blended;\s*observed\s*1\.00\s*\[0\.9[2-3]\d*–1\.00\],\s*n=50,\s*freshness\s*2d\)/);
+
+  const dOnWithPin = await call('router_preview', dOn, { category: 'bugfix', model: 'cheap-m' });
+  const expectedRawDecision = CORE.routeDecide(
+    { category: 'bugfix', model: 'cheap-m' } as any,
+    {
+      lanes: lanes.filter((l) => CORE.modelMatchesPin(l.model, 'cheap-m')),
+      observedCapability: undefined,
+      observedCapabilityByModel: overlay,
+      observedCapabilityByModelDifficulty: undefined,
+      healthPenaltyMap: {},
+      depletionForecastMap: {},
+      quotaHeadroomMap: {},
+      fullAccessLaneIds: [],
+      gateReady: true,
+    } as any,
+    {}
+  );
+  assert.equal(
+    JSON.stringify(dOnWithPin.structuredContent!.decision),
+    JSON.stringify(expectedRawDecision)
+  );
+
+  const thinOverlay = { 'cheap-m': { bugfix: { rate: 1.0, n: 0.5 } } };
+  const dThin = deps({
+    candidateLanes: () => lanes,
+    allLanes: () => lanes,
+    observedCapabilityByModel: () => thinOverlay,
+    readLedger: () => [outcome(twoDaysAgo, 'cheap-m', 'pass')],
+    now: () => now,
+  });
+
+  const previewThin = await call('router_preview', dThin, { category: 'bugfix', model: 'cheap-m' });
+  assert.match(previewThin.content[0]!.text, /declared\s*0\.60;\s*insufficient\s*outcome\s*evidence\s*\(n=0\.5\)/);
+
+  const statusThin = await call('router_status', dThin);
+  assert.match(statusThin.content[0]!.text, /cheap\s*\(cheap-m\)\s*bugfix:\s*capability\s*0\.60\s*\(declared;\s*insufficient\s*outcome\s*evidence\s*\(n=0\.5\)\)/);
+
+  const dOff = deps({
+    candidateLanes: () => lanes,
+    allLanes: () => lanes,
+    observedCapabilityByModel: () => undefined,
+    readLedger: () => [],
+    now: () => now,
+  });
+
+  const previewOff = await call('router_preview', dOff, { category: 'bugfix' });
+  assert.doesNotMatch(previewOff.content[0]!.text, /learned/);
+  assert.doesNotMatch(previewOff.content[0]!.text, /insufficient/);
+
+  const statusOff = await call('router_status', dOff);
+  assert.doesNotMatch(statusOff.content[0]!.text, /Learned Capabilities:/);
+
+  const emptyOverlay = { 'cheap-m': { bugfix: { rate: 0.0, n: 0 } } };
+  const dEmpty = deps({
+    candidateLanes: () => lanes,
+    allLanes: () => lanes,
+    observedCapabilityByModel: () => emptyOverlay,
+    readLedger: () => [],
+    now: () => now,
+  });
+
+  // Fix 2: n <= 0 must show declared + insufficient-evidence
+  const previewEmpty = await call('router_preview', dEmpty, { category: 'bugfix', model: 'cheap-m' });
+  assert.match(previewEmpty.content[0]!.text, /declared\s*0\.60;\s*insufficient\s*outcome\s*evidence\s*\(n=0\)/);
+
+  const statusEmpty = await call('router_status', dEmpty);
+  assert.match(statusEmpty.content[0]!.text, /cheap\s*\(cheap-m\)\s*bugfix:\s*capability\s*0\.60\s*\(declared;\s*insufficient\s*outcome\s*evidence\s*\(n=0\)\)/);
 });
 
 test('preview applies the availability filter (skips a lane that cannot run)', async () => {

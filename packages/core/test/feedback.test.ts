@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { DEFAULT_HALF_LIFE_DAYS, outcomeCapability } from '../src/feedback.ts';
+import { DEFAULT_HALF_LIFE_DAYS, outcomeCapability, capabilityInterval, evidenceFreshnessDays } from '../src/feedback.ts';
 import { SCHEMA_VERSION } from '../src/ledger.ts';
 import type { LedgerEvent, OutcomeEvent, TaskEvent } from '../src/ledger.ts';
 
@@ -215,4 +215,59 @@ test('user feedback voter correctly aggregates and adjusts the overlay', () => {
   const o = outcomeCapability(events, NOW);
   near(o['model-x']!.bugfix!.rate, 0.5);
   near(o['model-x']!.bugfix!.n, 2);
+});
+
+test('capabilityInterval computes correct Wilson score intervals for known values', () => {
+  // For rate = 0.84, n = 50:
+  const interval = capabilityInterval({ rate: 0.84, n: 50 });
+  assert.ok(interval !== undefined);
+  near(interval.lo, 0.714856, 1e-4);
+  near(interval.hi, 0.916628, 1e-4);
+  assert.equal(interval.n, 50);
+  assert.equal(interval.rate, 0.84);
+});
+
+test('capabilityInterval finite safety and invalid inputs', () => {
+  // n <= 0
+  assert.equal(capabilityInterval({ rate: 0.5, n: 0 }), undefined);
+  assert.equal(capabilityInterval({ rate: 0.5, n: -10 }), undefined);
+
+  // Non-finite
+  assert.equal(capabilityInterval({ rate: 0.5, n: NaN }), undefined);
+  assert.equal(capabilityInterval({ rate: 0.5, n: Infinity }), undefined);
+  assert.equal(capabilityInterval({ rate: NaN, n: 10 }), undefined);
+  assert.equal(capabilityInterval({ rate: Infinity, n: 10 }), undefined);
+});
+
+test('capabilityInterval rejects rate outside [0,1]', () => {
+  assert.equal(capabilityInterval({ rate: 1.5, n: 10 }), undefined);
+  assert.equal(capabilityInterval({ rate: -0.5, n: 10 }), undefined);
+});
+
+test('capabilityInterval edge case n=1, rate=0 and rate=1', () => {
+  const r0 = capabilityInterval({ rate: 0, n: 1 });
+  assert.ok(r0 !== undefined);
+  assert.equal(r0.lo, 0);
+  near(r0.hi, 0.79349, 1e-4); // Wilson upper bound for 0/1
+
+  const r1 = capabilityInterval({ rate: 1, n: 1 });
+  assert.ok(r1 !== undefined);
+  near(r1.lo, 0.20650, 1e-4); // Wilson lower bound for 1/1
+  assert.equal(r1.hi, 1);
+});
+
+test('evidenceFreshnessDays returns correct age in days of the newest outcome', () => {
+  const outcomes = [
+    outcome({ ts: isoDaysAgo(10) }),
+    outcome({ ts: isoDaysAgo(3) }),
+    outcome({ ts: isoDaysAgo(7) }),
+  ];
+  const age = evidenceFreshnessDays(outcomes, NOW);
+  assert.ok(age !== undefined);
+  near(age, 3, 1e-6);
+});
+
+test('evidenceFreshnessDays returns undefined when no outcomes or invalid timestamps', () => {
+  assert.equal(evidenceFreshnessDays([], NOW), undefined);
+  assert.equal(evidenceFreshnessDays([outcome({ ts: 'not-a-date' })], NOW), undefined);
 });

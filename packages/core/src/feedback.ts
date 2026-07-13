@@ -237,3 +237,101 @@ export function outcomeCapabilityByDifficulty(
   }
   return overlay;
 }
+
+export interface CapabilityInterval {
+  lo: number;
+  hi: number;
+  n: number;
+  rate: number;
+}
+
+export interface CapabilityIntervalOptions {
+  confidence?: number;
+}
+
+function zValueForConfidence(confidence: number): number {
+  const map: Record<number, number> = {
+    0.80: 1.28155,
+    0.85: 1.43953,
+    0.90: 1.64485,
+    0.95: 1.95996,
+    0.98: 2.32635,
+    0.99: 2.57583,
+    0.999: 3.29053,
+  };
+  return map[confidence] ?? 1.95996;
+}
+
+/**
+ * Computes a Wilson score interval for the proportion observed.rate with sample size observed.n.
+ * Returns undefined if n <= 0 or not finite, or rate is not finite.
+ */
+export function capabilityInterval(
+  observed: { rate: number; n: number },
+  opts?: CapabilityIntervalOptions,
+): CapabilityInterval | undefined {
+  if (!observed) return undefined;
+  const rawN = observed.n;
+  const rawRate = observed.rate;
+  if (!Number.isFinite(rawN) || rawN <= 0 || !Number.isFinite(rawRate) || rawRate < 0 || rawRate > 1) {
+    return undefined;
+  }
+  const rate = rawRate;
+  const confidence = opts?.confidence ?? 0.95;
+  const z = zValueForConfidence(confidence);
+  const z2 = z * z;
+
+  const denom = 1 + z2 / rawN;
+  if (!Number.isFinite(denom) || denom === 0) {
+    return undefined;
+  }
+
+  const center = (rate + z2 / (2 * rawN)) / denom;
+  const inner = (rate * (1 - rate)) / rawN + z2 / (4 * rawN * rawN);
+  if (inner < 0 || !Number.isFinite(inner)) {
+    return undefined;
+  }
+
+  const spread = (z * Math.sqrt(inner)) / denom;
+  if (!Number.isFinite(center) || !Number.isFinite(spread)) {
+    return undefined;
+  }
+
+  const lo = Math.max(0, Math.min(1, center - spread));
+  const hi = Math.max(0, Math.min(1, center + spread));
+
+  return { lo, hi, n: rawN, rate };
+}
+
+/**
+ * Computes the age in days of the newest contributing outcome.
+ * Returns undefined when there are no contributing outcomes.
+ */
+export function evidenceFreshnessDays(
+  outcomes: readonly OutcomeEvent[],
+  now: number,
+): number | undefined {
+  if (!Number.isFinite(now)) {
+    return undefined;
+  }
+  if (!outcomes || outcomes.length === 0) {
+    return undefined;
+  }
+  let maxTs = -Infinity;
+  let hasValid = false;
+  for (const e of outcomes) {
+    if (!e.ts) continue;
+    const tsMs = Date.parse(e.ts);
+    if (Number.isFinite(tsMs)) {
+      if (tsMs > maxTs) {
+        maxTs = tsMs;
+      }
+      hasValid = true;
+    }
+  }
+  if (!hasValid || maxTs === -Infinity) {
+    return undefined;
+  }
+  const ageDays = (now - maxTs) / MS_PER_DAY;
+  return Math.max(0, ageDays);
+}

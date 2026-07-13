@@ -27,6 +27,11 @@ import {
   CLASSIFY_FALLBACK_CATEGORY,
   SCHEMA_VERSION,
   serializeEvent,
+  capabilityInterval,
+  evidenceFreshnessDays,
+  resolveLaneModelKey,
+  declaredCapabilityFor,
+  effectiveCapabilityFor,
 } from '../../core/src/index.ts';
 import type { LedgerEvent, OutcomeEvent } from '../../core/src/index.ts';
 
@@ -47,6 +52,11 @@ const CORE: CorePort = {
   classifyTask,
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
+  capabilityInterval,
+  evidenceFreshnessDays,
+  resolveLaneModelKey,
+  declaredCapabilityFor,
+  effectiveCapabilityFor,
 };
 const TOOLS = createTools(CORE);
 

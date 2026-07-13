@@ -78,6 +78,8 @@ export interface CorePort {
   modelMatchesPin: (laneModel: string, pin: string) => boolean;
   /** Helper to check if a reader lane is elevated */
   isReaderElevated?: (lane: Lane, fullAccessLaneIds?: readonly string[]) => boolean;
+  declaredCapabilityFor?: (lane: Lane, category: TaskCategory) => number;
+  effectiveCapabilityFor?: (lane: Lane, category: TaskCategory, overlay?: ObservedCapabilityByLane, opts?: any) => number;
   /** Canonical task categories (core's TASK_CATEGORIES). */
   taskCategories: readonly TaskCategory[];
   classifyTask: (text: string) => { category: TaskCategory; confidence: number; scores: Partial<Record<TaskCategory, number>> };
@@ -95,6 +97,9 @@ export interface CorePort {
   resolvedPriorFor?: (lane: Lane, category: TaskCategory, priorOverlay?: CapabilityPriorOverlay, opts?: ResolvedPriorOptions) => ResolvedPrior;
   forecastCost?: (promptText: string, lane: { model: string; costBasis: CostBasis }, priceTable?: PriceTable) => CostForecast;
   contributingOutcomes?: (events: readonly LedgerEvent[], now: number, opts?: any) => OutcomeEvent[];
+  capabilityInterval?: (observed: { rate: number; n: number }, opts?: { confidence?: number }) => any;
+  evidenceFreshnessDays?: (outcomes: readonly OutcomeEvent[], now: number) => number | undefined;
+  resolveLaneModelKey?: (lane: Lane) => string;
   analyzePlan?: (
     events: readonly LedgerEvent[],
     lanes: readonly Lane[],
@@ -727,6 +732,88 @@ function formatQuotaEstimateText(
   return `${modelOrId}: ≥${routedPct}% routed; you reported ${calPct}%; est. ${lowerBoundPct}–100% used (calibrated, ${est.confidence})`;
 }
 
+function getCalibratedEvidence(
+  core: CorePort,
+  lane: Lane,
+  category: TaskCategory,
+  difficulty: DifficultyBucket | undefined,
+  ledger: readonly LedgerEvent[],
+  now: number,
+  laneOverlay?: ObservedCapabilityByLane,
+  modelOverlay?: ObservedCapabilityByModel,
+  difficultyOverlay?: ObservedCapabilityByModelDifficulty,
+) {
+  let cell: any;
+  let cellSource: 'difficulty' | 'model' | 'lane' | undefined;
+
+  if (difficulty && difficultyOverlay && core.resolveLaneModelKey) {
+    const modelKey = core.resolveLaneModelKey(lane);
+    const difficultyCell = difficultyOverlay[modelKey]?.[category]?.[difficulty];
+    if (difficultyCell) {
+      cell = difficultyCell;
+      cellSource = 'difficulty';
+    }
+  }
+
+  if (!cell) {
+    if (modelOverlay && core.resolveLaneModelKey) {
+      const modelKey = core.resolveLaneModelKey(lane);
+      const modelCell = modelOverlay[modelKey]?.[category];
+      if (modelCell) {
+        cell = modelCell;
+        cellSource = 'model';
+      }
+    }
+
+    if (!cell && laneOverlay) {
+      const laneCell = laneOverlay[lane.id]?.[category];
+      if (laneCell) {
+        cell = laneCell;
+        cellSource = 'lane';
+      }
+    }
+  }
+
+  const n = (cell && typeof cell.n === 'number' && Number.isFinite(cell.n)) ? cell.n : 0;
+  const rate = (cell && typeof cell.rate === 'number' && Number.isFinite(cell.rate)) ? cell.rate : 0;
+
+  const interval = (n > 0 && rate >= 0 && rate <= 1 && core.capabilityInterval)
+    ? core.capabilityInterval({ rate, n })
+    : undefined;
+
+  let freshnessDays: number | undefined;
+  if (n > 0 && core.contributingOutcomes && core.evidenceFreshnessDays) {
+    const contribs = core.contributingOutcomes(ledger, now);
+    const cellOutcomes = contribs.filter((e) => {
+      const resolved = e.subject_model_resolved?.trim();
+      const raw = e.subject_model?.trim();
+      const eModelKey = resolved || raw || '';
+
+      const matchesCategory = e.category === category;
+      if (!matchesCategory) return false;
+
+      if (cellSource === 'difficulty') {
+        const matchesModel = core.resolveLaneModelKey ? (eModelKey === core.resolveLaneModelKey(lane)) : true;
+        return matchesModel && e.difficulty === difficulty;
+      } else if (cellSource === 'model') {
+        const matchesModel = core.resolveLaneModelKey ? (eModelKey === core.resolveLaneModelKey(lane)) : true;
+        return matchesModel;
+      } else if (cellSource === 'lane') {
+        return e.subject_lane_id === lane.id;
+      }
+      return false;
+    });
+    freshnessDays = core.evidenceFreshnessDays(cellOutcomes, now);
+  }
+
+  return {
+    rate,
+    n,
+    interval,
+    freshnessDays,
+  };
+}
+
 // --- tool factory --------------------------------------------------------------
 
 /**
@@ -1259,7 +1346,48 @@ function policyExplanation(
           }
         }
         let decisionReason = decision.reason;
+        let decisionReasonForObject = decision.reason;
         if (lane) {
+          const hasOverlay = observedCapability !== undefined || observedCapabilityByModel !== undefined;
+          if (hasOverlay) {
+            const ledger = deps.readLedger?.() ?? [];
+            const evidence = getCalibratedEvidence(
+              core,
+              lane,
+              category,
+              difficulty,
+              ledger,
+              deps.now(),
+              observedCapability,
+              observedCapabilityByModel,
+              observedCapabilityByModelDifficulty,
+            );
+            if (evidence) {
+              const declared = core.declaredCapabilityFor ? core.declaredCapabilityFor(lane, category) : 0.5;
+              const match = decisionReason.match(/\s*\(learned:\s*declared\s*[^)]+\)/);
+              if (evidence.n >= 1.0 && evidence.interval) {
+                const lo = evidence.interval.lo;
+                const hi = evidence.interval.hi;
+                const effCap = decision.scores.find((s) => s.laneId === lane.id)?.factors.capability ?? evidence.rate;
+                const freshnessText = evidence.freshnessDays !== undefined ? `, freshness ${Math.round(evidence.freshnessDays)}d` : '';
+                const newNote = `(learned: blended ${effCap.toFixed(2)}, observed ${evidence.rate.toFixed(2)} [${lo.toFixed(2)}–${hi.toFixed(2)}] (95% CI), n=${Math.round(evidence.n)}${freshnessText})`;
+                if (match) {
+                  decisionReason = decisionReason.replace(match[0], ` ${newNote}`);
+                } else {
+                  decisionReason += ` ${newNote}`;
+                }
+              } else {
+                const nVal = evidence.n;
+                const thinNote = `(declared ${declared.toFixed(2)}; insufficient outcome evidence (n=${nVal.toFixed(nVal % 1 === 0 ? 0 : 1)}))`;
+                if (match) {
+                  decisionReason = decisionReason.replace(match[0], ` ${thinNote}`);
+                } else {
+                  decisionReason += ` ${thinNote}`;
+                }
+              }
+            }
+          }
+
           const winnerModel = lane.model;
           let hasUserFeedback = false;
           try {
@@ -1283,9 +1411,14 @@ function policyExplanation(
           } catch {
             // ignore ledger read errors for preview tool
           }
-          if (hasUserFeedback && decisionReason.includes('(learned:')) {
-            decisionReason = decisionReason.replace(/\(learned:\s*([^)]+)\)/, '(learned (includes your feedback): $1)');
-            decision = { ...decision, reason: decisionReason };
+          if (hasUserFeedback) {
+            if (decisionReason.includes('(learned:')) {
+              decisionReason = decisionReason.replace(/\(learned:\s*([^)]+)\)/, '(learned (includes your feedback): $1)');
+            }
+            if (decisionReasonForObject.includes('(learned:')) {
+              decisionReasonForObject = decisionReasonForObject.replace(/\(learned:\s*([^)]+)\)/, '(learned (includes your feedback): $1)');
+              decision = { ...decision, reason: decisionReasonForObject };
+            }
           }
         }
 
@@ -1447,6 +1580,49 @@ function policyExplanation(
         }
         if (healthLines.length > 0) {
           lines.push('', 'Lane Health:', ...healthLines);
+        }
+        const learnedLines: string[] = [];
+        if (enabled) {
+          const observedCapability = deps.getFrozen?.() ? undefined : deps.observedCapability();
+          const observedCapabilityByModel = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModel?.();
+          const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModelDifficulty?.();
+          const hasOverlay = observedCapability !== undefined || observedCapabilityByModel !== undefined;
+          if (hasOverlay) {
+            const allLanes = deps.allLanes?.() ?? [];
+            const ledger = deps.readLedger?.() ?? [];
+            const now = deps.now();
+            for (const l of allLanes) {
+              for (const cat of core.taskCategories) {
+                const evidence = getCalibratedEvidence(
+                  core,
+                  l,
+                  cat,
+                  undefined,
+                  ledger,
+                  now,
+                  observedCapability,
+                  observedCapabilityByModel,
+                  observedCapabilityByModelDifficulty,
+                );
+                if (evidence) {
+                  const declared = core.declaredCapabilityFor ? core.declaredCapabilityFor(l, cat) : 0.5;
+                  if (evidence.n >= 1.0 && evidence.interval) {
+                    const lo = evidence.interval.lo;
+                    const hi = evidence.interval.hi;
+                    const effCap = core.effectiveCapabilityFor ? core.effectiveCapabilityFor(l, cat, observedCapability, { modelOverlay: observedCapabilityByModel }) : evidence.rate;
+                    const freshnessText = evidence.freshnessDays !== undefined ? `, freshness ${Math.round(evidence.freshnessDays)}d` : '';
+                    learnedLines.push(`  ${l.id} (${l.model}) ${cat}: capability ${effCap.toFixed(2)} (blended; observed ${evidence.rate.toFixed(2)} [${lo.toFixed(2)}–${hi.toFixed(2)}], n=${Math.round(evidence.n)}${freshnessText})`);
+                  } else {
+                    const nVal = evidence.n;
+                    learnedLines.push(`  ${l.id} (${l.model}) ${cat}: capability ${declared.toFixed(2)} (declared; insufficient outcome evidence (n=${nVal.toFixed(nVal % 1 === 0 ? 0 : 1)}))`);
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (learnedLines.length > 0) {
+          lines.push('', 'Learned Capabilities:', ...learnedLines);
         }
         // P2: the rankings-prior posture. Lanes aren't loaded on this read-only
         // path, so the meta line reports the snapshot itself (per-category lane
