@@ -7838,15 +7838,28 @@ function effectiveCapabilityFor(lane, category, overlay, opts) {
   const declared = declaredCapabilityFor(lane, category);
   return applyDifficultyCell(effectiveCapability(declared, observed, opts), lane, category, opts);
 }
-function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts, healthPenaltyMap) {
+function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts, healthPenaltyMap, laneCost, routingPolicy) {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
   const effOpts = observedCapabilityByModel ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel } : effectiveOpts;
   const capability = effOpts?.priorOverlay || effOpts?.difficulty && effOpts?.difficultyOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts) : effectiveCapability(declared, observed);
-  const costPenalty = COST_PENALTY[lane.costBasis];
+  const costPenaltyRaw = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
   const healthPenaltyRaw = healthPenaltyMap?.[lane.id] ?? 0;
-  const healthPenalty = Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0 ? Math.min(1, healthPenaltyRaw) : 0;
+  let healthPenalty = Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0 ? Math.min(1, healthPenaltyRaw) : 0;
+  let costPenalty = costPenaltyRaw;
+  if (routingPolicy === "preserve-frontier") {
+    const rawSignal = laneCost?.[lane.id];
+    let costSignal = COST_PENALTY[lane.costBasis];
+    let multiplier = 5;
+    if (rawSignal !== void 0 && Number.isFinite(rawSignal) && rawSignal >= 0) {
+      costSignal = Math.min(1e6, rawSignal);
+      multiplier = 0.2;
+    }
+    costPenalty += costSignal * multiplier;
+  } else if (routingPolicy === "reliable") {
+    healthPenalty = healthPenalty * 5;
+  }
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty - healthPenalty;
   const factors = {
     capability,
@@ -7871,10 +7884,13 @@ function compareScores(a, b) {
   if (b.score !== a.score) return b.score - a.score;
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
-function describe(lane, best, task, tiered = false, preferred = false) {
+function describe(lane, best, task, routingPolicy, tiered = false, preferred = false) {
   const f = best.factors;
   const cap = f.capability.toFixed(2);
   let reason = preferred ? `Selected ${lane.id} (${lane.model}) for ${task.category}: preferred lane (explicit offload), capability ${cap} at ${lane.costBasis} cost.` : tiered ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.` : `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
+  if (routingPolicy !== void 0 && routingPolicy !== "balanced") {
+    reason += ` (policy: ${routingPolicy} active)`;
+  }
   if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
     reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
   }
@@ -7925,11 +7941,11 @@ function routeDecide(task, ctx, policy) {
     );
   }
   const effectiveOpts = effectiveOptsForTask(ctx, task);
+  const routingPolicy = ctx.routingPolicy ?? (ctx.strategy === "tiered" ? "cheapest" : "balanced");
   const scored = candidates.map(
-    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty)
+    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty, ctx.laneCost, routingPolicy)
   );
-  const strategy = ctx.strategy ?? "maximize";
-  const tiered = strategy === "tiered";
+  const tiered = routingPolicy === "cheapest";
   const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
   let preferred = false;
   if (ctx.preferLaneId != null) {
@@ -7945,7 +7961,7 @@ function routeDecide(task, ctx, policy) {
   const wonByTier = !preferred && tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
   return {
     laneId: winner.laneId,
-    reason: describe(winningLane, winner, task, wonByTier, preferred),
+    reason: describe(winningLane, winner, task, ctx.routingPolicy, wonByTier, preferred),
     scores,
     policyVerdict: verdicts.get(winner.laneId)
   };
@@ -10171,6 +10187,17 @@ function isValidIso8601(val) {
   return Number.isFinite(msParsed);
 }
 
+// ../mcp/src/routing-policy.ts
+var NAMED_ROUTING_POLICIES = [
+  "balanced",
+  "cheapest",
+  "preserve-frontier",
+  "reliable"
+];
+function isValidRoutingPolicy(val) {
+  return typeof val === "string" && NAMED_ROUTING_POLICIES.includes(val);
+}
+
 // ../mcp/src/tools.ts
 var ToolInputError = class extends Error {
   constructor(message) {
@@ -10389,6 +10416,9 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       return ok(banner, { summary: data, ...alerts.length ? { quotaAlerts: alerts } : {} });
     })
   };
+  function policyExplanation(routingPolicy) {
+    return " active";
+  }
   const previewTool = {
     name: "router_preview",
     description: "Preview which lane would handle a task category under the current lanes + policy, without executing anything. Powers /router:why. Read-only; no content is sent anywhere.",
@@ -10421,6 +10451,11 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         full_access: {
           type: "boolean",
           description: "OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` \u2014 elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it."
+        },
+        policy: {
+          type: "string",
+          enum: ["balanced", "cheapest", "preserve-frontier", "reliable"],
+          description: "OPTIONAL routing policy to override the project default for this request."
         }
       }
     },
@@ -10433,11 +10468,15 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       const pinnedModel = optString(args, "model")?.trim() || void 0;
       const full_access = optBool(args, "full_access");
+      const requestPolicy = optEnum(args, "policy", ["balanced", "cheapest", "preserve-frontier", "reliable"]);
       if (full_access && !pinnedModel) {
         throw new ToolInputError("full_access requires a model pin.");
       }
       const task = { category, ...difficulty ? { difficulty } : {} };
       const resolvedAccessNeed = access_need === "repo-tight" ? "repo-tight" : "worker-ok";
+      const hasRequestPolicy = requestPolicy !== void 0;
+      const explicitPolicy = hasRequestPolicy || (deps.routingPolicyExplicit?.() ?? false);
+      const routingPolicy = requestPolicy ?? deps.routingPolicy?.() ?? (deps.tieredStrategy === "tiered" ? "cheapest" : "balanced");
       if (!deps.getEnabled()) {
         return ok(
           `category "${category}": TokenMaxed routing is DISABLED for this project \u2014 it would run on the host (native). Run /tokenmaxed:on to re-enable.`,
@@ -10499,16 +10538,14 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           ...priorCtx,
           ...quotaCtx,
           ...healthCtx,
-          ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
+          ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {},
+          routingPolicy,
+          ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+          ...routingPolicy === "cheapest" ? { strategy: "tiered", ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {} } : {}
         };
         const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
       }
-      const tieredCtx = deps.tieredStrategy === "tiered" ? {
-        strategy: "tiered",
-        ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {},
-        ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}
-      } : {};
       const preferLaneId = deps.preferredLane?.();
       const ctx = {
         lanes,
@@ -10525,7 +10562,9 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...quotaCtx,
         ...healthCtx,
         ...availableIds ? { availableLaneIds: availableIds } : {},
-        ...tieredCtx,
+        routingPolicy,
+        ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+        ...routingPolicy === "cheapest" ? { strategy: "tiered", ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {} } : {},
         ...preferLaneId ? { preferLaneId } : {},
         ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
       };
@@ -10675,6 +10714,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
+        ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
         ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
@@ -10702,7 +10742,12 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const mismatches = enabled && deps.idMismatch ? await deps.idMismatch() : [];
       const preferred = deps.preferredLane?.();
       const yolo = deps.getYolo?.() ?? false;
+      const policy = deps.routingPolicy?.() ?? "balanced";
+      const explicitPolicy = deps.routingPolicyExplicit?.() ?? false;
       const lines = [`TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`];
+      if (explicitPolicy) {
+        lines.push(`Active routing policy: ${policy}`);
+      }
       if (yolo) {
         lines.push(
           "\u26A0\uFE0F YOLO mode is ON \u2014 every trust/egress gate is bypassed: ALL configured worker/reader lanes are selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner still runs. Disable with /tokenmaxed:yolo off."
@@ -10826,6 +10871,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       return ok(lines.join("\n"), {
         enabled,
         yolo,
+        policy,
         ...preferred ? { preferLaneId: preferred } : {},
         staleness: warnings,
         idMismatch: mismatches
@@ -11164,6 +11210,11 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         full_access: {
           type: "boolean",
           description: "OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` \u2014 elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it."
+        },
+        policy: {
+          type: "string",
+          enum: ["balanced", "cheapest", "preserve-frontier", "reliable"],
+          description: "OPTIONAL routing policy to override the project default for this request."
         }
       }
     },
@@ -11178,6 +11229,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       const model = optString(args, "model");
       const full_access = optBool(args, "full_access");
+      const policy = optEnum(args, "policy", ["balanced", "cheapest", "preserve-frontier", "reliable"]);
       if (full_access && !model) {
         throw new ToolInputError("full_access requires a model pin.");
       }
@@ -11200,7 +11252,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...access_need ? { access_need } : {},
         ...difficulty ? { difficulty } : {},
         ...model ? { model } : {},
-        ...full_access !== void 0 ? { full_access } : {}
+        ...full_access !== void 0 ? { full_access } : {},
+        ...policy ? { policy } : {}
       });
       const finalOutcome = resolution.categoryInferred ? {
         ...outcome,
@@ -11476,7 +11529,37 @@ ${r.notes}` : "";
       );
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool];
+  const setPolicyTool = {
+    name: "router_set_policy",
+    description: 'Set or clear a per-project named routing policy for TokenMaxed routing. Policy must be one of: balanced, cheapest, preserve-frontier, reliable. Pass "off", "clear", or "none" to clear. Powers /tokenmaxed:policy.',
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        policy: {
+          type: "string",
+          description: 'The routing policy to use: "balanced", "cheapest", "preserve-frontier", "reliable", or "off"/"clear"/"none" to clear.'
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const raw = optString(args, "policy");
+      const policy = typeof raw === "string" ? raw.trim().toLowerCase() : void 0;
+      if (!policy || policy === "off" || policy === "clear" || policy === "none") {
+        deps.setRoutingPolicy?.(void 0);
+        return ok("Routing policy cleared (reset to default behavior).", { policy: "balanced" });
+      }
+      if (!isValidRoutingPolicy(policy)) {
+        throw new ToolInputError(`Invalid routing policy "${policy}". Allowed values: balanced, cheapest, preserve-frontier, reliable.`);
+      }
+      deps.setRoutingPolicy?.(policy);
+      return ok(
+        `Routing policy set to "${policy}" for this project.`,
+        { policy }
+      );
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool];
 }
 function receiptLine(r) {
   const int = (n) => Math.round(n).toLocaleString("en-US");

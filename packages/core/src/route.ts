@@ -384,6 +384,8 @@ function scoreLane(
   observedCapabilityByModel?: ObservedCapabilityByModel,
   effectiveOpts?: EffectiveCapabilityOptions,
   healthPenaltyMap?: Record<string, number>,
+  laneCost?: Record<string, number>,
+  routingPolicy?: 'balanced' | 'cheapest' | 'preserve-frontier' | 'reliable',
 ): LaneScore {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
@@ -397,12 +399,30 @@ function scoreLane(
     effOpts?.priorOverlay || (effOpts?.difficulty && effOpts?.difficultyOverlay)
       ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts)
       : effectiveCapability(declared, observed);
-  const costPenalty = COST_PENALTY[lane.costBasis];
+  const costPenaltyRaw = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom?.[lane.id]);
   const healthPenaltyRaw = healthPenaltyMap?.[lane.id] ?? 0;
-  const healthPenalty = (Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0)
+  let healthPenalty = (Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0)
     ? Math.min(1.0, healthPenaltyRaw)
     : 0;
+
+  // Future routing policies to consider:
+  // - fastest: needs latency data (currently unavailable)
+  // - explore: needs non-determinism (currently all routing is strictly deterministic)
+  let costPenalty = costPenaltyRaw;
+  if (routingPolicy === 'preserve-frontier') {
+    const rawSignal = laneCost?.[lane.id];
+    let costSignal = COST_PENALTY[lane.costBasis];
+    let multiplier = 5.0;
+    if (rawSignal !== undefined && Number.isFinite(rawSignal) && rawSignal >= 0) {
+      costSignal = Math.min(1000000, rawSignal);
+      multiplier = 0.2;
+    }
+    costPenalty += costSignal * multiplier;
+  } else if (routingPolicy === 'reliable') {
+    healthPenalty = healthPenalty * 5.0;
+  }
+
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty - healthPenalty;
   const factors: LaneScore['factors'] = {
     capability,
@@ -436,7 +456,14 @@ function compareScores(a: LaneScore, b: LaneScore): number {
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
 
-function describe(lane: Lane, best: LaneScore, task: Task, tiered = false, preferred = false): string {
+function describe(
+  lane: Lane,
+  best: LaneScore,
+  task: Task,
+  routingPolicy: 'balanced' | 'cheapest' | 'preserve-frontier' | 'reliable' | undefined,
+  tiered = false,
+  preferred = false,
+): string {
   const f = best.factors;
   const cap = f.capability.toFixed(2);
   let reason = preferred
@@ -446,6 +473,12 @@ function describe(lane: Lane, best: LaneScore, task: Task, tiered = false, prefe
       ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the ` +
         `capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.`
       : `Selected ${lane.id} (${lane.model}) for ${task.category}: ` + `capability ${cap} at ${lane.costBasis} cost.`;
+
+  // Append policy if active and not balanced
+  if (routingPolicy !== undefined && routingPolicy !== 'balanced') {
+    reason += ` (policy: ${routingPolicy} active)`;
+  }
+
   // Annotate only when evidence actually moved the score (avoid overstating tiny
   // samples): at least one weighted review AND a different rounded value.
   if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
@@ -573,11 +606,13 @@ export function routeDecide(
   // Task-aware opts: context-level (rankings prior) + the difficulty cell when
   // the task carries a bucket and the learned difficulty overlay is present.
   const effectiveOpts = effectiveOptsForTask(ctx, task);
+  // Legacy strategy parameter is treated as an input alias.
+  // routingPolicy takes precedence over strategy if both are provided.
+  const routingPolicy = ctx.routingPolicy ?? (ctx.strategy === 'tiered' ? 'cheapest' : 'balanced');
   const scored = candidates.map((lane) =>
-    scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty),
+    scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty, ctx.laneCost, routingPolicy),
   );
-  const strategy = ctx.strategy ?? 'maximize';
-  const tiered = strategy === 'tiered';
+  const tiered = routingPolicy === 'cheapest';
   // `maximize` (default): most capable wins. `tiered`: cheapest lane clearing the
   // capability floor wins ("start cheap"); falls back to maximize if none clear it.
   const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
@@ -608,7 +643,7 @@ export function routeDecide(
 
   return {
     laneId: winner.laneId,
-    reason: describe(winningLane, winner, task, wonByTier, preferred),
+    reason: describe(winningLane, winner, task, ctx.routingPolicy, wonByTier, preferred),
     scores,
     policyVerdict: verdicts.get(winner.laneId)!,
   };

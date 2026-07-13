@@ -73,6 +73,8 @@ import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
 import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
+import { readPolicy, writePolicy, isValidRoutingPolicy } from './routing-policy.ts';
+import type { PolicyStore, NamedRoutingPolicy } from './routing-policy.ts';
 import { readReserves, writeReserve } from './reserve.ts';
 import type { ReserveStore } from './reserve.ts';
 import { readCalibrations, writeCalibration } from './calibration.ts';
@@ -203,6 +205,25 @@ function filePreferStore(statePath: string): PreferStore {
     },
   };
 }
+
+/** A JSON-file-backed {@link PolicyStore} (string-valued); tolerant of a missing/corrupt file. */
+function filePolicyStore(statePath: string): PolicyStore {
+  return {
+    read: () => {
+      if (!existsSync(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync(statePath, 'utf8'));
+      } catch {
+        return {}; // corrupt file ⇒ treat as empty (default balanced)
+      }
+    },
+    write: (state) => {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    },
+  };
+}
+
 
 /** A JSON-file-backed {@link ReserveStore} (object-valued); tolerant of a missing/corrupt file. */
 function fileReserveStore(statePath: string): ReserveStore {
@@ -753,6 +774,20 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || undefined;
   const readPreferredLane = (): string | undefined => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
 
+  // Per-project named routing policy store (policy.json).
+  // An env var TOKENMAXED_ROUTING_POLICY is a fallback default; the per-project
+  // state wins when present.
+  const policyStatePath = env.TOKENMAXED_POLICY_STATE ?? join(dirname(statePath), 'policy.json');
+  const policyStore = filePolicyStore(policyStatePath);
+  const policyEnvFallback = isValidRoutingPolicy(env.TOKENMAXED_ROUTING_POLICY?.trim())
+    ? (env.TOKENMAXED_ROUTING_POLICY.trim() as NamedRoutingPolicy)
+    : undefined;
+  const readRoutingPolicy = (): NamedRoutingPolicy => {
+    const projectPolicy = readPolicy(policyStore, projectKey);
+    return projectPolicy ?? policyEnvFallback ?? (tieredStrategy === 'tiered' ? 'cheapest' : 'balanced');
+  };
+
+
   const fullAccessStatePath = env.TOKENMAXED_FULL_ACCESS_STATE ?? join(dirname(statePath), 'full-access.json');
   const fullAccessStore = fileFullAccessStore(fullAccessStatePath);
   const fullAccessEnvFallback = env.TOKENMAXED_FULL_ACCESS
@@ -941,8 +976,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
             const m = quotaHeadroomMap(events, resolvedCandidates, now, resolvedTargets); // same events snapshot
             return Object.keys(m).length > 0 ? { capHeadroom: m } : {};
           })(),
-          ...(tieredStrategy === 'tiered'
-            ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(candidates, snapshot.priceTable) }
+          routingPolicy: readRoutingPolicy(),
+          ...(laneCostMap ? { laneCost: laneCostMap(candidates, snapshot.priceTable) } : {}),
+          ...(readRoutingPolicy() === 'cheapest'
+            ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}) }
             : {}),
           ...(preferred && preferred !== cappedLane.id ? { preferLaneId: preferred } : {}),
         });
@@ -1015,6 +1052,14 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   };
 
   const delegate = async (request: DelegateRequest): Promise<DelegateOutcome> => {
+    if (request.policy !== undefined) {
+      const pStr = typeof request.policy === 'string' ? request.policy.trim().toLowerCase() : '';
+      if (!isValidRoutingPolicy(pStr)) {
+        throw new Error(`Invalid routing policy "${request.policy}". Allowed values: balanced, cheapest, preserve-frontier, reliable.`);
+      }
+    }
+    const requestPolicy = typeof request.policy === 'string' ? request.policy.trim().toLowerCase() : undefined;
+    const routingPolicy = (requestPolicy ?? readRoutingPolicy()) as NamedRoutingPolicy;
     // No DEFAULT lane config yet ⇒ nothing to route to; do it on the host and tell
     // the user how to set up, rather than erroring. But an EXPLICIT missing path is
     // a misconfiguration — surface it (mirrors loadPolicySafe / usableCandidates).
@@ -1127,9 +1172,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
           ? { capabilityPrior: p.overlay, ...(p.stale ? { capabilityPriorStale: true } : {}) }
           : {};
       })(),
-      // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
-      ...(tieredStrategy === 'tiered'
-        ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}), laneCost: laneCostMap(lanes, priceTable) }
+      // NAMED ROUTING POLICIES:
+      routingPolicy,
+      ...(laneCostMap ? { laneCost: laneCostMap(lanes, priceTable) } : {}),
+      ...(routingPolicy === 'cheapest'
+        ? { strategy: 'tiered' as const, ...(tierFloor !== undefined ? { tierFloor } : {}) }
         : {}),
       // Universal preferred-lane override: favor this lane when it is an eligible+
       // available+capable candidate (hard rails still gate it). Absent ⇒ normal ranking.
@@ -1411,6 +1458,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Universal preferred-lane override (per-project state + env fallback).
     preferredLane: readPreferredLane,
     setPreferredLane: (laneId) => writePreferred(preferStore, projectKey, laneId),
+    // Per-project named routing policy (per-project state + env fallback).
+    routingPolicy: readRoutingPolicy,
+    setRoutingPolicy: (policy) => writePolicy(policyStore, projectKey, policy),
+    routingPolicyExplicit: (): boolean => {
+      const projectPolicy = readPolicy(policyStore, projectKey);
+      return projectPolicy !== undefined || policyEnvFallback !== undefined;
+    },
     // Reader Full-Access Grants
     readerLanes: () => {
       if (!existsSync(lanesPath)) return [];

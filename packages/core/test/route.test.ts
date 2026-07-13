@@ -578,3 +578,213 @@ test('yolo still honors an explicit policy `block` rule and disabledLaneIds (del
     [],
   );
 });
+
+// --- NAMED ROUTING POLICIES ---------------------------------------------------
+
+test('policies: balanced / unset strategy is byte-identical', () => {
+  const tLanes = [
+    tlane({ id: 'cheap', capability: { docs: 0.7 }, costBasis: 'subscription' }),
+    tlane({ id: 'mid', capability: { docs: 0.85 }, costBasis: 'subscription' }),
+  ];
+  const dUnset = routeDecide({ category: 'docs' }, { lanes: tLanes }, noPolicy);
+  const dBalanced = routeDecide({ category: 'docs' }, { lanes: tLanes, routingPolicy: 'balanced' }, noPolicy);
+  assert.deepEqual(dUnset, dBalanced);
+});
+
+test('policies: cheapest strategy acts as tiered strategy', () => {
+  const tLanes = [
+    tlane({ id: 'cheap', capability: { docs: 0.7 }, costBasis: 'subscription' }),
+    tlane({ id: 'mid', capability: { docs: 0.85 }, costBasis: 'subscription' }),
+    tlane({ id: 'exp', capability: { docs: 0.95 }, costBasis: 'subscription' }),
+  ];
+  const d = routeDecide({ category: 'docs' }, { lanes: tLanes, routingPolicy: 'cheapest', tierFloor: 0.6 }, noPolicy);
+  assert.equal(d.laneId, 'cheap');
+  assert.match(d.reason, /cheapest lane clearing/);
+});
+
+test('policies: preserve-frontier deprioritizes expensive/frontier lane but still selects if sole capable', () => {
+  const frontier = tlane({ id: 'frontier', capability: { docs: 0.9 }, costBasis: 'metered' });
+  const standard = tlane({ id: 'standard', capability: { docs: 0.7 }, costBasis: 'subscription' });
+
+  // Under balanced: frontier wins on capability
+  const dBalanced = routeDecide({ category: 'docs' }, { lanes: [frontier, standard] }, noPolicy);
+  assert.equal(dBalanced.laneId, 'frontier');
+
+  // Under preserve-frontier: standard wins because frontier gets a large cost-scaled penalty
+  const dPreserve = routeDecide({ category: 'docs' }, { lanes: [frontier, standard], routingPolicy: 'preserve-frontier' }, noPolicy);
+  assert.equal(dPreserve.laneId, 'standard');
+  assert.match(dPreserve.reason, /policy: preserve-frontier/);
+
+  // If frontier is the ONLY capable lane (standard has capability 0), frontier must still win (no hard block)
+  const optoutStandard = tlane({ id: 'standard', capability: { docs: 0 }, costBasis: 'subscription' });
+  const dSole = routeDecide({ category: 'docs' }, { lanes: [frontier, optoutStandard], routingPolicy: 'preserve-frontier' }, noPolicy);
+  assert.equal(dSole.laneId, 'frontier');
+});
+
+test('policies: reliable prefers healthier lane but still selects if sole capable', () => {
+  const laneA = tlane({ id: 'laneA', capability: { docs: 0.8 }, costBasis: 'subscription' });
+  const laneB = tlane({ id: 'laneB', capability: { docs: 0.75 }, costBasis: 'subscription' });
+
+  // Under balanced: laneA wins on capability
+  const dBalanced = routeDecide({ category: 'docs' }, { lanes: [laneA, laneB] }, noPolicy);
+  assert.equal(dBalanced.laneId, 'laneA');
+
+  // Under reliable: laneB wins because laneA has health penalty
+  const dReliable = routeDecide({ category: 'docs' }, { lanes: [laneA, laneB], routingPolicy: 'reliable', healthPenalty: { laneA: 0.2 } }, noPolicy);
+  assert.equal(dReliable.laneId, 'laneB');
+  assert.match(dReliable.reason, /policy: reliable/);
+
+  // If laneA is the ONLY capable lane, laneA must still win (no hard block)
+  const optoutLaneB = tlane({ id: 'laneB', capability: { docs: 0 }, costBasis: 'subscription' });
+  const dSole = routeDecide({ category: 'docs' }, { lanes: [laneA, optoutLaneB], routingPolicy: 'reliable', healthPenalty: { laneA: 0.8 } }, noPolicy);
+  assert.equal(dSole.laneId, 'laneA');
+});
+
+test('policies: FULL-serialization byte-equality (JSON.stringify) for balanced/unset and legacy-tiered', () => {
+  const tLanes = [
+    tlane({ id: 'cheap', capability: { docs: 0.7 }, costBasis: 'subscription' }),
+    tlane({ id: 'mid', capability: { docs: 0.85 }, costBasis: 'subscription' }),
+  ];
+
+  // 1. balanced vs unset policy
+  const dUnset = routeDecide({ category: 'docs' }, { lanes: tLanes }, noPolicy);
+  const dBalanced = routeDecide({ category: 'docs' }, { lanes: tLanes, routingPolicy: 'balanced' }, noPolicy);
+  assert.equal(JSON.stringify(dUnset), JSON.stringify(dBalanced));
+
+  // 2. legacy-tiered vs the expected pre-feature shape
+  const dLegacyTiered = routeDecide({ category: 'docs' }, { lanes: tLanes, strategy: 'tiered', tierFloor: 0.6 }, noPolicy);
+  const expectedPreFeatureLegacyTiered = {
+    laneId: 'cheap',
+    reason: 'Selected cheap (m) for docs: cheapest lane clearing the capability floor (tiered), capability 0.70 at subscription cost.',
+    scores: [
+      {
+        laneId: 'cheap',
+        score: 0.6499999999999999,
+        factors: {
+          capability: 0.7,
+          costPenalty: 0.05,
+          capPenalty: 0,
+          declared: 0.7,
+          evidenceN: 0
+        }
+      },
+      {
+        laneId: 'mid',
+        score: 0.7999999999999999,
+        factors: {
+          capability: 0.85,
+          costPenalty: 0.05,
+          capPenalty: 0,
+          declared: 0.85,
+          evidenceN: 0
+        }
+      }
+    ],
+    policyVerdict: 'force-trusted'
+  };
+  assert.equal(JSON.stringify(dLegacyTiered), JSON.stringify(expectedPreFeatureLegacyTiered));
+});
+
+test('policies: non-finite/negative laneCost safe (no NaN/boost)', () => {
+  const frontier = tlane({ id: 'frontier', capability: { docs: 0.9 }, costBasis: 'metered' });
+  const standard = tlane({ id: 'standard', capability: { docs: 0.7 }, costBasis: 'subscription' });
+
+  // Negative laneCost on frontier must NOT boost it (standard must still win under preserve-frontier)
+  const dNeg = routeDecide(
+    { category: 'docs' },
+    {
+      lanes: [frontier, standard],
+      routingPolicy: 'preserve-frontier',
+      laneCost: { frontier: -10, standard: 1 },
+    },
+    noPolicy
+  );
+  assert.equal(dNeg.laneId, 'standard');
+
+  // NaN / Infinity / -Infinity must not cause NaN score or exceptions
+  const dNaN = routeDecide(
+    { category: 'docs' },
+    {
+      lanes: [frontier, standard],
+      routingPolicy: 'preserve-frontier',
+      laneCost: { frontier: NaN, standard: Infinity },
+    },
+    noPolicy
+  );
+  assert.ok(dNaN.laneId);
+  const f = dNaN.scores.find(s => s.laneId === 'frontier')?.factors;
+  assert.ok(Number.isFinite(f?.costPenalty));
+});
+
+test('policies: ALL 4 policies select the sole capable lane', () => {
+  const capable = tlane({ id: 'capable', capability: { docs: 0.8 }, costBasis: 'metered' });
+  const incapable = tlane({ id: 'incapable', capability: { docs: 0.0 }, costBasis: 'subscription' });
+  const lanes = [capable, incapable];
+
+  const policies: ('balanced' | 'cheapest' | 'preserve-frontier' | 'reliable')[] = [
+    'balanced',
+    'cheapest',
+    'preserve-frontier',
+    'reliable',
+  ];
+
+  for (const pol of policies) {
+    const res = routeDecide({ category: 'docs' }, { lanes, routingPolicy: pol, tierFloor: 0.6 }, noPolicy);
+    assert.equal(res.laneId, 'capable', `Policy ${pol} failed to select sole capable lane`);
+  }
+});
+
+test('policies: preserve-frontier with all-expensive lanes', () => {
+  const expA = tlane({ id: 'expA', capability: { docs: 0.8 }, costBasis: 'metered' });
+  const expB = tlane({ id: 'expB', capability: { docs: 0.9 }, costBasis: 'metered' });
+  const lanes = [expA, expB];
+
+  const res = routeDecide(
+    { category: 'docs' },
+    {
+      lanes,
+      routingPolicy: 'preserve-frontier',
+      laneCost: { expA: 100, expB: 200 },
+    },
+    noPolicy
+  );
+  assert.equal(res.laneId, 'expA');
+});
+
+test('policies: reliable with all-unhealthy lanes', () => {
+  const laneA = tlane({ id: 'laneA', capability: { docs: 0.8 }, costBasis: 'subscription' });
+  const laneB = tlane({ id: 'laneB', capability: { docs: 0.9 }, costBasis: 'subscription' });
+  const lanes = [laneA, laneB];
+
+  const res = routeDecide(
+    { category: 'docs' },
+    {
+      lanes,
+      routingPolicy: 'reliable',
+      healthPenalty: { laneA: 1.0, laneB: 1.0 },
+    },
+    noPolicy
+  );
+  assert.equal(res.laneId, 'laneB');
+});
+
+test('policies: determinism per policy (same inputs yield same decision)', () => {
+  const tLanes = [
+    tlane({ id: 'cheap', capability: { docs: 0.7 }, costBasis: 'subscription' }),
+    tlane({ id: 'mid', capability: { docs: 0.85 }, costBasis: 'subscription' }),
+  ];
+
+  const policies: ('balanced' | 'cheapest' | 'preserve-frontier' | 'reliable')[] = [
+    'balanced',
+    'cheapest',
+    'preserve-frontier',
+    'reliable',
+  ];
+
+  for (const pol of policies) {
+    const ctx = { lanes: tLanes, routingPolicy: pol, tierFloor: 0.6 };
+    const d1 = routeDecide({ category: 'docs' }, ctx, noPolicy);
+    const d2 = routeDecide({ category: 'docs' }, ctx, noPolicy);
+    assert.deepEqual(d1, d2, `Determinism failed for policy ${pol}`);
+  }
+});

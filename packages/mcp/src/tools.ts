@@ -47,6 +47,8 @@ import type { SettingKey, SettingsReport } from './settings.ts';
 import { formatSummaryBanner } from './summary.ts';
 import type { SummaryData } from './summary.ts';
 import { isValidIso8601 } from './target.ts';
+import { isValidRoutingPolicy } from './routing-policy.ts';
+import type { NamedRoutingPolicy } from './routing-policy.ts';
 
 // --- ports + result + dependency shapes ----------------------------------------
 
@@ -241,6 +243,12 @@ export interface ToolDeps {
   preferredLane?: () => string | undefined;
   /** Set (lane id) or clear (undefined) the per-project preferred lane. Powers /tokenmaxed:prefer. */
   setPreferredLane?: (laneId: string | undefined) => void;
+  /** The per-project named routing policy, or undefined when unset. */
+  routingPolicy?: () => NamedRoutingPolicy | undefined;
+  /** Set (policy name) or clear (undefined) the per-project named routing policy. Powers /tokenmaxed:policy. */
+  setRoutingPolicy?: (policy: string | undefined) => void;
+  /** Check if a policy was explicitly chosen (via project JSON or routing-policy env var). */
+  routingPolicyExplicit?: () => boolean;
   /** Get currently configured reader lanes. */
   readerLanes?: () => Lane[];
   /** Get all configured lanes. */
@@ -407,6 +415,8 @@ export interface DelegateRequest {
    * Requires `model`. Never infer it.
    */
   full_access?: boolean;
+  /** OPTIONAL per-request routing policy override. */
+  policy?: NamedRoutingPolicy;
 }
 
 /** The outcome of an offload (content-free; the host decides what to do with it). */
@@ -753,6 +763,12 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
+function policyExplanation(
+  routingPolicy: NamedRoutingPolicy,
+): string {
+  return ' active';
+}
+
   const previewTool: ToolDef = {
     name: 'router_preview',
     description:
@@ -792,6 +808,11 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` — elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it.',
         },
+        policy: {
+          type: 'string',
+          enum: ['balanced', 'cheapest', 'preserve-frontier', 'reliable'],
+          description: 'OPTIONAL routing policy to override the project default for this request.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -804,6 +825,7 @@ export function createTools(core: CorePort): ToolDef[] {
         const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
         const pinnedModel = optString(args, 'model')?.trim() || undefined;
         const full_access = optBool(args, 'full_access');
+        const requestPolicy = optEnum(args, 'policy', ['balanced', 'cheapest', 'preserve-frontier', 'reliable']);
         if (full_access && !pinnedModel) {
           throw new ToolInputError('full_access requires a model pin.');
         }
@@ -815,6 +837,9 @@ export function createTools(core: CorePort): ToolDef[] {
         // restriction). Preview has no instruction/files, so a future heuristic that
         // reads them would need them threaded here to keep exact delegate parity.
         const resolvedAccessNeed: AccessNeed = access_need === 'repo-tight' ? 'repo-tight' : 'worker-ok';
+        const hasRequestPolicy = requestPolicy !== undefined;
+        const explicitPolicy = hasRequestPolicy || (deps.routingPolicyExplicit?.() ?? false);
+        const routingPolicy = requestPolicy ?? deps.routingPolicy?.() ?? (deps.tieredStrategy === 'tiered' ? 'cheapest' : 'balanced');
 
         // When routing is off for the project, router_delegate degrades to native;
         // the preview must say the same so /tokenmaxed:why never advertises a lane
@@ -915,21 +940,15 @@ export function createTools(core: CorePort): ToolDef[] {
             ...quotaCtx,
             ...healthCtx,
             ...(fullAccessLaneIds.length ? { fullAccessLaneIds } : {}),
+            routingPolicy,
+            ...(deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}),
+            ...(routingPolicy === 'cheapest'
+              ? { strategy: 'tiered' as const, ...(deps.tierFloor !== undefined ? { tierFloor: deps.tierFloor } : {}) }
+              : {}),
           };
           const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
           availableIds = await deps.availableLaneIds(eligible);
         }
-        // MODEL-TIERS: mirror delegate's tiered posture + cost signal so /why agrees.
-        const tieredCtx =
-          deps.tieredStrategy === 'tiered'
-            ? {
-                strategy: 'tiered' as const,
-                ...(deps.tierFloor !== undefined ? { tierFloor: deps.tierFloor } : {}),
-                ...(deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}),
-              }
-            : {};
-        // The per-project preferred lane (universal offload override): mirror it into the
-        // preview ctx so /tokenmaxed:why shows the SAME pick router_delegate would make.
         const preferLaneId = deps.preferredLane?.();
         const ctx: RouteContext = {
           lanes,
@@ -946,7 +965,11 @@ export function createTools(core: CorePort): ToolDef[] {
           ...quotaCtx,
           ...healthCtx,
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
-          ...tieredCtx,
+          routingPolicy,
+          ...(deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}),
+          ...(routingPolicy === 'cheapest'
+            ? { strategy: 'tiered' as const, ...(deps.tierFloor !== undefined ? { tierFloor: deps.tierFloor } : {}) }
+            : {}),
           ...(preferLaneId ? { preferLaneId } : {}),
           ...(fullAccessLaneIds.length ? { fullAccessLaneIds } : {}),
         };
@@ -1143,6 +1166,7 @@ export function createTools(core: CorePort): ToolDef[] {
 
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
+          ...(explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : []),
           ...(pinnedModel ? [`  model pinned by request: "${pinnedModel}" — only lanes serving it were considered (no substitution on failure).`] : []),
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
@@ -1177,7 +1201,12 @@ export function createTools(core: CorePort): ToolDef[] {
         const mismatches = enabled && deps.idMismatch ? await deps.idMismatch() : [];
         const preferred = deps.preferredLane?.();
         const yolo = deps.getYolo?.() ?? false;
+        const policy = deps.routingPolicy?.() ?? 'balanced';
+        const explicitPolicy = deps.routingPolicyExplicit?.() ?? false;
         const lines = [`TokenMaxed routing is ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`];
+        if (explicitPolicy) {
+          lines.push(`Active routing policy: ${policy}`);
+        }
         if (yolo) {
           lines.push(
             '⚠️ YOLO mode is ON — every trust/egress gate is bypassed: ALL configured worker/reader lanes are selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner still runs. Disable with /tokenmaxed:yolo off.',
@@ -1313,6 +1342,7 @@ export function createTools(core: CorePort): ToolDef[] {
         return ok(lines.join('\n'), {
           enabled,
           yolo,
+          policy,
           ...(preferred ? { preferLaneId: preferred } : {}),
           staleness: warnings as unknown as Record<string, unknown>[],
           idMismatch: mismatches as unknown as Record<string, unknown>[],
@@ -1706,6 +1736,11 @@ export function createTools(core: CorePort): ToolDef[] {
           description:
             'OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` — elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it.',
         },
+        policy: {
+          type: 'string',
+          enum: ['balanced', 'cheapest', 'preserve-frontier', 'reliable'],
+          description: 'OPTIONAL routing policy to override the project default for this request.',
+        },
       },
     },
     handler: (deps, args) =>
@@ -1720,6 +1755,7 @@ export function createTools(core: CorePort): ToolDef[] {
         const difficulty = optEnum(args, 'difficulty', DIFFICULTIES);
         const model = optString(args, 'model');
         const full_access = optBool(args, 'full_access');
+        const policy = optEnum(args, 'policy', ['balanced', 'cheapest', 'preserve-frontier', 'reliable']);
         if (full_access && !model) {
           throw new ToolInputError('full_access requires a model pin.');
         }
@@ -1748,6 +1784,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(difficulty ? { difficulty } : {}),
           ...(model ? { model } : {}),
           ...(full_access !== undefined ? { full_access } : {}),
+          ...(policy ? { policy } : {}),
         });
 
         const finalOutcome = resolution.categoryInferred
@@ -2070,7 +2107,41 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool];
+  const setPolicyTool: ToolDef = {
+    name: 'router_set_policy',
+    description:
+      'Set or clear a per-project named routing policy for TokenMaxed routing. Policy must be one of: balanced, cheapest, preserve-frontier, reliable. Pass "off", "clear", or "none" to clear. Powers /tokenmaxed:policy.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        policy: {
+          type: 'string',
+          description:
+            'The routing policy to use: "balanced", "cheapest", "preserve-frontier", "reliable", or "off"/"clear"/"none" to clear.',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const raw = optString(args, 'policy');
+        const policy = typeof raw === 'string' ? raw.trim().toLowerCase() : undefined;
+        if (!policy || policy === 'off' || policy === 'clear' || policy === 'none') {
+          deps.setRoutingPolicy?.(undefined);
+          return ok('Routing policy cleared (reset to default behavior).', { policy: 'balanced' });
+        }
+        if (!isValidRoutingPolicy(policy)) {
+          throw new ToolInputError(`Invalid routing policy "${policy}". Allowed values: balanced, cheapest, preserve-frontier, reliable.`);
+        }
+        deps.setRoutingPolicy?.(policy);
+        return ok(
+          `Routing policy set to "${policy}" for this project.`,
+          { policy },
+        );
+      }),
+  };
+
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

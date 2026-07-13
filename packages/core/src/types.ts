@@ -410,12 +410,19 @@ export interface RouteContext {
   /** Task-level context the policy gate evaluates against (defaults to unknown/sensitive). */
   policyContext?: PolicyContext;
   /**
-   * Routing strategy (MODEL-TIERS). `maximize` (default) picks the highest
-   * capability-vs-cost score — today's behavior. `tiered` picks the CHEAPEST lane
-   * whose EFFECTIVE capability clears `tierFloor` ("start cheap"); if none clear it,
-   * it falls back to `maximize` so routing never fails. Opt-in via the adapter.
+   * Legacy routing strategy (MODEL-TIERS). Deprecated: use `routingPolicy` instead.
+   * Maps `tiered` to `cheapest` policy, and `maximize` to `balanced` policy.
+   * If both are provided, `routingPolicy` takes precedence.
    */
   strategy?: 'maximize' | 'tiered';
+  /**
+   * Named routing policy. If provided, overrides/precedes legacy `strategy`.
+   * - `balanced` (DEFAULT) — capability − cost − quota − health.
+   * - `cheapest` — cheapest lane clearing the capability floor, step up only when needed (tiered).
+   * - `preserve-frontier` — conserve most capable/expensive lanes by adding a cost-scaled penalty.
+   * - `reliable` — weight lane health signal more heavily.
+   */
+  routingPolicy?: 'balanced' | 'cheapest' | 'preserve-frontier' | 'reliable';
   /** Tiered floor: minimum effective capability a lane must clear (default ~0.6). */
   tierFloor?: number;
   /** Per-category overrides for {@link tierFloor}. */
