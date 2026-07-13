@@ -146,6 +146,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:prefer <lane>` · `/tokenmaxed:prefer off` | temporarily favor one configured lane (any vendor, CLI or API) over normal routing — e.g. to push a sprint's work to a cheaper subscription while another's credits run low; clears with `off`. Honored only when that lane is eligible, available, and capable for the task (else it falls back to normal routing). Persisted per project; no relaunch. |
 | `/tokenmaxed:reserve <lane> <pct>` · `/tokenmaxed:reserve off` | reserve a fraction of a lane's quota (e.g. 15% of Opus) so routing keeps that headroom in reserve; clears with `off`. Persisted per project; no relaunch. |
 | `/tokenmaxed:calibrate <lane> <pct>` · `/tokenmaxed:calibrate off` | calibrate a lane's true used fraction (e.g. 70% of Opus weekly cap) so routing respects it as a floor; clears with `off`. Persisted per project; no relaunch. |
+| `/tokenmaxed:until <lane> <until>` · `/tokenmaxed:until off` | pace the lane so it lasts until the specified target datetime (ISO format, e.g. "2026-07-15T09:00"); clears with `off`. Persisted per project; no relaunch. |
 | `/tokenmaxed:full-access [model]` · `/tokenmaxed:full-access off` | grant/revoke a named model's reader lane(s) full repo access — the scoped alternative to YOLO; secret scanner still enforced; output reader-derived. |
 | `/tokenmaxed:yolo` · `/tokenmaxed:yolo off` | **⚠️ dangerous** — turn YOLO mode on/off for this project (the `--dangerously-skip-permissions` analogue); see **YOLO mode** under optional features below. |
 

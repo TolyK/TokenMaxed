@@ -42,7 +42,7 @@ export type {
   OverlayBuildResult,
 } from './capability-prior.ts';
 export type { EffectiveCapabilityOptions, EligibleLane } from './route.ts';
-export { laneDepletionForecast, laneObservations, laneQuotaState, projectOccupancy, quotaHeadroomMap, WEEK_MS } from './quota.ts';
+export { laneDepletionForecast, laneObservations, laneQuotaState, projectOccupancy, quotaHeadroomMap, WEEK_MS, computePacePressure, adjustHeadroomForPace } from './quota.ts';
 export type { DepletionProjection, LaneDepletionForecast, LaneQuotaState, QuotaAxisState, QuotaObservation } from './quota.ts';
 export { outcomeCapability, outcomeCapabilityByDifficulty, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
 export type { OutcomeCapabilityOptions } from './feedback.ts';

@@ -7465,7 +7465,7 @@ var MIN_SPAN_FRACTION = 0.25;
 var MAX_HALF_RATE_RATIO = 3;
 var MODERATE_SPAN_FRACTION = 0.5;
 var MODERATE_HALF_RATE_RATIO = 2;
-function projectOccupancy(observations, limit, windowMs, now) {
+function projectOccupancy(observations, limit, windowMs, now, calibrationAmount = 0) {
   if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return void 0;
   const inWindow = observations.filter((o) => Number.isFinite(o.ts) && o.ts > now - windowMs && o.ts <= now && Number.isFinite(o.amount) && o.amount > 0).sort((a, b) => a.ts - b.ts);
   if (inWindow.length < MIN_SAMPLES) return void 0;
@@ -7484,7 +7484,7 @@ function projectOccupancy(observations, limit, windowMs, now) {
   if (ratio >= MAX_HALF_RATE_RATIO) return void 0;
   const total = firstHalf + secondHalf;
   const lambda = total / windowMs;
-  let occupancy = total;
+  let occupancy = Math.max(total, calibrationAmount);
   if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
   const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
   let t = now;
@@ -7526,7 +7526,8 @@ function laneDepletionForecast(events, lane, now) {
     if (!(typeof a.limit === "number" && a.limit > 0)) continue;
     const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
     const usableLimit = a.limit * reserveFactor;
-    const p = projectOccupancy(obs, usableLimit, a.windowMs, now);
+    const calibrationAmount = (lane.calibration_fraction ?? 0) * a.limit;
+    const p = projectOccupancy(obs, usableLimit, a.windowMs, now, calibrationAmount);
     if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
   }
   return best;

@@ -8057,7 +8057,7 @@ var MIN_SPAN_FRACTION = 0.25;
 var MAX_HALF_RATE_RATIO = 3;
 var MODERATE_SPAN_FRACTION = 0.5;
 var MODERATE_HALF_RATE_RATIO = 2;
-function projectOccupancy(observations, limit, windowMs, now) {
+function projectOccupancy(observations, limit, windowMs, now, calibrationAmount = 0) {
   if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return void 0;
   const inWindow = observations.filter((o) => Number.isFinite(o.ts) && o.ts > now - windowMs && o.ts <= now && Number.isFinite(o.amount) && o.amount > 0).sort((a, b) => a.ts - b.ts);
   if (inWindow.length < MIN_SAMPLES) return void 0;
@@ -8076,7 +8076,7 @@ function projectOccupancy(observations, limit, windowMs, now) {
   if (ratio >= MAX_HALF_RATE_RATIO) return void 0;
   const total = firstHalf + secondHalf;
   const lambda = total / windowMs;
-  let occupancy = total;
+  let occupancy = Math.max(total, calibrationAmount);
   if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
   const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
   let t = now;
@@ -8118,7 +8118,8 @@ function laneDepletionForecast(events, lane, now) {
     if (!(typeof a.limit === "number" && a.limit > 0)) continue;
     const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
     const usableLimit = a.limit * reserveFactor;
-    const p = projectOccupancy(obs, usableLimit, a.windowMs, now);
+    const calibrationAmount = (lane.calibration_fraction ?? 0) * a.limit;
+    const p = projectOccupancy(obs, usableLimit, a.windowMs, now, calibrationAmount);
     if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
   }
   return best;
@@ -10133,6 +10134,26 @@ function formatLaneSetup(rows) {
   return lines;
 }
 
+// ../mcp/src/target.ts
+function isValidIso8601(val) {
+  const trimmed = val.trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(?:Z|[+-]\d{2}(?::?\d{2})?)$/.exec(trimmed);
+  if (!match) return false;
+  const year = parseInt(match[1], 10);
+  const month = parseInt(match[2], 10);
+  const day = parseInt(match[3], 10);
+  const hour = parseInt(match[4], 10);
+  const minute = parseInt(match[5], 10);
+  const second = match[6] ? parseInt(match[6], 10) : 0;
+  const ms = match[7] ? parseInt(match[7].padEnd(3, "0").slice(0, 3), 10) : 0;
+  const utcD = new Date(Date.UTC(year, month - 1, day, hour, minute, second, ms));
+  if (utcD.getUTCFullYear() !== year || utcD.getUTCMonth() !== month - 1 || utcD.getUTCDate() !== day || utcD.getUTCHours() !== hour || utcD.getUTCMinutes() !== minute || utcD.getUTCSeconds() !== second) {
+    return false;
+  }
+  const msParsed = Date.parse(trimmed);
+  return Number.isFinite(msParsed);
+}
+
 // ../mcp/src/tools.ts
 var ToolInputError = class extends Error {
   constructor(message) {
@@ -10631,6 +10652,16 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       if (calibrationLines.length > 0) {
         lines.push("", "Manual quota calibrations (project override):", ...calibrationLines);
       }
+      const targets = deps.getTargets?.() ?? {};
+      const targetLines = [];
+      for (const [key, val] of Object.entries(targets)) {
+        if (typeof val === "string") {
+          targetLines.push(`  ${key}: target last until ${val}`);
+        }
+      }
+      if (targetLines.length > 0) {
+        lines.push("", "Pacing targets (project override):", ...targetLines);
+      }
       const capPrior = deps.capabilityPrior?.([]);
       if (capPrior?.state === "on") {
         lines.push(
@@ -10889,6 +10920,72 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       return ok(
         `Manual quota calibration of ${pct3}% set for: ${resolvedNames} in this project.`,
         { lane, fraction: value, matchedLanes: matchedLanes.map((l) => l.id) }
+      );
+    })
+  };
+  const setTargetTool = {
+    name: "router_set_target",
+    description: "Set or clear a pacing target datetime for a lane or model name in this project. Pacing will deprioritize the lane if its forecast depletion time is before the target. Value must be an ISO-8601 datetime string in the future. If lane is empty, clears all targets for the project. Powers /tokenmaxed:until.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: "string",
+          description: "The lane ID or model name to target (e.g. claude-native or opus). If empty, clears all targets for this project."
+        },
+        until: {
+          type: "string",
+          description: 'The target ISO-8601 datetime string (e.g. "2026-07-15T09:00"). Use "off", "none", or "clear" to remove the target for this lane.'
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const rawLane = optString(args, "lane");
+      const lane = typeof rawLane === "string" ? rawLane.trim() : void 0;
+      const rawUntil = optString(args, "until");
+      const untilStr = typeof rawUntil === "string" ? rawUntil.trim() : void 0;
+      const isClearingTarget = !untilStr || ["off", "none", "clear"].includes(untilStr.toLowerCase());
+      if (untilStr && !isClearingTarget) {
+        if (!isValidIso8601(untilStr)) {
+          throw new ToolInputError(`Invalid ISO datetime string: "${rawUntil}". Must be in strict ISO-8601 format.`);
+        }
+        const ms = Date.parse(untilStr);
+        if (ms <= Date.now()) {
+          throw new ToolInputError(`Invalid datetime: "${rawUntil}". Must be in the future.`);
+        }
+      }
+      if (lane && untilStr && !isClearingTarget) {
+        const allLanes2 = deps.allLanes?.() ?? [];
+        const matchedLanes2 = allLanes2.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+        if (matchedLanes2.length === 0) {
+          const connectable = allLanes2.map((l) => l.model).sort();
+          throw new ToolInputError(
+            `No connected lanes match "${lane}". Connected models: ${connectable.join(", ") || "(none)"}`
+          );
+        }
+      }
+      if (!lane) {
+        deps.setTarget?.(void 0, void 0);
+        return ok(
+          "All target datetimes CLEARED for this project.",
+          { targets: null }
+        );
+      }
+      if (isClearingTarget) {
+        deps.setTarget?.(lane, void 0);
+        return ok(
+          `Target datetime CLEARED for lane/model "${lane}" in this project.`,
+          { lane, until: null }
+        );
+      }
+      deps.setTarget?.(lane, untilStr);
+      const allLanes = deps.allLanes?.() ?? [];
+      const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+      const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(", ");
+      return ok(
+        `Target datetime of ${untilStr} set for: ${resolvedNames} in this project.`,
+        { lane, until: untilStr, matchedLanes: matchedLanes.map((l) => l.id) }
       );
     })
   };
@@ -11167,7 +11264,7 @@ ${r.notes}` : "";
       }
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, delegateTool, reviewTool, setupTool, configTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool];
 }
 function receiptLine(r) {
   const int = (n) => Math.round(n).toLocaleString("en-US");

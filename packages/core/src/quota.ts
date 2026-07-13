@@ -167,6 +167,7 @@ export function projectOccupancy(
   limit: number,
   windowMs: number,
   now: number,
+  calibrationAmount = 0,
 ): DepletionProjection | undefined {
   if (!(limit > 0) || !(windowMs > 0) || !Number.isFinite(now)) return undefined;
   // In-window, valid observations — same (now - window, now] boundary as the counts.
@@ -197,7 +198,7 @@ export function projectOccupancy(
   const lambda = total / windowMs; // units per ms over the full horizon
 
   // Simulate: piecewise-linear occupancy between expirations.
-  let occupancy = total;
+  let occupancy = Math.max(total, calibrationAmount);
   if (occupancy >= limit) return { etaMs: 0, confidence: confidenceOf(spanFraction, ratio) };
   const expirations = inWindow.map((o) => ({ at: o.ts + windowMs, amount: o.amount }));
   let t = now;
@@ -255,10 +256,53 @@ export function laneDepletionForecast(events: readonly LedgerEvent[], lane: Lane
       ? (tokens ??= laneObservations(events, lane.id, true))
       : (requests ??= laneObservations(events, lane.id, false));
     const usableLimit = a.limit * reserveFactor;
-    const p = projectOccupancy(obs, usableLimit, a.windowMs, now);
+    const calibrationAmount = (lane.calibration_fraction ?? 0) * a.limit;
+    const p = projectOccupancy(obs, usableLimit, a.windowMs, now, calibrationAmount);
     if (p && (best === undefined || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
   }
   return best;
+}
+
+function isSafeMs(val: any): val is number {
+  return typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Compute the pace pressure fraction in [0, 1] based on projected depletion vs target time.
+ * If projected depletion ETA is before the target, return the shortfall as a fraction of now -> target.
+ */
+export function computePacePressure(
+  forecast: { etaMs: number } | undefined,
+  targetMs: number | undefined,
+  now: number,
+): number {
+  if (!isSafeMs(now) || !isSafeMs(targetMs) || !forecast || !isSafeMs(forecast.etaMs)) {
+    return 0;
+  }
+  if (targetMs <= now) return 0;
+  const etaTimeMs = now + forecast.etaMs;
+  if (!Number.isFinite(etaTimeMs) || etaTimeMs > Number.MAX_SAFE_INTEGER) return 0;
+  if (etaTimeMs >= targetMs) return 0;
+  const shortfall = targetMs - etaTimeMs;
+  const total = targetMs - now;
+  if (total <= 0 || !Number.isFinite(shortfall) || !Number.isFinite(total)) return 0;
+  const pressure = shortfall / total;
+  return Number.isFinite(pressure) ? Math.max(0, Math.min(1, pressure)) : 0;
+}
+
+/**
+ * Adjust the headroom by subtracting the pace pressure.
+ */
+export function adjustHeadroomForPace(
+  headroom: number,
+  forecast: { etaMs: number } | undefined,
+  targetMs: number | undefined,
+  now: number,
+): number {
+  const safeHeadroom = (typeof headroom === 'number' && Number.isFinite(headroom)) ? headroom : 0;
+  const pressure = computePacePressure(forecast, targetMs, now);
+  const result = safeHeadroom - pressure;
+  return Number.isFinite(result) ? Math.max(0, Math.min(1, result)) : 0;
 }
 
 /**
@@ -268,7 +312,12 @@ export function laneDepletionForecast(events: readonly LedgerEvent[], lane: Lane
  * keeps the zero-change-when-absent invariant literal (no config anywhere ⇒
  * an EMPTY map ⇒ the adapter passes nothing).
  */
-export function quotaHeadroomMap(events: readonly LedgerEvent[], lanes: readonly Lane[], now: number): Record<string, number> {
+export function quotaHeadroomMap(
+  events: readonly LedgerEvent[],
+  lanes: readonly Lane[],
+  now: number,
+  targets?: Record<string, number>,
+): Record<string, number> {
   const out: Record<string, number> = Object.create(null);
   for (const lane of lanes) {
     const hasAny =
@@ -276,7 +325,22 @@ export function quotaHeadroomMap(events: readonly LedgerEvent[], lanes: readonly
       (typeof lane.requests_per_week === 'number' && lane.requests_per_week > 0) ||
       (typeof lane.tokens_per_week === 'number' && lane.tokens_per_week > 0);
     if (!hasAny) continue;
-    out[lane.id] = laneQuotaState(events, lane, now).headroom;
+    let headroom = laneQuotaState(events, lane, now).headroom;
+    if (!Number.isFinite(headroom)) {
+      headroom = 1;
+    }
+    const targetMs = targets?.[lane.id];
+    if (targetMs !== undefined && targetMs > now) {
+      const forecast = laneDepletionForecast(events, lane, now);
+      if (forecast && forecast.confidence === 'moderate') {
+        headroom = adjustHeadroomForPace(headroom, forecast, targetMs, now);
+      }
+    }
+    if (!Number.isFinite(headroom)) {
+      headroom = 1;
+    }
+    out[lane.id] = headroom;
   }
   return out;
 }
+

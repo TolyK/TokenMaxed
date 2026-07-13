@@ -45,6 +45,7 @@ import type { LaneSetupRow } from './lane-setup.ts';
 import type { SettingKey, SettingsReport } from './settings.ts';
 import { formatSummaryBanner } from './summary.ts';
 import type { SummaryData } from './summary.ts';
+import { isValidIso8601 } from './target.ts';
 
 // --- ports + result + dependency shapes ----------------------------------------
 
@@ -241,6 +242,10 @@ export interface ToolDeps {
   getReserves?: () => Record<string, number>;
   /** Set (lane/model, fraction) or clear capacity reservations. */
   setReserve?: (lane: string | undefined, fraction: number | undefined) => void;
+  /** Read the project's target datetimes. */
+  getTargets?: () => Record<string, string>;
+  /** Set (lane/model, isoString) or clear target datetimes. */
+  setTarget?: (lane: string | undefined, until: string | undefined) => void;
   /** Read the project's manual calibrations. */
   getCalibrations?: () => Record<string, number>;
   /** Set (lane/model, fraction) or clear manual calibrations. */
@@ -1111,6 +1116,16 @@ export function createTools(core: CorePort): ToolDef[] {
         if (calibrationLines.length > 0) {
           lines.push('', 'Manual quota calibrations (project override):', ...calibrationLines);
         }
+        const targets = deps.getTargets?.() ?? {};
+        const targetLines: string[] = [];
+        for (const [key, val] of Object.entries(targets)) {
+          if (typeof val === 'string') {
+            targetLines.push(`  ${key}: target last until ${val}`);
+          }
+        }
+        if (targetLines.length > 0) {
+          lines.push('', 'Pacing targets (project override):', ...targetLines);
+        }
         // P2: the rankings-prior posture. Lanes aren't loaded on this read-only
         // path, so the meta line reports the snapshot itself (per-category lane
         // detail lives in /tokenmaxed:why). Rendered ONLY when on/error — the
@@ -1413,6 +1428,86 @@ export function createTools(core: CorePort): ToolDef[] {
         );
       }),
   };
+
+  const setTargetTool: ToolDef = {
+    name: 'router_set_target',
+    description:
+      'Set or clear a pacing target datetime for a lane or model name in this project. Pacing will deprioritize the lane if its forecast depletion time is before the target. Value must be an ISO-8601 datetime string in the future. If lane is empty, clears all targets for the project. Powers /tokenmaxed:until.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: 'string',
+          description:
+            'The lane ID or model name to target (e.g. claude-native or opus). If empty, clears all targets for this project.',
+        },
+        until: {
+          type: 'string',
+          description:
+            'The target ISO-8601 datetime string (e.g. "2026-07-15T09:00"). Use "off", "none", or "clear" to remove the target for this lane.',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const rawLane = optString(args, 'lane');
+        const lane = typeof rawLane === 'string' ? rawLane.trim() : undefined;
+        const rawUntil = optString(args, 'until');
+        const untilStr = typeof rawUntil === 'string' ? rawUntil.trim() : undefined;
+
+        // 1. Validate 'until' field if supplied
+        const isClearingTarget = !untilStr || ['off', 'none', 'clear'].includes(untilStr.toLowerCase());
+        if (untilStr && !isClearingTarget) {
+          if (!isValidIso8601(untilStr)) {
+            throw new ToolInputError(`Invalid ISO datetime string: "${rawUntil}". Must be in strict ISO-8601 format.`);
+          }
+          const ms = Date.parse(untilStr);
+          if (ms <= Date.now()) {
+            throw new ToolInputError(`Invalid datetime: "${rawUntil}". Must be in the future.`);
+          }
+        }
+
+        // 2. Validate 'lane' field if setting a target (not clearing)
+        if (lane && untilStr && !isClearingTarget) {
+          const allLanes = deps.allLanes?.() ?? [];
+          const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+          if (matchedLanes.length === 0) {
+            const connectable = allLanes.map((l) => l.model).sort();
+            throw new ToolInputError(
+              `No connected lanes match "${lane}". Connected models: ${connectable.join(', ') || '(none)'}`
+            );
+          }
+        }
+
+        // 3. Perform actions after all validations succeed
+        if (!lane) {
+          deps.setTarget?.(undefined, undefined);
+          return ok(
+            'All target datetimes CLEARED for this project.',
+            { targets: null }
+          );
+        }
+
+        if (isClearingTarget) {
+          deps.setTarget?.(lane, undefined);
+          return ok(
+            `Target datetime CLEARED for lane/model "${lane}" in this project.`,
+            { lane, until: null }
+          );
+        }
+
+        deps.setTarget?.(lane, untilStr);
+        const allLanes = deps.allLanes?.() ?? [];
+        const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+        const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(', ');
+        return ok(
+          `Target datetime of ${untilStr} set for: ${resolvedNames} in this project.`,
+          { lane, until: untilStr, matchedLanes: matchedLanes.map((l) => l.id) }
+        );
+      }),
+  };
+
 
   const delegateTool: ToolDef = {
     name: 'router_delegate',
@@ -1739,7 +1834,7 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, delegateTool, reviewTool, setupTool, configTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */
