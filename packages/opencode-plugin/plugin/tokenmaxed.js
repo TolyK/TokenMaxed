@@ -7709,6 +7709,15 @@ function requireNonNegativeNumber(value, where) {
   }
   return value;
 }
+function isValidIsoDate(str) {
+  const match = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const y = parseInt(match[1] || "", 10);
+  const m = parseInt(match[2] || "", 10) - 1;
+  const d = parseInt(match[3] || "", 10);
+  const dateObj = new Date(Date.UTC(y, m, d));
+  return dateObj.getUTCFullYear() === y && dateObj.getUTCMonth() === m && dateObj.getUTCDate() === d;
+}
 function validatePriceTable(data) {
   if (!isPlainObject2(data)) {
     throw new PriceError("Price table must be a JSON object.");
@@ -7742,6 +7751,24 @@ function validatePriceTable(data) {
         throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
       }
       entry.released = raw.released;
+    }
+    if (raw.deprecated !== void 0) {
+      if (typeof raw.deprecated !== "boolean") {
+        throw new PriceError(`models["${model}"].deprecated must be a boolean when present.`);
+      }
+      entry.deprecated = raw.deprecated;
+    }
+    if (raw.deprecated_from !== void 0) {
+      if (typeof raw.deprecated_from !== "string" || !isValidIsoDate(raw.deprecated_from)) {
+        throw new PriceError(`models["${model}"].deprecated_from must be a valid date-only string in YYYY-MM-DD format when present.`);
+      }
+      entry.deprecated_from = raw.deprecated_from;
+    }
+    if (raw.successor !== void 0) {
+      if (typeof raw.successor !== "string" || raw.successor.trim() === "") {
+        throw new PriceError(`models["${model}"].successor must be a non-empty string when present.`);
+      }
+      entry.successor = raw.successor;
     }
     models[model] = entry;
   }

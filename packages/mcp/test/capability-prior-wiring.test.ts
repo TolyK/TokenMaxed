@@ -50,6 +50,8 @@ const CORE: CorePort = {
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
   resolvedPriorFor,
+  assessDeprecation: () => ({ status: 'ok' }),
+  resolveDeprecatedModel: (l: any) => ({ lane: l }),
 };
 const TOOLS = createTools(CORE);
 

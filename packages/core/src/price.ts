@@ -27,6 +27,9 @@ export interface ModelPrice {
    */
   family?: string;
   released?: string;
+  deprecated?: boolean;
+  deprecated_from?: string;
+  successor?: string;
 }
 
 /** A validated price table: per-model list prices plus the frontier baseline. */
@@ -80,6 +83,16 @@ function requireNonNegativeNumber(value: unknown, where: string): number {
   return value;
 }
 
+function isValidIsoDate(str: string): boolean {
+  const match = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const y = parseInt(match[1] || '', 10);
+  const m = parseInt(match[2] || '', 10) - 1;
+  const d = parseInt(match[3] || '', 10);
+  const dateObj = new Date(Date.UTC(y, m, d));
+  return dateObj.getUTCFullYear() === y && dateObj.getUTCMonth() === m && dateObj.getUTCDate() === d;
+}
+
 /** Validate an already-parsed object into a {@link PriceTable}, or throw {@link PriceError}. */
 export function validatePriceTable(data: unknown): PriceTable {
   if (!isPlainObject(data)) {
@@ -118,6 +131,25 @@ export function validatePriceTable(data: unknown): PriceTable {
         throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
       }
       entry.released = raw.released;
+    }
+    // Deprecation and successor metadata (schema_version >= 3)
+    if (raw.deprecated !== undefined) {
+      if (typeof raw.deprecated !== 'boolean') {
+        throw new PriceError(`models["${model}"].deprecated must be a boolean when present.`);
+      }
+      entry.deprecated = raw.deprecated;
+    }
+    if (raw.deprecated_from !== undefined) {
+      if (typeof raw.deprecated_from !== 'string' || !isValidIsoDate(raw.deprecated_from)) {
+        throw new PriceError(`models["${model}"].deprecated_from must be a valid date-only string in YYYY-MM-DD format when present.`);
+      }
+      entry.deprecated_from = raw.deprecated_from;
+    }
+    if (raw.successor !== undefined) {
+      if (typeof raw.successor !== 'string' || raw.successor.trim() === '') {
+        throw new PriceError(`models["${model}"].successor must be a non-empty string when present.`);
+      }
+      entry.successor = raw.successor;
     }
     models[model] = entry;
   }

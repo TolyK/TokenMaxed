@@ -37,8 +37,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
-  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor, analyzeBacktest, fingerprintTask } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent, QuotaEstimate, CostForecast, TaskFingerprint } from '@tokenmaxed/core';
+  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor, analyzeBacktest, fingerprintTask, assessDeprecation, resolveDeprecatedModel } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent, QuotaEstimate, CostForecast, TaskFingerprint, DeprecationReport } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -319,7 +319,7 @@ function fileFullAccessStore(statePath: string): FullAccessStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor, analyzeBacktest, fingerprintTask };
+export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor, analyzeBacktest, fingerprintTask, assessDeprecation, resolveDeprecatedModel, resolveLaneModel };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -857,15 +857,28 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return [];
     }
-    const priceTable = loadPriceTable(pricesPath);
-    return loadLaneConfig(lanesPath)
-      .candidateLanes(category)
+    let priceTable: PriceTable | undefined;
+    try {
+      priceTable = loadPriceTable(pricesPath);
+    } catch {
+      // ignore / fail-open
+    }
+    const lanes = loadLaneConfig(lanesPath).candidateLanes(category);
+    if (!priceTable) {
+      return lanes;
+    }
+    const now = Date.now();
+    return lanes
       // Resolve `<family>@latest` to a concrete priced id BEFORE the priceability
       // filter, so an aliased lane routes/prices/displays on its concrete model.
-      .map((lane) => resolveLaneModel(lane, priceTable))
+      .map((lane) => {
+        const resolved = resolveLaneModel(lane, priceTable!);
+        const { lane: migrated } = resolveDeprecatedModel(resolved, priceTable!, now);
+        return migrated;
+      })
       // Drop any STILL-unresolved alias (no priced family member) regardless of cost
       // basis, so a literal "@latest" can never reach execution; then priceability.
-      .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
+      .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable!));
   };
 
   // B3/B4 — quota alerts with an overflow plan (plan §1.5 context contract):
@@ -1083,11 +1096,16 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const policy = loadPolicySafe();
     const priceTable = loadPriceTable(pricesPath);
     const ledger = new JsonlLedger(ledgerPath);
+    const now = Date.now();
     // Same usable set preview sees: unpriceable metered lanes are already excluded,
     // so runTask never picks one and can't throw on cost after paying for it.
     let lanes = registry
       .candidateLanes(request.category)
-      .map((lane) => resolveLaneModel(lane, priceTable)) // <family>@latest ⇒ concrete priced id
+      .map((lane) => {
+        const resolved = resolveLaneModel(lane, priceTable);
+        const { lane: migrated } = resolveDeprecatedModel(resolved, priceTable, now);
+        return migrated;
+      })
       // Drop a still-unresolved alias (any cost basis) so literal "@latest" never runs.
       .filter((lane) => !parseModelAlias(lane.model).latest && recordableLane(lane, priceTable));
     // Per-request model PIN (the user named a model in their prompt): restrict
@@ -1095,13 +1113,20 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // not connected / can't run ⇒ the task comes back native with the reason.
     const pinnedModel = request.model?.trim() || undefined;
     if (pinnedModel) {
-      const pinnedLanes = lanes.filter((l) => modelMatchesPin(l.model, pinnedModel));
+      const pinnedLanes = lanes.filter((l) => {
+        const origModel = registry.byId(l.id)?.model;
+        return modelMatchesPin(l.model, pinnedModel) || (origModel && modelMatchesPin(origModel, pinnedModel));
+      });
       if (pinnedLanes.length === 0) {
         // Distinguish honestly: configured-but-dropped (unresolved @latest /
         // unpriceable metered) vs simply not connected for this category.
         const configuredMatch = registry
           .candidateLanes(request.category)
-          .some((l) => modelMatchesPin(l.model, pinnedModel) || modelMatchesPin(resolveLaneModel(l, priceTable).model, pinnedModel));
+          .some((l) => {
+            const resolved = resolveLaneModel(l, priceTable);
+            const { lane: migrated } = resolveDeprecatedModel(resolved, priceTable, now);
+            return modelMatchesPin(l.model, pinnedModel) || modelMatchesPin(migrated.model, pinnedModel);
+          });
         const connected = [...new Set(lanes.map((l) => l.model))].sort();
         return {
           laneId: 'native',
@@ -1125,7 +1150,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     for (const lane of lanes) {
       if (lane.trust_mode === 'reader') {
         const matchesProjectOrEnvGrant = grants.some((g) => g.toLowerCase() === lane.id.toLowerCase());
-        const matchesPromptPin = !!request.full_access && !!request.model && modelMatchesPin(lane.model, request.model);
+        const origModel = registry.byId(lane.id)?.model;
+        const matchesPromptPin = !!request.full_access && !!request.model && (
+          modelMatchesPin(lane.model, request.model) || (origModel && modelMatchesPin(origModel, request.model))
+        );
         if (matchesProjectOrEnvGrant || matchesPromptPin) {
           fullAccessLaneIds.push(lane.id);
         }
@@ -1412,58 +1440,70 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   };
 
   const freshness = async () => {
-    if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
-    const registry = loadLaneConfig(lanesPath);
-    const eligible = registry.lanes.filter(
-      (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
-    );
-    const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
-    return reportFreshness(
-      eligible,
-      {
-        fetchList: (lane) => fetchModelList(lane, { resolveAuth }),
-        table: loadPriceTable(pricesPath),
-        now: Date.now(),
-        readCache: () => readFreshnessCache(cachePath),
-        writeCache: (c) => writeFreshnessCache(cachePath, c),
-      },
-      { refresh: true },
-    );
+    try {
+      if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
+      const registry = loadLaneConfig(lanesPath);
+      const eligible = registry.lanes.filter(
+        (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
+      );
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
+      return reportFreshness(
+        eligible,
+        {
+          fetchList: (lane) => fetchModelList(lane, { resolveAuth }),
+          table: loadPriceTable(pricesPath),
+          now: Date.now(),
+          readCache: () => readFreshnessCache(cachePath),
+          writeCache: (c) => writeFreshnessCache(cachePath, c),
+        },
+        { refresh: true },
+      );
+    } catch {
+      return [];
+    }
   };
 
   const idMismatch = async () => {
-    if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
-    const registry = loadLaneConfig(lanesPath);
-    const eligible = registry.lanes.filter(
-      (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
-    );
-    const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
-    return reportModelIdMismatches(eligible, {
-      table: loadPriceTable(pricesPath),
-      now: Date.now(),
-      ttlMs: ID_MISMATCH_TTL_MS,
-      readCache: () => readFreshnessCache(cachePath),
-    });
+    try {
+      if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
+      const registry = loadLaneConfig(lanesPath);
+      const eligible = registry.lanes.filter(
+        (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
+      );
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
+      return reportModelIdMismatches(eligible, {
+        table: loadPriceTable(pricesPath),
+        now: Date.now(),
+        ttlMs: ID_MISMATCH_TTL_MS,
+        readCache: () => readFreshnessCache(cachePath),
+      });
+    } catch {
+      return [];
+    }
   };
 
   const freshnessCacheOnly = async () => {
-    if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
-    const registry = loadLaneConfig(lanesPath);
-    const eligible = registry.lanes.filter(
-      (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
-    );
-    const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
-    return reportFreshness(
-      eligible,
-      {
-        fetchList: () => { throw new Error('egress not allowed'); },
-        table: loadPriceTable(pricesPath),
-        now: Date.now(),
-        readCache: () => readFreshnessCache(cachePath),
-        writeCache: () => {}, // NO-OP
-      },
-      { refresh: false },
-    );
+    try {
+      if (globallyDisabled || !gateReady || !existsSync(lanesPath)) return [];
+      const registry = loadLaneConfig(lanesPath);
+      const eligible = registry.lanes.filter(
+        (l) => l.kind === 'api' && l.trust_mode !== 'blocked' && !!l.authHandle && resolveAuth(l.authHandle).length > 0,
+      );
+      const cachePath = env.TOKENMAXED_MODEL_CACHE ?? join(dirname(statePath), 'model-freshness.json');
+      return reportFreshness(
+        eligible,
+        {
+          fetchList: () => { throw new Error('egress not allowed'); },
+          table: loadPriceTable(pricesPath),
+          now: Date.now(),
+          readCache: () => readFreshnessCache(cachePath),
+          writeCache: () => {}, // NO-OP
+        },
+        { refresh: false },
+      );
+    } catch {
+      return [];
+    }
   };
 
   const doctor = () => runDoctor(env, { freshness: freshnessCacheOnly, idMismatch });
@@ -1528,7 +1568,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // /tokenmaxed:why reflects the tiered pick (cheapest clearing the floor).
     tieredStrategy,
     ...(tierFloor !== undefined ? { tierFloor } : {}),
-    laneCost: (lanes: readonly Lane[]) => laneCostMap(lanes, loadPriceTable(pricesPath)),
+    laneCost: (lanes: readonly Lane[]) => {
+      try {
+        return laneCostMap(lanes, loadPriceTable(pricesPath));
+      } catch {
+        return {};
+      }
+    },
     loadPriceTable: () => loadPriceTable(pricesPath),
     readRepoFiles: (paths: readonly string[]) =>
       readRepoFiles(paths, {

@@ -57,6 +57,8 @@ const CORE: CorePort = {
   resolveLaneModelKey,
   declaredCapabilityFor,
   effectiveCapabilityFor,
+  assessDeprecation: () => ({ status: 'ok' }),
+  resolveDeprecatedModel: (l: any) => ({ lane: l }),
 };
 const TOOLS = createTools(CORE);
 

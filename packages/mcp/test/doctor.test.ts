@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -601,4 +601,57 @@ lanes:
   } finally {
     Date.now = originalNow;
   }
+});
+
+test('runDoctor reports model deprecations and successor recommendations', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tokenmaxed-doctor-deprecation-'));
+  const lanesFile = join(dir, 'lanes.yaml');
+  const pricesFile = join(dir, 'prices.json');
+
+  const lanesYaml = `lanes:
+  - id: old-lane
+    kind: api
+    model: old-model
+    trust_mode: full
+    costBasis: subscription
+    provenance: openai
+    jurisdiction: US
+    endpoint: http://localhost
+    authHandle: TEST
+    capability:
+      bugfix: 0.8
+`;
+
+  const priceTable = {
+    schema_version: 3,
+    frontier_model: 'opus',
+    models: {
+      opus: { inputPer1M: 15, outputPer1M: 75 },
+      'old-model': {
+        inputPer1M: 1,
+        outputPer1M: 1,
+        deprecated: true,
+        deprecated_from: '2020-05-01',
+        successor: 'opus'
+      }
+    }
+  };
+
+  writeFileSync(lanesFile, lanesYaml, 'utf8');
+  writeFileSync(pricesFile, JSON.stringify(priceTable), 'utf8');
+
+  const env = {
+    TOKENMAXED_LANES: lanesFile,
+    TOKENMAXED_PRICES: pricesFile,
+  };
+
+  const report = await runDoctor(env, {});
+  const deprecationWarnings = report.findings.filter((f) => f.title.includes('deprecated model'));
+  assert.equal(deprecationWarnings.length, 1);
+  const w = deprecationWarnings[0]!;
+  assert.equal(w.severity, 'warn');
+  assert.match(w.detail, /lane old-lane uses old-model, deprecated since 2020-05-01 → migrate to opus \(priced: yes\)/);
+  assert.match(w.fix, /use successor model "opus"/);
+
+  rmSync(dir, { recursive: true, force: true });
 });
