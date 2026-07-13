@@ -50,6 +50,7 @@ import type {
   BacktestSummary,
   BacktestPolicy,
   BacktestEvidence,
+  TaskFingerprint,
 } from '@tokenmaxed/core';
 
 import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshness-report.ts';
@@ -124,6 +125,7 @@ export interface CorePort {
       policyB: any;
     }
   ) => BacktestSummary;
+  fingerprintTask?: (text: string, opts?: { referencedFileCount?: number }) => TaskFingerprint;
 }
 
 /** P2: metadata about the active rankings snapshot, for /why + /status + setup. */
@@ -1012,6 +1014,7 @@ function policyExplanation(
           ...(repo_class ? { repo_class } : {}),
           ...(sensitivity ? { sensitivity } : {}),
         };
+        const fingerprint = core.fingerprintTask ? core.fingerprintTask(instruction ?? '', { referencedFileCount: files?.length }) : undefined;
         // Route over the category's candidate lanes (capability-0 opt-outs excluded),
         // matching the documented run path — never the full lane set.
         // Per-request model PIN (delegate parity): a pinned lane is NEVER
@@ -1089,6 +1092,7 @@ function policyExplanation(
             readerEgress: deps.readerEgress,
             policyContext,
             access_need: resolvedAccessNeed,
+            ...(fingerprint ? { fingerprint } : {}),
             ...(deps.host ? { host: deps.host } : {}),
             ...(yolo ? { yolo: true } : {}),
             ...(observedCapability ? { observedCapability } : {}),
@@ -1114,6 +1118,7 @@ function policyExplanation(
           readerEgress: deps.readerEgress,
           policyContext,
           access_need: resolvedAccessNeed,
+          ...(fingerprint ? { fingerprint } : {}),
           ...(deps.host ? { host: deps.host } : {}),
           ...(yolo ? { yolo: true } : {}),
           ...(observedCapability ? { observedCapability } : {}),
@@ -1436,12 +1441,22 @@ function policyExplanation(
           }
         }
 
+        let fingerprintLine = '';
+        if (fingerprint) {
+          const langText = fingerprint.language.lang === 'unknown'
+            ? 'unknown'
+            : `${fingerprint.language.lang} (${fingerprint.language.confidence.toFixed(1)})`;
+          const secText = fingerprint.securitySensitive ? 'yes' : 'no';
+          fingerprintLine = `  fingerprint: ${langText} · context: ${fingerprint.contextSizeBand} · tools: ${fingerprint.toolNeed} · ${fingerprint.planVsImpl} · security: ${secText} · blast: ${fingerprint.blastRadius}`;
+        }
+
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
           ...(explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : []),
           ...(pinnedModel ? [`  model pinned by request: "${pinnedModel}" — only lanes serving it were considered (no substitution on failure).`] : []),
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
+          ...(fingerprintLine ? [fingerprintLine] : []),
           `  why: ${decisionReason}`,
           ...(forecastLine ? [forecastLine] : []),
           ...(difficulty
@@ -1457,7 +1472,7 @@ function policyExplanation(
           ...(preferNote ? [preferNote] : []),
           ...(freezeNote ? [freezeNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}), ...(deps.getFrozen?.() ? { frozen: true } : {}), ...(hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}), ...(forecastData ? { forecast: forecastData } : {}) });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...(fingerprint ? { fingerprint } : {}), ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}), ...(deps.getFrozen?.() ? { frozen: true } : {}), ...(hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}), ...(forecastData ? { forecast: forecastData } : {}) });
       }),
   };
 

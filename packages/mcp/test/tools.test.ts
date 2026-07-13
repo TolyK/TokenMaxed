@@ -36,6 +36,7 @@ import {
   declaredCapabilityFor,
   effectiveCapabilityFor,
   analyzeBacktest,
+  fingerprintTask,
 } from '../../core/src/index.ts';
 import type { Lane, LedgerEvent, Policy, RouteDecision, OutcomeEventInput, OutcomeEvent, PriceTable } from '../../core/src/index.ts';
 
@@ -72,6 +73,7 @@ const CORE: CorePort = {
   declaredCapabilityFor,
   effectiveCapabilityFor,
   analyzeBacktest,
+  fingerprintTask,
 };
 const TOOLS = createTools(CORE);
 
@@ -1732,6 +1734,7 @@ test('router_preview: byte-identity full-serialization baseline comparison', asy
     'category "docs" → lane "mid"',
     '  cli · m · trust=full',
     '  policy verdict: force-trusted',
+    '  fingerprint: unknown · context: small · tools: low · impl · security: no · blast: narrow',
     '  why: Selected mid (m) for docs: capability 0.85 at subscription cost.'
   ].join('\n');
 
@@ -1771,7 +1774,15 @@ test('router_preview: byte-identity full-serialization baseline comparison', asy
     verdict: 'force-trusted',
     native: false,
     yolo: false,
-    fullAccessLaneIds: []
+    fullAccessLaneIds: [],
+    fingerprint: {
+      language: { lang: 'unknown', confidence: 0 },
+      contextSizeBand: 'small',
+      toolNeed: 'low',
+      planVsImpl: 'impl',
+      securitySensitive: false,
+      blastRadius: 'narrow'
+    }
   };
 
   const expectedResult = {
@@ -2541,4 +2552,103 @@ test('router_backtest tool rejects invalid period with ToolInputError details', 
   assert.equal(res.isError, true);
   const text = res.content[0]!.text;
   assert.match(text, /Invalid period format "banana"/i);
+});
+
+test('router_preview: task fingerprint is surfaced in text and structured output', async () => {
+  const lanes = [
+    lane({ id: 'metered-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const d = deps({
+    candidateLanes: () => lanes,
+  });
+
+  const res = await call('router_preview', d, {
+    category: 'bugfix',
+    instruction: 'Write a python script to check credentials jwt token. Also run typecheck.',
+  });
+
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+
+  // Assert presence of formatted fingerprint
+  assert.match(text, /fingerprint: python \(0\.2\) · context: small · tools: medium · impl · security: yes · blast: narrow/);
+
+  // Assert structured content contains the fingerprint
+  const struct = res.structuredContent as any;
+  assert.ok(struct.fingerprint);
+  assert.equal(struct.fingerprint.language.lang, 'python');
+  assert.equal(struct.fingerprint.language.confidence, 0.2);
+  assert.equal(struct.fingerprint.contextSizeBand, 'small');
+  assert.equal(struct.fingerprint.toolNeed, 'medium');
+  assert.equal(struct.fingerprint.planVsImpl, 'impl');
+  assert.equal(struct.fingerprint.securitySensitive, true);
+  assert.equal(struct.fingerprint.blastRadius, 'narrow');
+});
+
+test('router_preview: task fingerprint is content-free under adversarial input', async () => {
+  const lanes = [
+    lane({ id: 'metered-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const d = deps({
+    candidateLanes: () => lanes,
+    readRepoFiles: (paths: readonly string[]) => {
+      // Return empty so the tool doesn't print any skipped/attached files warning text
+      return { attachments: [], skipped: [] };
+    },
+  });
+
+  const instruction = 'AdversarialPromptSecretX99';
+  const fileCount = 42;
+  const files = Array.from({ length: fileCount }, (_, i) => `file${i}.js`);
+
+  const res = await call('router_preview', d, {
+    category: 'bugfix',
+    instruction,
+    files,
+  });
+
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+
+  // Assert absence of any input substring, raw input length, or count in the rendered text
+  assert.ok(!text.includes(instruction));
+  assert.ok(!text.includes(String(instruction.length))); // input length
+  assert.ok(!text.includes(String(fileCount))); // count of files
+
+  // Recursively assert no leakage in structured content (keys AND values)
+  const struct = res.structuredContent as any;
+  assert.ok(struct.fingerprint);
+
+  const ignoredWords = new Set([
+    'ts', 'js', 'python', 'go', 'rust', 'java', 'c', 'cpp', 'csharp', 'ruby', 'php', 'shell', 'sql', 'unknown',
+    'small', 'medium', 'large', 'xlarge', 'low', 'high', 'plan', 'mixed', 'impl', 'narrow', 'moderate', 'wide',
+    'true', 'false', 'yes', 'no'
+  ]);
+  const words = instruction.toLowerCase().split(/[^a-z0-9]+/i).filter(w => w.length >= 3 && !ignoredWords.has(w));
+  const forbiddenNumbers = new Set([fileCount, instruction.length]);
+
+  function walk(value: any) {
+    if (typeof value === 'string') {
+      const valLower = value.toLowerCase();
+      for (const word of words) {
+        assert.ok(!valLower.includes(word), `Structured value "${value}" contains input substring "${word}"`);
+      }
+    } else if (typeof value === 'number') {
+      assert.ok(!forbiddenNumbers.has(value), `Structured value contains forbidden number ${value}`);
+    } else if (value && typeof value === 'object') {
+      for (const k of Object.keys(value)) {
+        const keyLower = k.toLowerCase();
+        for (const word of words) {
+          assert.ok(!keyLower.includes(word), `Structured key "${k}" contains input substring "${word}"`);
+        }
+        const keyNum = Number(k);
+        if (Number.isFinite(keyNum)) {
+          assert.ok(!forbiddenNumbers.has(keyNum), `Structured key "${k}" represents forbidden number ${keyNum}`);
+        }
+        walk(value[k]);
+      }
+    }
+  }
+
+  walk(struct.fingerprint);
 });

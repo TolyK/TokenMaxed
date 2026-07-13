@@ -1,3 +1,5 @@
+import type { TaskFingerprint } from './fingerprint.ts';
+
 /**
  * Core domain types for the TokenMaxed routing brain.
  *
@@ -325,6 +327,8 @@ export type ObservedCapabilityByModelDifficulty = Record<
 export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];
+  /** Rich task fingerprint for sub-signals (backlog #6). */
+  fingerprint?: TaskFingerprint;
   /**
    * Lane ids the user explicitly authorized to be elevated from `reader` to full repo access
    * (per-project grant or per-prompt flag, resolved by the adapter). Absent ⇒ no elevation,

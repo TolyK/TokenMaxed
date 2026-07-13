@@ -10564,6 +10564,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
       };
+      const fingerprint = core.fingerprintTask ? core.fingerprintTask(instruction ?? "", { referencedFileCount: files?.length }) : void 0;
       let lanes = deps.candidateLanes(category, pinnedModel ? { includeReserved: true } : void 0);
       const policy = deps.loadPolicy();
       if (pinnedModel) {
@@ -10613,6 +10614,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           readerEgress: deps.readerEgress,
           policyContext,
           access_need: resolvedAccessNeed,
+          ...fingerprint ? { fingerprint } : {},
           ...deps.host ? { host: deps.host } : {},
           ...yolo ? { yolo: true } : {},
           ...observedCapability ? { observedCapability } : {},
@@ -10636,6 +10638,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         readerEgress: deps.readerEgress,
         policyContext,
         access_need: resolvedAccessNeed,
+        ...fingerprint ? { fingerprint } : {},
         ...deps.host ? { host: deps.host } : {},
         ...yolo ? { yolo: true } : {},
         ...observedCapability ? { observedCapability } : {},
@@ -10898,12 +10901,19 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           }
         }
       }
+      let fingerprintLine = "";
+      if (fingerprint) {
+        const langText = fingerprint.language.lang === "unknown" ? "unknown" : `${fingerprint.language.lang} (${fingerprint.language.confidence.toFixed(1)})`;
+        const secText = fingerprint.securitySensitive ? "yes" : "no";
+        fingerprintLine = `  fingerprint: ${langText} \xB7 context: ${fingerprint.contextSizeBand} \xB7 tools: ${fingerprint.toolNeed} \xB7 ${fingerprint.planVsImpl} \xB7 security: ${secText} \xB7 blast: ${fingerprint.blastRadius}`;
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
         ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
+        ...fingerprintLine ? [fingerprintLine] : [],
         `  why: ${decisionReason}`,
         ...forecastLine ? [forecastLine] : [],
         ...difficulty ? [
@@ -10917,7 +10927,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...preferNote ? [preferNote] : [],
         ...freezeNote ? [freezeNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...deps.getFrozen?.() ? { frozen: true } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...fingerprint ? { fingerprint } : {}, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...deps.getFrozen?.() ? { frozen: true } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
     })
   };
   const statusTool = {
