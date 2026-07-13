@@ -1113,6 +1113,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       lanes.find((l) => l.id === laneId)?.model ?? registry.byId(laneId)?.model;
 
     const grants = readFullAccessGrants(lanes);
+    const yoloOn = readYoloState();
     const fullAccessLaneIds: string[] = [];
     for (const lane of lanes) {
       if (lane.trust_mode === 'reader') {
@@ -1123,6 +1124,14 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         }
       }
     }
+    if (yoloOn) {
+      for (const lane of registry.lanes) {
+        if (lane.trust_mode === 'reader' && !fullAccessLaneIds.includes(lane.id)) {
+          fullAccessLaneIds.push(lane.id);
+        }
+      }
+    }
+
 
     // F-1/P6: apply the model-keyed learned overlay (undefined when off ⇒ declared
     // scores). Core selectors read ctx.observedCapabilityByModel; runWithEscalation
@@ -1155,7 +1164,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // YOLO: when on, eligibleLanes/routeDecide force every trust+egress gate open
       // (the --dangerously-skip-permissions analogue). Read per call so the toggle
       // takes effect without a relaunch; the kill-switch still forces it off.
-      ...(readYoloState() ? { yolo: true } : {}),
+      ...(yoloOn ? { yolo: true } : {}),
       ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
       ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
       // B quota pressure: near-cap lanes are deprioritized by scoreLane's

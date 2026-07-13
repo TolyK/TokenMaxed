@@ -136,6 +136,8 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       laneReview: 'current',
     }),
     routingPolicyExplicit: () => false,
+    readerLanes: () => [],
+    allLanes: () => [],
     now: () => FIXED_NOW,
     ...over,
   };
@@ -1144,6 +1146,190 @@ test('delegate and preview compute IDENTICAL fullAccessLaneIds including exact-m
     } catch {}
   }
 });
+
+test('YOLO: delegate and preview automatically elevate reader lanes in fullAccessLaneIds, scope to readers, block still drops', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tokenmaxed-yolo-wiring-'));
+  const lanesYaml = `lanes:
+  - id: minimax-api
+    kind: api
+    model: MiniMax-M3
+    trust_mode: reader
+    costBasis: metered
+    provenance: minimax
+    jurisdiction: CN
+    endpoint: http://localhost
+    capability:
+      bugfix: 0.99
+    repo_read_attestation: true
+    authHandle: minimax
+  - id: deepseek-api
+    kind: api
+    model: deepseek-v3
+    trust_mode: worker
+    costBasis: metered
+    provenance: deepseek
+    jurisdiction: CN
+    endpoint: http://localhost
+    capability:
+      bugfix: 0.7
+    authHandle: deepseek
+
+  - id: claude-native
+    kind: cli
+    model: claude-opus
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    native: true
+    capability:
+      bugfix: 0.5
+
+`;
+  writeFileSync(join(dir, 'lanes.yaml'), lanesYaml, 'utf8');
+  writeFileSync(join(dir, 'full-access.json'), JSON.stringify({}), 'utf8');
+  writeFileSync(join(dir, 'yolo.json'), JSON.stringify({ 'wiring-test': true }), 'utf8');
+  writeFileSync(join(dir, 'policy.yaml'), 'rules: []\n', 'utf8');
+
+  const env = {
+    TOKENMAXED_LANES: join(dir, 'lanes.yaml'),
+    TOKENMAXED_POLICY: join(dir, 'policy.yaml'),
+    TOKENMAXED_LEDGER: join(dir, 'ledger.jsonl'),
+    TOKENMAXED_STATE: join(dir, 'state.json'),
+    TOKENMAXED_YOLO_STATE: join(dir, 'yolo.json'),
+    TOKENMAXED_FULL_ACCESS_STATE: join(dir, 'full-access.json'),
+    TOKENMAXED_PRICES: fileURLToPath(new URL('../prices.seed.json', import.meta.url)),
+    TOKENMAXED_PROJECT: 'wiring-test',
+    TOKENMAXED_GATE_READY: 'true',
+    TOKENMAXED_READER_EGRESS: 'true',
+    TOKENMAXED_KEY_minimax: 'sk-minimax',
+    TOKENMAXED_KEY_deepseek: 'sk-deepseek',
+  };
+
+  try {
+    const serverDeps = makeServerDeps(env);
+
+    // 1. Call router_preview via dispatch
+    const previewRes = await dispatch(TOOLS, serverDeps, 'router_preview', {
+      category: 'bugfix',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.ok(!previewRes.isError, JSON.stringify(previewRes));
+    const previewIds = previewRes.structuredContent!.fullAccessLaneIds as string[];
+    assert.ok(previewIds);
+    // YOLO is ON, so minimax-api (reader) is elevated, but deepseek-api (worker) is not!
+    assert.ok(previewIds.includes('minimax-api'));
+    assert.ok(!previewIds.includes('deepseek-api'));
+    // Since minimax-api is elevated and has bugfix capability (and we have no block), it should win
+    const previewDecision = previewRes.structuredContent!.decision as { laneId: string } | null;
+    assert.ok(previewDecision);
+    assert.equal(previewDecision.laneId, 'minimax-api');
+
+    // 2. Call router_delegate via dispatch
+    const delegateRes = await dispatch(TOOLS, serverDeps, 'router_delegate', {
+      category: 'bugfix',
+      instruction: 'test',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.notEqual(delegateRes.isError, true);
+    const delegateIds = delegateRes.structuredContent!.fullAccessLaneIds as string[];
+    assert.ok(delegateIds, JSON.stringify(delegateRes));
+    assert.ok(delegateIds.includes('minimax-api'));
+    assert.ok(!delegateIds.includes('deepseek-api'));
+    const delegateLaneId = delegateRes.structuredContent!.laneId as string;
+    assert.equal(delegateLaneId, 'minimax-api');
+
+
+    // 3. YOLO + explicit persisted grant union (deduped)
+    writeFileSync(join(dir, 'full-access.json'), JSON.stringify({ 'wiring-test': ['minimax-api'] }), 'utf8');
+    const serverDepsUnion = makeServerDeps(env);
+    const previewResUnion = await dispatch(TOOLS, serverDepsUnion, 'router_preview', {
+      category: 'bugfix',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.ok(!previewResUnion.isError);
+    const unionIds = previewResUnion.structuredContent!.fullAccessLaneIds as string[];
+    assert.deepEqual(unionIds, ['minimax-api']);
+
+    // 4. Actually test a policy block rule for the reader lane under YOLO
+    const policyYamlBlock = `rules:
+  - trust_mode: reader
+    verdict: block
+`;
+    writeFileSync(join(dir, 'policy.yaml'), policyYamlBlock, 'utf8');
+    const serverDepsBlock = makeServerDeps(env);
+    const previewResBlock = await dispatch(TOOLS, serverDepsBlock, 'router_preview', {
+      category: 'bugfix',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.ok(!previewResBlock.isError);
+    // minimax-api is blocked, so it should fall back to claude-native
+    const blockDecision = previewResBlock.structuredContent!.decision as { laneId: string } | null;
+    assert.ok(blockDecision);
+    assert.equal(blockDecision.laneId, 'claude-native');
+
+    // 5. Test disabledLaneIds under YOLO
+    const policyYamlDisable = `disabledLaneIds:
+  - minimax-api
+`;
+    writeFileSync(join(dir, 'policy.yaml'), policyYamlDisable, 'utf8');
+    const serverDepsDisable = makeServerDeps(env);
+    const previewResDisable = await dispatch(TOOLS, serverDepsDisable, 'router_preview', {
+      category: 'bugfix',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.ok(!previewResDisable.isError);
+    const disableDecision = previewResDisable.structuredContent!.decision as { laneId: string } | null;
+    assert.ok(disableDecision);
+    assert.equal(disableDecision.laneId, 'claude-native');
+
+    // 6. YOLO-off byte-identical case
+    writeFileSync(join(dir, 'full-access.json'), JSON.stringify({}), 'utf8');
+    writeFileSync(join(dir, 'yolo.json'), JSON.stringify({ 'wiring-test': false }), 'utf8');
+    writeFileSync(join(dir, 'policy.yaml'), 'rules: []\n', 'utf8');
+    const serverDepsYoloOff = makeServerDeps(env);
+    const previewResYoloOff = await dispatch(TOOLS, serverDepsYoloOff, 'router_preview', {
+      category: 'bugfix',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.ok(!previewResYoloOff.isError);
+    const yoloOffIds = previewResYoloOff.structuredContent!.fullAccessLaneIds as string[];
+    assert.ok(!yoloOffIds || yoloOffIds.length === 0);
+    const yoloOffDecision = previewResYoloOff.structuredContent!.decision;
+    assert.ok(yoloOffDecision);
+    const expectedDecision = {
+      laneId: 'claude-native',
+      reason: 'Selected claude-native (claude-opus) for bugfix: capability 0.50 at subscription cost.',
+      scores: [
+        {
+          laneId: 'claude-native',
+          score: 0.45,
+          factors: {
+            capability: 0.5,
+            costPenalty: 0.05,
+            capPenalty: 0,
+            declared: 0.5,
+            evidenceN: 0
+          }
+        }
+      ],
+      policyVerdict: 'force-trusted'
+    };
+    assert.equal(JSON.stringify(yoloOffDecision), JSON.stringify(expectedDecision));
+
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
 
 test('router_set_policy tool sets, clears, and validates policy', async () => {
   let policySet: string | undefined = undefined;

@@ -239,3 +239,29 @@ test('eligibleLanes EXCLUDES an elevated reader when policyContext.secretHit ===
   const eligible = eligibleLanes(task, ctx, policy);
   assert.equal(eligible.some((e) => e.lane.id === 'minimax-api'), false);
 });
+
+test('core YOLO: reader is elevated, worker is not, and secretHit still blocks', () => {
+  const policy: Policy = {};
+  const task: Task = { category: 'feature' };
+  const ctx: RouteContext = {
+    lanes: [readerLane, workerLane, fullLane],
+    gateReady: true,
+    readerEgress: true,
+    yolo: true,
+    policyContext: { repo_class: 'private', sensitivity: 'sensitive' },
+    fullAccessLaneIds: ['minimax-api']
+  };
+  assert.equal(isReaderElevated(readerLane, ctx.fullAccessLaneIds), true);
+  assert.equal(isReaderElevated(workerLane, ctx.fullAccessLaneIds), false);
+
+  const eligible = eligibleLanes(task, ctx, policy);
+  assert.ok(eligible.some(e => e.lane.id === 'minimax-api'));
+
+  // Under secret hit, even with yolo, it should exclude the elevated reader
+  const ctxSecret: RouteContext = {
+    ...ctx,
+    policyContext: { ...ctx.policyContext, secretHit: true }
+  };
+  const eligibleSecret = eligibleLanes(task, ctxSecret, policy);
+  assert.equal(eligibleSecret.some(e => e.lane.id === 'minimax-api'), false);
+});

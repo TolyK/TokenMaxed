@@ -918,6 +918,15 @@ function policyExplanation(
             }
           }
         }
+        if (yolo) {
+          const configReaders = deps.readerLanes ? deps.readerLanes() : [];
+          for (const lane of configReaders) {
+            if (!fullAccessLaneIds.includes(lane.id)) {
+              fullAccessLaneIds.push(lane.id);
+            }
+          }
+        }
+
 
         // Same availability filter delegate routes with (when the host provides it),
         // so /tokenmaxed:why never advertises a lane that can't actually run. Probe
@@ -1005,7 +1014,7 @@ function policyExplanation(
         // verdict that would normally restrict the task to a full lane — say so, so the
         // pick isn't mistaken for a normal gated decision.
         const yoloNote = yolo
-          ? `  ⚠️ YOLO mode ON: trust/egress gates are bypassed — workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.`
+          ? `  ⚠️ YOLO mode ON: trust/egress gates are bypassed — workers/readers are selectable even on private/sensitive/unknown context, and reader lanes run with FULL repo access. Disable with /tokenmaxed:yolo off.`
           : undefined;
         // B: quota-pressure visibility — detected via the ACTUAL score factors
         // (no threshold duplication): a nonzero capPenalty on the winner means
@@ -1209,7 +1218,7 @@ function policyExplanation(
         }
         if (yolo) {
           lines.push(
-            '⚠️ YOLO mode is ON — every trust/egress gate is bypassed: ALL configured worker/reader lanes are selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner still runs. Disable with /tokenmaxed:yolo off.',
+            '⚠️ YOLO mode is ON — every trust/egress gate is bypassed: ALL configured worker/reader lanes are selectable regardless of repo_class/sensitivity or per-lane attestation, reader lanes run with FULL repo access, and (possibly private) repo code may be sent to any configured vendor. The secret scanner still runs. Disable with /tokenmaxed:yolo off.',
           );
         }
         if (preferred) {
@@ -1406,7 +1415,7 @@ function policyExplanation(
   const setYoloTool: ToolDef = {
     name: 'router_set_yolo',
     description:
-      "Turn YOLO mode ON or OFF for this project — the TokenMaxed analogue of Claude's --dangerously-skip-permissions. When ON, the router forces every trust/egress gate OPEN: ALL configured worker/reader lanes become selectable regardless of repo_class, sensitivity, the gate-ready/reader-egress opt-ins, or per-lane attestation, and a 'force-trusted' policy verdict no longer restricts a task to a full lane. This means (possibly private) repository code may be sent to ANY configured vendor lane. It does NOT disable the secret scanner, an explicit policy 'block' rule, the disabledLaneIds list, or the user-owned-config / RCE guard. The setting is persisted per project and survives restarts; the TOKENMAXED_DISABLE kill-switch always overrides it back off. Powers /tokenmaxed:yolo. Only enable on code you are comfortable sending to every lane you have configured.",
+      "Turn YOLO mode ON or OFF for this project — the TokenMaxed analogue of Claude's --dangerously-skip-permissions. When ON, the router forces every trust/egress gate OPEN: ALL configured worker/reader lanes become selectable regardless of repo_class, sensitivity, the gate-ready/reader-egress opt-ins, or per-lane attestation, reader lanes run with FULL repo access, and a 'force-trusted' policy verdict no longer restricts a task to a full lane. This means (possibly private) repository code may be sent to ANY configured vendor lane. It does NOT disable the secret scanner, an explicit policy 'block' rule, the disabledLaneIds list, or the user-owned-config / RCE guard. The setting is persisted per project and survives restarts; the TOKENMAXED_DISABLE kill-switch always overrides it back off. Powers /tokenmaxed:yolo. Only enable on code you are comfortable sending to every lane you have configured.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -1425,7 +1434,7 @@ function policyExplanation(
         if (!deps.setYolo) throw new ToolInputError('YOLO mode is not supported by this server build.');
         deps.setYolo(enabled);
         const text = enabled
-          ? '⚠️ YOLO mode ENABLED for this project — every trust/egress gate is bypassed: ALL configured worker/reader lanes are now selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner, explicit policy `block` rules, and disabledLaneIds still apply. Run /tokenmaxed:yolo off to restore normal gated routing.'
+          ? '⚠️ YOLO mode ENABLED for this project — every trust/egress gate is bypassed: ALL configured worker/reader lanes are now selectable regardless of repo_class/sensitivity or per-lane attestation, reader lanes run with FULL repo access, and (possibly private) repo code may be sent to any configured vendor. The secret scanner, explicit policy `block` rules, and disabledLaneIds still apply. Run /tokenmaxed:yolo off to restore normal gated routing.'
           : 'YOLO mode DISABLED for this project — routing is back to normal gated behavior (trust/egress gates enforced).';
         return ok(text, { yolo: enabled });
       }),
@@ -1861,7 +1870,7 @@ function policyExplanation(
               : []),
           `  reader egress: ${r.readerEgress ? 'on' : 'off'} (enable with TOKENMAXED_READER_EGRESS=true — lets reader lanes receive repo-read code; also needs per-lane repo_read_attestation)`,
           `  tiered routing: ${r.tiered ? 'on' : 'off'} (enable with TOKENMAXED_TIERED=true — start on the cheapest lane clearing the capability floor, step up on review failure)`,
-          `  YOLO mode: ${r.yolo ? '⚠️ ON (env default)' : 'off'} (the --dangerously-skip-permissions analogue: TOKENMAXED_YOLO=true or /tokenmaxed:yolo on — bypasses ALL trust/egress gates so every worker/reader lane is selectable; secret scanner still applies)`,
+          `  YOLO mode: ${r.yolo ? '⚠️ ON (env default)' : 'off'} (the --dangerously-skip-permissions analogue: TOKENMAXED_YOLO=true or /tokenmaxed:yolo on — bypasses ALL trust/egress gates so every worker/reader lane is selectable, reader lanes run with FULL repo access; secret scanner still applies)`,
           '',
           ...(r.laneReview === 'changed'
             ? ['⚠ Your lanes changed since you last reviewed them — confirm the summary below.']
