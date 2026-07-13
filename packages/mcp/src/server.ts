@@ -37,7 +37,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
-  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor, quotaEstimate, forecastCost } from '@tokenmaxed/core';
+  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor, quotaEstimate, forecastCost, contributingOutcomes } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent, QuotaEstimate, CostForecast } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -74,6 +74,7 @@ import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
 import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
+import { readFrozen, writeFrozen } from './freeze.ts';
 import { readPolicy, writePolicy, isValidRoutingPolicy } from './routing-policy.ts';
 import type { PolicyStore, NamedRoutingPolicy } from './routing-policy.ts';
 import { readReserves, writeReserve } from './reserve.ts';
@@ -318,7 +319,7 @@ function fileFullAccessStore(statePath: string): FullAccessStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost };
+export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -732,7 +733,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // off/error ⇒ no ctx fields ⇒ declared priors, byte-identical scores.
   const capabilityPriorFor = (lanes: readonly Lane[]) => loadCapabilityPriorState(env, lanes);
   const buildObservedByModel = (): ObservedCapabilityByModel | undefined => {
-    if (!learnEnabled) return undefined;
+    if (!learnEnabled || readFrozenState()) return undefined;
     // Fail OPEN: a malformed/unreadable ledger must never block routing (mirrors
     // the best-effort recording path). On any read/parse error, fall back to
     // declared capability by returning undefined.
@@ -746,7 +747,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // Consulted by core only for a difficulty-tagged task (explicit on the request,
   // or an escalation leg), so its presence alone never changes routing.
   const buildObservedByModelDifficulty = (): ObservedCapabilityByModelDifficulty | undefined => {
-    if (!learnEnabled) return undefined;
+    if (!learnEnabled || readFrozenState()) return undefined;
     try {
       return outcomeCapabilityByDifficulty(new JsonlLedger(ledgerPath).readAll(), Date.now());
     } catch {
@@ -774,6 +775,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || undefined;
   const readPreferredLane = (): string | undefined => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
+
+  const freezeStatePath = env.TOKENMAXED_FREEZE_STATE ?? join(dirname(statePath), 'learning-frozen.json');
+  const freezeStore = fileToggleStore(freezeStatePath);
+  const readFrozenState = (): boolean => readFrozen(freezeStore, projectKey);
+  const writeFrozenState = (on: boolean): void => writeFrozen(freezeStore, projectKey, on);
 
   // Per-project named routing policy store (policy.json).
   // An env var TOKENMAXED_ROUTING_POLICY is a fallback default; the per-project
@@ -1463,6 +1469,10 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
 
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
+    getFrozen: readFrozenState,
+    setFrozen: writeFrozenState,
+    appendOutcome: (input) => new JsonlLedger(ledgerPath).appendOutcome(input),
+    newId: () => randomUUID(),
     // The documented route input (capability-0 opt-outs excluded) minus
     // unpriceable metered lanes. When escalation is on, ALSO reserve manager-
     // eligible lanes (as delegate does), so /tokenmaxed:why mirrors the initial

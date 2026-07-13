@@ -152,6 +152,8 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:until <lane> <until>` · `/tokenmaxed:until off` | pace the lane so it lasts until the specified target datetime (ISO format, e.g. "2026-07-15T09:00"); clears with `off`. Persisted per project; no relaunch. |
 | `/tokenmaxed:full-access [model]` · `/tokenmaxed:full-access off` | grant/revoke a named model's reader lane(s) full repo access — the scoped alternative to YOLO; secret scanner still enforced; output reader-derived. |
 | `/tokenmaxed:yolo` · `/tokenmaxed:yolo off` | **⚠️ dangerous** — turn YOLO mode on/off for this project (the `--dangerously-skip-permissions` analogue); see **YOLO mode** under optional features below. |
+| `/tokenmaxed:feedback <verdict>` | record direct user feedback on routing or offload quality (`good` / `wrong-model` / `bad-output` / `too-slow`). Opinions feed learned capabilities exactly like manager reviews. |
+| `/tokenmaxed:freeze [on\|off]` | temporarily freeze or unfreeze capability outcome learning for this project; routing falls back to declared/prior capability without recent outcomes. Persisted per project; no relaunch. |
 
 ### Launch it (and turn on optional features)
 
@@ -324,8 +326,7 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     when a reviewed result still failed, or — when no eligible manager is available
     — the result delivered **unreviewed**), and the per-offload escalation rate
     shows up in `/tokenmaxed:savings`.
-  - **Learned capability** — let observed manager-review outcomes adjust routing
-    over time; enable with `TOKENMAXED_LEARN_CAPABILITY=true`. Each lane's
+  - **Learned capability** — let observed manager-review outcomes and direct user feedback (`/tokenmaxed:feedback`) adjust routing over time; enable with `TOKENMAXED_LEARN_CAPABILITY=true`. Each lane's
     hand-assigned per-category `capability` score is treated as a **prior**; the
     recent pass/needs-rework/fail rate for that lane×category (recency-decayed,
     ~30-day half-life) shrinks it toward what's actually observed. A cheap lane
@@ -476,7 +477,7 @@ that visible and gives you the choice:
 
 The same brain, natively in OpenAI's Codex CLI (v0.124+ for hooks): the plugin
 bundles the MCP server (tools appear as `tokenmaxed:router_delegate` etc.),
-all thirteen skills (`$tokenmaxed-setup`, `$tokenmaxed-why`, …, generated from
+all twenty-two skills (`$tokenmaxed-setup`, `$tokenmaxed-why`, …, generated from
 the Claude Code skills — one source of truth), and the same lifecycle
 protections — the session-start summary, the PreToolUse routing gate, and the
 turn-end review loop (Codex's Stop hook `block` semantics drive the rework
@@ -501,7 +502,7 @@ lanes, policy, ledger, settings — is the same user-owned `~/.tokenmaxed`.
 The same brain in [OpenCode](https://opencode.ai) (v1.17+): a bundled MCP
 server (tools appear as `tokenmaxed_router_delegate` etc.), an in-process
 lifecycle plugin (session summary banner, deterministic routing gate on the
-delegate tool), and all thirteen commands (`/tokenmaxed-setup`,
+delegate tool), and all twenty-two commands (`/tokenmaxed-setup`,
 `/tokenmaxed-why`, … — generated from the Claude Code skills, one source of
 truth).
 
@@ -538,7 +539,7 @@ session banner, a real routing-gate veto (`before_tool_call`), and — unlike
 OpenCode — a real turn-end review gate: OpenClaw's `before_agent_finalize`
 hook can force a rework pass (`action: revise`), so the review loop iterates
 natively, bounded by the same per-session round cap as the other hosts. All
-thirteen skills ship in OpenClaw's native AgentSkills format (manual-only
+twenty-two skills ship in OpenClaw's native AgentSkills format (manual-only
 skills keep `disable-model-invocation`).
 
 ```bash
@@ -569,7 +570,7 @@ The same brain in [Cline](https://cline.bot), both surfaces: a bundled MCP
 server (tools appear as `tokenmaxed__router_delegate` on the CLI, or via
 `use_mcp_tool` in the VS Code extension), the PreToolUse routing gate (the one
 blocking file hook Cline offers — it handles both surfaces' payload shapes),
-the TaskStart session banner, and all thirteen skills in Cline's native
+the TaskStart session banner, and all twenty-two skills in Cline's native
 SKILL.md format.
 
 ```bash
@@ -601,7 +602,7 @@ The same brain in [Hermes](https://github.com/NousResearch/hermes-agent)
 (`pre_tool_call` veto), the session banner (`pre_llm_call` context injection,
 once per session), and a real turn-end review via `pre_verify`, which can
 force another agent iteration with the reviewer notes (capped host-side by
-`agent.max_verify_nudges`) — plus all thirteen skills, loaded in place via
+`agent.max_verify_nudges`) — plus all twenty-two skills, loaded in place via
 `skills.external_dirs` (each auto-becomes `/tokenmaxed-<name>`).
 
 ```bash

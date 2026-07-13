@@ -36,6 +36,9 @@ import type {
   TaskCategory,
   TaskStatus,
   TokenStats,
+  OutcomeEventInput,
+  OutcomeEvent,
+  ReviewVerdict,
   QuotaEstimate,
   CostForecast,
   CostBasis,
@@ -88,6 +91,7 @@ export interface CorePort {
    */
   resolvedPriorFor?: (lane: Lane, category: TaskCategory, priorOverlay?: CapabilityPriorOverlay, opts?: ResolvedPriorOptions) => ResolvedPrior;
   forecastCost?: (promptText: string, lane: { model: string; costBasis: CostBasis }, priceTable?: PriceTable) => CostForecast;
+  contributingOutcomes?: (events: readonly LedgerEvent[], now: number, opts?: any) => OutcomeEvent[];
 }
 
 /** P2: metadata about the active rankings snapshot, for /why + /status + setup. */
@@ -249,6 +253,14 @@ export interface ToolDeps {
   preferredLane?: () => string | undefined;
   /** Set (lane id) or clear (undefined) the per-project preferred lane. Powers /tokenmaxed:prefer. */
   setPreferredLane?: (laneId: string | undefined) => void;
+  /** Generate a new unique ID (UUID). */
+  newId?: () => string;
+  /** Append one outcome (review) event; returns the persisted event. */
+  appendOutcome?: (input: OutcomeEventInput) => OutcomeEvent;
+  /** Whether capability learning is frozen for the project. */
+  getFrozen?: () => boolean;
+  /** Set or clear the project's frozen capability learning state. */
+  setFrozen?: (frozen: boolean) => void;
   /** The per-project named routing policy, or undefined when unset. */
   routingPolicy?: () => NamedRoutingPolicy | undefined;
   /** Set (policy name) or clear (undefined) the per-project named routing policy. Powers /tokenmaxed:policy. */
@@ -909,10 +921,10 @@ function policyExplanation(
         }
         // Apply the learned overlay (F-1) so /tokenmaxed:why reflects the same
         // effective capability router_delegate routes with. Undefined ⇒ declared.
-        const observedCapability = deps.observedCapability();
-        const observedCapabilityByModel = deps.observedCapabilityByModel?.();
+        const observedCapability = deps.getFrozen?.() ? undefined : deps.observedCapability();
+        const observedCapabilityByModel = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModel?.();
         // P6 §4: consulted by core only when the previewed task carries a difficulty.
-        const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
+        const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModelDifficulty?.();
         // P2: the rankings prior — the SAME loader delegate uses, so /why shows the
         // same prior-adjusted pick. 'off'/'error' (or an absent dep) ⇒ no ctx fields
         // ⇒ declared priors, byte-identical to before. NOTE: under escalation the
@@ -1038,6 +1050,9 @@ function policyExplanation(
         // pick isn't mistaken for a normal gated decision.
         const yoloNote = yolo
           ? `  ⚠️ YOLO mode ON: trust/egress gates are bypassed — workers/readers are selectable even on private/sensitive/unknown context, and reader lanes run with FULL repo access. Disable with /tokenmaxed:yolo off.`
+          : undefined;
+        const freezeNote = deps.getFrozen?.()
+          ? '  learning: frozen for this project (outcome learning is paused; routing falls back to declared/prior capability without recent outcomes).'
           : undefined;
         // B: quota-pressure visibility — detected via the ACTUAL score factors
         // (no threshold duplication): a nonzero capPenalty on the winner means
@@ -1230,6 +1245,36 @@ function policyExplanation(
             forecastLine = `  forecast: ~${int(forecast.estTokensIn)} input tok${costStr} (${forecast.note})${skippedNote}`;
           }
         }
+        let decisionReason = decision.reason;
+        if (lane) {
+          const winnerModel = lane.model;
+          let hasUserFeedback = false;
+          try {
+            const ledger = deps.readLedger?.() ?? [];
+            if (core.contributingOutcomes) {
+              const contribs = core.contributingOutcomes(ledger, deps.now());
+              for (const e of contribs) {
+                const resolved = e.subject_model_resolved?.trim();
+                const raw = e.subject_model?.trim();
+                const eModel = resolved || raw || '';
+                if (
+                  e.voter === 'user' &&
+                  e.category === category &&
+                  eModel === winnerModel
+                ) {
+                  hasUserFeedback = true;
+                  break;
+                }
+              }
+            }
+          } catch {
+            // ignore ledger read errors for preview tool
+          }
+          if (hasUserFeedback && decisionReason.includes('(learned:')) {
+            decisionReason = decisionReason.replace(/\(learned:\s*([^)]+)\)/, '(learned (includes your feedback): $1)');
+            decision = { ...decision, reason: decisionReason };
+          }
+        }
 
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
@@ -1237,7 +1282,7 @@ function policyExplanation(
           ...(pinnedModel ? [`  model pinned by request: "${pinnedModel}" — only lanes serving it were considered (no substitution on failure).`] : []),
           lane ? `  ${lane.kind} · ${lane.model} · trust=${lane.trust_mode}` : '  (lane not found in config)',
           `  policy verdict: ${verdict}`,
-          `  why: ${decision.reason}`,
+          `  why: ${decisionReason}`,
           ...(forecastLine ? [forecastLine] : []),
           ...(difficulty
             ? [
@@ -1250,8 +1295,9 @@ function policyExplanation(
           ...hostLines,
           ...(yoloNote ? [yoloNote] : []),
           ...(preferNote ? [preferNote] : []),
+          ...(freezeNote ? [freezeNote] : []),
         ].join('\n');
-        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}), ...(hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}), ...(forecastData ? { forecast: forecastData } : {}) });
+        return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...(difficulty ? { difficulty } : {}), ...(priorStructured ? { capabilityPrior: priorStructured } : {}), ...(preferLaneId ? { preferLaneId } : {}), ...(deps.getFrozen?.() ? { frozen: true } : {}), ...(hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}), ...(forecastData ? { forecast: forecastData } : {}) });
       }),
   };
 
@@ -1271,9 +1317,27 @@ function policyExplanation(
         const yolo = deps.getYolo?.() ?? false;
         const policy = deps.routingPolicy?.() ?? 'balanced';
         const explicitPolicy = deps.routingPolicyExplicit?.() ?? false;
+        const frozen = deps.getFrozen?.() ?? false;
         const lines = [`TokenMaxed routing is ${enabled ? 'ENABLED' : 'DISABLED'} for this project.`];
         if (explicitPolicy) {
           lines.push(`Active routing policy: ${policy}`);
+        }
+        if (frozen) {
+          lines.push('Capability learning is frozen for this project (routing falls back to declared/prior capability without recent outcomes).');
+        }
+        let userFeedbackEvents: OutcomeEvent[] = [];
+        try {
+          userFeedbackEvents = (deps.readLedger?.() ?? []).filter(
+            (e): e is OutcomeEvent => e.event_type === 'outcome' && e.voter === 'user'
+          );
+        } catch {
+          // ignore ledger read errors for status tool
+        }
+        const pass = userFeedbackEvents.filter((e) => e.verdict === 'pass').length;
+        const needsRework = userFeedbackEvents.filter((e) => e.verdict === 'needs-rework').length;
+        const fail = userFeedbackEvents.filter((e) => e.verdict === 'fail').length;
+        if (userFeedbackEvents.length > 0) {
+          lines.push(`Lifetime raw user feedback counts: ${pass} good, ${needsRework} too-slow, ${fail} bad/wrong-model (opinion-only; not the deduped/decayed learning evidence).`);
         }
         if (yolo) {
           lines.push(
@@ -1412,6 +1476,8 @@ function policyExplanation(
           yolo,
           policy,
           ...(preferred ? { preferLaneId: preferred } : {}),
+          ...(frozen ? { frozen: true } : {}),
+          ...(userFeedbackEvents.length > 0 ? { userFeedbackCounts: { pass, needsRework, fail } } : {}),
           staleness: warnings as unknown as Record<string, unknown>[],
           idMismatch: mismatches as unknown as Record<string, unknown>[],
         });
@@ -2209,6 +2275,219 @@ function policyExplanation(
       }),
   };
 
+  const feedbackTool: ToolDef = {
+    name: 'router_feedback',
+    description:
+      'Record direct user feedback on routing / offload quality to adapt future decisions. The feedback verdict can apply to the LAST offload in the ledger or target an explicit lane + category (+ optional difficulty). Opinions are marked as user feedback and feed learned capabilities exactly like manager reviews. Content-free.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['verdict'],
+      properties: {
+        verdict: {
+          type: 'string',
+          enum: ['good', 'wrong-model', 'bad-output', 'too-slow'],
+          description: 'The user verdict on the offload quality.',
+        },
+        lane: {
+          type: 'string',
+          description: 'OPTIONAL explicit lane id to target (requires category).',
+        },
+        category: {
+          type: 'string',
+          enum: [...core.taskCategories],
+          description: 'OPTIONAL explicit category to target (requires lane).',
+        },
+        difficulty: {
+          type: 'string',
+          enum: [...DIFFICULTIES],
+          description: 'OPTIONAL explicit difficulty to target (requires lane + category).',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        if (!('verdict' in args)) {
+          throw new ToolInputError('"verdict" is required.');
+        }
+        const verdict = optEnum(args, 'verdict', ['good', 'wrong-model', 'bad-output', 'too-slow'] as const);
+        if (verdict === undefined) {
+          throw new ToolInputError('Invalid verdict. Allowed values: good, wrong-model, bad-output, too-slow.');
+        }
+
+        if ('lane' in args) {
+          const laneVal = args.lane;
+          if (typeof laneVal !== 'string' || laneVal.trim() === '') {
+            throw new ToolInputError('"lane" cannot be blank when supplied.');
+          }
+        }
+
+        if ('category' in args) {
+          const catVal = args.category;
+          if (typeof catVal !== 'string' || !core.taskCategories.includes(catVal as any)) {
+            throw new ToolInputError(`Invalid category. Allowed values: ${core.taskCategories.join(', ')}.`);
+          }
+        }
+
+        if ('difficulty' in args) {
+          const diffVal = args.difficulty;
+          if (typeof diffVal !== 'string' || !DIFFICULTIES.includes(diffVal as any)) {
+            throw new ToolInputError(`Invalid difficulty. Allowed values: ${DIFFICULTIES.join(', ')}.`);
+          }
+        }
+
+        const explicitLane = optString(args, 'lane')?.trim();
+        const explicitCategory = optEnum(args, 'category', core.taskCategories);
+        const explicitDifficulty = optEnum(args, 'difficulty', DIFFICULTIES);
+
+        if (explicitDifficulty && (!explicitLane || !explicitCategory)) {
+          throw new ToolInputError('"difficulty" requires both "lane" and "category".');
+        }
+        if ((args.lane !== undefined || args.category !== undefined) && (!explicitLane || !explicitCategory)) {
+          throw new ToolInputError('Explicit targeting requires both "lane" and "category".');
+        }
+
+        let subjectLaneId: string;
+        let subjectModel: string;
+        let subjectModelResolved: string;
+        let category: TaskCategory;
+        let difficulty: DifficultyBucket | undefined;
+        let taskId: string;
+        let attempt = 0;
+
+        if (explicitLane && explicitCategory) {
+          const allLanes = deps.allLanes?.() ?? [];
+          const found = allLanes.find((l) => l.id === explicitLane);
+          if (!found) {
+            throw new ToolInputError(`Lane "${explicitLane}" is not configured.`);
+          }
+          subjectLaneId = explicitLane;
+          subjectModel = found.model;
+          subjectModelResolved = found.model;
+          category = explicitCategory;
+          difficulty = explicitDifficulty;
+          taskId = deps.newId ? deps.newId() : Math.random().toString(36).substring(2, 15);
+        } else {
+          // target last offload
+          let ledger: LedgerEvent[];
+          try {
+            ledger = deps.readLedger();
+          } catch (err) {
+            throw new Error(`Failed to read ledger: ${(err as any).message}`);
+          }
+          if (!ledger || ledger.length === 0) {
+            throw new ToolInputError('No recent offloads found in the ledger to rate (ledger is empty).');
+          }
+          let lastOffload: LedgerEvent | undefined;
+          for (const e of ledger) {
+            if (e.event_type === 'task' && e.status !== 'native') {
+              if (!lastOffload) {
+                lastOffload = e;
+              } else {
+                const currentSeq = e.seq ?? 0;
+                const bestSeq = lastOffload.seq ?? 0;
+                if (currentSeq > bestSeq) {
+                  lastOffload = e;
+                } else if (currentSeq === bestSeq) {
+                  const currentTs = e.ts ? new Date(e.ts).getTime() : 0;
+                  const bestTs = lastOffload.ts ? new Date(lastOffload.ts).getTime() : 0;
+                  if (currentTs > bestTs) {
+                    lastOffload = e;
+                  }
+                }
+              }
+            }
+          }
+          if (!lastOffload || lastOffload.event_type !== 'task') {
+            throw new ToolInputError('No recent offloads found in the ledger to rate (no non-native task events).');
+          }
+          subjectLaneId = lastOffload.laneId;
+          subjectModel = lastOffload.model;
+          subjectModelResolved = lastOffload.model;
+          category = lastOffload.category;
+          difficulty = undefined;
+          taskId = lastOffload.task_id;
+          attempt = lastOffload.attempt;
+        }
+
+        // Map verdict to ReviewVerdict: good => pass, wrong-model/bad-output => fail, too-slow => needs-rework
+        let mappedVerdict: ReviewVerdict;
+        if (verdict === 'good') {
+          mappedVerdict = 'pass';
+        } else if (verdict === 'too-slow') {
+          mappedVerdict = 'needs-rework';
+        } else {
+          mappedVerdict = 'fail';
+        }
+
+        const newReviewId = deps.newId ? deps.newId() : Math.random().toString(36).substring(2, 15);
+        const outcomeInput: OutcomeEventInput = {
+          subject_id: taskId,
+          subject_type: 'router_task',
+          review_id: newReviewId,
+          attempt,
+          category,
+          reviewer_lane_id: 'user',
+          reviewer_model: 'user',
+          reviewer_trust_mode: 'full',
+          reviewer_provenance: 'user',
+          verdict: mappedVerdict,
+          voter: 'user',
+          policy_verdict: 'allow',
+          subject_lane_id: subjectLaneId,
+          subject_model: subjectModel,
+          subject_model_resolved: subjectModelResolved,
+          task_id: taskId,
+          ...(difficulty ? { difficulty } : {}),
+        };
+
+        if (!deps.appendOutcome) {
+          throw new Error('Ledger writing is not supported by this host.');
+        }
+
+        const event = deps.appendOutcome(outcomeInput);
+
+        const targetMsg = explicitLane
+          ? `explicitly for lane "${subjectLaneId}" (category ${category}${difficulty ? `, difficulty ${difficulty}` : ''})`
+          : `for the last offload on lane "${subjectLaneId}" (task ${taskId}, category ${category}${difficulty ? `, difficulty ${difficulty}` : ''})`;
+
+        return ok(
+          `Recorded user feedback: rated "${verdict}" (mapped to "${mappedVerdict}") ${targetMsg}.`,
+          { verdict: mappedVerdict, voter: 'user', event }
+        );
+      }),
+  };
+
+  const setFreezeTool: ToolDef = {
+    name: 'router_set_freeze',
+    description:
+      'Freeze or unfreeze TokenMaxed capability outcome learning for this project. When frozen, accumulated outcome learning is paused, and routing falls back to declared/prior capability without recent outcomes. User feedback and reviews are still recorded in the ledger but will not affect routing. Persisted per project. Powers /tokenmaxed:freeze.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['enabled'],
+      properties: {
+        enabled: {
+          type: 'boolean',
+          description: 'Whether to freeze learning for the project (true = freeze, false = unfreeze).',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const enabled = optBool(args, 'enabled');
+        if (enabled === undefined) throw new ToolInputError('"enabled" is required.');
+        if (!deps.setFrozen) {
+          throw new Error('Project settings write is not supported by this host.');
+        }
+        deps.setFrozen(enabled);
+        const msg = enabled
+          ? 'Capability outcome learning is FROZEN for this project (routing falls back to declared/prior capability without recent outcomes).'
+          : 'Capability outcome learning is UNFROZEN for this project (outcome learning is active/resumed).';
+        return ok(msg, { frozen: enabled });
+      }),
+  };
+
   const doctorTool: ToolDef = {
     name: 'router_doctor',
     description:
@@ -2233,7 +2512,7 @@ function policyExplanation(
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

@@ -28,8 +28,9 @@ import {
   SCHEMA_VERSION,
   serializeEvent,
   forecastCost,
+  contributingOutcomes,
 } from '../../core/src/index.ts';
-import type { Lane, LedgerEvent, Policy, RouteDecision } from '../../core/src/index.ts';
+import type { Lane, LedgerEvent, Policy, RouteDecision, OutcomeEventInput, OutcomeEvent } from '../../core/src/index.ts';
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -56,6 +57,7 @@ const CORE: CorePort = {
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
   forecastCost,
+  contributingOutcomes,
 };
 const TOOLS = createTools(CORE);
 
@@ -160,11 +162,13 @@ test('builds the expected tool set with object input schemas', () => {
       'router_config',
       'router_delegate',
       'router_doctor',
+      'router_feedback',
       'router_preview',
       'router_review',
       'router_savings',
       'router_set_calibration',
       'router_set_enabled',
+      'router_set_freeze',
       'router_set_full_access',
       'router_set_policy',
       'router_set_prefer',
@@ -1726,4 +1730,315 @@ test('router_doctor runs diagnostics and formats findings sorted by severity', a
     (resFindings.structuredContent!.findings as any[]).map((f) => f.title),
     ['Malformed config', 'Stale model', 'Plugin suggestion']
   );
+});
+
+test('router_feedback: records user feedback (good/wrong-model/bad-output/too-slow) and targets last offload or explicit lane+category', async () => {
+  const ledger: LedgerEvent[] = [
+    taskEvent({ ts: new Date().toISOString(), task_id: 't-last', laneId: 'lane-a', model: 'model-a', category: 'bugfix', attempt: 0, status: 'ok' }),
+  ];
+  const outcomesAppended: OutcomeEventInput[] = [];
+  const d = deps({
+    readLedger: () => ledger,
+    allLanes: () => [lane({ id: 'lane-a', model: 'model-a' }), lane({ id: 'lane-b', model: 'model-b' })],
+    appendOutcome: (input) => {
+      outcomesAppended.push(input);
+      return { ...input, event_type: 'outcome', id: 'new-id', seq: 2, ts: new Date().toISOString() } as any;
+    },
+    newId: () => 'uid-123',
+  });
+
+  // 1. last offload, good feedback
+  const r1 = await call('router_feedback', d, { verdict: 'good' });
+  assert.notEqual(r1.isError, true);
+  assert.equal(outcomesAppended.length, 1);
+  const ev1 = outcomesAppended[0]!;
+  assert.equal(ev1.subject_id, 't-last');
+  assert.equal(ev1.subject_lane_id, 'lane-a');
+  assert.equal(ev1.subject_model, 'model-a');
+  assert.equal(ev1.category, 'bugfix');
+  assert.equal(ev1.verdict, 'pass');
+  assert.equal(ev1.voter, 'user');
+  assert.equal(ev1.reviewer_lane_id, 'user');
+  assert.equal(ev1.reviewer_model, 'user');
+
+  // 2. last offload, wrong-model feedback (maps to fail)
+  const r2 = await call('router_feedback', d, { verdict: 'wrong-model' });
+  assert.equal(outcomesAppended[1]!.verdict, 'fail');
+
+  // 3. last offload, bad-output feedback (maps to fail)
+  const r3 = await call('router_feedback', d, { verdict: 'bad-output' });
+  assert.equal(outcomesAppended[2]!.verdict, 'fail');
+
+  // 4. last offload, too-slow feedback (maps to needs-rework)
+  const r4 = await call('router_feedback', d, { verdict: 'too-slow' });
+  assert.equal(outcomesAppended[3]!.verdict, 'needs-rework');
+
+  // 5. explicit targeting
+  const r5 = await call('router_feedback', d, { verdict: 'good', lane: 'lane-b', category: 'codegen', difficulty: 'easy' });
+  assert.notEqual(r5.isError, true);
+  const ev5 = outcomesAppended[4]!;
+  assert.equal(ev5.subject_lane_id, 'lane-b');
+  assert.equal(ev5.subject_model, 'model-b');
+  assert.equal(ev5.category, 'codegen');
+  assert.equal(ev5.difficulty, 'easy');
+  assert.equal(ev5.verdict, 'pass');
+  assert.equal(ev5.voter, 'user');
+});
+
+test('router_set_freeze: toggles freeze learning state and builds observed capability accordingly', async () => {
+  let frozenState = false;
+  const d = deps({
+    getFrozen: () => frozenState,
+    setFrozen: (f) => { frozenState = f; },
+    readLedger: () => [],
+  });
+
+  // check freeze on
+  const r1 = await call('router_set_freeze', d, { enabled: true });
+  assert.notEqual(r1.isError, true);
+  assert.equal(frozenState, true);
+  assert.match(r1.content[0]!.text, /FROZEN/);
+
+  // check status reports it
+  const rStatus = await call('router_status', d);
+  assert.match(rStatus.content[0]!.text, /Capability learning is frozen/);
+
+  // check freeze off
+  const r2 = await call('router_set_freeze', d, { enabled: false });
+  assert.notEqual(r2.isError, true);
+  assert.equal(frozenState, false);
+  assert.match(r2.content[0]!.text, /UNFROZEN/);
+});
+
+test('freeze: suppresses observed overlays so routing uses declared capability only', async () => {
+  const strong = lane({ id: 'strong', model: 'strong-m', costBasis: 'subscription', capability: { bugfix: 0.85 } });
+  const cheap = lane({ id: 'cheap', model: 'cheap-m', costBasis: 'local', capability: { bugfix: 0.6 } });
+  const lanes = [strong, cheap];
+  const overlay = { 'cheap-m': { bugfix: { rate: 1.0, n: 100_000 } } };
+
+  // 1. With learning on and not frozen, cheap lane wins because overlay is used
+  const dNotFrozen = deps({
+    candidateLanes: () => lanes,
+    observedCapabilityByModel: () => overlay,
+    getFrozen: () => false,
+  });
+  const r1 = await call('router_preview', dNotFrozen, { category: 'bugfix' });
+  assert.equal((r1.structuredContent!.decision as { laneId: string }).laneId, 'cheap');
+
+  // 2. With learning on but frozen, strong lane wins because overlay is suppressed
+  const dFrozen = deps({
+    candidateLanes: () => lanes,
+    observedCapabilityByModel: () => overlay,
+    getFrozen: () => true,
+  });
+  const r2 = await call('router_preview', dFrozen, { category: 'bugfix' });
+  assert.equal((r2.structuredContent!.decision as { laneId: string }).laneId, 'strong');
+  assert.match(r2.content[0]!.text, /learning: frozen for this project/);
+});
+
+test('router_feedback: edge cases and validations', async () => {
+  const allLanes = [lane({ id: 'lane-a', model: 'model-a' })];
+  const dEmptyLedger = deps({
+    readLedger: () => [],
+    allLanes: () => allLanes,
+  });
+
+  // 1. Missing verdict
+  const rMissingVerdict = await call('router_feedback', dEmptyLedger, {} as any);
+  assert.equal(rMissingVerdict.isError, true);
+  assert.match(rMissingVerdict.content[0]!.text, /"verdict" is required/);
+
+  // 2. Bad verdict enum
+  const rBadVerdict = await call('router_feedback', dEmptyLedger, { verdict: 'excellent' });
+  assert.equal(rBadVerdict.isError, true);
+  assert.match(rBadVerdict.content[0]!.text, /must be one of/);
+
+  // 3. Blank lane
+  const rBlankLane = await call('router_feedback', dEmptyLedger, { verdict: 'good', lane: '  ', category: 'bugfix' });
+  assert.equal(rBlankLane.isError, true);
+  assert.match(rBlankLane.content[0]!.text, /cannot be blank/);
+
+  // 4. Invalid category
+  const rBadCat = await call('router_feedback', dEmptyLedger, { verdict: 'good', lane: 'lane-a', category: 'writing' });
+  assert.equal(rBadCat.isError, true);
+  assert.match(rBadCat.content[0]!.text, /Invalid category/);
+
+  // 5. Partial target (lane without category)
+  const rPartialLane = await call('router_feedback', dEmptyLedger, { verdict: 'good', lane: 'lane-a' });
+  assert.equal(rPartialLane.isError, true);
+  assert.match(rPartialLane.content[0]!.text, /requires both/);
+
+  // 6. Unknown lane
+  const rUnknownLane = await call('router_feedback', dEmptyLedger, { verdict: 'good', lane: 'unknown-lane', category: 'bugfix' });
+  assert.equal(rUnknownLane.isError, true);
+  assert.match(rUnknownLane.content[0]!.text, /is not configured/);
+
+  // 7. Native-only ledger
+  const dNativeOnly = deps({
+    readLedger: () => [taskEvent({ ts: new Date().toISOString(), laneId: 'native', model: 'native', category: 'bugfix', status: 'native' })],
+    allLanes: () => allLanes,
+  });
+  const rNativeOnly = await call('router_feedback', dNativeOnly, { verdict: 'good' });
+  assert.equal(rNativeOnly.isError, true);
+  assert.match(rNativeOnly.content[0]!.text, /no non-native task events/);
+
+  // 8. Empty ledger
+  const rEmpty = await call('router_feedback', dEmptyLedger, { verdict: 'good' });
+  assert.equal(rEmpty.isError, true);
+  assert.match(rEmpty.content[0]!.text, /ledger is empty/);
+
+  // 9. Unreadable ledger
+  const dUnreadable = deps({
+    readLedger: () => { throw new Error('disk failure'); },
+    allLanes: () => allLanes,
+  });
+  const rUnreadable = await call('router_feedback', dUnreadable, { verdict: 'good' });
+  assert.equal(rUnreadable.isError, true);
+  assert.match(rUnreadable.content[0]!.text, /Failed to read ledger/);
+});
+
+test('router_set_freeze: validation of missing freeze boolean', async () => {
+  const d = deps({
+    getFrozen: () => false,
+    setFrozen: () => {},
+  });
+  const r = await call('router_set_freeze', d, {} as any);
+  assert.equal(r.isError, true);
+  assert.match(r.content[0]!.text, /"enabled" is required/);
+});
+
+test('preview includes user feedback provenance annotation in why reasoning only when it actually contributes', async () => {
+  const strong = lane({ id: 'strong', model: 'strong-m', costBasis: 'subscription', capability: { bugfix: 0.85 } });
+  const cheap = lane({ id: 'cheap', model: 'cheap-m', costBasis: 'local', capability: { bugfix: 0.6 } });
+  const lanes = [strong, cheap];
+  const overlay = { 'cheap-m': { bugfix: { rate: 1.0, n: 100_000 } } };
+
+  // 1. Contributing user feedback -> should show "(includes your feedback)"
+  const dContributing = deps({
+    candidateLanes: () => lanes,
+    observedCapabilityByModel: () => overlay,
+    getFrozen: () => false,
+    readLedger: () => [
+      {
+        event_type: 'outcome',
+        subject_type: 'router_task',
+        task_id: 't1',
+        attempt: 0,
+        seq: 1,
+        category: 'bugfix',
+        subject_lane_id: 'cheap',
+        subject_model: 'cheap-m',
+        subject_model_resolved: 'cheap-m',
+        verdict: 'pass',
+        voter: 'user',
+        ts: new Date(FIXED_NOW).toISOString(),
+      } as any,
+    ],
+  });
+
+  const res1 = await call('router_preview', dContributing, { category: 'bugfix' });
+  assert.notEqual(res1.isError, true);
+  assert.match(res1.content[0]!.text, /learned \(includes your feedback\)/);
+  assert.match((res1.structuredContent!.decision as any).reason, /learned \(includes your feedback\)/);
+
+  // 2. Superseded user feedback (later sequence review by model wins) -> should NOT show "(includes your feedback)"
+  const dSuperseded = deps({
+    candidateLanes: () => lanes,
+    observedCapabilityByModel: () => overlay,
+    getFrozen: () => false,
+    readLedger: () => [
+      {
+        event_type: 'outcome',
+        subject_type: 'router_task',
+        task_id: 't1',
+        attempt: 0,
+        seq: 1,
+        category: 'bugfix',
+        subject_lane_id: 'cheap',
+        subject_model: 'cheap-m',
+        subject_model_resolved: 'cheap-m',
+        verdict: 'fail',
+        voter: 'user', // user outcome at seq 1
+        ts: new Date(FIXED_NOW).toISOString(),
+      } as any,
+      {
+        event_type: 'outcome',
+        subject_type: 'router_task',
+        task_id: 't1',
+        attempt: 0,
+        seq: 2, // higher seq model review supersedes user
+        category: 'bugfix',
+        subject_lane_id: 'cheap',
+        subject_model: 'cheap-m',
+        subject_model_resolved: 'cheap-m',
+        verdict: 'pass',
+        voter: 'reviewer_model',
+        ts: new Date(FIXED_NOW).toISOString(),
+      } as any,
+    ],
+  });
+
+  const res2 = await call('router_preview', dSuperseded, { category: 'bugfix' });
+  assert.notEqual(res2.isError, true);
+  assert.doesNotMatch(res2.content[0]!.text, /includes your feedback/);
+  assert.doesNotMatch((res2.structuredContent!.decision as any).reason, /includes your feedback/);
+
+  // 3. Decayed user feedback (old user outcome decayed to weight 0) -> should NOT show "(includes your feedback)"
+  const dDecayed = deps({
+    candidateLanes: () => lanes,
+    observedCapabilityByModel: () => overlay,
+    getFrozen: () => false,
+    readLedger: () => [
+      {
+        event_type: 'outcome',
+        subject_type: 'router_task',
+        task_id: 't1',
+        attempt: 0,
+        seq: 1,
+        category: 'bugfix',
+        subject_lane_id: 'cheap',
+        subject_model: 'cheap-m',
+        subject_model_resolved: 'cheap-m',
+        verdict: 'pass',
+        voter: 'user',
+        ts: '1900-01-01T00:00:00.000Z', // decayed to weight 0
+      } as any,
+    ],
+  });
+
+  const res3 = await call('router_preview', dDecayed, { category: 'bugfix' });
+  assert.notEqual(res3.isError, true);
+  assert.doesNotMatch(res3.content[0]!.text, /includes your feedback/);
+  assert.doesNotMatch((res3.structuredContent!.decision as any).reason, /includes your feedback/);
+
+  // 4. Model containing separator character (handled identically to core since we reuse it)
+  const sepLane = lane({ id: 'sep-l', model: 'cheap\u0000m', costBasis: 'local', capability: { bugfix: 0.6 } });
+  const sepLanes = [strong, sepLane];
+  const sepOverlay = { 'cheap\u0000m': { bugfix: { rate: 1.0, n: 100_000 } } };
+  const dSep = deps({
+    candidateLanes: () => sepLanes,
+    observedCapabilityByModel: () => sepOverlay,
+    getFrozen: () => false,
+    readLedger: () => [
+      {
+        event_type: 'outcome',
+        subject_type: 'router_task',
+        task_id: 't1',
+        attempt: 0,
+        seq: 1,
+        category: 'bugfix',
+        subject_lane_id: 'sep-l',
+        subject_model: 'cheap\u0000m',
+        subject_model_resolved: 'cheap\u0000m',
+        verdict: 'pass',
+        voter: 'user',
+        ts: new Date(FIXED_NOW).toISOString(),
+      } as any,
+    ],
+  });
+
+  const res4 = await call('router_preview', dSep, { category: 'bugfix' });
+  assert.notEqual(res4.isError, true);
+  assert.match(res4.content[0]!.text, /learned \(includes your feedback\)/);
+  assert.match((res4.structuredContent!.decision as any).reason, /learned \(includes your feedback\)/);
 });

@@ -1,11 +1,11 @@
 /**
  * F-1 capability feedback — the aggregation half of the loop. Pure and
- * clock-free: it turns the ledger's content-free manager-review verdicts into an
- * {@link ObservedCapabilityByModel} overlay that {@link effectiveCapabilityFor}
- * blends with the declared config prior.
+ * clock-free: it turns the ledger's content-free manager-review verdicts and
+ * direct user feedback outcomes into an {@link ObservedCapabilityByModel}
+ * overlay that {@link effectiveCapabilityFor} blends with the declared config prior.
  *
  * The signal is deliberately conservative (see the filters below) so routing
- * only learns from genuine, attributable, reviewer-cast outcomes:
+ * only learns from genuine, attributable, reviewer-cast or user-cast outcomes:
  *  - recency-decayed (recent verdicts dominate stale ones — model rankings churn);
  *  - de-duplicated per attempt (a re-reviewed attempt can't be double-counted);
  *  - attributed to the resolved model that produced the work (`subject_model_resolved`
@@ -57,15 +57,15 @@ export interface OutcomeCapabilityOptions {
 }
 
 /**
- * Whether an event is a learnable, attributable, reviewer-cast router-task
- * outcome. Excludes host-turn / unattributed subjects (we only learn about
- * offload lanes) and user votes (they don't steer routing in v1).
+ * Whether an event is a learnable, attributable router-task outcome.
+ * Excludes host-turn / unattributed subjects (we only learn about
+ * offload lanes). Allows reviewer models and direct user feedback.
  */
 function isLearnableOutcome(e: LedgerEvent): e is OutcomeEvent {
   return (
     e.event_type === 'outcome' &&
     e.subject_type === 'router_task' &&
-    e.voter === 'reviewer_model' &&
+    (e.voter === 'reviewer_model' || e.voter === 'user') &&
     typeof e.subject_lane_id === 'string' &&
     e.subject_lane_id !== '' &&
     typeof e.task_id === 'string' &&
@@ -95,20 +95,14 @@ interface Accumulator {
 }
 
 /**
- * Build the model-keyed observed-capability overlay from ledger events as of `now`.
- *
- * @param events the ledger (any mix; only learnable outcomes with a recorded model are used).
- * @param now    current time in epoch ms (injected — core stays clock-free).
- *               Outcomes timestamped after `now` are treated as age 0 (weight ≤ 1),
- *               never negative age.
- * @returns a sparse `{ [modelKey]: { [category]: { rate, n } } }`; only model×category
- *   pairs with real (decayed) evidence appear. Deterministic for the same inputs.
+ * Returns the exact list of OutcomeEvents that actually contribute to the capability overlays
+ * (survived learnability filters, de-duplication, and decay weight > 0 check).
  */
-export function outcomeCapability(
+export function contributingOutcomes(
   events: readonly LedgerEvent[],
   now: number,
   opts: OutcomeCapabilityOptions = {},
-): ObservedCapabilityByModel {
+): OutcomeEvent[] {
   const halfLife =
     Number.isFinite(opts.halfLifeDays) && (opts.halfLifeDays as number) > 0
       ? (opts.halfLifeDays as number)
@@ -127,13 +121,47 @@ export function outcomeCapability(
     if (!prev || e.seq > prev.seq) latest.set(key, e);
   }
 
-  // Accumulate decay-weighted verdicts per model×category.
-  const acc = new Map<string, Accumulator>();
+  // Filter out zero-weight outcomes
+  const result: OutcomeEvent[] = [];
   for (const e of latest.values()) {
     const tsMs = Date.parse(e.ts);
     const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
     const weight = Math.pow(0.5, ageDays / halfLife);
     if (!Number.isFinite(weight) || weight <= 0) continue;
+    result.push(e);
+  }
+  return result;
+}
+
+/**
+ * Build the model-keyed observed-capability overlay from ledger events as of `now`.
+ *
+ * @param events the ledger (any mix; only learnable outcomes with a recorded model are used).
+ * @param now    current time in epoch ms (injected — core stays clock-free).
+ *               Outcomes timestamped after `now` are treated as age 0 (weight ≤ 1),
+ *               never negative age.
+ * @returns a sparse `{ [modelKey]: { [category]: { rate, n } } }`; only model×category
+ *   pairs with real (decayed) evidence appear. Deterministic for the same inputs.
+ */
+export function outcomeCapability(
+  events: readonly LedgerEvent[],
+  now: number,
+  opts: OutcomeCapabilityOptions = {},
+): ObservedCapabilityByModel {
+  const contribs = contributingOutcomes(events, now, opts);
+  const halfLife =
+    Number.isFinite(opts.halfLifeDays) && (opts.halfLifeDays as number) > 0
+      ? (opts.halfLifeDays as number)
+      : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+
+  // Accumulate decay-weighted verdicts per model×category.
+  const acc = new Map<string, Accumulator>();
+  for (const e of contribs) {
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+
     const modelKey = modelKeyFromOutcome(e)!;
     const accKey = [modelKey, e.category].join(SEP);
     let a = acc.get(accKey);
@@ -171,36 +199,24 @@ export function outcomeCapabilityByDifficulty(
   now: number,
   opts: OutcomeCapabilityOptions = {},
 ): ObservedCapabilityByModelDifficulty {
+  const contribs = contributingOutcomes(events, now, opts);
   const halfLife =
     Number.isFinite(opts.halfLifeDays) && (opts.halfLifeDays as number) > 0
       ? (opts.halfLifeDays as number)
       : DEFAULT_HALF_LIFE_DAYS;
   const nowMs = Number.isFinite(now) ? now : Number.NaN;
 
-  // De-dup identically to outcomeCapability so the two views can never disagree
-  // about WHICH outcome represents an attempt (only about whether it's bucketed).
-  const latest = new Map<string, OutcomeEvent>();
-  for (const e of events) {
-    if (!isLearnableOutcome(e)) continue;
-    const modelKey = modelKeyFromOutcome(e);
-    if (!modelKey) continue;
-    if (!Number.isFinite(Date.parse(e.ts))) continue;
-    const key = dedupKey(e);
-    const prev = latest.get(key);
-    if (!prev || e.seq > prev.seq) latest.set(key, e);
-  }
-
   interface DifficultyAccumulator extends Accumulator {
     difficulty: DifficultyBucket;
   }
   const acc = new Map<string, DifficultyAccumulator>();
-  for (const e of latest.values()) {
+  for (const e of contribs) {
     const difficulty = e.difficulty;
     if (!difficulty) continue; // unbucketed ⇒ category-level view only
     const tsMs = Date.parse(e.ts);
     const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
     const weight = Math.pow(0.5, ageDays / halfLife);
-    if (!Number.isFinite(weight) || weight <= 0) continue;
+
     const modelKey = modelKeyFromOutcome(e)!;
     const accKey = [modelKey, e.category, difficulty].join(SEP);
     let a = acc.get(accKey);
