@@ -243,3 +243,103 @@ export function assessStaleness(
   if (!newer) return { status: 'fresh' };
   return { status: 'stale', newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
 }
+
+export type DeprecationReport =
+  | { status: 'ok' }
+  | { status: 'deprecated'; from?: string; successor?: string; successorUsable: boolean };
+
+export function isSuccessorUsable(
+  successor: string,
+  table: PriceTable,
+  now: number,
+  originalModelId: string
+): boolean {
+  if (!Number.isFinite(now)) {
+    return false;
+  }
+  if (!Object.hasOwn(table.models, successor)) {
+    return false;
+  }
+  if (parseModelAlias(successor).latest) {
+    return false;
+  }
+
+  // Traversal to check for structural cycles (e.g. A -> B -> C -> A)
+  let current: string | undefined = successor;
+  const visited = new Set<string>([originalModelId]);
+  while (current !== undefined) {
+    if (visited.has(current)) {
+      return false; // Cycle detected
+    }
+    visited.add(current);
+    const targetModel = (Object.hasOwn(table.models, current) ? table.models[current] : undefined) as { successor?: string } | undefined;
+    if (!targetModel) break;
+    current = targetModel.successor;
+  }
+
+  const succModel = table.models[successor];
+  if (succModel && succModel.deprecated) {
+    if (succModel.deprecated_from) {
+      const fromMs = Date.parse(succModel.deprecated_from);
+      if (Number.isNaN(fromMs) || fromMs <= now) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function assessDeprecation(
+  modelId: string,
+  table: PriceTable,
+  now: number,
+): DeprecationReport {
+  if (!Number.isFinite(now)) {
+    return { status: 'ok' };
+  }
+  const m = Object.hasOwn(table.models, modelId) ? table.models[modelId] : undefined;
+  if (!m || !m.deprecated) {
+    return { status: 'ok' };
+  }
+  if (m.deprecated_from) {
+    const fromMs = Date.parse(m.deprecated_from);
+    if (!Number.isNaN(fromMs) && fromMs > now) {
+      return { status: 'ok' };
+    }
+  }
+  const successor = m.successor;
+  const successorUsable = successor !== undefined && isSuccessorUsable(successor, table, now, modelId);
+  return {
+    status: 'deprecated',
+    from: m.deprecated_from,
+    successor,
+    successorUsable,
+  };
+}
+
+export function resolveDeprecatedModel<L extends { model: string }>(
+  lane: L,
+  table: PriceTable,
+  now: number,
+): { lane: L; migratedFrom?: string; warning?: string } {
+  if (!Number.isFinite(now)) {
+    return { lane };
+  }
+  const modelId = lane.model;
+  const report = assessDeprecation(modelId, table, now);
+  if (report.status !== 'deprecated') {
+    return { lane };
+  }
+  const succ = report.successor;
+  if (succ && report.successorUsable) {
+    const warning = `Lane "${(lane as any).id || 'unknown'}" concrete model "${modelId}" is deprecated (effective ${report.from || 'immediately'}) -> auto-migrated to successor "${succ}".`;
+    return {
+      lane: { ...lane, model: succ },
+      migratedFrom: modelId,
+      warning,
+    };
+  }
+  return { lane };
+}

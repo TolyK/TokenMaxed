@@ -1,8 +1,8 @@
 import { basename, dirname, join } from 'node:path';
 import { existsSync, readdirSync, realpathSync } from 'node:fs';
 
-import { isManagerEligible } from '@tokenmaxed/core';
-import { loadLaneConfig, loadPolicyConfig } from '@tokenmaxed/core/node';
+import { isManagerEligible, assessDeprecation, resolveLaneModel } from '@tokenmaxed/core';
+import { loadLaneConfig, loadPolicyConfig, loadPriceTable } from '@tokenmaxed/core/node';
 import type { Lane, LaneRegistry } from '@tokenmaxed/core';
 
 import { isLaneAvailable, commandOnPath, makeAvailabilityDeps } from './availability.ts';
@@ -484,6 +484,49 @@ export async function runDoctor(
           detail: 'model ID casing validation failed',
           fix: 'Verify the model cache.',
         });
+      }
+    }
+
+    // 9. Deprecation check
+    if (registry) {
+      const pricesPath = env.TOKENMAXED_PRICES ?? homeFile('prices.json');
+      if (existsSync(pricesPath)) {
+        try {
+          const priceTable = loadPriceTable(pricesPath);
+          const now = Date.now();
+          for (const lane of registry.lanes) {
+            const concrete = resolveLaneModel(lane, priceTable).model;
+            const report = assessDeprecation(concrete, priceTable, now);
+            if (report.status === 'deprecated') {
+              const dateStr = report.from ? `since ${report.from}` : 'immediately';
+              let detail = '';
+              let fix = '';
+              if (!report.successor) {
+                detail = `lane ${lane.id} uses ${concrete}, deprecated ${dateStr} → no successor configured`;
+                fix = `Update the lane's model in lanes.yaml to a non-deprecated model.`;
+              } else if (report.successorUsable) {
+                detail = `lane ${lane.id} uses ${concrete}, deprecated ${dateStr} → migrate to ${report.successor} (priced: yes)`;
+                fix = `Update the lane's model in lanes.yaml to use successor model "${report.successor}".`;
+              } else {
+                if (!Object.hasOwn(priceTable.models, report.successor)) {
+                  detail = `lane ${lane.id} uses ${concrete}, deprecated ${dateStr} → successor ${report.successor} is not priced — add its price`;
+                  fix = `Add successor model "${report.successor}" to the price table to enable migration.`;
+                } else {
+                  detail = `lane ${lane.id} uses ${concrete}, deprecated ${dateStr} → successor ${report.successor} is unusable — fix config`;
+                  fix = `Update the lane's model in lanes.yaml to a non-deprecated model.`;
+                }
+              }
+              findings.push({
+                severity: 'warn',
+                title: `Lane "${lane.id}" uses a deprecated model`,
+                detail,
+                fix,
+              });
+            }
+          }
+        } catch {
+          // fail-open
+        }
       }
     }
   }

@@ -89,8 +89,11 @@ export {
   sameFamily,
   assessStaleness,
   detectModelIdMismatch,
+  assessDeprecation,
+  resolveDeprecatedModel,
+  isSuccessorUsable,
 } from './model-freshness.ts';
-export type { ModelSpec, FamilyModel, StalenessReport, PriceTableStaleness, ModelIdMismatch } from './model-freshness.ts';
+export type { ModelSpec, FamilyModel, StalenessReport, PriceTableStaleness, ModelIdMismatch, DeprecationReport } from './model-freshness.ts';
 export {
   LedgerError,
   EVENT_FIELDS,

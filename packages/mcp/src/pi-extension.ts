@@ -53,6 +53,8 @@ import {
   classifyTask,
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
+  assessDeprecation,
+  resolveDeprecatedModel,
 } from '@tokenmaxed/core';
 
 import { bannerWithinBudget, delegateDenyReason, makeIdleReviewHandler } from './opencode-plugin.ts';
@@ -81,6 +83,8 @@ const PURE_CORE: CorePort = {
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
   resolvedPriorFor,
+  assessDeprecation,
+  resolveDeprecatedModel,
 };
 
 /**

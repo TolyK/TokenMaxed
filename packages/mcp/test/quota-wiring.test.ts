@@ -51,6 +51,8 @@ const CORE: CorePort = {
   CLASSIFY_FALLBACK_CATEGORY,
   quotaEstimate,
   laneQuotaState,
+  assessDeprecation: () => ({ status: 'ok' }),
+  resolveDeprecatedModel: (l: any) => ({ lane: l }),
 };
 const TOOLS = createTools(CORE);
 

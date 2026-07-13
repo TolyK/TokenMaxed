@@ -7483,6 +7483,83 @@ function assessStaleness(pinnedId, family, remote, table) {
   if (!newer) return { status: "fresh" };
   return { status: "stale", newest: newest.id, newestPriced: Object.hasOwn(table.models, newest.id) };
 }
+function isSuccessorUsable(successor, table, now, originalModelId) {
+  if (!Number.isFinite(now)) {
+    return false;
+  }
+  if (!Object.hasOwn(table.models, successor)) {
+    return false;
+  }
+  if (parseModelAlias(successor).latest) {
+    return false;
+  }
+  let current = successor;
+  const visited = /* @__PURE__ */ new Set([originalModelId]);
+  while (current !== void 0) {
+    if (visited.has(current)) {
+      return false;
+    }
+    visited.add(current);
+    const targetModel = Object.hasOwn(table.models, current) ? table.models[current] : void 0;
+    if (!targetModel) break;
+    current = targetModel.successor;
+  }
+  const succModel = table.models[successor];
+  if (succModel && succModel.deprecated) {
+    if (succModel.deprecated_from) {
+      const fromMs = Date.parse(succModel.deprecated_from);
+      if (Number.isNaN(fromMs) || fromMs <= now) {
+        return false;
+      }
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+function assessDeprecation(modelId, table, now) {
+  if (!Number.isFinite(now)) {
+    return { status: "ok" };
+  }
+  const m = Object.hasOwn(table.models, modelId) ? table.models[modelId] : void 0;
+  if (!m || !m.deprecated) {
+    return { status: "ok" };
+  }
+  if (m.deprecated_from) {
+    const fromMs = Date.parse(m.deprecated_from);
+    if (!Number.isNaN(fromMs) && fromMs > now) {
+      return { status: "ok" };
+    }
+  }
+  const successor = m.successor;
+  const successorUsable = successor !== void 0 && isSuccessorUsable(successor, table, now, modelId);
+  return {
+    status: "deprecated",
+    from: m.deprecated_from,
+    successor,
+    successorUsable
+  };
+}
+function resolveDeprecatedModel(lane, table, now) {
+  if (!Number.isFinite(now)) {
+    return { lane };
+  }
+  const modelId = lane.model;
+  const report = assessDeprecation(modelId, table, now);
+  if (report.status !== "deprecated") {
+    return { lane };
+  }
+  const succ = report.successor;
+  if (succ && report.successorUsable) {
+    const warning = `Lane "${lane.id || "unknown"}" concrete model "${modelId}" is deprecated (effective ${report.from || "immediately"}) -> auto-migrated to successor "${succ}".`;
+    return {
+      lane: { ...lane, model: succ },
+      migratedFrom: modelId,
+      warning
+    };
+  }
+  return { lane };
+}
 
 // ../core/src/capability-prior.ts
 var DEFAULT_CAPABILITY = 0.5;
@@ -8009,6 +8086,15 @@ function requireNonNegativeNumber(value, where) {
   }
   return value;
 }
+function isValidIsoDate(str) {
+  const match = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return false;
+  const y = parseInt(match[1] || "", 10);
+  const m = parseInt(match[2] || "", 10) - 1;
+  const d = parseInt(match[3] || "", 10);
+  const dateObj = new Date(Date.UTC(y, m, d));
+  return dateObj.getUTCFullYear() === y && dateObj.getUTCMonth() === m && dateObj.getUTCDate() === d;
+}
 function validatePriceTable(data) {
   if (!isPlainObject2(data)) {
     throw new PriceError("Price table must be a JSON object.");
@@ -8042,6 +8128,24 @@ function validatePriceTable(data) {
         throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
       }
       entry.released = raw.released;
+    }
+    if (raw.deprecated !== void 0) {
+      if (typeof raw.deprecated !== "boolean") {
+        throw new PriceError(`models["${model}"].deprecated must be a boolean when present.`);
+      }
+      entry.deprecated = raw.deprecated;
+    }
+    if (raw.deprecated_from !== void 0) {
+      if (typeof raw.deprecated_from !== "string" || !isValidIsoDate(raw.deprecated_from)) {
+        throw new PriceError(`models["${model}"].deprecated_from must be a valid date-only string in YYYY-MM-DD format when present.`);
+      }
+      entry.deprecated_from = raw.deprecated_from;
+    }
+    if (raw.successor !== void 0) {
+      if (typeof raw.successor !== "string" || raw.successor.trim() === "") {
+        throw new PriceError(`models["${model}"].successor must be a non-empty string when present.`);
+      }
+      entry.successor = raw.successor;
     }
     models[model] = entry;
   }
@@ -10537,6 +10641,15 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       if (category === void 0) throw new ToolInputError('"category" is required.');
       const instruction = optString(args, "instruction");
       const files = optStringArray(args, "files");
+      let priceTableCached;
+      let priceTableLoaded = false;
+      const getPriceTable = () => {
+        if (!priceTableLoaded) {
+          priceTableCached = deps.loadPriceTable ? deps.loadPriceTable() : void 0;
+          priceTableLoaded = true;
+        }
+        return priceTableCached;
+      };
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
@@ -10568,7 +10681,11 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       let lanes = deps.candidateLanes(category, pinnedModel ? { includeReserved: true } : void 0);
       const policy = deps.loadPolicy();
       if (pinnedModel) {
-        const pinnedLanes = lanes.filter((l) => core.modelMatchesPin(l.model, pinnedModel));
+        const allLanes = deps.allLanes ? deps.allLanes() : [];
+        const pinnedLanes = lanes.filter((l) => {
+          const origModel = allLanes.find((x) => x.id === l.id)?.model;
+          return core.modelMatchesPin(l.model, pinnedModel) || origModel && core.modelMatchesPin(origModel, pinnedModel);
+        });
         if (pinnedLanes.length === 0) {
           const connected = [...new Set(lanes.map((l) => l.model))].sort();
           return ok(
@@ -10592,7 +10709,9 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       for (const lane2 of lanes) {
         if (lane2.trust_mode === "reader") {
           const matchesProjectOrEnvGrant = grants.some((g) => g.toLowerCase() === lane2.id.toLowerCase());
-          const matchesPromptPin = !!full_access && !!pinnedModel && core.modelMatchesPin(lane2.model, pinnedModel);
+          const allLanes = deps.allLanes ? deps.allLanes() : [];
+          const origModel = allLanes.find((x) => x.id === lane2.id)?.model;
+          const matchesPromptPin = !!full_access && !!pinnedModel && (core.modelMatchesPin(lane2.model, pinnedModel) || origModel && core.modelMatchesPin(origModel, pinnedModel));
           if (matchesProjectOrEnvGrant || matchesPromptPin) {
             fullAccessLaneIds.push(lane2.id);
           }
@@ -10814,21 +10933,23 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           }
         }
         if (lane && core.forecastCost) {
-          const priceTable = deps.loadPriceTable ? deps.loadPriceTable() : void 0;
-          const forecast = core.forecastCost(combinedText, lane, priceTable);
-          forecastData = forecast;
-          const int = (n) => Math.round(n).toLocaleString("en-US");
-          let costStr = "";
-          if (forecast.estCostUsd !== void 0) {
-            if (forecast.estCostUsd === 0) {
-              costStr = " \xB7 $0";
-            } else if (forecast.estCostUsd > 0 && forecast.estCostUsd < 1e-4) {
-              costStr = " \xB7 ~<$0.0001 metered";
-            } else {
-              costStr = ` \xB7 ~$${forecast.estCostUsd.toFixed(4)} metered`;
+          try {
+            const forecast = core.forecastCost(combinedText, lane, getPriceTable());
+            forecastData = forecast;
+            const int = (n) => Math.round(n).toLocaleString("en-US");
+            let costStr = "";
+            if (forecast.estCostUsd !== void 0) {
+              if (forecast.estCostUsd === 0) {
+                costStr = " \xB7 $0";
+              } else if (forecast.estCostUsd > 0 && forecast.estCostUsd < 1e-4) {
+                costStr = " \xB7 ~<$0.0001 metered";
+              } else {
+                costStr = ` \xB7 ~$${forecast.estCostUsd.toFixed(4)} metered`;
+              }
             }
+            forecastLine = `  forecast: ~${int(forecast.estTokensIn)} input tok${costStr} (${forecast.note})${skippedNote}`;
+          } catch {
           }
-          forecastLine = `  forecast: ~${int(forecast.estTokensIn)} input tok${costStr} (${forecast.note})${skippedNote}`;
         }
       }
       let decisionReason = decision.reason;
@@ -10907,6 +11028,39 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         const secText = fingerprint.securitySensitive ? "yes" : "no";
         fingerprintLine = `  fingerprint: ${langText} \xB7 context: ${fingerprint.contextSizeBand} \xB7 tools: ${fingerprint.toolNeed} \xB7 ${fingerprint.planVsImpl} \xB7 security: ${secText} \xB7 blast: ${fingerprint.blastRadius}`;
       }
+      const deprecationLines = [];
+      if (core.resolveLaneModel) {
+        const allLanes = deps.allLanes?.() ?? [];
+        if (allLanes.length > 0) {
+          try {
+            const table = getPriceTable();
+            if (table) {
+              const now = deps.now();
+              for (const l of allLanes) {
+                const concrete = core.resolveLaneModel(l, table).model;
+                const report = core.assessDeprecation(concrete, table, now);
+                if (report.status === "deprecated") {
+                  const dateStr = report.from ? `since ${report.from}` : "immediately";
+                  let line = "";
+                  if (!report.successor) {
+                    line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 no successor configured`;
+                  } else if (report.successorUsable) {
+                    line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 migrate to ${report.successor} (priced: yes)`;
+                  } else {
+                    if (!Object.hasOwn(table.models, report.successor)) {
+                      line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 successor ${report.successor} is not priced \u2014 add its price`;
+                    } else {
+                      line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 successor ${report.successor} is unusable \u2014 fix config`;
+                    }
+                  }
+                  deprecationLines.push(line);
+                }
+              }
+            }
+          } catch {
+          }
+        }
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
@@ -10919,6 +11073,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...difficulty ? [
           `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
         ] : [],
+        ...deprecationLines,
         ...quotaLines,
         ...healthLines,
         ...priorLines,
@@ -11126,6 +11281,51 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       } else if (enabled && deps.freshness) {
         lines.push("No stale models flagged (only enabled, keyed API lanes with a known family are checked).");
       }
+      const deprecations = [];
+      const deprecationPayload = [];
+      if (enabled && core.resolveLaneModel) {
+        const allLanes = deps.allLanes?.() ?? [];
+        if (allLanes.length > 0) {
+          try {
+            const priceTable = deps.loadPriceTable?.();
+            if (priceTable) {
+              const now = deps.now();
+              for (const l of allLanes) {
+                const concrete = core.resolveLaneModel(l, priceTable).model;
+                const report = core.assessDeprecation(concrete, priceTable, now);
+                if (report.status === "deprecated") {
+                  const dateStr = report.from ? `since ${report.from}` : "immediately";
+                  let line = "";
+                  if (!report.successor) {
+                    line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 no successor configured`;
+                  } else if (report.successorUsable) {
+                    line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 migrate to ${report.successor} (priced: yes)`;
+                  } else {
+                    if (!Object.hasOwn(priceTable.models, report.successor)) {
+                      line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 successor ${report.successor} is not priced \u2014 add its price`;
+                    } else {
+                      line = `  lane ${l.id} uses ${concrete}, deprecated ${dateStr} \u2192 successor ${report.successor} is unusable \u2014 fix config`;
+                    }
+                  }
+                  deprecations.push(line);
+                  deprecationPayload.push({
+                    laneId: l.id,
+                    model: concrete,
+                    deprecatedFrom: report.from,
+                    successor: report.successor,
+                    successorPriced: report.successor !== void 0 && Object.hasOwn(priceTable.models, report.successor),
+                    successorUsable: report.successorUsable
+                  });
+                }
+              }
+            }
+          } catch {
+          }
+        }
+      }
+      if (deprecations.length > 0) {
+        lines.push("", "Deprecated models (update configuration to migrate):", ...deprecations);
+      }
       return ok(lines.join("\n"), {
         enabled,
         yolo,
@@ -11134,7 +11334,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...frozen ? { frozen: true } : {},
         ...userFeedbackEvents.length > 0 ? { userFeedbackCounts: { pass, needsRework, fail } } : {},
         staleness: warnings,
-        idMismatch: mismatches
+        idMismatch: mismatches,
+        ...deprecationPayload.length > 0 ? { deprecations: deprecationPayload } : {}
       });
     })
   };
@@ -12448,7 +12649,9 @@ var PURE_CORE = {
   classifyTask,
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
-  resolvedPriorFor
+  resolvedPriorFor,
+  assessDeprecation,
+  resolveDeprecatedModel
 };
 var PI_TOOL_KILL_MS = 25 * 6e4;
 function spawnToolChild(scriptPath, name, args, env, signal) {

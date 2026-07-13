@@ -37,6 +37,9 @@ import {
   effectiveCapabilityFor,
   analyzeBacktest,
   fingerprintTask,
+  assessDeprecation,
+  resolveDeprecatedModel,
+  resolveLaneModel,
 } from '../../core/src/index.ts';
 import type { Lane, LedgerEvent, Policy, RouteDecision, OutcomeEventInput, OutcomeEvent, PriceTable } from '../../core/src/index.ts';
 
@@ -47,7 +50,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createTools, dispatch, resolveCategory } from '../src/tools.ts';
 import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, SetupReport, ToolDeps } from '../src/tools.ts';
-import { makeServerDeps } from '../src/server.ts';
+import { makeServerDeps, CORE as PROD_CORE } from '../src/server.ts';
 
 // --- harness -------------------------------------------------------------------
 
@@ -74,6 +77,9 @@ const CORE: CorePort = {
   effectiveCapabilityFor,
   analyzeBacktest,
   fingerprintTask,
+  assessDeprecation,
+  resolveDeprecatedModel,
+  resolveLaneModel,
 };
 const TOOLS = createTools(CORE);
 
@@ -2651,4 +2657,342 @@ test('router_preview: task fingerprint is content-free under adversarial input',
   }
 
   walk(struct.fingerprint);
+});
+
+test('router_preview: surfaces model deprecation warning', async () => {
+  const table: PriceTable = {
+    schema_version: 3,
+    frontier_model: 'live',
+    models: {
+      live: { inputPer1M: 1, outputPer1M: 1 },
+      old: {
+        inputPer1M: 1,
+        outputPer1M: 1,
+        deprecated: true,
+        deprecated_from: '2026-05-01',
+        successor: 'live'
+      },
+      unpriced: {
+        inputPer1M: 1,
+        outputPer1M: 1,
+        deprecated: true,
+        successor: 'absent'
+      }
+    }
+  };
+
+  const lanes = [
+    lane({ id: 'lane-1', model: 'old', costBasis: 'subscription' }),
+    lane({ id: 'lane-2', model: 'unpriced', costBasis: 'subscription' }),
+  ];
+
+  const d = deps({
+    candidateLanes: () => lanes,
+    allLanes: () => lanes,
+    loadPriceTable: () => table,
+    now: () => Date.parse('2026-06-01'),
+  });
+
+  const res = await call('router_preview', d, { category: 'docs' });
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+
+  // Surfaced deprecation line for old model
+  assert.match(text, /lane lane-1 uses old, deprecated since 2026-05-01 → migrate to live \(priced: yes\)/);
+
+  // Surfaced deprecation line for unpriced successor
+  assert.match(text, /lane lane-2 uses unpriced, deprecated immediately → successor absent is not priced — add its price/);
+});
+
+test('router_status: surfaces model deprecation warnings', async () => {
+  const table: PriceTable = {
+    schema_version: 3,
+    frontier_model: 'live',
+    models: {
+      live: { inputPer1M: 1, outputPer1M: 1 },
+      old: {
+        inputPer1M: 1,
+        outputPer1M: 1,
+        deprecated: true,
+        deprecated_from: '2026-05-01',
+        successor: 'live'
+      }
+    }
+  };
+
+  const lanes = [
+    lane({ id: 'lane-1', model: 'old', costBasis: 'subscription' }),
+  ];
+
+  const d = deps({
+    allLanes: () => lanes,
+    loadPriceTable: () => table,
+    now: () => Date.parse('2026-06-01'),
+  });
+
+  const res = await call('router_status', d);
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+
+  assert.match(text, /Deprecated models \(update configuration to migrate\):/);
+  assert.match(text, /lane lane-1 uses old, deprecated since 2026-05-01 → migrate to live \(priced: yes\)/);
+
+  // Assert structured output
+  const struct = res.structuredContent as any;
+  assert.ok(struct.deprecations);
+  assert.equal(struct.deprecations.length, 1);
+  assert.equal(struct.deprecations[0].laneId, 'lane-1');
+  assert.equal(struct.deprecations[0].model, 'old');
+  assert.equal(struct.deprecations[0].successor, 'live');
+  assert.equal(struct.deprecations[0].successorPriced, true);
+});
+
+test('production CORE wiring with real makeServerDeps', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tm-wiring-'));
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        choices: [{ message: { content: 'mocked success output' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 20 }
+      })
+    } as any;
+  };
+
+  const lanesYaml = `lanes:
+  - id: lane-old
+    kind: api
+    model: old-model
+    endpoint: http://mock-endpoint
+    authHandle: test_handle
+    trust_mode: full
+    costBasis: subscription
+    provenance: minimax
+    jurisdiction: US
+    capability:
+      docs: 0.95
+  - id: lane-alias
+    kind: api
+    model: alias-dep
+    endpoint: http://mock-endpoint
+    authHandle: test_handle
+    trust_mode: full
+    costBasis: subscription
+    provenance: minimax
+    jurisdiction: US
+    capability:
+      docs: 0.95
+  - id: lane-non
+    kind: api
+    model: non-dep
+    endpoint: http://mock-endpoint
+    authHandle: test_handle
+    trust_mode: full
+    costBasis: subscription
+    provenance: minimax
+    jurisdiction: US
+    capability:
+      docs: 0.95
+`;
+  writeFileSync(join(dir, 'lanes.yaml'), lanesYaml, 'utf8');
+
+  const pricesJson = {
+    schema_version: 3,
+    frontier_model: 'opus',
+    models: {
+      opus: { inputPer1M: 10, outputPer1M: 50 },
+      'opus@latest': { inputPer1M: 10, outputPer1M: 50 },
+      'old-model': {
+        inputPer1M: 1,
+        outputPer1M: 5,
+        deprecated: true,
+        deprecated_from: '2020-01-01',
+        successor: 'opus'
+      },
+      'alias-dep': {
+        inputPer1M: 1,
+        outputPer1M: 5,
+        deprecated: true,
+        successor: 'opus@latest'
+      },
+      'non-dep': {
+        inputPer1M: 2,
+        outputPer1M: 8
+      }
+    }
+  };
+  writeFileSync(join(dir, 'prices.json'), JSON.stringify(pricesJson), 'utf8');
+
+  const env = {
+    TOKENMAXED_LANES: join(dir, 'lanes.yaml'),
+    TOKENMAXED_PRICES: join(dir, 'prices.json'),
+    TOKENMAXED_PROJECT: 'wiring-test',
+    TOKENMAXED_GATE_READY: 'true',
+    TOKENMAXED_READER_EGRESS: 'true',
+    TOKENMAXED_KEY_test_handle: 'dummy-key',
+  };
+
+  const serverDeps = makeServerDeps(env);
+  const prodTools = createTools(PROD_CORE);
+
+  // 1. Assert production /status renders the deprecation and unusable successor config gap
+  const statusRes = await dispatch(prodTools, serverDeps, 'router_status', {});
+  assert.ok(!statusRes.isError, JSON.stringify(statusRes));
+  const statusText = statusRes.content?.[0]?.text ?? '';
+  assert.match(statusText, /lane lane-old uses old-model, deprecated since 2020-01-01 → migrate to opus \(priced: yes\)/);
+  assert.match(statusText, /lane lane-alias uses alias-dep, deprecated immediately → successor opus@latest is unusable — fix config/);
+
+  const payload = statusRes.structuredContent as any;
+  const laneAliasDep = payload.deprecations.find((d: any) => d.laneId === 'lane-alias');
+  assert.ok(laneAliasDep, 'lane-alias deprecation payload not found');
+  assert.equal(laneAliasDep.successorPriced, true, 'successor opus@latest should be priced');
+  assert.equal(laneAliasDep.successorUsable, false, 'successor opus@latest should be unusable');
+  assert.ok(!statusText.includes('migrate to opus@latest'), 'should not guide to migrate to an alias');
+
+  // 2. Assert production /why (router_preview) returns correct warnings
+  const previewRes = await dispatch(prodTools, serverDeps, 'router_preview', { category: 'docs' });
+  assert.ok(!previewRes.isError, JSON.stringify(previewRes));
+  const previewText = previewRes.content?.[0]?.text ?? '';
+  assert.match(previewText, /lane lane-old uses old-model, deprecated since 2020-01-01 → migrate to opus \(priced: yes\)/);
+
+  // 3. Assert delegate migrated old-model to the priced successor concrete model 'opus'
+  const delegateRes1 = await dispatch(prodTools, serverDeps, 'router_delegate', {
+    category: 'docs',
+    instruction: 'test',
+    model: 'old-model'
+  });
+  assert.ok(!delegateRes1.isError, JSON.stringify(delegateRes1));
+  const verdict1 = delegateRes1.structuredContent as any;
+  assert.equal(verdict1.laneId, 'lane-old');
+  assert.equal(verdict1.model, 'opus');
+
+  // 4. Assert non-deprecated lane is unchanged
+  const delegateRes2 = await dispatch(prodTools, serverDeps, 'router_delegate', {
+    category: 'docs',
+    instruction: 'test',
+    model: 'non-dep'
+  });
+  assert.ok(!delegateRes2.isError, JSON.stringify(delegateRes2));
+  const verdict2 = delegateRes2.structuredContent as any;
+  assert.equal(verdict2.laneId, 'lane-non');
+  assert.equal(verdict2.model, 'non-dep');
+
+  // 5. Assert alias successor is rejected and unchanged
+  const delegateRes3 = await dispatch(prodTools, serverDeps, 'router_delegate', {
+    category: 'docs',
+    instruction: 'test',
+    model: 'alias-dep'
+  });
+  assert.ok(!delegateRes3.isError, JSON.stringify(delegateRes3));
+  const verdict3 = delegateRes3.structuredContent as any;
+  assert.equal(verdict3.laneId, 'lane-alias');
+  assert.equal(verdict3.model, 'alias-dep');
+
+  // 6. Assert pinned preview and delegate agree on the migrated successor model 'opus'
+  const pinnedPreviewRes = await dispatch(prodTools, serverDeps, 'router_preview', {
+    category: 'docs',
+    model: 'old-model'
+  });
+  assert.ok(!pinnedPreviewRes.isError, JSON.stringify(pinnedPreviewRes));
+  const pinnedPreviewText = pinnedPreviewRes.content?.[0]?.text ?? '';
+  assert.match(pinnedPreviewText, /category "docs" → lane "lane-old"/);
+  assert.match(pinnedPreviewText, /api · opus · trust=full/);
+  const pinnedPreviewStructured = pinnedPreviewRes.structuredContent as any;
+  assert.equal(pinnedPreviewStructured.decision?.laneId, 'lane-old');
+
+  globalThis.fetch = originalFetch;
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('throwing/absent price loader leaves paths byte-identical', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tm-throwing-'));
+  const lanesYaml = `lanes:
+  - id: lane-1
+    kind: api
+    model: some-model
+    endpoint: http://mock-endpoint
+    authHandle: test_handle
+    trust_mode: full
+    costBasis: subscription
+    provenance: minimax
+    jurisdiction: US
+    capability:
+      docs: 0.95
+`;
+  writeFileSync(join(dir, 'lanes.yaml'), lanesYaml, 'utf8');
+
+  const pricesNormal = {
+    schema_version: 3,
+    frontier_model: 'some-model',
+    models: {
+      'some-model': {
+        inputPer1M: 10,
+        outputPer1M: 50
+      }
+    }
+  };
+  writeFileSync(join(dir, 'prices-normal.json'), JSON.stringify(pricesNormal), 'utf8');
+
+  // 1. Normal Setup (Baseline)
+  const envNormal = {
+    TOKENMAXED_LANES: join(dir, 'lanes.yaml'),
+    TOKENMAXED_PRICES: join(dir, 'prices-normal.json'),
+    TOKENMAXED_PROJECT: 'throwing-test',
+    TOKENMAXED_GATE_READY: 'true',
+    TOKENMAXED_READER_EGRESS: 'true',
+    TOKENMAXED_KEY_test_handle: 'dummy-key',
+  };
+  const serverDepsNormal = makeServerDeps(envNormal);
+  const prodTools = createTools(PROD_CORE);
+
+  const statusNormal = await dispatch(prodTools, serverDepsNormal, 'router_status', {});
+  assert.ok(!statusNormal.isError, JSON.stringify(statusNormal));
+  const previewNormal = await dispatch(prodTools, serverDepsNormal, 'router_preview', { category: 'docs' });
+  assert.ok(!previewNormal.isError, JSON.stringify(previewNormal));
+
+  const statusNormalStr = JSON.stringify(statusNormal);
+  const previewNormalStr = JSON.stringify(previewNormal);
+
+  // 2. Throwing Setup (Non-existent price file)
+  const envThrowing = {
+    ...envNormal,
+    TOKENMAXED_PRICES: join(dir, 'non-existent-prices.json'),
+  };
+  const serverDepsThrowing = makeServerDeps(envThrowing);
+
+  const statusThrowing = await dispatch(prodTools, serverDepsThrowing, 'router_status', {});
+  assert.ok(!statusThrowing.isError, JSON.stringify(statusThrowing));
+  const previewThrowing = await dispatch(prodTools, serverDepsThrowing, 'router_preview', { category: 'docs' });
+  assert.ok(!previewThrowing.isError, JSON.stringify(previewThrowing));
+
+  const statusThrowingStr = JSON.stringify(statusThrowing);
+  const previewThrowingStr = JSON.stringify(previewThrowing);
+
+  // Assert byte-identical for Throwing
+  assert.equal(statusThrowingStr, statusNormalStr, 'status output differs under throwing loader');
+  assert.equal(previewThrowingStr, previewNormalStr, 'preview output differs under throwing loader');
+
+  // 3. Absent/Undefined Setup
+  const serverDepsAbsent = {
+    ...serverDepsNormal,
+    loadPriceTable: undefined,
+    laneCost: undefined,
+  };
+
+  const statusAbsent = await dispatch(prodTools, serverDepsAbsent, 'router_status', {});
+  assert.ok(!statusAbsent.isError, JSON.stringify(statusAbsent));
+  const previewAbsent = await dispatch(prodTools, serverDepsAbsent, 'router_preview', { category: 'docs' });
+  assert.ok(!previewAbsent.isError, JSON.stringify(previewAbsent));
+
+  const statusAbsentStr = JSON.stringify(statusAbsent);
+  const previewAbsentStr = JSON.stringify(previewAbsent);
+
+  // Assert byte-identical for Absent
+  assert.equal(statusAbsentStr, statusNormalStr, 'status output differs under absent loader');
+  assert.equal(previewAbsentStr, previewNormalStr, 'preview output differs under absent loader');
+
+  rmSync(dir, { recursive: true, force: true });
 });
