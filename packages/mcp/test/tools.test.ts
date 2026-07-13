@@ -156,6 +156,7 @@ test('builds the expected tool set with object input schemas', () => {
       'router_preview',
       'router_review',
       'router_savings',
+      'router_set_calibration',
       'router_set_enabled',
       'router_set_full_access',
       'router_set_prefer',

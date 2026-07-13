@@ -8014,11 +8014,12 @@ function amountInWindow(observations, now, windowMs) {
   }
   return sum;
 }
-function axisState(count, limit, reserve = 0) {
+function axisState(count, limit, reserve = 0, calibration = 0) {
   const rawUsed = windowUsedFraction(count, limit);
+  const floorUsed = Math.max(rawUsed, calibration);
   const r = Math.max(0, Math.min(0.9999, reserve));
   const mult = 1 / (1 - r);
-  const used = rawUsed === 0 ? 0 : rawUsed * mult;
+  const used = floorUsed === 0 ? 0 : floorUsed * mult;
   return { count, limit, used, level: windowLevel(used) };
 }
 function laneQuotaState(events, lane, now) {
@@ -8029,20 +8030,21 @@ function laneQuotaState(events, lane, now) {
   const hasWeekTokens = typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
   if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
   const reserve = lane.reserve_fraction ?? 0;
+  const calibration = lane.calibration_fraction ?? 0;
   const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
   if (hasWindow) {
     const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
     const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
-    state.window = axisState(count, lane.requests_per_window, reserve);
+    state.window = axisState(count, lane.requests_per_window, reserve, calibration);
     axes.push(state.window);
   }
   if (hasWeekRequests) {
-    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week, reserve);
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week, reserve, calibration);
     axes.push(state.weekRequests);
   }
   if (hasWeekTokens) {
     const tokens = laneObservations(events, lane.id, true);
-    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week, reserve);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week, reserve, calibration);
     axes.push(state.weekTokens);
   }
   let headroom = 1;
@@ -10466,9 +10468,79 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           quotaLines.push(`  \u26A0 preferred lane overrides quota pressure${detail ? ` (${detail})` : ""} \u2014 /tokenmaxed:prefer off to release it.`);
         }
       }
+      const resolveCalibrationFractionLocal = (lane2, calibrations) => {
+        const laneIdLower = lane2.id.toLowerCase();
+        const laneModelLower = lane2.model.toLowerCase();
+        for (const [key, fraction] of Object.entries(calibrations)) {
+          if (key.toLowerCase() === laneIdLower) return fraction;
+        }
+        for (const [key, fraction] of Object.entries(calibrations)) {
+          if (key.toLowerCase() === laneModelLower) return fraction;
+        }
+        for (const [key, fraction] of Object.entries(calibrations)) {
+          if (core.modelMatchesPin(lane2.model, key)) return fraction;
+        }
+        return void 0;
+      };
+      const getDeprioritizedLabel = (laneId) => {
+        const l = lanes.find((x) => x.id === laneId);
+        if (!l || !core.laneQuotaState) return `${laneId} (routed-share near cap)`;
+        const calibrations = deps.getCalibrations?.() ?? {};
+        const calOverride = resolveCalibrationFractionLocal(l, calibrations);
+        if (calOverride === void 0) {
+          return `${laneId} (routed-share near cap)`;
+        }
+        const events = deps.readLedger?.() ?? [];
+        const now = deps.now();
+        const laneWithCal = { ...l, calibration_fraction: calOverride };
+        const s = core.laneQuotaState(events, laneWithCal, now);
+        const sRaw = core.laneQuotaState(events, l, now);
+        const hasWindow = typeof l.requests_per_window === "number" && l.requests_per_window > 0;
+        const hasWeekRequests = typeof l.requests_per_week === "number" && l.requests_per_week > 0;
+        const hasWeekTokens = typeof l.tokens_per_week === "number" && l.tokens_per_week > 0;
+        const r = Math.max(0, Math.min(0.9999, l.reserve_fraction ?? 0));
+        const mult = 1 / (1 - r);
+        let isCalDerived = false;
+        const maxCalPct = Math.round(calOverride * 100);
+        let maxUsedValue = -Infinity;
+        let bindingAxis = void 0;
+        if (hasWindow && s.window) {
+          if (s.window.used > maxUsedValue) {
+            maxUsedValue = s.window.used;
+            bindingAxis = "window";
+          }
+        }
+        if (hasWeekRequests && s.weekRequests) {
+          if (s.weekRequests.used > maxUsedValue) {
+            maxUsedValue = s.weekRequests.used;
+            bindingAxis = "weekRequests";
+          }
+        }
+        if (hasWeekTokens && s.weekTokens) {
+          if (s.weekTokens.used > maxUsedValue) {
+            maxUsedValue = s.weekTokens.used;
+            bindingAxis = "weekTokens";
+          }
+        }
+        if (bindingAxis === "window" && s.window && sRaw.window) {
+          const rawUsed = sRaw.window.used / mult;
+          if (calOverride >= rawUsed) isCalDerived = true;
+        } else if (bindingAxis === "weekRequests" && s.weekRequests && sRaw.weekRequests) {
+          const rawUsed = sRaw.weekRequests.used / mult;
+          if (calOverride >= rawUsed) isCalDerived = true;
+        } else if (bindingAxis === "weekTokens" && s.weekTokens && sRaw.weekTokens) {
+          const rawUsed = sRaw.weekTokens.used / mult;
+          if (calOverride >= rawUsed) isCalDerived = true;
+        }
+        if (isCalDerived) {
+          return `${laneId} (you reported ~${maxCalPct}% used)`;
+        }
+        return `${laneId} (routed-share near cap)`;
+      };
       const pressuredLosers = decision.scores.filter((s) => s.laneId !== decision.laneId && s.factors.capPenalty > 0).map((s) => s.laneId);
       if (pressuredLosers.length > 0) {
-        quotaLines.push(`  quota-deprioritized: ${pressuredLosers.join(", ")} (routed-share near cap)`);
+        const labels = pressuredLosers.map(getDeprioritizedLabel);
+        quotaLines.push(`  quota-deprioritized: ${labels.join(", ")}`);
       }
       const priorLines = [];
       let priorStructured;
@@ -10548,6 +10620,17 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       if (reserveLines.length > 0) {
         lines.push("", "Capacity reservations (project override):", ...reserveLines);
       }
+      const calibrations = deps.getCalibrations?.() ?? {};
+      const calibrationLines = [];
+      for (const [key, val] of Object.entries(calibrations)) {
+        if (typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 1) {
+          const pct3 = Math.round(val * 100);
+          calibrationLines.push(`  ${key}: calibrated (you reported ${pct3}% used)`);
+        }
+      }
+      if (calibrationLines.length > 0) {
+        lines.push("", "Manual quota calibrations (project override):", ...calibrationLines);
+      }
       const capPrior = deps.capabilityPrior?.([]);
       if (capPrior?.state === "on") {
         lines.push(
@@ -10558,7 +10641,14 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       }
       const quotaAlerts = enabled && deps.quotaAlerts ? await deps.quotaAlerts() : [];
       if (quotaAlerts.length > 0) {
-        lines.push("", "Quota (routed share only \u2014 not your total subscription usage):", ...quotaAlerts.map((a) => `  ${a}`));
+        const calibrationAlerts = quotaAlerts.filter((a) => a.includes("calibrated:"));
+        const routedAlerts = quotaAlerts.filter((a) => !a.includes("calibrated:"));
+        if (routedAlerts.length > 0) {
+          lines.push("", "Quota (routed share only \u2014 not your total subscription usage):", ...routedAlerts.map((a) => `  ${a}`));
+        }
+        if (calibrationAlerts.length > 0) {
+          lines.push("", "Quota (based on your manual calibrations):", ...calibrationAlerts.map((a) => `  ${a}`));
+        }
       }
       if (mismatches.length > 0) {
         lines.push("", "Model ids the vendor will REJECT (fix before offloading):", ...renderModelIdMismatchWarnings(mismatches));
@@ -10720,6 +10810,84 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(", ");
       return ok(
         `Capacity reservation of ${pct3}% set for: ${resolvedNames} in this project.`,
+        { lane, fraction: value, matchedLanes: matchedLanes.map((l) => l.id) }
+      );
+    })
+  };
+  const setCalibrationTool = {
+    name: "router_set_calibration",
+    description: "Set or clear a manual used-fraction calibration for a lane or model name in this project. When set, this used fraction acts as a floor for the lane's quota. Use a percentage (0\u2013100) or a decimal (0\u20131). If lane is empty, clears all calibrations for the project. Powers /tokenmaxed:calibrate.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: "string",
+          description: "The lane ID or model name to calibrate (e.g. claude-native or opus). If empty, clears all calibrations for this project."
+        },
+        fraction: {
+          type: "string",
+          description: 'The calibration fraction (e.g. "70%" or "0.7"). Use "off", "none", or "clear" to remove the calibration for this lane.'
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const rawLane = optString(args, "lane");
+      const lane = typeof rawLane === "string" ? rawLane.trim() : void 0;
+      const rawFraction = optString(args, "fraction");
+      const fractionStr = typeof rawFraction === "string" ? rawFraction.trim().toLowerCase() : void 0;
+      if (!lane) {
+        deps.setCalibration?.(void 0, void 0);
+        return ok(
+          "All manual quota calibrations CLEARED for this project.",
+          { calibrations: null }
+        );
+      }
+      if (!fractionStr || ["off", "none", "clear"].includes(fractionStr)) {
+        deps.setCalibration?.(lane, void 0);
+        return ok(
+          `Manual quota calibration CLEARED for lane/model "${lane}" in this project.`,
+          { lane, fraction: null }
+        );
+      }
+      const numRegex = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+      let value;
+      if (fractionStr.endsWith("%")) {
+        const numPart = fractionStr.slice(0, -1);
+        if (!numRegex.test(numPart)) {
+          throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be a number in 0\u2013100%.`);
+        }
+        const parsed = Number(numPart);
+        if (parsed < 0 || parsed > 100) {
+          throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be in range 0\u2013100%.`);
+        }
+        value = parsed / 100;
+      } else {
+        if (!numRegex.test(fractionStr)) {
+          throw new ToolInputError(`Invalid calibration value: "${rawFraction}". Must be a percentage (0\u2013100) or decimal (0\u20131).`);
+        }
+        const parsed = Number(fractionStr);
+        if (parsed >= 0 && parsed <= 1) {
+          value = parsed;
+        } else if (parsed > 1 && parsed <= 100 && !fractionStr.includes(".")) {
+          value = parsed / 100;
+        } else {
+          throw new ToolInputError(`Invalid calibration value: "${rawFraction}". Must be a percentage in 0\u2013100 or decimal in 0\u20131.`);
+        }
+      }
+      const allLanes = deps.allLanes?.() ?? [];
+      const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+      if (matchedLanes.length === 0) {
+        const connectable = allLanes.map((l) => l.model).sort();
+        throw new ToolInputError(
+          `No connected lanes match "${lane}". Connected models: ${connectable.join(", ") || "(none)"}`
+        );
+      }
+      deps.setCalibration?.(lane, value);
+      const pct3 = Math.round(value * 100);
+      const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(", ");
+      return ok(
+        `Manual quota calibration of ${pct3}% set for: ${resolvedNames} in this project.`,
         { lane, fraction: value, matchedLanes: matchedLanes.map((l) => l.id) }
       );
     })
@@ -10999,7 +11167,7 @@ ${r.notes}` : "";
       }
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, delegateTool, reviewTool, setupTool, configTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, delegateTool, reviewTool, setupTool, configTool];
 }
 function receiptLine(r) {
   const int = (n) => Math.round(n).toLocaleString("en-US");
