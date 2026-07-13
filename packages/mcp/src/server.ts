@@ -37,8 +37,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
-  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent } from '@tokenmaxed/core';
+  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor, quotaEstimate } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent, QuotaEstimate } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -77,6 +77,8 @@ import { readReserves, writeReserve } from './reserve.ts';
 import type { ReserveStore } from './reserve.ts';
 import { readCalibrations, writeCalibration } from './calibration.ts';
 import type { CalibrationStore } from './calibration.ts';
+import { readRoutedShares, writeRoutedShare } from './routed-share.ts';
+import type { RoutedShareStore } from './routed-share.ts';
 import { readTargets, writeTarget } from './target.ts';
 import type { TargetStore } from './target.ts';
 import { readYolo, writeYolo } from './yolo.ts';
@@ -238,6 +240,24 @@ function fileCalibrationStore(statePath: string): CalibrationStore {
   };
 }
 
+/** A JSON-file-backed {@link RoutedShareStore} (object-valued); tolerant of a missing/corrupt file. */
+function fileRoutedShareStore(statePath: string): RoutedShareStore {
+  return {
+    read: () => {
+      if (!existsSync(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync(statePath, 'utf8'));
+      } catch {
+        return {}; // corrupt file ⇒ treat as empty
+      }
+    },
+    write: (state) => {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    },
+  };
+}
+
 /** A JSON-file-backed {@link TargetStore} (object-valued); tolerant of a missing/corrupt file. */
 function fileTargetStore(statePath: string): TargetStore {
   return {
@@ -276,7 +296,7 @@ function fileFullAccessStore(statePath: string): FullAccessStore {
 }
 
 /** The real core operations, bound for injection into the tools. */
-export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState };
+export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -359,6 +379,34 @@ export function resolveCalibrationFraction(lane: Lane, calibrations: Record<stri
   return undefined;
 }
 
+export function resolveRoutedShareFraction(lane: Lane, routedShares: Record<string, number>): number | undefined {
+  const laneIdLower = lane.id.toLowerCase();
+  const laneModelLower = lane.model.toLowerCase();
+
+  // 1. Exact lane.id match
+  for (const [key, fraction] of Object.entries(routedShares)) {
+    if (key.toLowerCase() === laneIdLower) {
+      return fraction;
+    }
+  }
+
+  // 2. Exact lane.model match
+  for (const [key, fraction] of Object.entries(routedShares)) {
+    if (key.toLowerCase() === laneModelLower) {
+      return fraction;
+    }
+  }
+
+  // 3. Family/prefix (modelMatchesPin) match
+  for (const [key, fraction] of Object.entries(routedShares)) {
+    if (modelMatchesPin(lane.model, key)) {
+      return fraction;
+    }
+  }
+
+  return undefined;
+}
+
 export function resolveTargetIso(lane: Lane, targets: Record<string, string>): string | undefined {
   const laneIdLower = lane.id.toLowerCase();
   const laneModelLower = lane.model.toLowerCase();
@@ -406,6 +454,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const calibrationStatePath = env.TOKENMAXED_CALIBRATION_STATE ?? join(dirname(statePath), 'calibration.json');
   const calibrationStore = fileCalibrationStore(calibrationStatePath);
   const readCalibrationsMap = (): Record<string, number> => readCalibrations(calibrationStore, projectKey);
+  const routedShareStatePath = env.TOKENMAXED_ROUTED_SHARE_STATE ?? join(dirname(statePath), 'routed-share.json');
+  const routedShareStore = fileRoutedShareStore(routedShareStatePath);
+  const readRoutedSharesMap = (): Record<string, number> => readRoutedShares(routedShareStore, projectKey);
   const targetStatePath = env.TOKENMAXED_TARGET_STATE ?? join(dirname(statePath), 'target.json');
   const targetStore = fileTargetStore(targetStatePath);
   const readTargetsMap = (): Record<string, string> => readTargets(targetStore, projectKey);
@@ -1385,6 +1436,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     setTarget: (lane, until) => writeTarget(targetStore, projectKey, lane, until),
     getCalibrations: readCalibrationsMap,
     setCalibration: (lane, fraction) => writeCalibration(calibrationStore, projectKey, lane, fraction),
+    getRoutedShares: readRoutedSharesMap,
+    setRoutedShare: (lane: string | undefined, fraction: number | undefined) => writeRoutedShare(routedShareStore, projectKey, lane, fraction),
     getFullAccess: readFullAccessGrants,
     grantFullAccess: (laneId) => grantFullAccess(fullAccessStore, projectKey, laneId),
     revokeFullAccess: (laneId) => revokeFullAccess(fullAccessStore, projectKey, laneId),

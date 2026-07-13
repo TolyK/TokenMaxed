@@ -26,6 +26,7 @@ const MANUAL_SKILLS: ReadonlyArray<{ name: string; tool: string }> = [
   { name: 'review', tool: `${P}router_review` },
   { name: 'setup', tool: `${P}router_setup` },
   { name: 'config', tool: `${P}router_config` },
+  { name: 'routed-share', tool: `${P}router_set_routed_share` },
 ];
 
 /** Model-invoked guidance skills (no disable flag). */
