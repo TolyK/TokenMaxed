@@ -27,6 +27,7 @@ import {
   CLASSIFY_FALLBACK_CATEGORY,
   SCHEMA_VERSION,
   serializeEvent,
+  forecastCost,
 } from '../../core/src/index.ts';
 import type { Lane, LedgerEvent, Policy, RouteDecision } from '../../core/src/index.ts';
 
@@ -54,6 +55,7 @@ const CORE: CorePort = {
   classifyTask,
   MIN_CLASSIFY_CONFIDENCE,
   CLASSIFY_FALLBACK_CATEGORY,
+  forecastCost,
 };
 const TOOLS = createTools(CORE);
 
@@ -1456,4 +1458,235 @@ test('router_preview and router_status are byte-identical to pre-feature shapes 
   const previewResExplicit = await call('router_preview', dExplicit, { category: 'docs' });
   assert.notEqual(previewResExplicit.isError, true);
   assert.equal(previewResExplicit.content?.[0]?.text?.includes('  policy: preserve-frontier active'), true);
+});
+
+test('router_preview: forecast renders correctly when instruction is supplied', async () => {
+  const lanes = [
+    lane({ id: 'metered-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const priceTable = {
+    schema_version: 1,
+    frontier_model: 'claude-opus-4-7',
+    models: {
+      'gpt-5.5': { inputPer1M: 10, outputPer1M: 30 },
+    },
+  };
+  const d = deps({
+    candidateLanes: () => lanes,
+    loadPriceTable: () => priceTable as any,
+  });
+
+  const res = await call('router_preview', d, {
+    category: 'bugfix',
+    instruction: 'hello world', // 3 tokens
+  });
+
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+  assert.ok(text.includes('forecast: ~3 input tok · ~<$0.0001 metered (input only, output extra)'));
+  assert.equal((res.structuredContent as any)?.forecast?.estTokensIn, 3);
+  assert.equal((res.structuredContent as any)?.forecast?.estCostUsd, 0.00003);
+});
+
+test('router_preview: forecast is completely omitted when instruction is absent', async () => {
+  const lanes = [
+    lane({ id: 'metered-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const d = deps({
+    candidateLanes: () => lanes,
+  });
+
+  const res = await call('router_preview', d, {
+    category: 'bugfix',
+  });
+
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+  assert.equal(text.includes('forecast:'), false);
+  assert.equal((res.structuredContent as any)?.forecast, undefined);
+});
+
+test('router_preview: forecast handles files attachment correctly', async () => {
+  const lanes = [
+    lane({ id: 'metered-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const priceTable = {
+    schema_version: 1,
+    frontier_model: 'claude-opus-4-7',
+    models: {
+      'gpt-5.5': { inputPer1M: 10, outputPer1M: 30 },
+    },
+  };
+  const d = deps({
+    candidateLanes: () => lanes,
+    loadPriceTable: () => priceTable as any,
+    readRepoFiles: (paths: readonly string[]) => {
+      assert.deepEqual(paths, ['foo.js']);
+      return {
+        attachments: [{ content: 'extra file content', provenance: 'host-authored', repo_derived: true }],
+        skipped: [],
+      };
+    },
+  });
+
+  // instruction is 'hello world' (11 chars -> 3 tokens)
+  // foo.js adds 'extra file content' (18 chars -> 5 tokens)
+  // combined is 'hello world\nextra file content' (30 chars -> 8 tokens)
+  const res = await call('router_preview', d, {
+    category: 'bugfix',
+    instruction: 'hello world',
+    files: ['foo.js'],
+  });
+
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+  assert.ok(text.includes('forecast: ~8 input tok · ~<$0.0001 metered (input only, output extra)'));
+  assert.equal((res.structuredContent as any)?.forecast?.estTokensIn, 8);
+});
+
+test('router_preview: forecast appends skipped files note', async () => {
+  const lanes = [
+    lane({ id: 'metered-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const d = deps({
+    candidateLanes: () => lanes,
+    readRepoFiles: () => ({
+      attachments: [],
+      skipped: [{ path: 'missing.js', reason: 'not found' }],
+    }),
+  });
+
+  const res = await call('router_preview', d, {
+    category: 'bugfix',
+    instruction: 'hello world',
+    files: ['missing.js'],
+  });
+
+  assert.notEqual(res.isError, true);
+  const text = res.content?.[0]?.text ?? '';
+  assert.ok(text.includes('missing.js: not found'));
+});
+
+test('router_preview: byte-identity full-serialization baseline comparison', async () => {
+  const lanes = [
+    lane({ id: 'cheap', capability: { docs: 0.7 }, costBasis: 'subscription' }),
+    lane({ id: 'mid', capability: { docs: 0.85 }, costBasis: 'subscription' }),
+  ];
+  const d = deps({
+    candidateLanes: () => lanes,
+    routingPolicy: () => 'balanced',
+    routingPolicyExplicit: () => false,
+  });
+
+  const res = await call('router_preview', d, { category: 'docs' });
+
+  const expectedText = [
+    'category "docs" → lane "mid"',
+    '  cli · m · trust=full',
+    '  policy verdict: force-trusted',
+    '  why: Selected mid (m) for docs: capability 0.85 at subscription cost.'
+  ].join('\n');
+
+  const expectedStructured = {
+    category: 'docs',
+    gateReady: true,
+    policyContext: {},
+    decision: {
+      laneId: 'mid',
+      reason: 'Selected mid (m) for docs: capability 0.85 at subscription cost.',
+      scores: [
+        {
+          laneId: 'mid',
+          score: 0.7999999999999999,
+          factors: {
+            capability: 0.85,
+            costPenalty: 0.05,
+            capPenalty: 0,
+            declared: 0.85,
+            evidenceN: 0
+          }
+        },
+        {
+          laneId: 'cheap',
+          score: 0.6499999999999999,
+          factors: {
+            capability: 0.7,
+            costPenalty: 0.05,
+            capPenalty: 0,
+            declared: 0.7,
+            evidenceN: 0
+          }
+        }
+      ],
+      policyVerdict: 'force-trusted'
+    },
+    verdict: 'force-trusted',
+    native: false,
+    yolo: false,
+    fullAccessLaneIds: []
+  };
+
+  const expectedResult = {
+    content: [{ type: 'text', text: expectedText }],
+    structuredContent: expectedStructured
+  };
+  assert.equal(JSON.stringify(res), JSON.stringify(expectedResult));
+});
+
+test('router_preview: forecast renders correctly with overflow/negative prices', async () => {
+  // 1. Overflow price
+  const lanesOverflow = [
+    lane({ id: 'overflow-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const priceTableOverflow = {
+    schema_version: 1,
+    frontier_model: 'claude-opus-4-7',
+    models: {
+      'gpt-5.5': { inputPer1M: Number.MAX_VALUE, outputPer1M: 0 },
+    },
+  };
+  const dOverflow = deps({
+    candidateLanes: () => lanesOverflow,
+    loadPriceTable: () => priceTableOverflow as any,
+  });
+
+  const resOverflow = await call('router_preview', dOverflow, {
+    category: 'bugfix',
+    instruction: 'hello world', // 3 tokens
+  });
+
+  assert.notEqual(resOverflow.isError, true);
+  const textOverflow = resOverflow.content?.[0]?.text ?? '';
+  assert.ok(!textOverflow.includes('$Infinity'));
+  assert.ok(!textOverflow.includes('$NaN'));
+  assert.ok(!textOverflow.includes('$-'));
+  assert.equal((resOverflow.structuredContent as any)?.forecast?.estCostUsd, undefined);
+
+  // 2. Negative price
+  const lanesNegative = [
+    lane({ id: 'negative-lane', model: 'gpt-5.5', costBasis: 'metered' }),
+  ];
+  const priceTableNegative = {
+    schema_version: 1,
+    frontier_model: 'claude-opus-4-7',
+    models: {
+      'gpt-5.5': { inputPer1M: -10, outputPer1M: 0 },
+    },
+  };
+  const dNegative = deps({
+    candidateLanes: () => lanesNegative,
+    loadPriceTable: () => priceTableNegative as any,
+  });
+
+  const resNegative = await call('router_preview', dNegative, {
+    category: 'bugfix',
+    instruction: 'hello world', // 3 tokens
+  });
+
+  assert.notEqual(resNegative.isError, true);
+  const textNegative = resNegative.content?.[0]?.text ?? '';
+  assert.ok(!textNegative.includes('$Infinity'));
+  assert.ok(!textNegative.includes('$NaN'));
+  assert.ok(!textNegative.includes('$-'));
+  assert.equal((resNegative.structuredContent as any)?.forecast?.estCostUsd, undefined);
 });

@@ -12,6 +12,7 @@
  */
 
 import type { CostBasis, Usage } from './types.ts';
+import { estimateTokens } from './usage.ts';
 
 /** Per-model list price, in US dollars per 1,000,000 tokens. */
 export interface ModelPrice {
@@ -202,5 +203,88 @@ export function aggregateSavings(rows: readonly CostPrimitives[]): SavingsSummar
     metered_avoided,
     frontier_avoided_pct: pct(frontier_avoided),
     metered_avoided_pct: pct(metered_avoided),
+  };
+}
+
+/** Cost forecast structure for pre-flight advisory display. */
+export interface CostForecast {
+  estTokensIn: number;
+  estCostUsd?: number;
+  basis: CostBasis;
+  note: string;
+}
+
+/**
+ * Pure cost forecasting for a given prompt/task before execution.
+ * Labels the token count as an estimate and the cost as a projection.
+ */
+export function forecastCost(
+  promptText: string,
+  lane: { model: string; costBasis: CostBasis },
+  priceTable?: PriceTable,
+): CostForecast {
+  let estTokensIn = 0;
+  if (typeof promptText === 'string') {
+    estTokensIn = estimateTokens(promptText);
+  }
+  if (typeof estTokensIn !== 'number' || !Number.isFinite(estTokensIn) || estTokensIn < 0) {
+    estTokensIn = 0;
+  }
+  estTokensIn = Math.floor(estTokensIn);
+
+  const basis = lane.costBasis;
+
+  if (basis === 'subscription') {
+    return {
+      estTokensIn,
+      estCostUsd: 0,
+      basis,
+      note: 'flat-rate subscription',
+    };
+  }
+
+  if (basis === 'local') {
+    return {
+      estTokensIn,
+      estCostUsd: 0,
+      basis,
+      note: 'local — no metered cost',
+    };
+  }
+
+  // metered lane
+  const missingNote = `missing price entry for model "${lane.model}" (price unavailable / output extra)`;
+
+  if (!priceTable || !priceTable.models || !Object.hasOwn(priceTable.models, lane.model)) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote,
+    };
+  }
+
+  const price = priceTable.models[lane.model];
+  if (!price || typeof price.inputPer1M !== 'number' || !Number.isFinite(price.inputPer1M) || price.inputPer1M < 0) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote,
+    };
+  }
+
+  const estCostUsd = (estTokensIn * price.inputPer1M) / 1_000_000;
+  if (typeof estCostUsd !== 'number' || !Number.isFinite(estCostUsd) || estCostUsd < 0) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote,
+    };
+  }
+
+  return {
+    estTokensIn,
+    estCostUsd,
+    basis,
+    note: 'input only, output extra',
   };
 }

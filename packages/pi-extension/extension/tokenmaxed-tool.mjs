@@ -22634,6 +22634,57 @@ function parseLaneConfig(text) {
   return new LaneRegistry(lanes);
 }
 
+// ../core/src/usage.ts
+var UsageError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UsageError";
+  }
+};
+function estimateTokens(text) {
+  if (text.length === 0) return 0;
+  return Math.ceil(text.length / 4);
+}
+function reportedInt(value, where) {
+  if (value === void 0) return 0;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new UsageError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function resolveUsage(args) {
+  const { reported, promptText = "", resultText = "" } = args;
+  const hasReported = reported !== void 0 && typeof reported.tokens_in === "number" && typeof reported.tokens_out === "number";
+  if (hasReported) {
+    const baseIn = reportedInt(reported.tokens_in, "reported.tokens_in");
+    const out = reportedInt(reported.tokens_out, "reported.tokens_out");
+    const cacheRead = reportedInt(reported.cache_read_input_tokens, "reported.cache_read_input_tokens");
+    const cacheCreate = reportedInt(
+      reported.cache_creation_input_tokens,
+      "reported.cache_creation_input_tokens"
+    );
+    return {
+      // Cache tokens count as input usage; we never claim them as cache savings.
+      tokens_in: baseIn + cacheRead + cacheCreate,
+      tokens_out: out,
+      tokens_estimated: false
+    };
+  }
+  return {
+    tokens_in: estimateTokens(promptText),
+    tokens_out: estimateTokens(resultText),
+    tokens_estimated: true
+  };
+}
+function usageFromReported(reported) {
+  const toInt = (n) => {
+    const v = Math.floor(Number(n));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  };
+  const tokens_in = toInt(reported.tokens_in) + toInt(reported.cache_read_input_tokens) + toInt(reported.cache_creation_input_tokens);
+  return { tokens_in, tokens_out: toInt(reported.tokens_out), tokens_estimated: false };
+}
+
 // ../core/src/price.ts
 var PriceError = class extends Error {
   constructor(message) {
@@ -22719,6 +22770,63 @@ function computeCostPrimitives(table, lane, usage) {
     metered_spent,
     frontier_avoided: frontier_cost - actual_cost,
     metered_avoided: frontier_cost - metered_spent
+  };
+}
+function forecastCost(promptText, lane, priceTable) {
+  let estTokensIn = 0;
+  if (typeof promptText === "string") {
+    estTokensIn = estimateTokens(promptText);
+  }
+  if (typeof estTokensIn !== "number" || !Number.isFinite(estTokensIn) || estTokensIn < 0) {
+    estTokensIn = 0;
+  }
+  estTokensIn = Math.floor(estTokensIn);
+  const basis = lane.costBasis;
+  if (basis === "subscription") {
+    return {
+      estTokensIn,
+      estCostUsd: 0,
+      basis,
+      note: "flat-rate subscription"
+    };
+  }
+  if (basis === "local") {
+    return {
+      estTokensIn,
+      estCostUsd: 0,
+      basis,
+      note: "local \u2014 no metered cost"
+    };
+  }
+  const missingNote = `missing price entry for model "${lane.model}" (price unavailable / output extra)`;
+  if (!priceTable || !priceTable.models || !Object.hasOwn(priceTable.models, lane.model)) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote
+    };
+  }
+  const price = priceTable.models[lane.model];
+  if (!price || typeof price.inputPer1M !== "number" || !Number.isFinite(price.inputPer1M) || price.inputPer1M < 0) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote
+    };
+  }
+  const estCostUsd = estTokensIn * price.inputPer1M / 1e6;
+  if (typeof estCostUsd !== "number" || !Number.isFinite(estCostUsd) || estCostUsd < 0) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote
+    };
+  }
+  return {
+    estTokensIn,
+    estCostUsd,
+    basis,
+    note: "input only, output extra"
   };
 }
 
@@ -23345,57 +23453,6 @@ function selectReviewManager(lanes, subject, category, ctx, policy) {
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   });
   return eligible[0];
-}
-
-// ../core/src/usage.ts
-var UsageError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "UsageError";
-  }
-};
-function estimateTokens(text) {
-  if (text.length === 0) return 0;
-  return Math.ceil(text.length / 4);
-}
-function reportedInt(value, where) {
-  if (value === void 0) return 0;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new UsageError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function resolveUsage(args) {
-  const { reported, promptText = "", resultText = "" } = args;
-  const hasReported = reported !== void 0 && typeof reported.tokens_in === "number" && typeof reported.tokens_out === "number";
-  if (hasReported) {
-    const baseIn = reportedInt(reported.tokens_in, "reported.tokens_in");
-    const out = reportedInt(reported.tokens_out, "reported.tokens_out");
-    const cacheRead = reportedInt(reported.cache_read_input_tokens, "reported.cache_read_input_tokens");
-    const cacheCreate = reportedInt(
-      reported.cache_creation_input_tokens,
-      "reported.cache_creation_input_tokens"
-    );
-    return {
-      // Cache tokens count as input usage; we never claim them as cache savings.
-      tokens_in: baseIn + cacheRead + cacheCreate,
-      tokens_out: out,
-      tokens_estimated: false
-    };
-  }
-  return {
-    tokens_in: estimateTokens(promptText),
-    tokens_out: estimateTokens(resultText),
-    tokens_estimated: true
-  };
-}
-function usageFromReported(reported) {
-  const toInt = (n) => {
-    const v = Math.floor(Number(n));
-    return Number.isFinite(v) && v > 0 ? v : 0;
-  };
-  const tokens_in = toInt(reported.tokens_in) + toInt(reported.cache_read_input_tokens) + toInt(reported.cache_creation_input_tokens);
-  return { tokens_in, tokens_out: toInt(reported.tokens_out), tokens_estimated: false };
 }
 
 // ../core/src/run.ts
@@ -26154,6 +26211,15 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       required: ["category"],
       properties: {
         category: { type: "string", enum: [...core.taskCategories], description: "Task category to route." },
+        instruction: {
+          type: "string",
+          description: "OPTIONAL instruction text to forecast input tokens and cost."
+        },
+        files: {
+          type: "array",
+          items: { type: "string" },
+          description: "OPTIONAL repo-relative file paths to include in the forecast."
+        },
         repo_class: { type: "string", enum: [...REPO_CLASSES2], description: "Repository class for policy (default unknown)." },
         sensitivity: { type: "string", enum: [...SENSITIVITIES2], description: "Content sensitivity for policy (default unknown)." },
         gate_ready: {
@@ -26188,6 +26254,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
     handler: (deps, args) => guardedAsync(async () => {
       const category = optEnum(args, "category", core.taskCategories);
       if (category === void 0) throw new ToolInputError('"category" is required.');
+      const instruction = optString(args, "instruction");
+      const files = optStringArray(args, "files");
       const repo_class = optEnum(args, "repo_class", REPO_CLASSES2);
       const sensitivity = optEnum(args, "sensitivity", SENSITIVITIES2);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
@@ -26446,6 +26514,38 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       if (healthDeprioritizedLosers.length > 0) {
         healthLines.push(`  health-deprioritized: ${healthDeprioritizedLosers.join(", ")}`);
       }
+      let forecastLine = "";
+      let forecastData = void 0;
+      if (instruction) {
+        let combinedText2 = instruction;
+        let skippedNote = "";
+        if (files && files.length && deps.readRepoFiles) {
+          const fileResult = deps.readRepoFiles(files);
+          for (const att of fileResult.attachments) {
+            combinedText2 += "\n" + att.content;
+          }
+          if (fileResult.skipped.length > 0) {
+            skippedNote = ` (${fileResult.skipped.length} file(s) not attached: ${fileResult.skipped.map((s) => `${s.path}: ${s.reason}`).join("; ")})`;
+          }
+        }
+        if (lane && core.forecastCost) {
+          const priceTable = deps.loadPriceTable ? deps.loadPriceTable() : void 0;
+          const forecast = core.forecastCost(combinedText2, lane, priceTable);
+          forecastData = forecast;
+          const int2 = (n) => Math.round(n).toLocaleString("en-US");
+          let costStr = "";
+          if (forecast.estCostUsd !== void 0) {
+            if (forecast.estCostUsd === 0) {
+              costStr = " \xB7 $0";
+            } else if (forecast.estCostUsd > 0 && forecast.estCostUsd < 1e-4) {
+              costStr = " \xB7 ~<$0.0001 metered";
+            } else {
+              costStr = ` \xB7 ~$${forecast.estCostUsd.toFixed(4)} metered`;
+            }
+          }
+          forecastLine = `  forecast: ~${int2(forecast.estTokensIn)} input tok${costStr} (${forecast.note})${skippedNote}`;
+        }
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
@@ -26453,6 +26553,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
         `  why: ${decision.reason}`,
+        ...forecastLine ? [forecastLine] : [],
         ...difficulty ? [
           `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
         ] : [],
@@ -26463,7 +26564,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
     })
   };
   const statusTool = {
@@ -27843,7 +27944,7 @@ function fileFullAccessStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost };
 function receiptFromEvents(events) {
   const legs = events.filter((e) => e.status !== "native");
   if (legs.length === 0) return void 0;
@@ -28655,6 +28756,16 @@ function makeServerDeps(env = process.env) {
     tieredStrategy,
     ...tierFloor !== void 0 ? { tierFloor } : {},
     laneCost: (lanes) => laneCostMap(lanes, loadPriceTable(pricesPath)),
+    loadPriceTable: () => loadPriceTable(pricesPath),
+    readRepoFiles: (paths) => readRepoFiles(paths, {
+      projectDir: env.TOKENMAXED_PROJECT_DIR ?? env.CLAUDE_PROJECT_DIR,
+      realpath: realpathSync,
+      readFile: (p) => readFileSync7(p, "utf8"),
+      stat: (p) => {
+        const s = statSync2(p);
+        return { isFile: s.isFile(), size: s.size };
+      }
+    }),
     // TOKENMAXED_DISABLE forces routing off (kill-switch + recursion guard),
     // overriding the per-project toggle.
     getEnabled: () => globallyDisabled ? false : readEnabled(store, projectKey),

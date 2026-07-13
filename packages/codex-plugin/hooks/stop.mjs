@@ -7927,6 +7927,12 @@ function parseLaneConfig(text) {
   return new LaneRegistry(lanes);
 }
 
+// ../core/src/usage.ts
+function estimateTokens(text) {
+  if (text.length === 0) return 0;
+  return Math.ceil(text.length / 4);
+}
+
 // ../core/src/price.ts
 var PriceError = class extends Error {
   constructor(message) {
@@ -8310,12 +8316,6 @@ async function review(request, deps) {
   if (out.notes !== void 0) result.notes = out.notes;
   if (out.suggested_lane_id !== void 0) result.suggested_lane_id = out.suggested_lane_id;
   return result;
-}
-
-// ../core/src/usage.ts
-function estimateTokens(text) {
-  if (text.length === 0) return 0;
-  return Math.ceil(text.length / 4);
 }
 
 // ../core/src/node.ts
