@@ -144,6 +144,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
 | `/tokenmaxed:config [key] [value\|clear]` | show or persist the feature settings (`~/.tokenmaxed/settings.json`) — the durable alternative to launch-time env flags. An env var always overrides a stored setting; the kill-switch, YOLO, and API keys stay env-only. Hooks/statusline apply changes on their next run; routing flags apply at the next session. |
 | `/tokenmaxed:prefer <lane>` · `/tokenmaxed:prefer off` | temporarily favor one configured lane (any vendor, CLI or API) over normal routing — e.g. to push a sprint's work to a cheaper subscription while another's credits run low; clears with `off`. Honored only when that lane is eligible, available, and capable for the task (else it falls back to normal routing). Persisted per project; no relaunch. |
+| `/tokenmaxed:policy <policy>` · `/tokenmaxed:policy off` | set or clear the per-project routing policy. Options: `balanced` (default), `cheapest`, `preserve-frontier`, `reliable`; clears with `off`. Persisted per project; no relaunch. |
 | `/tokenmaxed:reserve <lane> <pct>` · `/tokenmaxed:reserve off` | reserve a fraction of a lane's quota (e.g. 15% of Opus) so routing keeps that headroom in reserve; clears with `off`. Persisted per project; no relaunch. |
 | `/tokenmaxed:calibrate <lane> <pct>` · `/tokenmaxed:calibrate off` | calibrate a lane's true used fraction (e.g. 70% of Opus weekly cap) so routing respects it as a floor; clears with `off`. Persisted per project; no relaunch. |
 | `/tokenmaxed:routed-share <lane> <pct>` · `/tokenmaxed:routed-share off` | set estimated routed share fraction of your work for a lane or model (e.g. 30% of Opus) used only to estimate total usage; clears with `off`. Persisted per project; no relaunch. |
@@ -376,6 +377,11 @@ per-launch if you'd rather opt into the gate explicitly each time.)
     that clears. A `capability: 0` lane is never selected; if nothing clears the floor,
     routing falls back to maximize so it never fails. `/tokenmaxed:why` shows the
     tiered pick. Family grouping uses each lane's `model_family`.
+  - **Named Routing Policies (choose your routing objective)** — set at runtime with `/tokenmaxed:policy <policy>` or configure via environment variable `TOKENMAXED_ROUTING_POLICY=<policy>`. Four policies are available:
+    - `balanced` (default): maximizes capability − cost − quota − health.
+    - `cheapest`: routes via tiered strategy (equivalent to `TOKENMAXED_TIERED=true`), choosing the cheapest capable lane clearing the capability floor.
+    - `preserve-frontier`: deprioritizes expensive/frontier lanes by applying a deterministic penalty scaling with cost.
+    - `reliable`: weights lane health signals heavily to favor highly reliable paths.
   - **⚠️ YOLO mode (the `--dangerously-skip-permissions` analogue)** — turns off
     the routing **permission gates** so EVERY configured worker/reader lane is
     selectable. Launch with `TOKENMAXED_YOLO=true` (session default), or flip it

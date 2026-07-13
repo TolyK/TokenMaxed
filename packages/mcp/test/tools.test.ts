@@ -135,6 +135,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
       lanes: [],
       laneReview: 'current',
     }),
+    routingPolicyExplicit: () => false,
     now: () => FIXED_NOW,
     ...over,
   };
@@ -159,6 +160,7 @@ test('builds the expected tool set with object input schemas', () => {
       'router_set_calibration',
       'router_set_enabled',
       'router_set_full_access',
+      'router_set_policy',
       'router_set_prefer',
       'router_set_reserve',
       'router_set_routed_share',
@@ -1141,4 +1143,131 @@ test('delegate and preview compute IDENTICAL fullAccessLaneIds including exact-m
       rmSync(dir, { recursive: true, force: true });
     } catch {}
   }
+});
+
+test('router_set_policy tool sets, clears, and validates policy', async () => {
+  let policySet: string | undefined = undefined;
+  const d = deps({
+    setRoutingPolicy: (p) => { policySet = p; },
+  });
+
+  // Valid policy
+  let res = await call('router_set_policy', d, { policy: 'preserve-frontier' });
+  assert.notEqual(res.isError, true);
+  assert.equal(policySet, 'preserve-frontier');
+
+  // Clear policy using 'off'
+  res = await call('router_set_policy', d, { policy: 'off' });
+  assert.notEqual(res.isError, true);
+  assert.equal(policySet, undefined);
+
+  // Clear policy using 'clear'
+  res = await call('router_set_policy', d, { policy: 'clear' });
+  assert.notEqual(res.isError, true);
+  assert.equal(policySet, undefined);
+
+  // Reject invalid policy
+  res = await call('router_set_policy', d, { policy: 'invalid-policy-name' });
+  assert.equal(res.isError, true);
+});
+
+test('delegate rejects invalid policy below tool boundary', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tokenmaxed-wiring-policy-'));
+  const lanesYaml = `lanes:\n  - id: minimax-api\n    kind: api\n    model: MiniMax-M3\n    trust_mode: reader\n    costBasis: metered\n    provenance: minimax\n    jurisdiction: CN\n    endpoint: http://localhost\n    capability:\n      bugfix: 0.8\n`;
+  writeFileSync(join(dir, 'lanes.yaml'), lanesYaml, 'utf8');
+
+  const env = {
+    TOKENMAXED_LANES: join(dir, 'lanes.yaml'),
+    TOKENMAXED_LEDGER: join(dir, 'ledger.jsonl'),
+    TOKENMAXED_STATE: join(dir, 'state.json'),
+    TOKENMAXED_PRICES: fileURLToPath(new URL('../prices.seed.json', import.meta.url)),
+    TOKENMAXED_PROJECT: 'wiring-policy-test',
+  };
+
+  try {
+    const serverDeps = makeServerDeps(env);
+    await assert.rejects(async () => {
+      await serverDeps.delegate({
+        category: 'bugfix',
+        instruction: 'test instruction',
+        policy: 'invalid-policy-name' as any,
+      });
+    }, /Invalid routing policy/);
+
+    await assert.rejects(async () => {
+      await serverDeps.delegate({
+        category: 'bugfix',
+        instruction: 'test instruction',
+        policy: '' as any,
+      });
+    }, /Invalid routing policy/);
+
+    await assert.rejects(async () => {
+      await serverDeps.delegate({
+        category: 'bugfix',
+        instruction: 'test instruction',
+        policy: '   ' as any,
+      });
+    }, /Invalid routing policy/);
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+test('router_preview and router_status are byte-identical to pre-feature shapes when no policy is explicit', async () => {
+  const lanes = [
+    lane({ id: 'cheap', capability: { docs: 0.7 }, costBasis: 'subscription' }),
+    lane({ id: 'mid', capability: { docs: 0.85 }, costBasis: 'subscription' }),
+  ];
+
+  // Case 1: No explicit policy set (neither request policy, nor project policy, nor env policy)
+  const dDefault = deps({
+    candidateLanes: () => lanes,
+    routingPolicy: () => 'balanced',
+    routingPolicyExplicit: () => false,
+  });
+
+  const statusResDefault = await call('router_status', dDefault);
+  assert.notEqual(statusResDefault.isError, true);
+  // Status text should NOT contain "Active routing policy:"
+  assert.equal(statusResDefault.content?.[0]?.text?.includes('Active routing policy:'), false);
+
+  const previewResDefault = await call('router_preview', dDefault, { category: 'docs' });
+  assert.notEqual(previewResDefault.isError, true);
+  // Preview text should NOT contain "  policy:"
+  assert.equal(previewResDefault.content?.[0]?.text?.includes('  policy:'), false);
+
+  // Case 2: Legacy TOKENMAXED_TIERED=true (tieredStrategy: 'tiered') without explicit policy
+  const dLegacy = deps({
+    candidateLanes: () => lanes,
+    tieredStrategy: 'tiered',
+    tierFloor: 0.6,
+    routingPolicy: () => 'cheapest',
+    routingPolicyExplicit: () => false,
+  });
+
+  const statusResLegacy = await call('router_status', dLegacy);
+  assert.notEqual(statusResLegacy.isError, true);
+  assert.equal(statusResLegacy.content?.[0]?.text?.includes('Active routing policy:'), false);
+
+  const previewResLegacy = await call('router_preview', dLegacy, { category: 'docs' });
+  assert.notEqual(previewResLegacy.isError, true);
+  assert.equal(previewResLegacy.content?.[0]?.text?.includes('  policy:'), false);
+
+  // Case 3: Explicit policy set (should render policy lines)
+  const dExplicit = deps({
+    candidateLanes: () => lanes,
+    routingPolicy: () => 'preserve-frontier',
+    routingPolicyExplicit: () => true,
+  });
+
+  const statusResExplicit = await call('router_status', dExplicit);
+  assert.notEqual(statusResExplicit.isError, true);
+  assert.equal(statusResExplicit.content?.[0]?.text?.includes('Active routing policy: preserve-frontier'), true);
+
+  const previewResExplicit = await call('router_preview', dExplicit, { category: 'docs' });
+  assert.notEqual(previewResExplicit.isError, true);
+  assert.equal(previewResExplicit.content?.[0]?.text?.includes('  policy: preserve-frontier active'), true);
 });

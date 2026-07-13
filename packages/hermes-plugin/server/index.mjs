@@ -23672,15 +23672,28 @@ function effectiveCapabilityFor(lane, category, overlay, opts) {
   const declared = declaredCapabilityFor(lane, category);
   return applyDifficultyCell(effectiveCapability(declared, observed, opts), lane, category, opts);
 }
-function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts, healthPenaltyMap) {
+function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts, healthPenaltyMap, laneCost, routingPolicy) {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
   const effOpts = observedCapabilityByModel ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel } : effectiveOpts;
   const capability = effOpts?.priorOverlay || effOpts?.difficulty && effOpts?.difficultyOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts) : effectiveCapability(declared, observed);
-  const costPenalty = COST_PENALTY[lane.costBasis];
+  const costPenaltyRaw = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
   const healthPenaltyRaw = healthPenaltyMap?.[lane.id] ?? 0;
-  const healthPenalty = Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0 ? Math.min(1, healthPenaltyRaw) : 0;
+  let healthPenalty = Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0 ? Math.min(1, healthPenaltyRaw) : 0;
+  let costPenalty = costPenaltyRaw;
+  if (routingPolicy === "preserve-frontier") {
+    const rawSignal = laneCost?.[lane.id];
+    let costSignal = COST_PENALTY[lane.costBasis];
+    let multiplier = 5;
+    if (rawSignal !== void 0 && Number.isFinite(rawSignal) && rawSignal >= 0) {
+      costSignal = Math.min(1e6, rawSignal);
+      multiplier = 0.2;
+    }
+    costPenalty += costSignal * multiplier;
+  } else if (routingPolicy === "reliable") {
+    healthPenalty = healthPenalty * 5;
+  }
   const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty - healthPenalty;
   const factors = {
     capability,
@@ -23705,10 +23718,13 @@ function compareScores(a, b) {
   if (b.score !== a.score) return b.score - a.score;
   return a.laneId < b.laneId ? -1 : a.laneId > b.laneId ? 1 : 0;
 }
-function describe2(lane, best, task, tiered = false, preferred = false) {
+function describe2(lane, best, task, routingPolicy, tiered = false, preferred = false) {
   const f = best.factors;
   const cap = f.capability.toFixed(2);
   let reason = preferred ? `Selected ${lane.id} (${lane.model}) for ${task.category}: preferred lane (explicit offload), capability ${cap} at ${lane.costBasis} cost.` : tiered ? `Selected ${lane.id} (${lane.model}) for ${task.category}: cheapest lane clearing the capability floor (tiered), capability ${cap} at ${lane.costBasis} cost.` : `Selected ${lane.id} (${lane.model}) for ${task.category}: capability ${cap} at ${lane.costBasis} cost.`;
+  if (routingPolicy !== void 0 && routingPolicy !== "balanced") {
+    reason += ` (policy: ${routingPolicy} active)`;
+  }
   if (f.evidenceN >= 1 && f.capability.toFixed(2) !== f.declared.toFixed(2)) {
     reason += ` (learned: declared ${f.declared.toFixed(2)}, n=${f.evidenceN.toFixed(1)}.)`;
   }
@@ -23759,11 +23775,11 @@ function routeDecide(task, ctx, policy) {
     );
   }
   const effectiveOpts = effectiveOptsForTask(ctx, task);
+  const routingPolicy = ctx.routingPolicy ?? (ctx.strategy === "tiered" ? "cheapest" : "balanced");
   const scored = candidates.map(
-    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty)
+    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty, ctx.laneCost, routingPolicy)
   );
-  const strategy = ctx.strategy ?? "maximize";
-  const tiered = strategy === "tiered";
+  const tiered = routingPolicy === "cheapest";
   const scores = tiered ? orderTiered(scored, candidates, task, ctx) : [...scored].sort(compareScores);
   let preferred = false;
   if (ctx.preferLaneId != null) {
@@ -23779,7 +23795,7 @@ function routeDecide(task, ctx, policy) {
   const wonByTier = !preferred && tiered && winner.factors.capability > 0 && winner.factors.capability >= tierFloorFor(task, ctx);
   return {
     laneId: winner.laneId,
-    reason: describe2(winningLane, winner, task, wonByTier, preferred),
+    reason: describe2(winningLane, winner, task, ctx.routingPolicy, wonByTier, preferred),
     scores,
     policyVerdict: verdicts.get(winner.laneId)
   };
@@ -27732,6 +27748,45 @@ function writeTarget(store, projectKey, key, until) {
   store.write(map);
 }
 
+// ../mcp/src/routing-policy.ts
+var NAMED_ROUTING_POLICIES = [
+  "balanced",
+  "cheapest",
+  "preserve-frontier",
+  "reliable"
+];
+function isValidRoutingPolicy(val) {
+  return typeof val === "string" && NAMED_ROUTING_POLICIES.includes(val);
+}
+function asMap3(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [k, v] of Object.entries(raw)) {
+    if (isValidRoutingPolicy(v)) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+function readPolicy(store, projectKey) {
+  const map = asMap3(store.read());
+  return Object.hasOwn(map, projectKey) ? map[projectKey] : void 0;
+}
+function writePolicy(store, projectKey, policy) {
+  const map = asMap3(store.read());
+  if (typeof policy === "string") {
+    const cleaned = policy.trim().toLowerCase();
+    if (cleaned === "off" || cleaned === "clear" || cleaned === "none") {
+      delete map[projectKey];
+    } else if (isValidRoutingPolicy(cleaned)) {
+      map[projectKey] = cleaned;
+    }
+  } else {
+    delete map[projectKey];
+  }
+  store.write(map);
+}
+
 // ../mcp/src/tools.ts
 var ToolInputError = class extends Error {
   constructor(message) {
@@ -27950,6 +28005,9 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       return ok(banner, { summary: data, ...alerts.length ? { quotaAlerts: alerts } : {} });
     })
   };
+  function policyExplanation(routingPolicy) {
+    return " active";
+  }
   const previewTool = {
     name: "router_preview",
     description: "Preview which lane would handle a task category under the current lanes + policy, without executing anything. Powers /router:why. Read-only; no content is sent anywhere.",
@@ -27982,6 +28040,11 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         full_access: {
           type: "boolean",
           description: "OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` \u2014 elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it."
+        },
+        policy: {
+          type: "string",
+          enum: ["balanced", "cheapest", "preserve-frontier", "reliable"],
+          description: "OPTIONAL routing policy to override the project default for this request."
         }
       }
     },
@@ -27994,11 +28057,15 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       const pinnedModel = optString(args, "model")?.trim() || void 0;
       const full_access = optBool(args, "full_access");
+      const requestPolicy = optEnum(args, "policy", ["balanced", "cheapest", "preserve-frontier", "reliable"]);
       if (full_access && !pinnedModel) {
         throw new ToolInputError("full_access requires a model pin.");
       }
       const task = { category, ...difficulty ? { difficulty } : {} };
       const resolvedAccessNeed = access_need === "repo-tight" ? "repo-tight" : "worker-ok";
+      const hasRequestPolicy = requestPolicy !== void 0;
+      const explicitPolicy = hasRequestPolicy || (deps.routingPolicyExplicit?.() ?? false);
+      const routingPolicy = requestPolicy ?? deps.routingPolicy?.() ?? (deps.tieredStrategy === "tiered" ? "cheapest" : "balanced");
       if (!deps.getEnabled()) {
         return ok(
           `category "${category}": TokenMaxed routing is DISABLED for this project \u2014 it would run on the host (native). Run /tokenmaxed:on to re-enable.`,
@@ -28060,16 +28127,14 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           ...priorCtx,
           ...quotaCtx,
           ...healthCtx,
-          ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
+          ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {},
+          routingPolicy,
+          ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+          ...routingPolicy === "cheapest" ? { strategy: "tiered", ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {} } : {}
         };
         const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
       }
-      const tieredCtx = deps.tieredStrategy === "tiered" ? {
-        strategy: "tiered",
-        ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {},
-        ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}
-      } : {};
       const preferLaneId = deps.preferredLane?.();
       const ctx = {
         lanes,
@@ -28086,7 +28151,9 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...quotaCtx,
         ...healthCtx,
         ...availableIds ? { availableLaneIds: availableIds } : {},
-        ...tieredCtx,
+        routingPolicy,
+        ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+        ...routingPolicy === "cheapest" ? { strategy: "tiered", ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {} } : {},
         ...preferLaneId ? { preferLaneId } : {},
         ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
       };
@@ -28236,6 +28303,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
+        ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
         ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
@@ -28263,7 +28331,12 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const mismatches = enabled && deps.idMismatch ? await deps.idMismatch() : [];
       const preferred = deps.preferredLane?.();
       const yolo = deps.getYolo?.() ?? false;
+      const policy = deps.routingPolicy?.() ?? "balanced";
+      const explicitPolicy = deps.routingPolicyExplicit?.() ?? false;
       const lines = [`TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`];
+      if (explicitPolicy) {
+        lines.push(`Active routing policy: ${policy}`);
+      }
       if (yolo) {
         lines.push(
           "\u26A0\uFE0F YOLO mode is ON \u2014 every trust/egress gate is bypassed: ALL configured worker/reader lanes are selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner still runs. Disable with /tokenmaxed:yolo off."
@@ -28387,6 +28460,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       return ok(lines.join("\n"), {
         enabled,
         yolo,
+        policy,
         ...preferred ? { preferLaneId: preferred } : {},
         staleness: warnings,
         idMismatch: mismatches
@@ -28725,6 +28799,11 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         full_access: {
           type: "boolean",
           description: "OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` \u2014 elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it."
+        },
+        policy: {
+          type: "string",
+          enum: ["balanced", "cheapest", "preserve-frontier", "reliable"],
+          description: "OPTIONAL routing policy to override the project default for this request."
         }
       }
     },
@@ -28739,6 +28818,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       const model = optString(args, "model");
       const full_access = optBool(args, "full_access");
+      const policy = optEnum(args, "policy", ["balanced", "cheapest", "preserve-frontier", "reliable"]);
       if (full_access && !model) {
         throw new ToolInputError("full_access requires a model pin.");
       }
@@ -28761,7 +28841,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...access_need ? { access_need } : {},
         ...difficulty ? { difficulty } : {},
         ...model ? { model } : {},
-        ...full_access !== void 0 ? { full_access } : {}
+        ...full_access !== void 0 ? { full_access } : {},
+        ...policy ? { policy } : {}
       });
       const finalOutcome = resolution.categoryInferred ? {
         ...outcome,
@@ -29037,7 +29118,37 @@ ${r.notes}` : "";
       );
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool];
+  const setPolicyTool = {
+    name: "router_set_policy",
+    description: 'Set or clear a per-project named routing policy for TokenMaxed routing. Policy must be one of: balanced, cheapest, preserve-frontier, reliable. Pass "off", "clear", or "none" to clear. Powers /tokenmaxed:policy.',
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        policy: {
+          type: "string",
+          description: 'The routing policy to use: "balanced", "cheapest", "preserve-frontier", "reliable", or "off"/"clear"/"none" to clear.'
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const raw = optString(args, "policy");
+      const policy = typeof raw === "string" ? raw.trim().toLowerCase() : void 0;
+      if (!policy || policy === "off" || policy === "clear" || policy === "none") {
+        deps.setRoutingPolicy?.(void 0);
+        return ok("Routing policy cleared (reset to default behavior).", { policy: "balanced" });
+      }
+      if (!isValidRoutingPolicy(policy)) {
+        throw new ToolInputError(`Invalid routing policy "${policy}". Allowed values: balanced, cheapest, preserve-frontier, reliable.`);
+      }
+      deps.setRoutingPolicy?.(policy);
+      return ok(
+        `Routing policy set to "${policy}" for this project.`,
+        { policy }
+      );
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool];
 }
 function receiptLine(r) {
   const int2 = (n) => Math.round(n).toLocaleString("en-US");
@@ -29148,7 +29259,7 @@ function unknownKeys(inputSchema, args) {
 }
 
 // ../mcp/src/prefer.ts
-function asMap3(raw) {
+function asMap4(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = /* @__PURE__ */ Object.create(null);
   for (const [k, v] of Object.entries(raw)) {
@@ -29157,11 +29268,11 @@ function asMap3(raw) {
   return out;
 }
 function readPreferred(store, projectKey) {
-  const map = asMap3(store.read());
+  const map = asMap4(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : void 0;
 }
 function writePreferred(store, projectKey, laneId) {
-  const map = asMap3(store.read());
+  const map = asMap4(store.read());
   if (typeof laneId === "string" && laneId.length > 0) {
     map[projectKey] = laneId;
   } else {
@@ -29171,7 +29282,7 @@ function writePreferred(store, projectKey, laneId) {
 }
 
 // ../mcp/src/reserve.ts
-function asMap4(raw) {
+function asMap5(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -29190,11 +29301,11 @@ function asMap4(raw) {
   return out;
 }
 function readReserves(store, projectKey) {
-  const map = asMap4(store.read());
+  const map = asMap5(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : {};
 }
 function writeReserve(store, projectKey, key, fraction) {
-  const map = asMap4(store.read());
+  const map = asMap5(store.read());
   if (key === void 0) {
     delete map[projectKey];
   } else {
@@ -29214,7 +29325,7 @@ function writeReserve(store, projectKey, key, fraction) {
 }
 
 // ../mcp/src/calibration.ts
-function asMap5(raw) {
+function asMap6(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -29233,11 +29344,11 @@ function asMap5(raw) {
   return out;
 }
 function readCalibrations(store, projectKey) {
-  const map = asMap5(store.read());
+  const map = asMap6(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : {};
 }
 function writeCalibration(store, projectKey, key, fraction) {
-  const map = asMap5(store.read());
+  const map = asMap6(store.read());
   if (key === void 0) {
     delete map[projectKey];
   } else {
@@ -29257,7 +29368,7 @@ function writeCalibration(store, projectKey, key, fraction) {
 }
 
 // ../mcp/src/routed-share.ts
-function asMap6(raw) {
+function asMap7(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -29276,11 +29387,11 @@ function asMap6(raw) {
   return out;
 }
 function readRoutedShares(store, projectKey) {
-  const map = asMap6(store.read());
+  const map = asMap7(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : {};
 }
 function writeRoutedShare(store, projectKey, key, fraction) {
-  const map = asMap6(store.read());
+  const map = asMap7(store.read());
   if (key === void 0) {
     delete map[projectKey];
   } else {
@@ -29300,7 +29411,7 @@ function writeRoutedShare(store, projectKey, key, fraction) {
 }
 
 // ../mcp/src/yolo.ts
-function asMap7(raw) {
+function asMap8(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = /* @__PURE__ */ Object.create(null);
   for (const [k, v] of Object.entries(raw)) {
@@ -29309,17 +29420,17 @@ function asMap7(raw) {
   return out;
 }
 function readYolo(store, projectKey, fallback = false) {
-  const map = asMap7(store.read());
+  const map = asMap8(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : fallback;
 }
 function writeYolo(store, projectKey, on) {
-  const map = asMap7(store.read());
+  const map = asMap8(store.read());
   map[projectKey] = on;
   store.write(map);
 }
 
 // ../mcp/src/full-access.ts
-function asMap8(raw) {
+function asMap9(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = /* @__PURE__ */ Object.create(null);
   for (const [k, v] of Object.entries(raw)) {
@@ -29341,7 +29452,7 @@ function asMap8(raw) {
   return out;
 }
 function readFullAccess(store, projectKey) {
-  const map = asMap8(store.read());
+  const map = asMap9(store.read());
   const list = map[projectKey];
   if (!list) return [];
   const seen = /* @__PURE__ */ new Set();
@@ -29359,7 +29470,7 @@ function grantFullAccess(store, projectKey, laneId) {
   if (typeof laneId !== "string") return;
   const trimmed = laneId.trim();
   if (trimmed.length === 0) return;
-  const map = asMap8(store.read());
+  const map = asMap9(store.read());
   const list = map[projectKey] ?? [];
   const seen = /* @__PURE__ */ new Set();
   const out = [];
@@ -29382,7 +29493,7 @@ function grantFullAccess(store, projectKey, laneId) {
   store.write(map);
 }
 function revokeFullAccess(store, projectKey, laneId) {
-  const map = asMap8(store.read());
+  const map = asMap9(store.read());
   if (!laneId || typeof laneId !== "string" || laneId.trim().length === 0) {
     delete map[projectKey];
   } else {
@@ -29476,6 +29587,22 @@ function fileToggleStore(statePath) {
   };
 }
 function filePreferStore(statePath) {
+  return {
+    read: () => {
+      if (!existsSync9(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync7(statePath, "utf8"));
+      } catch {
+        return {};
+      }
+    },
+    write: (state) => {
+      mkdirSync6(dirname8(statePath), { recursive: true });
+      writeFileSync5(statePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+    }
+  };
+}
+function filePolicyStore(statePath) {
   return {
     read: () => {
       if (!existsSync9(statePath)) return {};
@@ -29888,6 +30015,13 @@ function makeServerDeps(env = process.env) {
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
   const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
+  const policyStatePath = env.TOKENMAXED_POLICY_STATE ?? join7(dirname8(statePath), "policy.json");
+  const policyStore = filePolicyStore(policyStatePath);
+  const policyEnvFallback = isValidRoutingPolicy(env.TOKENMAXED_ROUTING_POLICY?.trim()) ? env.TOKENMAXED_ROUTING_POLICY.trim() : void 0;
+  const readRoutingPolicy = () => {
+    const projectPolicy = readPolicy(policyStore, projectKey);
+    return projectPolicy ?? policyEnvFallback ?? (tieredStrategy === "tiered" ? "cheapest" : "balanced");
+  };
   const fullAccessStatePath = env.TOKENMAXED_FULL_ACCESS_STATE ?? join7(dirname8(statePath), "full-access.json");
   const fullAccessStore = fileFullAccessStore(fullAccessStatePath);
   const fullAccessEnvFallback = env.TOKENMAXED_FULL_ACCESS ? env.TOKENMAXED_FULL_ACCESS.split(",").map((x) => x.trim()).filter((x) => x.length > 0) : [];
@@ -30022,7 +30156,9 @@ function makeServerDeps(env = process.env) {
             const m = quotaHeadroomMap(events, resolvedCandidates, now, resolvedTargets);
             return Object.keys(m).length > 0 ? { capHeadroom: m } : {};
           })(),
-          ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(candidates, snapshot.priceTable) } : {},
+          routingPolicy: readRoutingPolicy(),
+          ...laneCostMap ? { laneCost: laneCostMap(candidates, snapshot.priceTable) } : {},
+          ...readRoutingPolicy() === "cheapest" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {} } : {},
           ...preferred && preferred !== cappedLane.id ? { preferLaneId: preferred } : {}
         });
         const catCounts = /* @__PURE__ */ new Map();
@@ -30075,6 +30211,14 @@ function makeServerDeps(env = process.env) {
     }
   };
   const delegate = async (request) => {
+    if (request.policy !== void 0) {
+      const pStr = typeof request.policy === "string" ? request.policy.trim().toLowerCase() : "";
+      if (!isValidRoutingPolicy(pStr)) {
+        throw new Error(`Invalid routing policy "${request.policy}". Allowed values: balanced, cheapest, preserve-frontier, reliable.`);
+      }
+    }
+    const requestPolicy = typeof request.policy === "string" ? request.policy.trim().toLowerCase() : void 0;
+    const routingPolicy = requestPolicy ?? readRoutingPolicy();
     if (!existsSync9(lanesPath)) {
       if (lanesPathExplicit) throw new Error(`configured lane file not found: ${lanesPath}`);
       return {
@@ -30153,8 +30297,10 @@ function makeServerDeps(env = process.env) {
         const p = capabilityPriorFor(lanes);
         return p.state === "on" ? { capabilityPrior: p.overlay, ...p.stale ? { capabilityPriorStale: true } : {} } : {};
       })(),
-      // MODEL-TIERS: tiered routing + the price-derived cost signal (when enabled).
-      ...tieredStrategy === "tiered" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {}, laneCost: laneCostMap(lanes, priceTable) } : {},
+      // NAMED ROUTING POLICIES:
+      routingPolicy,
+      ...laneCostMap ? { laneCost: laneCostMap(lanes, priceTable) } : {},
+      ...routingPolicy === "cheapest" ? { strategy: "tiered", ...tierFloor !== void 0 ? { tierFloor } : {} } : {},
       // Universal preferred-lane override: favor this lane when it is an eligible+
       // available+capable candidate (hard rails still gate it). Absent ⇒ normal ranking.
       ...(() => {
@@ -30363,6 +30509,13 @@ function makeServerDeps(env = process.env) {
     // Universal preferred-lane override (per-project state + env fallback).
     preferredLane: readPreferredLane,
     setPreferredLane: (laneId) => writePreferred(preferStore, projectKey, laneId),
+    // Per-project named routing policy (per-project state + env fallback).
+    routingPolicy: readRoutingPolicy,
+    setRoutingPolicy: (policy) => writePolicy(policyStore, projectKey, policy),
+    routingPolicyExplicit: () => {
+      const projectPolicy = readPolicy(policyStore, projectKey);
+      return projectPolicy !== void 0 || policyEnvFallback !== void 0;
+    },
     // Reader Full-Access Grants
     readerLanes: () => {
       if (!existsSync9(lanesPath)) return [];
