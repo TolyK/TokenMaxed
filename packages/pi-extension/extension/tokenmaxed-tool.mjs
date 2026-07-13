@@ -21809,18 +21809,30 @@ function effectiveCapabilityFor(lane, category, overlay, opts) {
   const declared = declaredCapabilityFor(lane, category);
   return applyDifficultyCell(effectiveCapability(declared, observed, opts), lane, category, opts);
 }
-function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts) {
+function scoreLane(lane, task, capHeadroom2, observedCapability, observedCapabilityByModel, effectiveOpts, healthPenaltyMap) {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
   const effOpts = observedCapabilityByModel ? { ...effectiveOpts, modelOverlay: observedCapabilityByModel } : effectiveOpts;
   const capability = effOpts?.priorOverlay || effOpts?.difficulty && effOpts?.difficultyOverlay ? effectiveCapabilityFor(lane, task.category, observedCapability, effOpts) : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom2?.[lane.id]);
-  const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
+  const healthPenaltyRaw = healthPenaltyMap?.[lane.id] ?? 0;
+  const healthPenalty = Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0 ? Math.min(1, healthPenaltyRaw) : 0;
+  const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty - healthPenalty;
+  const factors = {
+    capability,
+    costPenalty,
+    capPenalty,
+    declared,
+    evidenceN: observed?.n ?? 0
+  };
+  if (healthPenaltyMap !== void 0) {
+    factors.healthPenalty = healthPenalty;
+  }
   return {
     laneId: lane.id,
     score,
-    factors: { capability, costPenalty, capPenalty, declared, evidenceN: observed?.n ?? 0 }
+    factors
   };
 }
 function compareScores(a, b) {
@@ -21885,7 +21897,7 @@ function routeDecide(task, ctx, policy) {
   }
   const effectiveOpts = effectiveOptsForTask(ctx, task);
   const scored = candidates.map(
-    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts)
+    (lane) => scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty)
   );
   const strategy = ctx.strategy ?? "maximize";
   const tiered = strategy === "tiered";
@@ -21921,7 +21933,11 @@ function orderTiered(scored, candidates, task, ctx) {
   const clears = scored.filter(isClear);
   if (clears.length === 0) return [...scored].sort(compareScores);
   const byTier = (a, b) => {
-    if (a.factors.capPenalty !== b.factors.capPenalty) return a.factors.capPenalty - b.factors.capPenalty;
+    const depriRawA = a.factors.capPenalty + (a.factors.healthPenalty ?? 0);
+    const depriA = Number.isFinite(depriRawA) ? depriRawA : 0;
+    const depriRawB = b.factors.capPenalty + (b.factors.healthPenalty ?? 0);
+    const depriB = Number.isFinite(depriRawB) ? depriRawB : 0;
+    if (depriA !== depriB) return depriA - depriB;
     const ca = costOf(a.laneId);
     const cb = costOf(b.laneId);
     if (ca !== cb) return ca - cb;
@@ -23010,6 +23026,97 @@ function classifyHttpStatus(status) {
   if (status === 401 || status === 403) return "auth_failed";
   if (status >= 400 && status < 500) return "bad_request";
   return "provider_error";
+}
+function laneHealth(events, lane, now) {
+  if (!Number.isFinite(now)) {
+    return {
+      errorRate: 0,
+      failureRate: 0,
+      n: 0,
+      circuitOpen: false
+    };
+  }
+  const HEALTH_HALF_LIFE_MS = 10 * 60 * 1e3;
+  const TRIP_WINDOW_MS = 5 * 60 * 1e3;
+  const COOLDOWN_WINDOW_MS = 5 * 60 * 1e3;
+  const laneEvents = events.filter(
+    (e) => {
+      if (e.event_type !== "task" || e.laneId !== lane.id || e.status === "native") {
+        return false;
+      }
+      const t = Date.parse(e.ts);
+      return Number.isFinite(t) && t <= now;
+    }
+  );
+  const sortedEvents = [...laneEvents].sort((a, b) => {
+    const ta = Date.parse(a.ts);
+    const tb = Date.parse(b.ts);
+    if (ta !== tb) return ta - tb;
+    return a.seq - b.seq;
+  });
+  let state = "CLOSED";
+  let lastFailureTime = 0;
+  let failuresInWindow = [];
+  for (const e of sortedEvents) {
+    const t = Date.parse(e.ts);
+    if (state === "OPEN" && t - lastFailureTime >= COOLDOWN_WINDOW_MS) {
+      state = "HALF_OPEN";
+    }
+    if (e.status === "ok") {
+      if (state === "HALF_OPEN") {
+        state = "CLOSED";
+        failuresInWindow = [];
+      }
+    } else if (e.status === "failed") {
+      if (state === "HALF_OPEN") {
+        state = "OPEN";
+        lastFailureTime = t;
+      } else if (state === "CLOSED") {
+        failuresInWindow.push(t);
+        failuresInWindow = failuresInWindow.filter((ft) => t - ft <= TRIP_WINDOW_MS);
+        if (failuresInWindow.length >= 3) {
+          state = "OPEN";
+          lastFailureTime = t;
+        }
+      } else if (state === "OPEN") {
+        lastFailureTime = t;
+      }
+    }
+  }
+  if (state === "OPEN" && now - lastFailureTime >= COOLDOWN_WINDOW_MS) {
+    state = "HALF_OPEN";
+  }
+  const circuitOpen = state === "OPEN";
+  let weightSum = 0;
+  let weightedFailures = 0;
+  for (const e of sortedEvents) {
+    const t = Date.parse(e.ts);
+    if (e.status !== "ok" && e.status !== "failed") continue;
+    const ageMs = Math.max(0, now - t);
+    const weight = Math.pow(0.5, ageMs / HEALTH_HALF_LIFE_MS);
+    if (Number.isFinite(weight) && weight > 0) {
+      weightSum += weight;
+      if (e.status === "failed") {
+        weightedFailures += weight;
+      }
+    }
+  }
+  const errorRate = weightSum > 0 ? weightedFailures / weightSum : 0;
+  const failureRate = errorRate;
+  return {
+    errorRate: Number.isFinite(errorRate) ? errorRate : 0,
+    failureRate: Number.isFinite(failureRate) ? failureRate : 0,
+    n: Number.isFinite(weightSum) ? weightSum : 0,
+    circuitOpen
+  };
+}
+function healthPenaltyFor(health) {
+  if (!health) return 0;
+  if (health.circuitOpen) {
+    return 1;
+  }
+  const penalty = health.errorRate * 0.2;
+  return Number.isFinite(penalty) ? Math.max(0, Math.min(0.2, penalty)) : 0;
 }
 
 // ../core/src/review.ts
@@ -24364,7 +24471,8 @@ var SETTING_KEYS = {
   tier_floor: "TOKENMAXED_TIER_FLOOR",
   review_on_stop: "TOKENMAXED_REVIEW_ON_STOP",
   /** positive integer */
-  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS"
+  review_max_rounds: "TOKENMAXED_REVIEW_MAX_ROUNDS",
+  lane_health: "TOKENMAXED_LANE_HEALTH"
 };
 var SETTING_KEY_LIST = Object.keys(SETTING_KEYS);
 var NUMERIC_KEYS = /* @__PURE__ */ new Set(["tier_floor", "review_max_rounds"]);
@@ -25926,6 +26034,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
       const capHeadroom2 = deps.capHeadroom?.(lanes);
       const quotaCtx = capHeadroom2 ? { capHeadroom: capHeadroom2 } : {};
+      const healthPenalty = deps.healthPenalty?.(lanes);
+      const healthCtx = healthPenalty ? { healthPenalty } : {};
       const grants = deps.getFullAccess ? deps.getFullAccess(lanes) : [];
       const fullAccessLaneIds = [];
       for (const lane2 of lanes) {
@@ -25952,6 +26062,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
           ...priorCtx,
           ...quotaCtx,
+          ...healthCtx,
           ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
         };
         const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
@@ -25976,6 +26087,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
         ...priorCtx,
         ...quotaCtx,
+        ...healthCtx,
         ...availableIds ? { availableLaneIds: availableIds } : {},
         ...tieredCtx,
         ...preferLaneId ? { preferLaneId } : {},
@@ -26114,6 +26226,19 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const hostLines = hostBlocked.map(
         (l) => `  host-blocked: ${l.id} (its hosts: list does not include '${deps.host ?? "unknown"}'; adding it is YOUR acknowledgement of that vendor's terms for this host)`
       );
+      const healthLines = [];
+      const winnerHealthDetail = lane ? deps.healthDetail?.(lane) : void 0;
+      if (winnerHealthDetail) {
+        healthLines.push(`  ${winnerHealthDetail}`);
+      }
+      const healthDeprioritizedLosers = decision.scores.filter((s) => s.laneId !== decision.laneId && (s.factors.healthPenalty ?? 0) > 0).map((s) => {
+        const l = lanes.find((x) => x.id === s.laneId);
+        const detail = l ? deps.healthDetail?.(l) : void 0;
+        return detail ? `${s.laneId} (${detail})` : s.laneId;
+      });
+      if (healthDeprioritizedLosers.length > 0) {
+        healthLines.push(`  health-deprioritized: ${healthDeprioritizedLosers.join(", ")}`);
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
@@ -26124,6 +26249,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
         ] : [],
         ...quotaLines,
+        ...healthLines,
         ...priorLines,
         ...hostLines,
         ...yoloNote ? [yoloNote] : [],
@@ -26182,6 +26308,25 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       }
       if (targetLines.length > 0) {
         lines.push("", "Pacing targets (project override):", ...targetLines);
+      }
+      const healthLines = [];
+      if (enabled && deps.healthDetail) {
+        const allLanesMap = /* @__PURE__ */ new Map();
+        for (const cat of core.taskCategories) {
+          const catLanes = deps.candidateLanes(cat, { includeReserved: true });
+          for (const l of catLanes) {
+            allLanesMap.set(l.id, l);
+          }
+        }
+        for (const lane of allLanesMap.values()) {
+          const detail = deps.healthDetail(lane);
+          if (detail) {
+            healthLines.push(`  ${lane.id}: ${detail}`);
+          }
+        }
+      }
+      if (healthLines.length > 0) {
+        lines.push("", "Lane Health:", ...healthLines);
       }
       const capPrior = deps.capabilityPrior?.([]);
       if (capPrior?.state === "on") {
@@ -27361,6 +27506,7 @@ function makeServerDeps(env = process.env) {
   const globallyDisabled = env.TOKENMAXED_DISABLE === "1" || env.TOKENMAXED_DISABLE === "true";
   const escalateEnabled = env.TOKENMAXED_ESCALATE === "true" && !globallyDisabled;
   const learnEnabled = env.TOKENMAXED_LEARN_CAPABILITY === "true" && !globallyDisabled;
+  const laneHealthEnabled = env.TOKENMAXED_LANE_HEALTH === "true" && !globallyDisabled;
   const readerEgress = env.TOKENMAXED_READER_EGRESS === "true" && !globallyDisabled;
   const tieredStrategy = env.TOKENMAXED_TIERED === "true" && !globallyDisabled ? "tiered" : "maximize";
   const parsedFloor = Number.parseFloat(env.TOKENMAXED_TIER_FLOOR ?? "");
@@ -27487,6 +27633,64 @@ function makeServerDeps(env = process.env) {
         }
       }
       return parts.length > 0 ? parts.join(" \xB7 ") : void 0;
+    } catch {
+      return void 0;
+    }
+  };
+  const buildHealthPenalty = (lanes) => {
+    if (!laneHealthEnabled) return void 0;
+    try {
+      const now = Date.now();
+      const events = new JsonlLedger(ledgerPath).readAll();
+      const map = /* @__PURE__ */ Object.create(null);
+      for (const lane of lanes) {
+        const health = laneHealth(events, lane, now);
+        const penalty = healthPenaltyFor(health);
+        if (penalty > 0) {
+          map[lane.id] = penalty;
+        }
+      }
+      return Object.keys(map).length > 0 ? map : void 0;
+    } catch {
+      return void 0;
+    }
+  };
+  const healthDetailFor = (lane) => {
+    if (!laneHealthEnabled) return void 0;
+    try {
+      const now = Date.now();
+      const events = new JsonlLedger(ledgerPath).readAll();
+      const laneEvents = events.filter(
+        (e) => {
+          if (e.event_type !== "task" || e.laneId !== lane.id || e.status === "native") return false;
+          if (e.status !== "ok" && e.status !== "failed") return false;
+          const t = Date.parse(e.ts);
+          return Number.isFinite(t) && t <= now;
+        }
+      );
+      const totalFailures = laneEvents.filter((e) => e.status === "failed").length;
+      if (totalFailures === 0) return void 0;
+      const health = laneHealth(events, lane, now);
+      const sortedEvents = [...laneEvents].sort((a, b) => {
+        const ta = Date.parse(a.ts);
+        const tb = Date.parse(b.ts);
+        if (ta !== tb) return tb - ta;
+        return b.seq - a.seq;
+      });
+      const last10 = sortedEvents.slice(0, 10);
+      const failedCount = last10.filter((e) => e.status === "failed").length;
+      const totalCount = last10.length;
+      if (health.circuitOpen) {
+        const lastFailEvent = sortedEvents.find((e) => e.status === "failed");
+        const lastFailTs = lastFailEvent ? Date.parse(lastFailEvent.ts) : 0;
+        const cooldownLeftMs = lastFailTs + 5 * 60 * 1e3 - now;
+        const cooldownLeftMin = Math.max(1, Math.ceil(cooldownLeftMs / (60 * 1e3)));
+        return `health: ${failedCount}/${totalCount} recent attempts failed; circuit open, retry in ~${cooldownLeftMin}m`;
+      } else if (failedCount > 0) {
+        return `health: ${failedCount}/${totalCount} recent attempts failed`;
+      } else {
+        return `health: healthy`;
+      }
     } catch {
       return void 0;
     }
@@ -27746,6 +27950,7 @@ function makeServerDeps(env = process.env) {
     const observedCapabilityByModel = buildObservedByModel();
     const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
     const capHeadroom2 = buildCapHeadroom(lanes);
+    const healthPenalty = buildHealthPenalty(lanes);
     const baseCtx = {
       lanes,
       gateReady,
@@ -27770,6 +27975,7 @@ function makeServerDeps(env = process.env) {
       // B quota pressure: near-cap lanes are deprioritized by scoreLane's
       // capPenalty; a capped lane can still win when it's the only capable one.
       ...capHeadroom2 ? { capHeadroom: capHeadroom2 } : {},
+      ...healthPenalty ? { healthPenalty } : {},
       // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
       // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
       // runWithEscalation preserves these through its effective-context spread, so
@@ -27955,6 +28161,8 @@ function makeServerDeps(env = process.env) {
     // so /tokenmaxed:why shows the identical quota pressure (parity law).
     capHeadroom: buildCapHeadroom,
     quotaDetail: quotaDetailFor,
+    healthPenalty: buildHealthPenalty,
+    healthDetail: healthDetailFor,
     // B3/B4: warn/critical alerts + omit-first projection + the overflow plan,
     // rendered by router_status and appended to router_summary.
     quotaAlerts: buildQuotaAlerts,

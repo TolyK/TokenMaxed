@@ -193,6 +193,10 @@ export interface ToolDeps {
   capHeadroom?: (lanes: readonly Lane[]) => Record<string, number> | undefined;
   /** B: compact per-lane quota detail ("5h 12/40 routed · …") for /why lines. */
   quotaDetail?: (lane: Lane) => string | undefined;
+  /** Lane health routing: the health penalty map for the RouteContext. */
+  healthPenalty?: (lanes: readonly Lane[]) => Record<string, number> | undefined;
+  /** Lane health routing: detailed health description for /why + status. */
+  healthDetail?: (lane: Lane) => string | undefined;
   /**
    * B3/B4: one advisory line per warn/critical quota lane — routed-share detail,
    * an omit-first depletion projection, and the per-category overflow plan
@@ -809,6 +813,8 @@ export function createTools(core: CorePort): ToolDef[] {
         // B: the same routed-share headroom map delegate routes with (parity).
         const capHeadroom = deps.capHeadroom?.(lanes);
         const quotaCtx: Partial<RouteContext> = capHeadroom ? { capHeadroom } : {};
+        const healthPenalty = deps.healthPenalty?.(lanes);
+        const healthCtx: Partial<RouteContext> = healthPenalty ? { healthPenalty } : {};
         const grants = deps.getFullAccess ? deps.getFullAccess(lanes) : [];
         const fullAccessLaneIds: string[] = [];
         for (const lane of lanes) {
@@ -840,6 +846,7 @@ export function createTools(core: CorePort): ToolDef[] {
             ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
             ...priorCtx,
             ...quotaCtx,
+            ...healthCtx,
             ...(fullAccessLaneIds.length ? { fullAccessLaneIds } : {}),
           };
           const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
@@ -870,6 +877,7 @@ export function createTools(core: CorePort): ToolDef[] {
           ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
           ...priorCtx,
           ...quotaCtx,
+          ...healthCtx,
           ...(availableIds ? { availableLaneIds: availableIds } : {}),
           ...tieredCtx,
           ...(preferLaneId ? { preferLaneId } : {}),
@@ -1050,6 +1058,24 @@ export function createTools(core: CorePort): ToolDef[] {
           (l) =>
             `  host-blocked: ${l.id} (its hosts: list does not include '${deps.host ?? 'unknown'}'; adding it is YOUR acknowledgement of that vendor's terms for this host)`,
         );
+
+        const healthLines: string[] = [];
+        const winnerHealthDetail = lane ? deps.healthDetail?.(lane) : undefined;
+        if (winnerHealthDetail) {
+          healthLines.push(`  ${winnerHealthDetail}`);
+        }
+
+        const healthDeprioritizedLosers = decision.scores
+          .filter((s) => s.laneId !== decision.laneId && (s.factors.healthPenalty ?? 0) > 0)
+          .map((s) => {
+            const l = lanes.find((x) => x.id === s.laneId);
+            const detail = l ? deps.healthDetail?.(l) : undefined;
+            return detail ? `${s.laneId} (${detail})` : s.laneId;
+          });
+        if (healthDeprioritizedLosers.length > 0) {
+          healthLines.push(`  health-deprioritized: ${healthDeprioritizedLosers.join(', ')}`);
+        }
+
         const text = [
           `category "${category}" → lane "${decision.laneId}"`,
           ...(pinnedModel ? [`  model pinned by request: "${pinnedModel}" — only lanes serving it were considered (no substitution on failure).`] : []),
@@ -1062,6 +1088,7 @@ export function createTools(core: CorePort): ToolDef[] {
               ]
             : []),
           ...quotaLines,
+          ...healthLines,
           ...priorLines,
           ...hostLines,
           ...(yoloNote ? [yoloNote] : []),
@@ -1125,6 +1152,25 @@ export function createTools(core: CorePort): ToolDef[] {
         }
         if (targetLines.length > 0) {
           lines.push('', 'Pacing targets (project override):', ...targetLines);
+        }
+        const healthLines: string[] = [];
+        if (enabled && deps.healthDetail) {
+          const allLanesMap = new Map<string, Lane>();
+          for (const cat of core.taskCategories) {
+            const catLanes = deps.candidateLanes(cat, { includeReserved: true });
+            for (const l of catLanes) {
+              allLanesMap.set(l.id, l);
+            }
+          }
+          for (const lane of allLanesMap.values()) {
+            const detail = deps.healthDetail(lane);
+            if (detail) {
+              healthLines.push(`  ${lane.id}: ${detail}`);
+            }
+          }
+        }
+        if (healthLines.length > 0) {
+          lines.push('', 'Lane Health:', ...healthLines);
         }
         // P2: the rankings-prior posture. Lanes aren't loaded on this read-only
         // path, so the meta line reports the snapshot itself (per-category lane

@@ -383,6 +383,7 @@ function scoreLane(
   observedCapability?: ObservedCapabilityByLane,
   observedCapabilityByModel?: ObservedCapabilityByModel,
   effectiveOpts?: EffectiveCapabilityOptions,
+  healthPenaltyMap?: Record<string, number>,
 ): LaneScore {
   const declared = declaredCapabilityFor(lane, task.category);
   const observed = observedForLane(lane, task.category, observedCapability, observedCapabilityByModel);
@@ -398,11 +399,25 @@ function scoreLane(
       : effectiveCapability(declared, observed);
   const costPenalty = COST_PENALTY[lane.costBasis];
   const capPenalty = capPenaltyFor(capHeadroom?.[lane.id]);
-  const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty;
+  const healthPenaltyRaw = healthPenaltyMap?.[lane.id] ?? 0;
+  const healthPenalty = (Number.isFinite(healthPenaltyRaw) && healthPenaltyRaw >= 0)
+    ? Math.min(1.0, healthPenaltyRaw)
+    : 0;
+  const score = WEIGHTS.capability * capability - WEIGHTS.cost * costPenalty - capPenalty - healthPenalty;
+  const factors: LaneScore['factors'] = {
+    capability,
+    costPenalty,
+    capPenalty,
+    declared,
+    evidenceN: observed?.n ?? 0,
+  };
+  if (healthPenaltyMap !== undefined) {
+    factors.healthPenalty = healthPenalty;
+  }
   return {
     laneId: lane.id,
     score,
-    factors: { capability, costPenalty, capPenalty, declared, evidenceN: observed?.n ?? 0 },
+    factors,
   };
 }
 
@@ -559,7 +574,7 @@ export function routeDecide(
   // the task carries a bucket and the learned difficulty overlay is present.
   const effectiveOpts = effectiveOptsForTask(ctx, task);
   const scored = candidates.map((lane) =>
-    scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts),
+    scoreLane(lane, task, ctx.capHeadroom, ctx.observedCapability, ctx.observedCapabilityByModel, effectiveOpts, ctx.healthPenalty),
   );
   const strategy = ctx.strategy ?? 'maximize';
   const tiered = strategy === 'tiered';
@@ -625,7 +640,11 @@ function orderTiered(scored: LaneScore[], candidates: readonly Lane[], task: Tas
   const clears = scored.filter(isClear);
   if (clears.length === 0) return [...scored].sort(compareScores); // none clear ⇒ maximize
   const byTier = (a: LaneScore, b: LaneScore): number => {
-    if (a.factors.capPenalty !== b.factors.capPenalty) return a.factors.capPenalty - b.factors.capPenalty; // cap-health
+    const depriRawA = a.factors.capPenalty + (a.factors.healthPenalty ?? 0);
+    const depriA = Number.isFinite(depriRawA) ? depriRawA : 0;
+    const depriRawB = b.factors.capPenalty + (b.factors.healthPenalty ?? 0);
+    const depriB = Number.isFinite(depriRawB) ? depriRawB : 0;
+    if (depriA !== depriB) return depriA - depriB; // combined cap + health deprioritization
     const ca = costOf(a.laneId);
     const cb = costOf(b.laneId);
     if (ca !== cb) return ca - cb; // cheaper first

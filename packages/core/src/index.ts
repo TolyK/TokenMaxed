@@ -131,8 +131,8 @@ export type {
   EscalationCaps,
   EscalationTargetOptions,
 } from './reassign.ts';
-export { FAILURE_KINDS, isTransient, shouldCooldown, classifyHttpStatus, LaneFailure } from './failure.ts';
-export type { FailureKind } from './failure.ts';
+export { FAILURE_KINDS, isTransient, shouldCooldown, classifyHttpStatus, LaneFailure, laneHealth, healthPenaltyFor } from './failure.ts';
+export type { FailureKind, LaneHealth } from './failure.ts';
 export { review, ReviewError } from './review.ts';
 export type { ReviewRequest, ReviewResult, ReviewDeps, ManagerReviewOutput } from './review.ts';
 export {

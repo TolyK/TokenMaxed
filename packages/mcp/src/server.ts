@@ -37,8 +37,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
-  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated } from '@tokenmaxed/core';
-import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
+  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated, laneHealth, healthPenaltyFor } from '@tokenmaxed/core';
+import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput, LaneHealth, TaskEvent } from '@tokenmaxed/core';
 import {
   JsonlLedger,
   executeReader,
@@ -426,6 +426,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // review outcomes adjust the EFFECTIVE capability routing scores by. Never active
   // under the kill-switch. Off ⇒ overlay is undefined ⇒ declared scores, unchanged.
   const learnEnabled = env.TOKENMAXED_LEARN_CAPABILITY === 'true' && !globallyDisabled;
+  // Lane health routing — OPT-IN, off by default.
+  const laneHealthEnabled = env.TOKENMAXED_LANE_HEALTH === 'true' && !globallyDisabled;
   // F-2 reader egress — OPT-IN, off by default. The GLOBAL half of the reader
   // gate; a lane is selectable only if this is on AND it has repo_read_attestation
   // AND an API reader executor AND the safety gate is ready. Never under the
@@ -585,6 +587,72 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       return undefined;
     }
   };
+
+  // Lane health helpers
+  const buildHealthPenalty = (lanes: readonly Lane[]): Record<string, number> | undefined => {
+    if (!laneHealthEnabled) return undefined;
+    try {
+      const now = Date.now();
+      const events = new JsonlLedger(ledgerPath).readAll();
+      const map: Record<string, number> = Object.create(null);
+      for (const lane of lanes) {
+        const health = laneHealth(events, lane, now);
+        const penalty = healthPenaltyFor(health);
+        if (penalty > 0) {
+          map[lane.id] = penalty;
+        }
+      }
+      return Object.keys(map).length > 0 ? map : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const healthDetailFor = (lane: Lane): string | undefined => {
+    if (!laneHealthEnabled) return undefined;
+    try {
+      const now = Date.now();
+      const events = new JsonlLedger(ledgerPath).readAll();
+      const laneEvents = events.filter(
+        (e): e is TaskEvent => {
+          if (e.event_type !== 'task' || e.laneId !== lane.id || e.status === 'native') return false;
+          if (e.status !== 'ok' && e.status !== 'failed') return false;
+          const t = Date.parse(e.ts);
+          return Number.isFinite(t) && t <= now;
+        }
+      );
+      const totalFailures = laneEvents.filter((e) => e.status === 'failed').length;
+      if (totalFailures === 0) return undefined;
+
+      const health = laneHealth(events, lane, now);
+
+      const sortedEvents = [...laneEvents].sort((a, b) => {
+        const ta = Date.parse(a.ts);
+        const tb = Date.parse(b.ts);
+        if (ta !== tb) return tb - ta; // newest first
+        return b.seq - a.seq;
+      });
+
+      const last10 = sortedEvents.slice(0, 10);
+      const failedCount = last10.filter((e) => e.status === 'failed').length;
+      const totalCount = last10.length;
+
+      if (health.circuitOpen) {
+        const lastFailEvent = sortedEvents.find((e) => e.status === 'failed');
+        const lastFailTs = lastFailEvent ? Date.parse(lastFailEvent.ts) : 0;
+        const cooldownLeftMs = lastFailTs + 5 * 60 * 1000 - now;
+        const cooldownLeftMin = Math.max(1, Math.ceil(cooldownLeftMs / (60 * 1000)));
+        return `health: ${failedCount}/${totalCount} recent attempts failed; circuit open, retry in ~${cooldownLeftMin}m`;
+      } else if (failedCount > 0) {
+        return `health: ${failedCount}/${totalCount} recent attempts failed`;
+      } else {
+        return `health: healthy`;
+      }
+    } catch {
+      return undefined;
+    }
+  };
+
   // P2 rankings prior — ONE loader (capability-prior-load.ts) shared by delegate,
   // preview, and status so every surface reports/routes the same posture. Loaded
   // per call (like prices) so snapshot edits apply without a restart. Fail-open:
@@ -967,6 +1035,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     const observedCapabilityByModelDifficulty = buildObservedByModelDifficulty();
     // B: routed-share quota headroom (undefined when no lane configures quotas).
     const capHeadroom = buildCapHeadroom(lanes);
+    const healthPenalty = buildHealthPenalty(lanes);
     // Exclude lanes that can't run now (e.g. Ollama down) so routing never picks an
     // unavailable lane on cost; threads through runTask/runWithEscalation to
     // routeDecide + canReassign. Empty ⇒ no candidate ⇒ runTask degrades to native.
@@ -996,6 +1065,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       // B quota pressure: near-cap lanes are deprioritized by scoreLane's
       // capPenalty; a capped lane can still win when it's the only capable one.
       ...(capHeadroom ? { capHeadroom } : {}),
+      ...(healthPenalty ? { healthPenalty } : {}),
       // P2 rankings prior: `lanes` are already model-resolved above, so the overlay
       // keys align with what actually runs. off/error ⇒ absent ⇒ declared priors.
       // runWithEscalation preserves these through its effective-context spread, so
@@ -1257,6 +1327,8 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // so /tokenmaxed:why shows the identical quota pressure (parity law).
     capHeadroom: buildCapHeadroom,
     quotaDetail: quotaDetailFor,
+    healthPenalty: buildHealthPenalty,
+    healthDetail: healthDetailFor,
     // B3/B4: warn/critical alerts + omit-first projection + the overflow plan,
     // rendered by router_status and appended to router_summary.
     quotaAlerts: buildQuotaAlerts,
