@@ -7686,7 +7686,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "requests_per_window",
   "window_ms",
   "requests_per_week",
-  "tokens_per_week"
+  "tokens_per_week",
+  "reserve_fraction"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7837,6 +7838,13 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
     }
     lane[field] = v;
+  }
+  if (entry.reserve_fraction !== void 0) {
+    const v = entry.reserve_fraction;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) {
+      throw new LaneConfigError(`${at("reserve_fraction")} must be a number in [0, 1] (got ${JSON.stringify(v)}).`);
+    }
+    lane.reserve_fraction = v;
   }
   if (entry.hosts !== void 0) {
     const v = entry.hosts;

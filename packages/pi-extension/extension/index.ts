@@ -8014,8 +8014,11 @@ function amountInWindow(observations, now, windowMs) {
   }
   return sum;
 }
-function axisState(count, limit) {
-  const used = windowUsedFraction(count, limit);
+function axisState(count, limit, reserve = 0) {
+  const rawUsed = windowUsedFraction(count, limit);
+  const r = Math.max(0, Math.min(0.9999, reserve));
+  const mult = 1 / (1 - r);
+  const used = rawUsed === 0 ? 0 : rawUsed * mult;
   return { count, limit, used, level: windowLevel(used) };
 }
 function laneQuotaState(events, lane, now) {
@@ -8025,20 +8028,21 @@ function laneQuotaState(events, lane, now) {
   const hasWeekRequests = typeof lane.requests_per_week === "number" && lane.requests_per_week > 0;
   const hasWeekTokens = typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
   if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
+  const reserve = lane.reserve_fraction ?? 0;
   const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
   if (hasWindow) {
     const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
     const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
-    state.window = axisState(count, lane.requests_per_window);
+    state.window = axisState(count, lane.requests_per_window, reserve);
     axes.push(state.window);
   }
   if (hasWeekRequests) {
-    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week);
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week, reserve);
     axes.push(state.weekRequests);
   }
   if (hasWeekTokens) {
     const tokens = laneObservations(events, lane.id, true);
-    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week, reserve);
     axes.push(state.weekTokens);
   }
   let headroom = 1;
@@ -8106,10 +8110,13 @@ function laneDepletionForecast(events, lane, now) {
   let best;
   let requests;
   let tokens;
+  const r = Math.max(0, Math.min(0.9999, lane.reserve_fraction ?? 0));
+  const reserveFactor = 1 - r;
   for (const a of axes) {
     if (!(typeof a.limit === "number" && a.limit > 0)) continue;
     const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
-    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    const usableLimit = a.limit * reserveFactor;
+    const p = projectOccupancy(obs, usableLimit, a.windowMs, now);
     if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
   }
   return best;
@@ -8147,7 +8154,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "requests_per_window",
   "window_ms",
   "requests_per_week",
-  "tokens_per_week"
+  "tokens_per_week",
+  "reserve_fraction"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -8298,6 +8306,13 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
     }
     lane[field] = v;
+  }
+  if (entry.reserve_fraction !== void 0) {
+    const v = entry.reserve_fraction;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) {
+      throw new LaneConfigError(`${at("reserve_fraction")} must be a number in [0, 1] (got ${JSON.stringify(v)}).`);
+    }
+    lane.reserve_fraction = v;
   }
   if (entry.hosts !== void 0) {
     const v = entry.hosts;
@@ -10522,6 +10537,17 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       if (preferred) {
         lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
       }
+      const reserves = deps.getReserves?.() ?? {};
+      const reserveLines = [];
+      for (const [key, val] of Object.entries(reserves)) {
+        if (typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 1) {
+          const pct3 = Math.round(val * 100);
+          reserveLines.push(`  ${key}: reserved ${pct3}%`);
+        }
+      }
+      if (reserveLines.length > 0) {
+        lines.push("", "Capacity reservations (project override):", ...reserveLines);
+      }
       const capPrior = deps.capabilityPrior?.([]);
       if (capPrior?.state === "on") {
         lines.push(
@@ -10618,6 +10644,84 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       deps.setYolo(enabled);
       const text = enabled ? "\u26A0\uFE0F YOLO mode ENABLED for this project \u2014 every trust/egress gate is bypassed: ALL configured worker/reader lanes are now selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner, explicit policy `block` rules, and disabledLaneIds still apply. Run /tokenmaxed:yolo off to restore normal gated routing." : "YOLO mode DISABLED for this project \u2014 routing is back to normal gated behavior (trust/egress gates enforced).";
       return ok(text, { yolo: enabled });
+    })
+  };
+  const setReserveTool = {
+    name: "router_set_reserve",
+    description: "Set or clear a capacity reservation fraction for a lane or model name in this project. When set, that fraction of the lane's quota is kept in reserve (daily/weekly limits are reached earlier). Use a percentage (0\u2013100) or a decimal (0\u20131). If lane is empty, clears all reservations for the project. Powers /tokenmaxed:reserve.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: "string",
+          description: "The lane ID or model name to reserve (e.g. claude-native or opus). If empty, clears all reservations for this project."
+        },
+        fraction: {
+          type: "string",
+          description: 'The reservation fraction (e.g. "15%" or "0.15"). Use "off", "none", or "clear" to remove the reservation for this lane.'
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const rawLane = optString(args, "lane");
+      const lane = typeof rawLane === "string" ? rawLane.trim() : void 0;
+      const rawFraction = optString(args, "fraction");
+      const fractionStr = typeof rawFraction === "string" ? rawFraction.trim().toLowerCase() : void 0;
+      if (!lane) {
+        deps.setReserve?.(void 0, void 0);
+        return ok(
+          "All capacity reservations CLEARED for this project.",
+          { reserves: null }
+        );
+      }
+      if (!fractionStr || ["off", "none", "clear"].includes(fractionStr)) {
+        deps.setReserve?.(lane, void 0);
+        return ok(
+          `Capacity reservation CLEARED for lane/model "${lane}" in this project.`,
+          { lane, fraction: null }
+        );
+      }
+      const numRegex = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+      let value;
+      if (fractionStr.endsWith("%")) {
+        const numPart = fractionStr.slice(0, -1);
+        if (!numRegex.test(numPart)) {
+          throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be a number in 0\u2013100%.`);
+        }
+        const parsed = Number(numPart);
+        if (parsed < 0 || parsed > 100) {
+          throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be in range 0\u2013100%.`);
+        }
+        value = parsed / 100;
+      } else {
+        if (!numRegex.test(fractionStr)) {
+          throw new ToolInputError(`Invalid reservation value: "${rawFraction}". Must be a percentage (0\u2013100) or decimal (0\u20131).`);
+        }
+        const parsed = Number(fractionStr);
+        if (parsed >= 0 && parsed <= 1) {
+          value = parsed;
+        } else if (parsed > 1 && parsed <= 100 && !fractionStr.includes(".")) {
+          value = parsed / 100;
+        } else {
+          throw new ToolInputError(`Invalid reservation value: "${rawFraction}". Must be a percentage in 0\u2013100 or decimal in 0\u20131.`);
+        }
+      }
+      const allLanes = deps.allLanes?.() ?? [];
+      const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+      if (matchedLanes.length === 0) {
+        const connectable = allLanes.map((l) => l.model).sort();
+        throw new ToolInputError(
+          `No connected lanes match "${lane}". Connected models: ${connectable.join(", ") || "(none)"}`
+        );
+      }
+      deps.setReserve?.(lane, value);
+      const pct3 = Math.round(value * 100);
+      const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(", ");
+      return ok(
+        `Capacity reservation of ${pct3}% set for: ${resolvedNames} in this project.`,
+        { lane, fraction: value, matchedLanes: matchedLanes.map((l) => l.id) }
+      );
     })
   };
   const delegateTool = {
@@ -10895,7 +10999,7 @@ ${r.notes}` : "";
       }
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, delegateTool, reviewTool, setupTool, configTool];
 }
 function receiptLine(r) {
   const int = (n) => Math.round(n).toLocaleString("en-US");

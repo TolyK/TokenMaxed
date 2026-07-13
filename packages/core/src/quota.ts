@@ -79,8 +79,11 @@ function amountInWindow(observations: readonly QuotaObservation[], now: number, 
   return sum;
 }
 
-function axisState(count: number, limit: number): QuotaAxisState {
-  const used = windowUsedFraction(count, limit);
+function axisState(count: number, limit: number, reserve = 0): QuotaAxisState {
+  const rawUsed = windowUsedFraction(count, limit);
+  const r = Math.max(0, Math.min(0.9999, reserve));
+  const mult = 1 / (1 - r);
+  const used = rawUsed === 0 ? 0 : rawUsed * mult;
   return { count, limit, used, level: windowLevel(used) };
 }
 
@@ -97,6 +100,7 @@ export function laneQuotaState(events: readonly LedgerEvent[], lane: Lane, now: 
   const hasWeekTokens = typeof lane.tokens_per_week === 'number' && lane.tokens_per_week > 0;
   if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
 
+  const reserve = lane.reserve_fraction ?? 0;
   const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
 
   if (hasWindow) {
@@ -104,16 +108,16 @@ export function laneQuotaState(events: readonly LedgerEvent[], lane: Lane, now: 
     // requestsInWindow shares boundary semantics with amountInWindow; reuse the
     // canonical helper for the count so the summary and this state always agree.
     const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
-    state.window = axisState(count, lane.requests_per_window!);
+    state.window = axisState(count, lane.requests_per_window!, reserve);
     axes.push(state.window);
   }
   if (hasWeekRequests) {
-    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week!);
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week!, reserve);
     axes.push(state.weekRequests);
   }
   if (hasWeekTokens) {
     const tokens = laneObservations(events, lane.id, true);
-    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week!);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week!, reserve);
     axes.push(state.weekTokens);
   }
 
@@ -241,12 +245,15 @@ export function laneDepletionForecast(events: readonly LedgerEvent[], lane: Lane
   let best: LaneDepletionForecast | undefined;
   let requests: QuotaObservation[] | undefined;
   let tokens: QuotaObservation[] | undefined;
+  const r = Math.max(0, Math.min(0.9999, lane.reserve_fraction ?? 0));
+  const reserveFactor = 1 - r;
   for (const a of axes) {
     if (!(typeof a.limit === 'number' && a.limit > 0)) continue;
     const obs = a.weighted
       ? (tokens ??= laneObservations(events, lane.id, true))
       : (requests ??= laneObservations(events, lane.id, false));
-    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    const usableLimit = a.limit * reserveFactor;
+    const p = projectOccupancy(obs, usableLimit, a.windowMs, now);
     if (p && (best === undefined || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
   }
   return best;

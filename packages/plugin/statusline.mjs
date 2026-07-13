@@ -7520,10 +7520,13 @@ function laneDepletionForecast(events, lane, now) {
   let best;
   let requests;
   let tokens;
+  const r = Math.max(0, Math.min(0.9999, lane.reserve_fraction ?? 0));
+  const reserveFactor = 1 - r;
   for (const a of axes) {
     if (!(typeof a.limit === "number" && a.limit > 0)) continue;
     const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
-    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    const usableLimit = a.limit * reserveFactor;
+    const p = projectOccupancy(obs, usableLimit, a.windowMs, now);
     if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
   }
   return best;
@@ -7561,7 +7564,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "requests_per_window",
   "window_ms",
   "requests_per_week",
-  "tokens_per_week"
+  "tokens_per_week",
+  "reserve_fraction"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7712,6 +7716,13 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
     }
     lane[field] = v;
+  }
+  if (entry.reserve_fraction !== void 0) {
+    const v = entry.reserve_fraction;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) {
+      throw new LaneConfigError(`${at("reserve_fraction")} must be a number in [0, 1] (got ${JSON.stringify(v)}).`);
+    }
+    lane.reserve_fraction = v;
   }
   if (entry.hosts !== void 0) {
     const v = entry.hosts;

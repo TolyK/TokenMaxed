@@ -233,6 +233,12 @@ export interface ToolDeps {
   setPreferredLane?: (laneId: string | undefined) => void;
   /** Get currently configured reader lanes. */
   readerLanes?: () => Lane[];
+  /** Get all configured lanes. */
+  allLanes?: () => Lane[];
+  /** Read the project's capacity reservations. */
+  getReserves?: () => Record<string, number>;
+  /** Set (lane/model, fraction) or clear capacity reservations. */
+  setReserve?: (lane: string | undefined, fraction: number | undefined) => void;
   /** Read the project's Reader -> Full-Access Grants list (including environment fallbacks). */
   getFullAccess?: (lanes?: readonly Lane[]) => string[];
   /** Grant a model name/id full access to the repository. */
@@ -997,6 +1003,17 @@ export function createTools(core: CorePort): ToolDef[] {
         if (preferred) {
           lines.push(`Preferred lane: "${preferred}" (favored when eligible/available/capable; /tokenmaxed:prefer off to clear).`);
         }
+        const reserves = deps.getReserves?.() ?? {};
+        const reserveLines: string[] = [];
+        for (const [key, val] of Object.entries(reserves)) {
+          if (typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= 1) {
+            const pct = Math.round(val * 100);
+            reserveLines.push(`  ${key}: reserved ${pct}%`);
+          }
+        }
+        if (reserveLines.length > 0) {
+          lines.push('', 'Capacity reservations (project override):', ...reserveLines);
+        }
         // P2: the rankings-prior posture. Lanes aren't loaded on this read-only
         // path, so the meta line reports the snapshot itself (per-category lane
         // detail lives in /tokenmaxed:why). Rendered ONLY when on/error — the
@@ -1114,6 +1131,94 @@ export function createTools(core: CorePort): ToolDef[] {
           ? '⚠️ YOLO mode ENABLED for this project — every trust/egress gate is bypassed: ALL configured worker/reader lanes are now selectable regardless of repo_class/sensitivity or per-lane attestation, and (possibly private) repo code may be sent to any configured vendor. The secret scanner, explicit policy `block` rules, and disabledLaneIds still apply. Run /tokenmaxed:yolo off to restore normal gated routing.'
           : 'YOLO mode DISABLED for this project — routing is back to normal gated behavior (trust/egress gates enforced).';
         return ok(text, { yolo: enabled });
+      }),
+  };
+
+  const setReserveTool: ToolDef = {
+    name: 'router_set_reserve',
+    description:
+      'Set or clear a capacity reservation fraction for a lane or model name in this project. When set, that fraction of the lane\'s quota is kept in reserve (daily/weekly limits are reached earlier). Use a percentage (0–100) or a decimal (0–1). If lane is empty, clears all reservations for the project. Powers /tokenmaxed:reserve.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        lane: {
+          type: 'string',
+          description:
+            'The lane ID or model name to reserve (e.g. claude-native or opus). If empty, clears all reservations for this project.',
+        },
+        fraction: {
+          type: 'string',
+          description:
+            'The reservation fraction (e.g. "15%" or "0.15"). Use "off", "none", or "clear" to remove the reservation for this lane.',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guarded(() => {
+        const rawLane = optString(args, 'lane');
+        const lane = typeof rawLane === 'string' ? rawLane.trim() : undefined;
+        const rawFraction = optString(args, 'fraction');
+        const fractionStr = typeof rawFraction === 'string' ? rawFraction.trim().toLowerCase() : undefined;
+
+        if (!lane) {
+          deps.setReserve?.(undefined, undefined);
+          return ok(
+            'All capacity reservations CLEARED for this project.',
+            { reserves: null }
+          );
+        }
+
+        if (!fractionStr || ['off', 'none', 'clear'].includes(fractionStr)) {
+          deps.setReserve?.(lane, undefined);
+          return ok(
+            `Capacity reservation CLEARED for lane/model "${lane}" in this project.`,
+            { lane, fraction: null }
+          );
+        }
+
+        const numRegex = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+        let value: number;
+        if (fractionStr.endsWith('%')) {
+          const numPart = fractionStr.slice(0, -1);
+          if (!numRegex.test(numPart)) {
+            throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be a number in 0–100%.`);
+          }
+          const parsed = Number(numPart);
+          if (parsed < 0 || parsed > 100) {
+            throw new ToolInputError(`Invalid percentage value: "${rawFraction}". Must be in range 0–100%.`);
+          }
+          value = parsed / 100;
+        } else {
+          if (!numRegex.test(fractionStr)) {
+            throw new ToolInputError(`Invalid reservation value: "${rawFraction}". Must be a percentage (0–100) or decimal (0–1).`);
+          }
+          const parsed = Number(fractionStr);
+          if (parsed >= 0 && parsed <= 1) {
+            value = parsed;
+          } else if (parsed > 1 && parsed <= 100 && !fractionStr.includes('.')) {
+            value = parsed / 100;
+          } else {
+            throw new ToolInputError(`Invalid reservation value: "${rawFraction}". Must be a percentage in 0–100 or decimal in 0–1.`);
+          }
+        }
+
+        const allLanes = deps.allLanes?.() ?? [];
+        const matchedLanes = allLanes.filter((l) => core.modelMatchesPin(l.model, lane) || l.id.toLowerCase() === lane.toLowerCase());
+        if (matchedLanes.length === 0) {
+          const connectable = allLanes.map((l) => l.model).sort();
+          throw new ToolInputError(
+            `No connected lanes match "${lane}". Connected models: ${connectable.join(', ') || '(none)'}`
+          );
+        }
+
+        deps.setReserve?.(lane, value);
+        const pct = Math.round(value * 100);
+        const resolvedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(', ');
+        return ok(
+          `Capacity reservation of ${pct}% set for: ${resolvedNames} in this project.`,
+          { lane, fraction: value, matchedLanes: matchedLanes.map((l) => l.id) }
+        );
       }),
   };
 
@@ -1442,7 +1547,7 @@ export function createTools(core: CorePort): ToolDef[] {
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, delegateTool, reviewTool, setupTool, configTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

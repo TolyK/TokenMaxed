@@ -72,6 +72,8 @@ import { readEnabled, writeEnabled } from './toggle.ts';
 import type { ToggleStore } from './toggle.ts';
 import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
+import { readReserves, writeReserve } from './reserve.ts';
+import type { ReserveStore } from './reserve.ts';
 import { readYolo, writeYolo } from './yolo.ts';
 import { readFullAccess, grantFullAccess, revokeFullAccess } from './full-access.ts';
 import type { FullAccessStore } from './full-access.ts';
@@ -195,6 +197,24 @@ function filePreferStore(statePath: string): PreferStore {
   };
 }
 
+/** A JSON-file-backed {@link ReserveStore} (object-valued); tolerant of a missing/corrupt file. */
+function fileReserveStore(statePath: string): ReserveStore {
+  return {
+    read: () => {
+      if (!existsSync(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync(statePath, 'utf8'));
+      } catch {
+        return {}; // corrupt file ⇒ treat as empty
+      }
+    },
+    write: (state) => {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    },
+  };
+}
+
 /** A JSON-file-backed {@link FullAccessStore} (string-array-valued); tolerant of a missing/corrupt file. */
 function fileFullAccessStore(statePath: string): FullAccessStore {
   return {
@@ -241,6 +261,34 @@ export function receiptFromEvents(events: readonly TaskEventInput[]): DelegateRe
   return receipt;
 }
 
+export function resolveReserveFraction(lane: Lane, reserves: Record<string, number>): number | undefined {
+  const laneIdLower = lane.id.toLowerCase();
+  const laneModelLower = lane.model.toLowerCase();
+
+  // 1. Exact lane.id match
+  for (const [key, fraction] of Object.entries(reserves)) {
+    if (key.toLowerCase() === laneIdLower) {
+      return fraction;
+    }
+  }
+
+  // 2. Exact lane.model match
+  for (const [key, fraction] of Object.entries(reserves)) {
+    if (key.toLowerCase() === laneModelLower) {
+      return fraction;
+    }
+  }
+
+  // 3. Family/prefix (modelMatchesPin) match
+  for (const [key, fraction] of Object.entries(reserves)) {
+    if (modelMatchesPin(lane.model, key)) {
+      return fraction;
+    }
+  }
+
+  return undefined;
+}
+
 /** Build the injected deps from the environment (lazy loaders per call). */
 export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const lanesPath = env.TOKENMAXED_LANES ?? DEFAULT_LANES;
@@ -249,6 +297,9 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const statePath = env.TOKENMAXED_STATE ?? homeFile('state.json');
   const projectKey = env.TOKENMAXED_PROJECT ?? 'default';
   const pricesPath = env.TOKENMAXED_PRICES ?? DEFAULT_PRICES;
+  const reserveStatePath = env.TOKENMAXED_RESERVE_STATE ?? join(dirname(statePath), 'reserve.json');
+  const reserveStore = fileReserveStore(reserveStatePath);
+  const readReservesMap = (): Record<string, number> => readReserves(reserveStore, projectKey);
   // Gate CLOSED by default: trusted CLI/local/native lanes (the common, safe
   // offloads) always work, but UNTRUSTED worker (BYOK API) lanes stay off until
   // explicitly enabled with TOKENMAXED_GATE_READY=true. Opening the gate is an
@@ -295,7 +346,15 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // fields anywhere stays byte-identical (zero-change-when-absent).
   const buildCapHeadroom = (lanes: readonly Lane[]): Record<string, number> | undefined => {
     try {
-      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanes, Date.now());
+      const reserves = readReservesMap();
+      const lanesWithReserves = lanes.map((lane) => {
+        const override = resolveReserveFraction(lane, reserves);
+        if (override !== undefined) {
+          return { ...lane, reserve_fraction: override };
+        }
+        return lane;
+      });
+      const map = quotaHeadroomMap(new JsonlLedger(ledgerPath).readAll(), lanesWithReserves, Date.now());
       return Object.keys(map).length > 0 ? map : undefined;
     } catch {
       return undefined;
@@ -305,14 +364,38 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   // are the ROUTED share — the label says so) for /why and the override warning.
   const quotaDetailFor = (lane: Lane): string | undefined => {
     try {
-      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), lane, Date.now());
+      const reserves = readReservesMap();
+      const override = resolveReserveFraction(lane, reserves);
+      const laneWithReserve = override !== undefined ? { ...lane, reserve_fraction: override } : lane;
+      const s = laneQuotaState(new JsonlLedger(ledgerPath).readAll(), laneWithReserve, Date.now());
       const parts: string[] = [];
       // Honest labeling: say the CONFIGURED window, not "5h", when overridden.
       const windowMs = typeof lane.window_ms === 'number' && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
       const windowLabel = windowMs === FIVE_HOUR_MS ? '5h' : fmtWindow(windowMs);
-      if (s.window) parts.push(`${windowLabel} ${s.window.count}/${s.window.limit} routed`);
-      if (s.weekRequests) parts.push(`7d ${s.weekRequests.count}/${s.weekRequests.limit} req routed`);
-      if (s.weekTokens) parts.push(`7d ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok routed`);
+      const reserve = laneWithReserve.reserve_fraction ?? 0;
+      const pct = Math.round(reserve * 100);
+
+      if (s.window) {
+        const usable = reserve > 0 ? Math.round(s.window.limit * (1 - reserve)) : s.window.limit;
+        const text = reserve > 0
+          ? `reserved ${pct}% — ${s.window.count}/${usable} usable routed`
+          : `${s.window.count}/${s.window.limit} routed`;
+        parts.push(`${windowLabel} ${text}`);
+      }
+      if (s.weekRequests) {
+        const usable = reserve > 0 ? Math.round(s.weekRequests.limit * (1 - reserve)) : s.weekRequests.limit;
+        const text = reserve > 0
+          ? `reserved ${pct}% — ${s.weekRequests.count}/${usable} req usable routed`
+          : `${s.weekRequests.count}/${s.weekRequests.limit} req routed`;
+        parts.push(`7d ${text}`);
+      }
+      if (s.weekTokens) {
+        const usable = reserve > 0 ? Math.round(s.weekTokens.limit * (1 - reserve)) : s.weekTokens.limit;
+        const text = reserve > 0
+          ? `reserved ${pct}% — ${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${usable.toLocaleString('en-US')} tok usable routed`
+          : `${Math.round(s.weekTokens.count).toLocaleString('en-US')}/${s.weekTokens.limit.toLocaleString('en-US')} tok routed`;
+        parts.push(`7d ${text}`);
+      }
       return parts.length > 0 ? parts.join(' · ') : undefined;
     } catch {
       return undefined;
@@ -455,8 +538,11 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       const now = Date.now();
       const policy = loadPolicySafe();
       const preferred = readPreferredLane();
+      const reserves = readReservesMap();
       const alerts: string[] = [];
-      for (const cappedLane of registry.lanes) {
+      for (const rawCappedLane of registry.lanes) {
+        const override = resolveReserveFraction(rawCappedLane, reserves);
+        const cappedLane = override !== undefined ? { ...rawCappedLane, reserve_fraction: override } : rawCappedLane;
         const state = laneQuotaState(events, cappedLane, now);
         const levels = [state.window?.level, state.weekRequests?.level, state.weekTokens?.level];
         if (!levels.some((l) => l === 'warn' || l === 'critical')) continue;
@@ -964,6 +1050,17 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         return [];
       }
     },
+    allLanes: () => {
+      if (!existsSync(lanesPath)) return [];
+      try {
+        const registry = loadLaneConfig(lanesPath);
+        return [...registry.lanes];
+      } catch {
+        return [];
+      }
+    },
+    getReserves: readReservesMap,
+    setReserve: (lane, fraction) => writeReserve(reserveStore, projectKey, lane, fraction),
     getFullAccess: readFullAccessGrants,
     grantFullAccess: (laneId) => grantFullAccess(fullAccessStore, projectKey, laneId),
     revokeFullAccess: (laneId) => revokeFullAccess(fullAccessStore, projectKey, laneId),
