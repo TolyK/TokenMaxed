@@ -42,10 +42,14 @@ test('parseMaxRounds defaults when unset or invalid', () => {
   assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: 'abc' }), DEFAULT_REVIEW_MAX_ROUNDS);
   assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: '0' }), DEFAULT_REVIEW_MAX_ROUNDS);
   assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: '-3' }), DEFAULT_REVIEW_MAX_ROUNDS);
+  assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: '3oops' }), DEFAULT_REVIEW_MAX_ROUNDS);
+  assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: '3.9' }), DEFAULT_REVIEW_MAX_ROUNDS);
+  assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: '' }), DEFAULT_REVIEW_MAX_ROUNDS);
 });
 
 test('parseMaxRounds honors a valid value and clamps to the cap', () => {
   assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: '3' }), 3);
+  assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: ' 3 ' }), 3); // trimmed integer is valid
   assert.equal(parseMaxRounds({ TOKENMAXED_REVIEW_MAX_ROUNDS: '999' }), 20);
 });
 

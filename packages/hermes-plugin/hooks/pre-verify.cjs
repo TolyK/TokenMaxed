@@ -7408,7 +7408,9 @@ var MAX_REVIEW_ROUNDS_CAP = 20;
 function parseMaxRounds(env) {
   const raw = env.TOKENMAXED_REVIEW_MAX_ROUNDS;
   if (raw === void 0) return DEFAULT_REVIEW_MAX_ROUNDS;
-  const n = Number.parseInt(raw, 10);
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_REVIEW_MAX_ROUNDS;
+  const n = Number.parseInt(trimmed, 10);
   if (!Number.isFinite(n) || n < 1) return DEFAULT_REVIEW_MAX_ROUNDS;
   return Math.min(n, MAX_REVIEW_ROUNDS_CAP);
 }

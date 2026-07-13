@@ -479,6 +479,8 @@ export interface EscalationOptions {
   minCapabilityDelta?: number;
   /** Candidate lanes for manager + target selection (default ctx.lanes). */
   candidates?: readonly Lane[];
+  /** Max total review rounds (rework + escalation). */
+  maxRounds?: number;
 }
 
 /** The outcome of an escalation run. */
@@ -548,9 +550,14 @@ export async function runWithEscalation(
   deps: EscalationDeps,
   opts: EscalationOptions = {},
 ): Promise<EscalationResult> {
-  const maxReworks = opts.maxReworks ?? 1;
-  const maxEscalations = opts.maxEscalations ?? 1;
+  const rawMaxRounds = opts.maxRounds;
+  const floored = rawMaxRounds !== undefined ? Math.floor(rawMaxRounds) : undefined;
+  const validRounds = rawMaxRounds !== undefined && Number.isFinite(rawMaxRounds) && Number.isSafeInteger(floored) && floored !== undefined && floored >= 1;
+  const maxRounds = validRounds ? (floored as number) : undefined;
+  const maxReworks = maxRounds !== undefined ? (opts.maxReworks ?? maxRounds) : (opts.maxReworks ?? 1);
+  const maxEscalations = maxRounds !== undefined ? (opts.maxEscalations ?? maxRounds) : (opts.maxEscalations ?? 1);
   const minCapabilityDelta = opts.minCapabilityDelta ?? 0.15;
+  const budget = maxRounds !== undefined ? maxRounds : maxReworks + maxEscalations + 1;
   const task: Task = {
     category: request.category,
     ...(request.difficulty ? { difficulty: request.difficulty } : {}),
@@ -586,8 +593,7 @@ export async function runWithEscalation(
   let subjectLane: Lane = subject;
 
   const counters = { reworks: 0, escalations: 0 };
-  // ≤ maxReworks + maxEscalations review rounds; the +1 is a hard safety bound.
-  for (let round = 0; round < maxReworks + maxEscalations + 1; round++) {
+  for (let round = 0; round < budget; round++) {
     const output = current.resultText as string;
     const reviewedAttempt = attempt;
     const stage = counters.reworks + counters.escalations; // 0 = initial review
@@ -618,6 +624,9 @@ export async function runWithEscalation(
     if (action === 'rework' && !isMarginalFree(subjectLane)) {
       // A metered subject can't be reworked free ⇒ skip straight to escalate/give_back.
       action = escalationDecision(verdict, { reworks: maxReworks, escalations: counters.escalations }, { maxReworks, maxEscalations });
+    }
+    if (action !== 'accept' && round + 1 >= budget) {
+      action = 'give_back';
     }
     let target: Lane | null = null;
     if (action === 'escalate') {
