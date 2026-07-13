@@ -58,6 +58,7 @@ const ALLOWED_LANE_KEYS = new Set([
   'window_ms',
   'requests_per_week',
   'tokens_per_week',
+  'reserve_fraction',
 ]);
 
 /** Raised for any malformed or invalid lane configuration, with a clear message. */
@@ -238,6 +239,14 @@ function parseLane(entry: unknown, index: number): Lane {
       throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
     }
     lane[field] = v;
+  }
+
+  if (entry.reserve_fraction !== undefined) {
+    const v = entry.reserve_fraction;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
+      throw new LaneConfigError(`${at('reserve_fraction')} must be a number in [0, 1] (got ${JSON.stringify(v)}).`);
+    }
+    lane.reserve_fraction = v;
   }
 
   // F: host allowlist — where this lane may be SELECTED (hostAllowsLane).

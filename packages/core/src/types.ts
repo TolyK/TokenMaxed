@@ -169,6 +169,8 @@ export interface Lane {
   requests_per_week?: number;
   /** B: trailing-7-day token cap (tokens_in + tokens_out), routed share only. */
   tokens_per_week?: number;
+  /** B: optional capacity reserve fraction (0..1). */
+  reserve_fraction?: number;
   /**
    * F: host allowlist — the host frameworks this lane may be selected under
    * (e.g. ['claude-code', 'cli']). ABSENT ⇒ allowed everywhere (back-compat).

@@ -7719,7 +7719,8 @@ var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "requests_per_window",
   "window_ms",
   "requests_per_week",
-  "tokens_per_week"
+  "tokens_per_week",
+  "reserve_fraction"
 ]);
 var LaneConfigError = class extends Error {
   constructor(message) {
@@ -7870,6 +7871,13 @@ function parseLane(entry, index) {
       throw new LaneConfigError(`${at(field)} must be a positive finite number (got ${JSON.stringify(v)}).`);
     }
     lane[field] = v;
+  }
+  if (entry.reserve_fraction !== void 0) {
+    const v = entry.reserve_fraction;
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) {
+      throw new LaneConfigError(`${at("reserve_fraction")} must be a number in [0, 1] (got ${JSON.stringify(v)}).`);
+    }
+    lane.reserve_fraction = v;
   }
   if (entry.hosts !== void 0) {
     const v = entry.hosts;
@@ -8639,8 +8647,11 @@ function amountInWindow(observations, now, windowMs) {
   }
   return sum;
 }
-function axisState(count, limit) {
-  const used = windowUsedFraction(count, limit);
+function axisState(count, limit, reserve = 0) {
+  const rawUsed = windowUsedFraction(count, limit);
+  const r = Math.max(0, Math.min(0.9999, reserve));
+  const mult = 1 / (1 - r);
+  const used = rawUsed === 0 ? 0 : rawUsed * mult;
   return { count, limit, used, level: windowLevel(used) };
 }
 function laneQuotaState(events, lane, now) {
@@ -8650,20 +8661,21 @@ function laneQuotaState(events, lane, now) {
   const hasWeekRequests = typeof lane.requests_per_week === "number" && lane.requests_per_week > 0;
   const hasWeekTokens = typeof lane.tokens_per_week === "number" && lane.tokens_per_week > 0;
   if (!hasWindow && !hasWeekRequests && !hasWeekTokens) return state;
+  const reserve = lane.reserve_fraction ?? 0;
   const requests = hasWindow || hasWeekRequests ? laneObservations(events, lane.id, false) : [];
   if (hasWindow) {
     const windowMs = typeof lane.window_ms === "number" && lane.window_ms > 0 ? lane.window_ms : FIVE_HOUR_MS;
     const count = requestsInWindow(requests.map((o) => o.ts), now, windowMs);
-    state.window = axisState(count, lane.requests_per_window);
+    state.window = axisState(count, lane.requests_per_window, reserve);
     axes.push(state.window);
   }
   if (hasWeekRequests) {
-    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week);
+    state.weekRequests = axisState(amountInWindow(requests, now, WEEK_MS), lane.requests_per_week, reserve);
     axes.push(state.weekRequests);
   }
   if (hasWeekTokens) {
     const tokens = laneObservations(events, lane.id, true);
-    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week);
+    state.weekTokens = axisState(amountInWindow(tokens, now, WEEK_MS), lane.tokens_per_week, reserve);
     axes.push(state.weekTokens);
   }
   let headroom = 1;
@@ -8731,10 +8743,13 @@ function laneDepletionForecast(events, lane, now) {
   let best;
   let requests;
   let tokens;
+  const r = Math.max(0, Math.min(0.9999, lane.reserve_fraction ?? 0));
+  const reserveFactor = 1 - r;
   for (const a of axes) {
     if (!(typeof a.limit === "number" && a.limit > 0)) continue;
     const obs = a.weighted ? tokens ??= laneObservations(events, lane.id, true) : requests ??= laneObservations(events, lane.id, false);
-    const p = projectOccupancy(obs, a.limit, a.windowMs, now);
+    const usableLimit = a.limit * reserveFactor;
+    const p = projectOccupancy(obs, usableLimit, a.windowMs, now);
     if (p && (best === void 0 || p.etaMs < best.etaMs)) best = { ...p, axis: a.axis };
   }
   return best;
