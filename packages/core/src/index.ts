@@ -44,7 +44,7 @@ export type {
 export type { EffectiveCapabilityOptions, EligibleLane } from './route.ts';
 export { laneDepletionForecast, laneObservations, laneQuotaState, projectOccupancy, quotaHeadroomMap, WEEK_MS, computePacePressure, adjustHeadroomForPace, quotaEstimate } from './quota.ts';
 export type { DepletionProjection, LaneDepletionForecast, LaneQuotaState, QuotaAxisState, QuotaObservation, QuotaEstimate } from './quota.ts';
-export { outcomeCapability, outcomeCapabilityByDifficulty, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
+export { outcomeCapability, outcomeCapabilityByDifficulty, contributingOutcomes, DEFAULT_HALF_LIFE_DAYS } from './feedback.ts';
 export type { OutcomeCapabilityOptions } from './feedback.ts';
 export { buildLeaderboard, sortLeaderboard } from './leaderboard.ts';
 export type { LeaderboardRow, LeaderboardDifficulty, LeaderboardSortBy } from './leaderboard.ts';

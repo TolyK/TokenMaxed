@@ -95,16 +95,22 @@ test('de-dup: only the latest (max seq) outcome per (task,attempt,model,category
   near(o[MODEL]!.bugfix!.n, 1); // counted once, not twice
 });
 
-test('non-reviewer / unattributed / host-turn / task events are excluded', () => {
+test('unattributed / host-turn / task events are excluded, but user feedback is included', () => {
   const taskEvent = { event_type: 'task' } as unknown as TaskEvent;
   const events: LedgerEvent[] = [
-    outcome({ task_id: 'u', subject_id: 'u', voter: 'user', verdict: 'fail' }), // user vote
     outcome({ subject_id: 'h', subject_type: 'host_turn', task_id: undefined, turn_id: 'x', subject_lane_id: undefined }),
     outcome({ task_id: 'n', subject_id: 'n', subject_lane_id: undefined }), // unattributed
     outcome({ task_id: undefined, subject_id: 'z' }), // no task_id
     taskEvent,
   ];
   assert.equal(Object.keys(outcomeCapability(events, NOW)).length, 0);
+
+  const userEvents: LedgerEvent[] = [
+    outcome({ task_id: 'u', subject_id: 'u', voter: 'user', verdict: 'fail' }),
+  ];
+  const o = outcomeCapability(userEvents, NOW);
+  assert.equal(o[MODEL]!.bugfix!.rate, 0);
+  assert.equal(o[MODEL]!.bugfix!.n, 1);
 });
 
 test('future-dated outcomes are clamped to age 0 (weight ≤ 1, never amplified)', () => {
@@ -199,4 +205,14 @@ test('subject_model alone is used when subject_model_resolved is absent', () => 
   ];
   const o = outcomeCapability(events, NOW);
   near(o['only-raw']!.bugfix!.rate, 1);
+});
+
+test('user feedback voter correctly aggregates and adjusts the overlay', () => {
+  const events: LedgerEvent[] = [
+    outcome({ task_id: 'a', subject_id: 'a', voter: 'user', verdict: 'pass', subject_model: 'model-x', subject_model_resolved: 'model-x' }),
+    outcome({ task_id: 'b', subject_id: 'b', voter: 'user', verdict: 'fail', subject_model: 'model-x', subject_model_resolved: 'model-x' }),
+  ];
+  const o = outcomeCapability(events, NOW);
+  near(o['model-x']!.bugfix!.rate, 0.5);
+  near(o['model-x']!.bugfix!.n, 2);
 });

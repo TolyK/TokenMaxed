@@ -24133,7 +24133,7 @@ function verdictValue(verdict) {
   return 0;
 }
 function isLearnableOutcome(e) {
-  return e.event_type === "outcome" && e.subject_type === "router_task" && e.voter === "reviewer_model" && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
+  return e.event_type === "outcome" && e.subject_type === "router_task" && (e.voter === "reviewer_model" || e.voter === "user") && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
 }
 function modelKeyFromOutcome(e) {
   const resolved = e.subject_model_resolved?.trim();
@@ -24145,7 +24145,7 @@ function modelKeyFromOutcome(e) {
 function dedupKey(e) {
   return [e.task_id, e.attempt, modelKeyFromOutcome(e), e.category].join(SEP);
 }
-function outcomeCapability(events, now, opts = {}) {
+function contributingOutcomes(events, now, opts = {}) {
   const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
   const nowMs = Number.isFinite(now) ? now : Number.NaN;
   const latest = /* @__PURE__ */ new Map();
@@ -24158,12 +24158,25 @@ function outcomeCapability(events, now, opts = {}) {
     const prev = latest.get(key);
     if (!prev || e.seq > prev.seq) latest.set(key, e);
   }
-  const acc = /* @__PURE__ */ new Map();
+  const result = [];
   for (const e of latest.values()) {
     const tsMs = Date.parse(e.ts);
     const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
     const weight = Math.pow(0.5, ageDays / halfLife);
     if (!Number.isFinite(weight) || weight <= 0) continue;
+    result.push(e);
+  }
+  return result;
+}
+function outcomeCapability(events, now, opts = {}) {
+  const contribs = contributingOutcomes(events, now, opts);
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const acc = /* @__PURE__ */ new Map();
+  for (const e of contribs) {
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
     const modelKey = modelKeyFromOutcome(e);
     const accKey = [modelKey, e.category].join(SEP);
     let a = acc.get(accKey);
@@ -24184,26 +24197,16 @@ function outcomeCapability(events, now, opts = {}) {
   return overlay;
 }
 function outcomeCapabilityByDifficulty(events, now, opts = {}) {
+  const contribs = contributingOutcomes(events, now, opts);
   const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
   const nowMs = Number.isFinite(now) ? now : Number.NaN;
-  const latest = /* @__PURE__ */ new Map();
-  for (const e of events) {
-    if (!isLearnableOutcome(e)) continue;
-    const modelKey = modelKeyFromOutcome(e);
-    if (!modelKey) continue;
-    if (!Number.isFinite(Date.parse(e.ts))) continue;
-    const key = dedupKey(e);
-    const prev = latest.get(key);
-    if (!prev || e.seq > prev.seq) latest.set(key, e);
-  }
   const acc = /* @__PURE__ */ new Map();
-  for (const e of latest.values()) {
+  for (const e of contribs) {
     const difficulty = e.difficulty;
     if (!difficulty) continue;
     const tsMs = Date.parse(e.ts);
     const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
     const weight = Math.pow(0.5, ageDays / halfLife);
-    if (!Number.isFinite(weight) || weight <= 0) continue;
     const modelKey = modelKeyFromOutcome(e);
     const accKey = [modelKey, e.category, difficulty].join(SEP);
     let a = acc.get(accKey);
@@ -28582,9 +28585,9 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         }
         lanes = pinnedLanes;
       }
-      const observedCapability = deps.observedCapability();
-      const observedCapabilityByModel = deps.observedCapabilityByModel?.();
-      const observedCapabilityByModelDifficulty = deps.observedCapabilityByModelDifficulty?.();
+      const observedCapability = deps.getFrozen?.() ? void 0 : deps.observedCapability();
+      const observedCapabilityByModel = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModel?.();
+      const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModelDifficulty?.();
       const capPrior = deps.capabilityPrior?.(lanes);
       const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
       const capHeadroom2 = deps.capHeadroom?.(lanes);
@@ -28676,6 +28679,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy, elevated).verdict : decision.policyVerdict;
       const preferNote = preferLaneId && decision.laneId !== preferLaneId ? `  note: preferred lane "${preferLaneId}" was not used \u2014 it isn't eligible, available, or capable for this category (fell back to normal routing).` : void 0;
       const yoloNote = yolo ? `  \u26A0\uFE0F YOLO mode ON: trust/egress gates are bypassed \u2014 workers/readers are selectable even on private/sensitive/unknown context, and reader lanes run with FULL repo access. Disable with /tokenmaxed:yolo off.` : void 0;
+      const freezeNote = deps.getFrozen?.() ? "  learning: frozen for this project (outcome learning is paused; routing falls back to declared/prior capability without recent outcomes)." : void 0;
       const quotaLines = [];
       const winnerCapPenalty = decision.scores.find((s) => s.laneId === decision.laneId)?.factors.capPenalty ?? 0;
       if (winnerCapPenalty > 0) {
@@ -28832,13 +28836,38 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           forecastLine = `  forecast: ~${int2(forecast.estTokensIn)} input tok${costStr} (${forecast.note})${skippedNote}`;
         }
       }
+      let decisionReason = decision.reason;
+      if (lane) {
+        const winnerModel = lane.model;
+        let hasUserFeedback = false;
+        try {
+          const ledger = deps.readLedger?.() ?? [];
+          if (core.contributingOutcomes) {
+            const contribs = core.contributingOutcomes(ledger, deps.now());
+            for (const e of contribs) {
+              const resolved = e.subject_model_resolved?.trim();
+              const raw = e.subject_model?.trim();
+              const eModel = resolved || raw || "";
+              if (e.voter === "user" && e.category === category && eModel === winnerModel) {
+                hasUserFeedback = true;
+                break;
+              }
+            }
+          }
+        } catch {
+        }
+        if (hasUserFeedback && decisionReason.includes("(learned:")) {
+          decisionReason = decisionReason.replace(/\(learned:\s*([^)]+)\)/, "(learned (includes your feedback): $1)");
+          decision = { ...decision, reason: decisionReason };
+        }
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
         ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
-        `  why: ${decision.reason}`,
+        `  why: ${decisionReason}`,
         ...forecastLine ? [forecastLine] : [],
         ...difficulty ? [
           `  difficulty: ${difficulty} \u2014 learned difficulty-specific evidence conditions capability when it exists (else category-level). Caveat: buckets reflect the depth at which review escalated under YOUR reviewer (an escalation-depth proxy), not ground-truth task complexity.`
@@ -28848,9 +28877,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...priorLines,
         ...hostLines,
         ...yoloNote ? [yoloNote] : [],
-        ...preferNote ? [preferNote] : []
+        ...preferNote ? [preferNote] : [],
+        ...freezeNote ? [freezeNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...deps.getFrozen?.() ? { frozen: true } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
     })
   };
   const statusTool = {
@@ -28865,9 +28895,26 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const yolo = deps.getYolo?.() ?? false;
       const policy = deps.routingPolicy?.() ?? "balanced";
       const explicitPolicy = deps.routingPolicyExplicit?.() ?? false;
+      const frozen = deps.getFrozen?.() ?? false;
       const lines = [`TokenMaxed routing is ${enabled ? "ENABLED" : "DISABLED"} for this project.`];
       if (explicitPolicy) {
         lines.push(`Active routing policy: ${policy}`);
+      }
+      if (frozen) {
+        lines.push("Capability learning is frozen for this project (routing falls back to declared/prior capability without recent outcomes).");
+      }
+      let userFeedbackEvents = [];
+      try {
+        userFeedbackEvents = (deps.readLedger?.() ?? []).filter(
+          (e) => e.event_type === "outcome" && e.voter === "user"
+        );
+      } catch {
+      }
+      const pass = userFeedbackEvents.filter((e) => e.verdict === "pass").length;
+      const needsRework = userFeedbackEvents.filter((e) => e.verdict === "needs-rework").length;
+      const fail = userFeedbackEvents.filter((e) => e.verdict === "fail").length;
+      if (userFeedbackEvents.length > 0) {
+        lines.push(`Lifetime raw user feedback counts: ${pass} good, ${needsRework} too-slow, ${fail} bad/wrong-model (opinion-only; not the deduped/decayed learning evidence).`);
       }
       if (yolo) {
         lines.push(
@@ -28994,6 +29041,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         yolo,
         policy,
         ...preferred ? { preferLaneId: preferred } : {},
+        ...frozen ? { frozen: true } : {},
+        ...userFeedbackEvents.length > 0 ? { userFeedbackCounts: { pass, needsRework, fail } } : {},
         staleness: warnings,
         idMismatch: mismatches
       });
@@ -29680,6 +29729,194 @@ ${r.notes}` : "";
       );
     })
   };
+  const feedbackTool = {
+    name: "router_feedback",
+    description: "Record direct user feedback on routing / offload quality to adapt future decisions. The feedback verdict can apply to the LAST offload in the ledger or target an explicit lane + category (+ optional difficulty). Opinions are marked as user feedback and feed learned capabilities exactly like manager reviews. Content-free.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["verdict"],
+      properties: {
+        verdict: {
+          type: "string",
+          enum: ["good", "wrong-model", "bad-output", "too-slow"],
+          description: "The user verdict on the offload quality."
+        },
+        lane: {
+          type: "string",
+          description: "OPTIONAL explicit lane id to target (requires category)."
+        },
+        category: {
+          type: "string",
+          enum: [...core.taskCategories],
+          description: "OPTIONAL explicit category to target (requires lane)."
+        },
+        difficulty: {
+          type: "string",
+          enum: [...DIFFICULTIES],
+          description: "OPTIONAL explicit difficulty to target (requires lane + category)."
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      if (!("verdict" in args)) {
+        throw new ToolInputError('"verdict" is required.');
+      }
+      const verdict = optEnum(args, "verdict", ["good", "wrong-model", "bad-output", "too-slow"]);
+      if (verdict === void 0) {
+        throw new ToolInputError("Invalid verdict. Allowed values: good, wrong-model, bad-output, too-slow.");
+      }
+      if ("lane" in args) {
+        const laneVal = args.lane;
+        if (typeof laneVal !== "string" || laneVal.trim() === "") {
+          throw new ToolInputError('"lane" cannot be blank when supplied.');
+        }
+      }
+      if ("category" in args) {
+        const catVal = args.category;
+        if (typeof catVal !== "string" || !core.taskCategories.includes(catVal)) {
+          throw new ToolInputError(`Invalid category. Allowed values: ${core.taskCategories.join(", ")}.`);
+        }
+      }
+      if ("difficulty" in args) {
+        const diffVal = args.difficulty;
+        if (typeof diffVal !== "string" || !DIFFICULTIES.includes(diffVal)) {
+          throw new ToolInputError(`Invalid difficulty. Allowed values: ${DIFFICULTIES.join(", ")}.`);
+        }
+      }
+      const explicitLane = optString(args, "lane")?.trim();
+      const explicitCategory = optEnum(args, "category", core.taskCategories);
+      const explicitDifficulty = optEnum(args, "difficulty", DIFFICULTIES);
+      if (explicitDifficulty && (!explicitLane || !explicitCategory)) {
+        throw new ToolInputError('"difficulty" requires both "lane" and "category".');
+      }
+      if ((args.lane !== void 0 || args.category !== void 0) && (!explicitLane || !explicitCategory)) {
+        throw new ToolInputError('Explicit targeting requires both "lane" and "category".');
+      }
+      let subjectLaneId;
+      let subjectModel;
+      let subjectModelResolved;
+      let category;
+      let difficulty;
+      let taskId;
+      let attempt = 0;
+      if (explicitLane && explicitCategory) {
+        const allLanes = deps.allLanes?.() ?? [];
+        const found = allLanes.find((l) => l.id === explicitLane);
+        if (!found) {
+          throw new ToolInputError(`Lane "${explicitLane}" is not configured.`);
+        }
+        subjectLaneId = explicitLane;
+        subjectModel = found.model;
+        subjectModelResolved = found.model;
+        category = explicitCategory;
+        difficulty = explicitDifficulty;
+        taskId = deps.newId ? deps.newId() : Math.random().toString(36).substring(2, 15);
+      } else {
+        let ledger;
+        try {
+          ledger = deps.readLedger();
+        } catch (err) {
+          throw new Error(`Failed to read ledger: ${err.message}`);
+        }
+        if (!ledger || ledger.length === 0) {
+          throw new ToolInputError("No recent offloads found in the ledger to rate (ledger is empty).");
+        }
+        let lastOffload;
+        for (const e of ledger) {
+          if (e.event_type === "task" && e.status !== "native") {
+            if (!lastOffload) {
+              lastOffload = e;
+            } else {
+              const currentSeq = e.seq ?? 0;
+              const bestSeq = lastOffload.seq ?? 0;
+              if (currentSeq > bestSeq) {
+                lastOffload = e;
+              } else if (currentSeq === bestSeq) {
+                const currentTs = e.ts ? new Date(e.ts).getTime() : 0;
+                const bestTs = lastOffload.ts ? new Date(lastOffload.ts).getTime() : 0;
+                if (currentTs > bestTs) {
+                  lastOffload = e;
+                }
+              }
+            }
+          }
+        }
+        if (!lastOffload || lastOffload.event_type !== "task") {
+          throw new ToolInputError("No recent offloads found in the ledger to rate (no non-native task events).");
+        }
+        subjectLaneId = lastOffload.laneId;
+        subjectModel = lastOffload.model;
+        subjectModelResolved = lastOffload.model;
+        category = lastOffload.category;
+        difficulty = void 0;
+        taskId = lastOffload.task_id;
+        attempt = lastOffload.attempt;
+      }
+      let mappedVerdict;
+      if (verdict === "good") {
+        mappedVerdict = "pass";
+      } else if (verdict === "too-slow") {
+        mappedVerdict = "needs-rework";
+      } else {
+        mappedVerdict = "fail";
+      }
+      const newReviewId = deps.newId ? deps.newId() : Math.random().toString(36).substring(2, 15);
+      const outcomeInput = {
+        subject_id: taskId,
+        subject_type: "router_task",
+        review_id: newReviewId,
+        attempt,
+        category,
+        reviewer_lane_id: "user",
+        reviewer_model: "user",
+        reviewer_trust_mode: "full",
+        reviewer_provenance: "user",
+        verdict: mappedVerdict,
+        voter: "user",
+        policy_verdict: "allow",
+        subject_lane_id: subjectLaneId,
+        subject_model: subjectModel,
+        subject_model_resolved: subjectModelResolved,
+        task_id: taskId,
+        ...difficulty ? { difficulty } : {}
+      };
+      if (!deps.appendOutcome) {
+        throw new Error("Ledger writing is not supported by this host.");
+      }
+      const event = deps.appendOutcome(outcomeInput);
+      const targetMsg = explicitLane ? `explicitly for lane "${subjectLaneId}" (category ${category}${difficulty ? `, difficulty ${difficulty}` : ""})` : `for the last offload on lane "${subjectLaneId}" (task ${taskId}, category ${category}${difficulty ? `, difficulty ${difficulty}` : ""})`;
+      return ok(
+        `Recorded user feedback: rated "${verdict}" (mapped to "${mappedVerdict}") ${targetMsg}.`,
+        { verdict: mappedVerdict, voter: "user", event }
+      );
+    })
+  };
+  const setFreezeTool = {
+    name: "router_set_freeze",
+    description: "Freeze or unfreeze TokenMaxed capability outcome learning for this project. When frozen, accumulated outcome learning is paused, and routing falls back to declared/prior capability without recent outcomes. User feedback and reviews are still recorded in the ledger but will not affect routing. Persisted per project. Powers /tokenmaxed:freeze.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["enabled"],
+      properties: {
+        enabled: {
+          type: "boolean",
+          description: "Whether to freeze learning for the project (true = freeze, false = unfreeze)."
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const enabled = optBool(args, "enabled");
+      if (enabled === void 0) throw new ToolInputError('"enabled" is required.');
+      if (!deps.setFrozen) {
+        throw new Error("Project settings write is not supported by this host.");
+      }
+      deps.setFrozen(enabled);
+      const msg = enabled ? "Capability outcome learning is FROZEN for this project (routing falls back to declared/prior capability without recent outcomes)." : "Capability outcome learning is UNFROZEN for this project (outcome learning is active/resumed).";
+      return ok(msg, { frozen: enabled });
+    })
+  };
   const doctorTool = {
     name: "router_doctor",
     description: "Run the TokenMaxed doctor diagnostic command to check config, lanes, availability, gates, and freshness. Reports a prioritized list of actionable problems with fixes.",
@@ -29703,7 +29940,7 @@ ${r.notes}` : "";
       return ok(lines.join("\n\n"), { findings: sorted });
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool];
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool];
 }
 function receiptLine(r) {
   const int2 = (n) => Math.round(n).toLocaleString("en-US");
@@ -29836,8 +30073,28 @@ function writePreferred(store, projectKey, laneId) {
   store.write(map);
 }
 
-// ../mcp/src/reserve.ts
+// ../mcp/src/freeze.ts
+var FROZEN_BY_DEFAULT = false;
 function asMap5(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = /* @__PURE__ */ Object.create(null);
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === "boolean") out[k] = v;
+  }
+  return out;
+}
+function readFrozen(store, projectKey) {
+  const map = asMap5(store.read());
+  return Object.hasOwn(map, projectKey) ? map[projectKey] : FROZEN_BY_DEFAULT;
+}
+function writeFrozen(store, projectKey, frozen) {
+  const map = asMap5(store.read());
+  map[projectKey] = frozen;
+  store.write(map);
+}
+
+// ../mcp/src/reserve.ts
+function asMap6(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -29856,11 +30113,11 @@ function asMap5(raw) {
   return out;
 }
 function readReserves(store, projectKey) {
-  const map = asMap5(store.read());
+  const map = asMap6(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : {};
 }
 function writeReserve(store, projectKey, key, fraction) {
-  const map = asMap5(store.read());
+  const map = asMap6(store.read());
   if (key === void 0) {
     delete map[projectKey];
   } else {
@@ -29880,7 +30137,7 @@ function writeReserve(store, projectKey, key, fraction) {
 }
 
 // ../mcp/src/calibration.ts
-function asMap6(raw) {
+function asMap7(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -29899,11 +30156,11 @@ function asMap6(raw) {
   return out;
 }
 function readCalibrations(store, projectKey) {
-  const map = asMap6(store.read());
+  const map = asMap7(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : {};
 }
 function writeCalibration(store, projectKey, key, fraction) {
-  const map = asMap6(store.read());
+  const map = asMap7(store.read());
   if (key === void 0) {
     delete map[projectKey];
   } else {
@@ -29923,7 +30180,7 @@ function writeCalibration(store, projectKey, key, fraction) {
 }
 
 // ../mcp/src/routed-share.ts
-function asMap7(raw) {
+function asMap8(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = {};
   for (const [k, v] of Object.entries(raw)) {
@@ -29942,11 +30199,11 @@ function asMap7(raw) {
   return out;
 }
 function readRoutedShares(store, projectKey) {
-  const map = asMap7(store.read());
+  const map = asMap8(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : {};
 }
 function writeRoutedShare(store, projectKey, key, fraction) {
-  const map = asMap7(store.read());
+  const map = asMap8(store.read());
   if (key === void 0) {
     delete map[projectKey];
   } else {
@@ -29966,7 +30223,7 @@ function writeRoutedShare(store, projectKey, key, fraction) {
 }
 
 // ../mcp/src/yolo.ts
-function asMap8(raw) {
+function asMap9(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = /* @__PURE__ */ Object.create(null);
   for (const [k, v] of Object.entries(raw)) {
@@ -29975,17 +30232,17 @@ function asMap8(raw) {
   return out;
 }
 function readYolo(store, projectKey, fallback = false) {
-  const map = asMap8(store.read());
+  const map = asMap9(store.read());
   return Object.hasOwn(map, projectKey) ? map[projectKey] : fallback;
 }
 function writeYolo(store, projectKey, on) {
-  const map = asMap8(store.read());
+  const map = asMap9(store.read());
   map[projectKey] = on;
   store.write(map);
 }
 
 // ../mcp/src/full-access.ts
-function asMap9(raw) {
+function asMap10(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out = /* @__PURE__ */ Object.create(null);
   for (const [k, v] of Object.entries(raw)) {
@@ -30007,7 +30264,7 @@ function asMap9(raw) {
   return out;
 }
 function readFullAccess(store, projectKey) {
-  const map = asMap9(store.read());
+  const map = asMap10(store.read());
   const list = map[projectKey];
   if (!list) return [];
   const seen = /* @__PURE__ */ new Set();
@@ -30025,7 +30282,7 @@ function grantFullAccess(store, projectKey, laneId) {
   if (typeof laneId !== "string") return;
   const trimmed = laneId.trim();
   if (trimmed.length === 0) return;
-  const map = asMap9(store.read());
+  const map = asMap10(store.read());
   const list = map[projectKey] ?? [];
   const seen = /* @__PURE__ */ new Set();
   const out = [];
@@ -30048,7 +30305,7 @@ function grantFullAccess(store, projectKey, laneId) {
   store.write(map);
 }
 function revokeFullAccess(store, projectKey, laneId) {
-  const map = asMap9(store.read());
+  const map = asMap10(store.read());
   if (!laneId || typeof laneId !== "string" || laneId.trim().length === 0) {
     delete map[projectKey];
   } else {
@@ -30253,7 +30510,7 @@ function fileFullAccessStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes };
 function receiptFromEvents(events) {
   const legs = events.filter((e) => e.status !== "native");
   if (legs.length === 0) return void 0;
@@ -30548,7 +30805,7 @@ function makeServerDeps(env = process.env) {
   };
   const capabilityPriorFor = (lanes) => loadCapabilityPriorState(env, lanes);
   const buildObservedByModel = () => {
-    if (!learnEnabled) return void 0;
+    if (!learnEnabled || readFrozenState()) return void 0;
     try {
       return outcomeCapability(new JsonlLedger(ledgerPath).readAll(), Date.now());
     } catch {
@@ -30556,7 +30813,7 @@ function makeServerDeps(env = process.env) {
     }
   };
   const buildObservedByModelDifficulty = () => {
-    if (!learnEnabled) return void 0;
+    if (!learnEnabled || readFrozenState()) return void 0;
     try {
       return outcomeCapabilityByDifficulty(new JsonlLedger(ledgerPath).readAll(), Date.now());
     } catch {
@@ -30570,6 +30827,10 @@ function makeServerDeps(env = process.env) {
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || void 0;
   const readPreferredLane = () => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
+  const freezeStatePath = env.TOKENMAXED_FREEZE_STATE ?? join8(dirname9(statePath), "learning-frozen.json");
+  const freezeStore = fileToggleStore(freezeStatePath);
+  const readFrozenState = () => readFrozen(freezeStore, projectKey);
+  const writeFrozenState = (on) => writeFrozen(freezeStore, projectKey, on);
   const policyStatePath = env.TOKENMAXED_POLICY_STATE ?? join8(dirname9(statePath), "policy.json");
   const policyStore = filePolicyStore(policyStatePath);
   const policyEnvFallback = isValidRoutingPolicy(env.TOKENMAXED_ROUTING_POLICY?.trim()) ? env.TOKENMAXED_ROUTING_POLICY.trim() : void 0;
@@ -31069,6 +31330,10 @@ function makeServerDeps(env = process.env) {
   const doctor = () => runDoctor(env, { freshness: freshnessCacheOnly, idMismatch });
   return {
     readLedger: () => new JsonlLedger(ledgerPath).readAll(),
+    getFrozen: readFrozenState,
+    setFrozen: writeFrozenState,
+    appendOutcome: (input) => new JsonlLedger(ledgerPath).appendOutcome(input),
+    newId: () => randomUUID3(),
     // The documented route input (capability-0 opt-outs excluded) minus
     // unpriceable metered lanes. When escalation is on, ALSO reserve manager-
     // eligible lanes (as delegate does), so /tokenmaxed:why mirrors the initial
