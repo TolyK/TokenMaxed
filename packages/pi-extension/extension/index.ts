@@ -10366,6 +10366,66 @@ function formatQuotaEstimateText(modelOrId, est, routedShare) {
   const calPct = est.reportedFraction !== void 0 ? Math.round(est.reportedFraction * 100) : 0;
   return `${modelOrId}: \u2265${routedPct}% routed; you reported ${calPct}%; est. ${lowerBoundPct}\u2013100% used (calibrated, ${est.confidence})`;
 }
+function getCalibratedEvidence(core, lane, category, difficulty, ledger, now, laneOverlay, modelOverlay, difficultyOverlay) {
+  let cell;
+  let cellSource;
+  if (difficulty && difficultyOverlay && core.resolveLaneModelKey) {
+    const modelKey = core.resolveLaneModelKey(lane);
+    const difficultyCell = difficultyOverlay[modelKey]?.[category]?.[difficulty];
+    if (difficultyCell) {
+      cell = difficultyCell;
+      cellSource = "difficulty";
+    }
+  }
+  if (!cell) {
+    if (modelOverlay && core.resolveLaneModelKey) {
+      const modelKey = core.resolveLaneModelKey(lane);
+      const modelCell = modelOverlay[modelKey]?.[category];
+      if (modelCell) {
+        cell = modelCell;
+        cellSource = "model";
+      }
+    }
+    if (!cell && laneOverlay) {
+      const laneCell = laneOverlay[lane.id]?.[category];
+      if (laneCell) {
+        cell = laneCell;
+        cellSource = "lane";
+      }
+    }
+  }
+  const n = cell && typeof cell.n === "number" && Number.isFinite(cell.n) ? cell.n : 0;
+  const rate = cell && typeof cell.rate === "number" && Number.isFinite(cell.rate) ? cell.rate : 0;
+  const interval = n > 0 && rate >= 0 && rate <= 1 && core.capabilityInterval ? core.capabilityInterval({ rate, n }) : void 0;
+  let freshnessDays;
+  if (n > 0 && core.contributingOutcomes && core.evidenceFreshnessDays) {
+    const contribs = core.contributingOutcomes(ledger, now);
+    const cellOutcomes = contribs.filter((e) => {
+      const resolved = e.subject_model_resolved?.trim();
+      const raw = e.subject_model?.trim();
+      const eModelKey = resolved || raw || "";
+      const matchesCategory = e.category === category;
+      if (!matchesCategory) return false;
+      if (cellSource === "difficulty") {
+        const matchesModel = core.resolveLaneModelKey ? eModelKey === core.resolveLaneModelKey(lane) : true;
+        return matchesModel && e.difficulty === difficulty;
+      } else if (cellSource === "model") {
+        const matchesModel = core.resolveLaneModelKey ? eModelKey === core.resolveLaneModelKey(lane) : true;
+        return matchesModel;
+      } else if (cellSource === "lane") {
+        return e.subject_lane_id === lane.id;
+      }
+      return false;
+    });
+    freshnessDays = core.evidenceFreshnessDays(cellOutcomes, now);
+  }
+  return {
+    rate,
+    n,
+    interval,
+    freshnessDays
+  };
+}
 function createTools(core) {
   function eventsInPeriod(deps, period) {
     const since = resolveSinceIso(period, deps.now());
@@ -10769,7 +10829,47 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         }
       }
       let decisionReason = decision.reason;
+      let decisionReasonForObject = decision.reason;
       if (lane) {
+        const hasOverlay = observedCapability !== void 0 || observedCapabilityByModel !== void 0;
+        if (hasOverlay) {
+          const ledger = deps.readLedger?.() ?? [];
+          const evidence = getCalibratedEvidence(
+            core,
+            lane,
+            category,
+            difficulty,
+            ledger,
+            deps.now(),
+            observedCapability,
+            observedCapabilityByModel,
+            observedCapabilityByModelDifficulty
+          );
+          if (evidence) {
+            const declared = core.declaredCapabilityFor ? core.declaredCapabilityFor(lane, category) : 0.5;
+            const match = decisionReason.match(/\s*\(learned:\s*declared\s*[^)]+\)/);
+            if (evidence.n >= 1 && evidence.interval) {
+              const lo = evidence.interval.lo;
+              const hi = evidence.interval.hi;
+              const effCap = decision.scores.find((s) => s.laneId === lane.id)?.factors.capability ?? evidence.rate;
+              const freshnessText = evidence.freshnessDays !== void 0 ? `, freshness ${Math.round(evidence.freshnessDays)}d` : "";
+              const newNote = `(learned: blended ${effCap.toFixed(2)}, observed ${evidence.rate.toFixed(2)} [${lo.toFixed(2)}\u2013${hi.toFixed(2)}] (95% CI), n=${Math.round(evidence.n)}${freshnessText})`;
+              if (match) {
+                decisionReason = decisionReason.replace(match[0], ` ${newNote}`);
+              } else {
+                decisionReason += ` ${newNote}`;
+              }
+            } else {
+              const nVal = evidence.n;
+              const thinNote = `(declared ${declared.toFixed(2)}; insufficient outcome evidence (n=${nVal.toFixed(nVal % 1 === 0 ? 0 : 1)}))`;
+              if (match) {
+                decisionReason = decisionReason.replace(match[0], ` ${thinNote}`);
+              } else {
+                decisionReason += ` ${thinNote}`;
+              }
+            }
+          }
+        }
         const winnerModel = lane.model;
         let hasUserFeedback = false;
         try {
@@ -10788,9 +10888,14 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           }
         } catch {
         }
-        if (hasUserFeedback && decisionReason.includes("(learned:")) {
-          decisionReason = decisionReason.replace(/\(learned:\s*([^)]+)\)/, "(learned (includes your feedback): $1)");
-          decision = { ...decision, reason: decisionReason };
+        if (hasUserFeedback) {
+          if (decisionReason.includes("(learned:")) {
+            decisionReason = decisionReason.replace(/\(learned:\s*([^)]+)\)/, "(learned (includes your feedback): $1)");
+          }
+          if (decisionReasonForObject.includes("(learned:")) {
+            decisionReasonForObject = decisionReasonForObject.replace(/\(learned:\s*([^)]+)\)/, "(learned (includes your feedback): $1)");
+            decision = { ...decision, reason: decisionReasonForObject };
+          }
         }
       }
       const text = [
@@ -10940,6 +11045,49 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       }
       if (healthLines.length > 0) {
         lines.push("", "Lane Health:", ...healthLines);
+      }
+      const learnedLines = [];
+      if (enabled) {
+        const observedCapability = deps.getFrozen?.() ? void 0 : deps.observedCapability();
+        const observedCapabilityByModel = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModel?.();
+        const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModelDifficulty?.();
+        const hasOverlay = observedCapability !== void 0 || observedCapabilityByModel !== void 0;
+        if (hasOverlay) {
+          const allLanes = deps.allLanes?.() ?? [];
+          const ledger = deps.readLedger?.() ?? [];
+          const now = deps.now();
+          for (const l of allLanes) {
+            for (const cat of core.taskCategories) {
+              const evidence = getCalibratedEvidence(
+                core,
+                l,
+                cat,
+                void 0,
+                ledger,
+                now,
+                observedCapability,
+                observedCapabilityByModel,
+                observedCapabilityByModelDifficulty
+              );
+              if (evidence) {
+                const declared = core.declaredCapabilityFor ? core.declaredCapabilityFor(l, cat) : 0.5;
+                if (evidence.n >= 1 && evidence.interval) {
+                  const lo = evidence.interval.lo;
+                  const hi = evidence.interval.hi;
+                  const effCap = core.effectiveCapabilityFor ? core.effectiveCapabilityFor(l, cat, observedCapability, { modelOverlay: observedCapabilityByModel }) : evidence.rate;
+                  const freshnessText = evidence.freshnessDays !== void 0 ? `, freshness ${Math.round(evidence.freshnessDays)}d` : "";
+                  learnedLines.push(`  ${l.id} (${l.model}) ${cat}: capability ${effCap.toFixed(2)} (blended; observed ${evidence.rate.toFixed(2)} [${lo.toFixed(2)}\u2013${hi.toFixed(2)}], n=${Math.round(evidence.n)}${freshnessText})`);
+                } else {
+                  const nVal = evidence.n;
+                  learnedLines.push(`  ${l.id} (${l.model}) ${cat}: capability ${declared.toFixed(2)} (declared; insufficient outcome evidence (n=${nVal.toFixed(nVal % 1 === 0 ? 0 : 1)}))`);
+                }
+              }
+            }
+          }
+        }
+      }
+      if (learnedLines.length > 0) {
+        lines.push("", "Learned Capabilities:", ...learnedLines);
       }
       const capPrior = deps.capabilityPrior?.([]);
       if (capPrior?.state === "on") {
