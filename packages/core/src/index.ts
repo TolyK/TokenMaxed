@@ -5,6 +5,8 @@ export { analyzePlan } from './plan.ts';
 export type { LanePlanStats, PlanOptimizationSuggestion, PlanOptimizationResult } from './plan.ts';
 export { analyzeBacktest, observedForLaneWithDifficulty } from './backtest.ts';
 export type { BacktestPolicy, BacktestDifference, BacktestSummary, BacktestEvidence } from './backtest.ts';
+export { fingerprintTask } from './fingerprint.ts';
+export type { TaskFingerprint } from './fingerprint.ts';
 
 export {
   routeDecide,

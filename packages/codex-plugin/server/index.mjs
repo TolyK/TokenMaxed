@@ -24984,6 +24984,316 @@ function analyzeBacktest(events, baseCtx, policy, now, opts) {
   };
 }
 
+// ../core/src/fingerprint.ts
+var LANGUAGES = [
+  "ts",
+  "js",
+  "python",
+  "go",
+  "rust",
+  "java",
+  "c",
+  "cpp",
+  "csharp",
+  "ruby",
+  "php",
+  "shell",
+  "sql"
+];
+var LANG_PATTERNS = {
+  ts: {
+    fenced: [/\b(ts|typescript)\b/i],
+    ext: [/\.(ts|tsx)\b/i],
+    kw: [/\btypescript\b/i]
+  },
+  js: {
+    fenced: [/\b(js|javascript)\b/i],
+    ext: [/\.(js|jsx|mjs|cjs)\b/i],
+    kw: [/\bjavascript\b/i]
+  },
+  python: {
+    fenced: [/\b(py|python)\b/i],
+    ext: [/\.(py|pyw)\b/i],
+    kw: [/\bpython\b/i]
+  },
+  go: {
+    fenced: [/\b(go|golang)\b/i],
+    ext: [/\.go\b/i],
+    kw: [/\bgolang\b/i, /\bgo lang\b/i, /\bgo code\b/i]
+  },
+  rust: {
+    fenced: [/\b(rs|rust)\b/i],
+    ext: [/\.rs\b/i],
+    kw: [/\brustlang\b/i, /\brust lang\b/i, /\brust code\b/i, /\brust\b/i]
+  },
+  java: {
+    fenced: [/\bjava\b/i],
+    ext: [/\.(java|jar)\b/i],
+    kw: [/\bjava\b/i]
+  },
+  c: {
+    fenced: [/^c$/i],
+    ext: [/\.(c|h)\b/i],
+    kw: [/\bc code\b/i]
+  },
+  cpp: {
+    fenced: [/^(cpp|c\+\+|cc)$/i, /\b(cpp|cc)\b/i, /\bc\+\+(?!\w)/i],
+    ext: [/\.(cpp|hpp|cc|cxx)\b/i],
+    kw: [/\bc\+\+(?!\w)/i, /\bcpp\b/i]
+  },
+  csharp: {
+    fenced: [/^(csharp|cs|c#)$/i, /\b(csharp|cs)\b/i, /\bc#(?!\w)/i],
+    ext: [/\.cs\b/i],
+    kw: [/\bc#(?!\w)/i, /\bcsharp\b/i]
+  },
+  ruby: {
+    fenced: [/\b(rb|ruby)\b/i],
+    ext: [/\.rb\b/i],
+    kw: [/\bruby\b/i]
+  },
+  php: {
+    fenced: [/\bphp\b/i],
+    ext: [/\.php\b/i],
+    kw: [/\bphp\b/i]
+  },
+  shell: {
+    fenced: [/\b(shell|sh|bash|zsh)\b/i],
+    ext: [/\.(sh|bash|zsh)\b/i],
+    kw: [/\bshell script\b/i, /\bbash script\b/i, /\bshell command\b/i, /\bterminal command\b/i, /\bbash\b/i, /\bzsh\b/i]
+  },
+  sql: {
+    fenced: [/\bsql\b/i],
+    ext: [/\.sql\b/i],
+    kw: [/\bsql\b/i, /\bpostgresql\b/i, /\bmysql\b/i, /\bsqlite\b/i]
+  }
+};
+function countMatches(regex, str) {
+  const flags = (regex.ignoreCase ? "i" : "") + "g";
+  const globalRegex = new RegExp(regex.source, flags);
+  let count = 0;
+  while (globalRegex.test(str)) {
+    count++;
+    if (globalRegex.lastIndex === 0) {
+      break;
+    }
+  }
+  return count;
+}
+function fingerprintTask(text, opts) {
+  const originalLen = text.length;
+  const fileCount = opts?.referencedFileCount ?? 0;
+  let contextSizeBand = "small";
+  if (originalLen > 5e4 || fileCount > 10) {
+    contextSizeBand = "xlarge";
+  } else if (originalLen > 15e3 || fileCount > 4) {
+    contextSizeBand = "large";
+  } else if (originalLen > 3e3 || fileCount > 1) {
+    contextSizeBand = "medium";
+  } else {
+    contextSizeBand = "small";
+  }
+  const MAX_SCAN_LEN = 65536;
+  const scanned = text.length > MAX_SCAN_LEN ? text.slice(0, MAX_SCAN_LEN) : text;
+  const trimmed = scanned.trim();
+  if (!trimmed) {
+    return {
+      language: { lang: "unknown", confidence: 0 },
+      contextSizeBand,
+      toolNeed: "low",
+      planVsImpl: "impl",
+      securitySensitive: false,
+      blastRadius: "narrow"
+    };
+  }
+  const lowerText = trimmed.toLowerCase();
+  const fencedTags = [];
+  const fencedRegex = /```(\S+)/g;
+  let match;
+  let fencedCount = 0;
+  while ((match = fencedRegex.exec(trimmed)) !== null && fencedCount++ < 100) {
+    if (match[1]) {
+      fencedTags.push(match[1].toLowerCase());
+    }
+  }
+  const scores = {
+    ts: 0,
+    js: 0,
+    python: 0,
+    go: 0,
+    rust: 0,
+    java: 0,
+    c: 0,
+    cpp: 0,
+    csharp: 0,
+    ruby: 0,
+    php: 0,
+    shell: 0,
+    sql: 0
+  };
+  for (const lang of LANGUAGES) {
+    const patterns = LANG_PATTERNS[lang];
+    for (const tag of fencedTags) {
+      for (const pat of patterns.fenced) {
+        if (pat.test(tag)) {
+          scores[lang] += 10;
+        }
+      }
+    }
+    for (const pat of patterns.ext) {
+      const matchCount = countMatches(pat, lowerText);
+      if (matchCount > 0) {
+        scores[lang] += matchCount * 5;
+      }
+    }
+    for (const pat of patterns.kw) {
+      const matchCount = countMatches(pat, lowerText);
+      if (matchCount > 0) {
+        scores[lang] += matchCount * 3;
+      }
+    }
+  }
+  let topScore = 0;
+  let topLang = null;
+  for (const lang of LANGUAGES) {
+    if (scores[lang] > topScore) {
+      topScore = scores[lang];
+      topLang = lang;
+    }
+  }
+  let secondScore = 0;
+  for (const lang of LANGUAGES) {
+    if (lang === topLang) continue;
+    if (scores[lang] > secondScore) {
+      secondScore = scores[lang];
+    }
+  }
+  let language = { lang: "unknown", confidence: 0 };
+  if (topScore > 0 && topLang) {
+    const separation = (topScore - secondScore) / topScore;
+    const strength = Math.min(1, topScore / 15);
+    const confidence = Math.max(0, Math.min(1, separation * strength));
+    if (confidence >= 0.15) {
+      language = { lang: topLang, confidence };
+    } else {
+      language = { lang: "unknown", confidence: 0 };
+    }
+  }
+  const highNeedKeywords = [
+    "npm run",
+    "npm install",
+    "npm test",
+    "cargo test",
+    "pytest",
+    "go test",
+    "run command",
+    "run script",
+    "run tests",
+    "compile",
+    "docker",
+    "db migrate",
+    "npm build",
+    "webpack",
+    "vite",
+    "execute",
+    "yarn test",
+    "yarn build",
+    "pip install",
+    "pip3 install"
+  ];
+  const medNeedKeywords = [
+    "run",
+    "test",
+    "build",
+    "search",
+    "browse",
+    "migrate",
+    "grep",
+    "lint",
+    "typecheck",
+    "format",
+    "verify",
+    "exec"
+  ];
+  let toolScore = 0;
+  for (const kw of highNeedKeywords) {
+    const regex = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    toolScore += countMatches(regex, trimmed) * 3;
+  }
+  for (const kw of medNeedKeywords) {
+    const regex = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    toolScore += countMatches(regex, trimmed) * 1;
+  }
+  let toolNeed = "low";
+  if (toolScore >= 5) {
+    toolNeed = "high";
+  } else if (toolScore >= 1) {
+    toolNeed = "medium";
+  }
+  const planKeywords = ["design", "spec", "architect", "plan", "proposal", "blueprint", "diagram", "concept", "rfc", "outline", "workflow", "structure", "flowchart"];
+  const implKeywords = ["write", "edit", "implement", "fix", "code", "refactor", "create", "add", "delete", "update", "modify", "bugfix", "patch", "tweak", "clean up"];
+  let planScore = 0;
+  let implScore = 0;
+  for (const kw of planKeywords) {
+    const regex = new RegExp(`\\b${kw}\\b`, "i");
+    planScore += countMatches(regex, trimmed);
+  }
+  for (const kw of implKeywords) {
+    const regex = new RegExp(`\\b${kw}\\b`, "i");
+    implScore += countMatches(regex, trimmed);
+  }
+  let planVsImpl = "impl";
+  if (planScore > 0 && implScore > 0) {
+    planVsImpl = "mixed";
+  } else if (planScore > 0) {
+    planVsImpl = "plan";
+  } else {
+    planVsImpl = "impl";
+  }
+  const secKeywords = ["auth", "crypto", "secret", "token", "password", "permission", "pii", "credential", "jwt", "encrypt", "decrypt", "hash", "login", "oauth", "session", "api key", "private key", "ssl", "tls", "cert"];
+  let securitySensitive = false;
+  for (const kw of secKeywords) {
+    const regex = new RegExp(`\\b${kw}\\b`, "i");
+    if (regex.test(trimmed)) {
+      securitySensitive = true;
+      break;
+    }
+  }
+  const wideKeywords = ["rename everywhere", "migration", "all files", "schema change", "every", "global", "cross-cutting", "breaking change", "database schema", "restructure whole", "refactor all"];
+  const modKeywords = ["rename", "directory", "multiple files", "components", "package", "module", "across", "impact"];
+  const narrowKeywords = ["single file", "local", "tweak", "one line", "helper", "isolated", "internal", "private"];
+  let wideScore = 0;
+  let modScore = 0;
+  let narrowScore = 0;
+  for (const kw of wideKeywords) {
+    const regex = new RegExp(`\\b${kw}\\b`, "i");
+    wideScore += countMatches(regex, trimmed) * 3;
+  }
+  for (const kw of modKeywords) {
+    const regex = new RegExp(`\\b${kw}\\b`, "i");
+    modScore += countMatches(regex, trimmed) * 1;
+  }
+  for (const kw of narrowKeywords) {
+    const regex = new RegExp(`\\b${kw}\\b`, "i");
+    narrowScore += countMatches(regex, trimmed) * 1;
+  }
+  let blastRadius = "narrow";
+  if (wideScore > 0) {
+    blastRadius = "wide";
+  } else if (modScore > 0) {
+    blastRadius = "moderate";
+  } else {
+    blastRadius = "narrow";
+  }
+  return {
+    language,
+    contextSizeBand,
+    toolNeed,
+    planVsImpl,
+    securitySensitive,
+    blastRadius
+  };
+}
+
 // ../core/src/window-quota.ts
 var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
 var WINDOW_WARN_USED = 0.7;
@@ -29179,6 +29489,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...repo_class ? { repo_class } : {},
         ...sensitivity ? { sensitivity } : {}
       };
+      const fingerprint = core.fingerprintTask ? core.fingerprintTask(instruction ?? "", { referencedFileCount: files?.length }) : void 0;
       let lanes = deps.candidateLanes(category, pinnedModel ? { includeReserved: true } : void 0);
       const policy = deps.loadPolicy();
       if (pinnedModel) {
@@ -29228,6 +29539,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           readerEgress: deps.readerEgress,
           policyContext,
           access_need: resolvedAccessNeed,
+          ...fingerprint ? { fingerprint } : {},
           ...deps.host ? { host: deps.host } : {},
           ...yolo ? { yolo: true } : {},
           ...observedCapability ? { observedCapability } : {},
@@ -29251,6 +29563,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         readerEgress: deps.readerEgress,
         policyContext,
         access_need: resolvedAccessNeed,
+        ...fingerprint ? { fingerprint } : {},
         ...deps.host ? { host: deps.host } : {},
         ...yolo ? { yolo: true } : {},
         ...observedCapability ? { observedCapability } : {},
@@ -29513,12 +29826,19 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           }
         }
       }
+      let fingerprintLine = "";
+      if (fingerprint) {
+        const langText = fingerprint.language.lang === "unknown" ? "unknown" : `${fingerprint.language.lang} (${fingerprint.language.confidence.toFixed(1)})`;
+        const secText = fingerprint.securitySensitive ? "yes" : "no";
+        fingerprintLine = `  fingerprint: ${langText} \xB7 context: ${fingerprint.contextSizeBand} \xB7 tools: ${fingerprint.toolNeed} \xB7 ${fingerprint.planVsImpl} \xB7 security: ${secText} \xB7 blast: ${fingerprint.blastRadius}`;
+      }
       const text = [
         `category "${category}" \u2192 lane "${decision.laneId}"`,
         ...explicitPolicy ? [`  policy: ${routingPolicy}${policyExplanation(routingPolicy)}`] : [],
         ...pinnedModel ? [`  model pinned by request: "${pinnedModel}" \u2014 only lanes serving it were considered (no substitution on failure).`] : [],
         lane ? `  ${lane.kind} \xB7 ${lane.model} \xB7 trust=${lane.trust_mode}` : "  (lane not found in config)",
         `  policy verdict: ${verdict}`,
+        ...fingerprintLine ? [fingerprintLine] : [],
         `  why: ${decisionReason}`,
         ...forecastLine ? [forecastLine] : [],
         ...difficulty ? [
@@ -29532,7 +29852,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...preferNote ? [preferNote] : [],
         ...freezeNote ? [freezeNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...deps.getFrozen?.() ? { frozen: true } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...fingerprint ? { fingerprint } : {}, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...deps.getFrozen?.() ? { frozen: true } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {}, ...forecastData ? { forecast: forecastData } : {} });
     })
   };
   const statusTool = {
@@ -31520,7 +31840,7 @@ function fileFullAccessStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor, analyzeBacktest };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor, analyzeBacktest, fingerprintTask };
 function receiptFromEvents(events) {
   const legs = events.filter((e) => e.status !== "native");
   if (legs.length === 0) return void 0;
@@ -32102,6 +32422,7 @@ function makeServerDeps(env = process.env) {
       lanes,
       gateReady,
       readerEgress,
+      fingerprint: fingerprintTask(request.instruction, { referencedFileCount: request.files?.length }),
       policyContext: request.policyContext ?? {},
       ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {},
       // Tandem access gate: resolve the caller's access_need (`auto`/unset ⇒
