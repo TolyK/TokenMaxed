@@ -6,6 +6,7 @@ export {
   eligibleLanes,
   hostAllowsLane,
   isSelectablePreGate,
+  isReaderElevated,
   modelMatchesPin,
   isManagerEligible,
   executionModeOf,

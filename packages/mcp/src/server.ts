@@ -37,7 +37,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import { FIVE_HOUR_MS, TASK_CATEGORIES, eligibleLanes,
-  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY } from '@tokenmaxed/core';
+  hostAllowsLane, modelMatchesPin, evaluate, filterEventsSince, inferAccessNeed, isManagerEligible, laneDepletionForecast, laneQuotaState, outcomeCapability, outcomeCapabilityByDifficulty, parseModelAlias, priceForModel, quotaHeadroomMap, resolveLaneModel, resolvedPriorFor, routeDecide, runTask, runWithEscalation, summarize, tokenStats, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, isReaderElevated } from '@tokenmaxed/core';
 import type { EscalationDeps, EscalationResult, Lane, LaneRegistry, ObservedCapabilityByModel, ObservedCapabilityByModelDifficulty, PriceTable, RouteContext, RunDeps, TaskCategory, TaskEventInput } from '@tokenmaxed/core';
 import {
   JsonlLedger,
@@ -73,6 +73,8 @@ import type { ToggleStore } from './toggle.ts';
 import { readPreferred, writePreferred } from './prefer.ts';
 import type { PreferStore } from './prefer.ts';
 import { readYolo, writeYolo } from './yolo.ts';
+import { readFullAccess, grantFullAccess, revokeFullAccess } from './full-access.ts';
+import type { FullAccessStore } from './full-access.ts';
 import type { CorePort, DelegateOutcome, DelegateReceipt, DelegateRequest, ReviewOutcome, ToolDef, ToolDeps } from './tools.ts';
 
 // User-owned (NOT repo-controlled) — see the SECURITY note above. HOME_TM and the
@@ -193,8 +195,26 @@ function filePreferStore(statePath: string): PreferStore {
   };
 }
 
+/** A JSON-file-backed {@link FullAccessStore} (string-array-valued); tolerant of a missing/corrupt file. */
+function fileFullAccessStore(statePath: string): FullAccessStore {
+  return {
+    read: () => {
+      if (!existsSync(statePath)) return {};
+      try {
+        return JSON.parse(readFileSync(statePath, 'utf8'));
+      } catch {
+        return {}; // corrupt file ⇒ treat as empty
+      }
+    },
+    write: (state) => {
+      mkdirSync(dirname(statePath), { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+    },
+  };
+}
+
 /** The real core operations, bound for injection into the tools. */
-export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
+export const CORE: CorePort = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor };
 
 /**
  * A3: aggregate the recorded task legs into the content-free receipt rendered
@@ -346,6 +366,33 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
   const preferStore = filePreferStore(preferStatePath);
   const preferEnvFallback = env.TOKENMAXED_PREFER_LANE?.trim() || undefined;
   const readPreferredLane = (): string | undefined => readPreferred(preferStore, projectKey) ?? preferEnvFallback;
+
+  const fullAccessStatePath = env.TOKENMAXED_FULL_ACCESS_STATE ?? join(dirname(statePath), 'full-access.json');
+  const fullAccessStore = fileFullAccessStore(fullAccessStatePath);
+  const fullAccessEnvFallback = env.TOKENMAXED_FULL_ACCESS
+    ? env.TOKENMAXED_FULL_ACCESS.split(',').map((x) => x.trim()).filter((x) => x.length > 0)
+    : [];
+  // Env TOKENMAXED_FULL_ACCESS: match each entry EXACTLY against lane.id or the resolved lane.model (case-insensitive).
+  // Takes lane IDs / exact model IDs.
+  const readFullAccessGrants = (allLanes?: readonly Lane[]): string[] => {
+    const projectGrants = readFullAccess(fullAccessStore, projectKey);
+    const projectGrantsLower = new Set(projectGrants.map((x) => x.toLowerCase()));
+    const envGrantsLower = new Set(fullAccessEnvFallback.map((x) => x.toLowerCase()));
+
+    const laneIds = new Set<string>();
+    if (allLanes) {
+      for (const lane of allLanes) {
+        if (projectGrantsLower.has(lane.id.toLowerCase())) {
+          laneIds.add(lane.id);
+        }
+        if (envGrantsLower.has(lane.id.toLowerCase()) || envGrantsLower.has(lane.model.toLowerCase())) {
+          laneIds.add(lane.id);
+        }
+      }
+      return [...laneIds];
+    }
+    return [...projectGrants, ...fullAccessEnvFallback];
+  };
   // YOLO mode (--dangerously-skip-permissions analogue): forces every trust/egress
   // gate open so all worker/reader lanes are selectable (see RouteContext.yolo).
   // Persisted in its OWN boolean file (per-project), with TOKENMAXED_YOLO as the
@@ -567,6 +614,19 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // the resolved lane set wins; fall back to the registry for ids not in it (native).
     const modelOf = (laneId: string): string | undefined =>
       lanes.find((l) => l.id === laneId)?.model ?? registry.byId(laneId)?.model;
+
+    const grants = readFullAccessGrants(lanes);
+    const fullAccessLaneIds: string[] = [];
+    for (const lane of lanes) {
+      if (lane.trust_mode === 'reader') {
+        const matchesProjectOrEnvGrant = grants.some((g) => g.toLowerCase() === lane.id.toLowerCase());
+        const matchesPromptPin = !!request.full_access && !!request.model && modelMatchesPin(lane.model, request.model);
+        if (matchesProjectOrEnvGrant || matchesPromptPin) {
+          fullAccessLaneIds.push(lane.id);
+        }
+      }
+    }
+
     // F-1/P6: apply the model-keyed learned overlay (undefined when off ⇒ declared
     // scores). Core selectors read ctx.observedCapabilityByModel; runWithEscalation
     // preserves it through its effective-context spread, so escalation/reassign benefit.
@@ -584,6 +644,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       gateReady,
       readerEgress,
       policyContext: request.policyContext ?? {},
+      ...(fullAccessLaneIds.length ? { fullAccessLaneIds } : {}),
       // Tandem access gate: resolve the caller's access_need (`auto`/unset ⇒
       // `worker-ok` today) BEFORE routing. `repo-tight` filters worker/reader lanes
       // out in eligibleLanes so only full-access lanes survive; `worker-ok` is a
@@ -718,6 +779,13 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
 
     // C-13 (opt-in): offload → review → escalate/rework/give_back. The manager
     // runs via the same trusted executor (core restricts managers to marginal-free
+    const withFullAccessGranted = (outcome: DelegateOutcome): DelegateOutcome => {
+      if (fullAccessLaneIds.includes(outcome.laneId)) {
+        return { ...outcome, fullAccessGranted: true };
+      }
+      return outcome;
+    };
+
     // lanes). Persist BOTH task + outcome events; a recording failure never
     // discards an already-produced result. Latency per leg is bounded by the CLI
     // spawn timeout; local/api legs are best-effort (abortable timeouts deferred).
@@ -765,16 +833,21 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         escRecordingFailed = true;
       }
       const escReceipt = receiptFromEvents(esc.events.flatMap((e) => (e.kind === 'task' ? [e.event] : [])));
-      return withSkippedNote(
-        withPinNote(
-          withPreferOverrideNote(
-            { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
-            esc.result.decision,
-          ),
-          esc.final_action === 'give_back' && esc.result.failureKind !== 'insufficient_context',
+      return {
+        ...withFullAccessGranted(
+          withSkippedNote(
+            withPinNote(
+              withPreferOverrideNote(
+                { ...escToOutcome(esc, modelOf, escRecordingFailed), ...(escReceipt ? { receipt: escReceipt } : {}) },
+                esc.result.decision,
+              ),
+              esc.final_action === 'give_back' && esc.result.failureKind !== 'insufficient_context',
+            ),
+            skippedNote,
+          )
         ),
-        skippedNote,
-      );
+        fullAccessLaneIds,
+      };
     }
 
     const result = await runTask(taskInput, ctx, policy, runDeps);
@@ -785,33 +858,38 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
       recordingFailed = true; // keep the result; recording is best-effort
     }
     const resultModel = modelOf(result.laneId);
-    return withSkippedNote(
-      withPinNote(
-        withPreferOverrideNote(
-        {
-        laneId: result.laneId,
-        status: result.status,
-        ...(result.native ? { native: true } : {}),
-        ...(result.resultText !== undefined ? { resultText: result.resultText } : {}),
-        ...(resultModel ? { model: resultModel } : {}),
-        ...(result.failureKind ? { failureKind: result.failureKind } : {}),
-        ...(result.failureKind === 'insufficient_context'
-          ? { reason: `worker handed back (insufficient context): ${result.resultText ?? 'needs repo/tool access'} — host should complete` }
-          : result.decision?.reason
-            ? { reason: result.decision.reason }
-            : {}),
-        ...(result.readerDerived ? { readerDerived: true } : {}),
-        ...(recordingFailed ? { recordingFailed: true } : {}),
-        ...((): { receipt?: DelegateReceipt } => {
-          const receipt = receiptFromEvents(result.events);
-          return receipt ? { receipt } : {};
-        })(),
-        },
-        result.decision,
-        ),
+    return {
+      ...withFullAccessGranted(
+        withSkippedNote(
+          withPinNote(
+            withPreferOverrideNote(
+            {
+            laneId: result.laneId,
+            status: result.status,
+            ...(result.native ? { native: true } : {}),
+            ...(result.resultText !== undefined ? { resultText: result.resultText } : {}),
+            ...(resultModel ? { model: resultModel } : {}),
+            ...(result.failureKind ? { failureKind: result.failureKind } : {}),
+            ...(result.failureKind === 'insufficient_context'
+              ? { reason: `worker handed back (insufficient context): ${result.resultText ?? 'needs repo/tool access'} — host should complete` }
+              : result.decision?.reason
+                ? { reason: result.decision.reason }
+                : {}),
+            ...(result.readerDerived ? { readerDerived: true } : {}),
+            ...(recordingFailed ? { recordingFailed: true } : {}),
+            ...((): { receipt?: DelegateReceipt } => {
+              const receipt = receiptFromEvents(result.events);
+              return receipt ? { receipt } : {};
+            })(),
+            },
+            result.decision,
+            ),
+          ),
+          skippedNote,
+        )
       ),
-      skippedNote,
-    );
+      fullAccessLaneIds,
+    };
   };
 
   return {
@@ -876,6 +954,19 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
     // Universal preferred-lane override (per-project state + env fallback).
     preferredLane: readPreferredLane,
     setPreferredLane: (laneId) => writePreferred(preferStore, projectKey, laneId),
+    // Reader Full-Access Grants
+    readerLanes: () => {
+      if (!existsSync(lanesPath)) return [];
+      try {
+        const registry = loadLaneConfig(lanesPath);
+        return registry.lanes.filter((l) => l.trust_mode === 'reader');
+      } catch {
+        return [];
+      }
+    },
+    getFullAccess: readFullAccessGrants,
+    grantFullAccess: (laneId) => grantFullAccess(fullAccessStore, projectKey, laneId),
+    revokeFullAccess: (laneId) => revokeFullAccess(fullAccessStore, projectKey, laneId),
     // YOLO mode (per-project state + TOKENMAXED_YOLO fallback; forced off by the
     // kill-switch). router_preview/router_status read getYolo; router_set_yolo writes it.
     getYolo: readYoloState,

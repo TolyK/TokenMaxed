@@ -7593,7 +7593,7 @@ function matchOne(condition, value) {
 function ruleMatches(rule, task, lane, repoClass, sensitivity) {
   return matchOne(rule.repo_class, repoClass) && matchOne(rule.sensitivity, sensitivity) && matchOne(rule.trust_mode, lane.trust_mode) && matchOne(rule.provenance, lane.provenance) && matchOne(rule.jurisdiction, lane.jurisdiction) && matchOne(rule.category, task.category);
 }
-function evaluate(task, lane, ctx, policy) {
+function evaluate(task, lane, ctx, policy, elevated = false) {
   const repoClass = ctx.repo_class ?? "unknown";
   const sensitivity = ctx.sensitivity ?? "unknown";
   let decision;
@@ -7612,7 +7612,8 @@ function evaluate(task, lane, ctx, policy) {
   if (ctx.secretHit === true && decision.verdict === "allow") {
     decision = { verdict: "force-trusted", reason: "secret detected: trusted/local lanes only" };
   }
-  if (lane.trust_mode === "reader" && decision.verdict !== "block" && (sensitivity !== "normal" || repoClass === "unknown" || ctx.secretHit === true)) {
+  const isHardCapped = lane.trust_mode === "reader" && decision.verdict !== "block" && (elevated ? ctx.secretHit === true : sensitivity !== "normal" || repoClass === "unknown" || ctx.secretHit === true);
+  if (isHardCapped) {
     return {
       verdict: "force-trusted",
       reason: "reader hard cap: reader lanes require a known repo + normal sensitivity + no secret"
@@ -7744,12 +7745,18 @@ function capPenaltyFor(headroom) {
   if (headroom <= CAP_CRITICAL_HEADROOM + CAP_EPSILON) return CAP_CRITICAL_PENALTY;
   return CAP_WARN_PENALTY;
 }
-function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false) {
+function isReaderElevated(lane, fullAccessLaneIds) {
+  return lane.trust_mode === "reader" && !!fullAccessLaneIds && fullAccessLaneIds.includes(lane.id);
+}
+function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false, elevated = false) {
   if (yolo) {
     if (lane.trust_mode === "full") return true;
     if (lane.trust_mode === "worker") return isExecutorCertified(lane);
     if (lane.trust_mode === "reader") return isReaderExecutorCertified(lane);
     return false;
+  }
+  if (lane.trust_mode === "reader" && elevated) {
+    return isReaderExecutorCertified(lane);
   }
   if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
   if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);
@@ -7882,10 +7889,13 @@ function eligibleLanes(task, ctx, policy) {
   const out = [];
   for (const lane of ctx.lanes) {
     if (disabled.has(lane.id) || !hostAllowsLane(lane, ctx)) continue;
-    if (!isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
+    const elevated = isReaderElevated(lane, ctx.fullAccessLaneIds);
+    if (!isSelectablePreGate(lane, gateReady, readerEgress, yolo, elevated)) continue;
     if (repoTight && !canDoRepoTight(lane)) continue;
-    const { verdict } = evaluate(task, lane, policyContext, policy);
-    if (yolo ? verdict === "block" : !laneAllowedByVerdict(lane, verdict)) continue;
+    const { verdict } = evaluate(task, lane, policyContext, policy, elevated);
+    const admitted = elevated ? verdict !== "block" && policyContext.secretHit !== true : laneAllowedByVerdict(lane, verdict);
+    if (elevated && policyContext.secretHit === true) continue;
+    if (yolo ? verdict === "block" : !admitted) continue;
     out.push({ lane, verdict });
   }
   return out;
@@ -10304,6 +10314,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         model: {
           type: "string",
           description: "OPTIONAL exact-model pin to preview \u2014 shows what a model-pinned delegate would do (the pinned lane, or WHY the pin cannot run). Same matching as router_delegate's model param."
+        },
+        full_access: {
+          type: "boolean",
+          description: "OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` \u2014 elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it."
         }
       }
     },
@@ -10315,6 +10329,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       const pinnedModel = optString(args, "model")?.trim() || void 0;
+      const full_access = optBool(args, "full_access");
+      if (full_access && !pinnedModel) {
+        throw new ToolInputError("full_access requires a model pin.");
+      }
       const task = { category, ...difficulty ? { difficulty } : {} };
       const resolvedAccessNeed = access_need === "repo-tight" ? "repo-tight" : "worker-ok";
       if (!deps.getEnabled()) {
@@ -10349,6 +10367,17 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
       const capHeadroom2 = deps.capHeadroom?.(lanes);
       const quotaCtx = capHeadroom2 ? { capHeadroom: capHeadroom2 } : {};
+      const grants = deps.getFullAccess ? deps.getFullAccess(lanes) : [];
+      const fullAccessLaneIds = [];
+      for (const lane2 of lanes) {
+        if (lane2.trust_mode === "reader") {
+          const matchesProjectOrEnvGrant = grants.some((g) => g.toLowerCase() === lane2.id.toLowerCase());
+          const matchesPromptPin = !!full_access && !!pinnedModel && core.modelMatchesPin(lane2.model, pinnedModel);
+          if (matchesProjectOrEnvGrant || matchesPromptPin) {
+            fullAccessLaneIds.push(lane2.id);
+          }
+        }
+      }
       let availableIds;
       if (deps.availableLaneIds) {
         const baseCtx = {
@@ -10363,7 +10392,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
           ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
           ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
           ...priorCtx,
-          ...quotaCtx
+          ...quotaCtx,
+          ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
         };
         const eligible = core.eligibleLanes(task, baseCtx, policy).map((e) => e.lane);
         availableIds = await deps.availableLaneIds(eligible);
@@ -10389,7 +10419,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...quotaCtx,
         ...availableIds ? { availableLaneIds: availableIds } : {},
         ...tieredCtx,
-        ...preferLaneId ? { preferLaneId } : {}
+        ...preferLaneId ? { preferLaneId } : {},
+        ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
       };
       let decision;
       try {
@@ -10398,16 +10429,17 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         if (pinnedModel) {
           return ok(
             `requested model "${pinnedModel}" cannot run right now (its lane is blocked or unavailable under current gates) \u2014 a model-pinned delegate would come back native, NOT substitute another model.`,
-            { category, gateReady, policyContext, decision: null, native: true, pinnedModel }
+            { category, gateReady, policyContext, decision: null, native: true, pinnedModel, fullAccessLaneIds }
           );
         }
         return ok(
           `category "${category}": no eligible lane (gate_ready=${gateReady}) \u2014 would run on the host (native).`,
-          { category, gateReady, policyContext, decision: null, native: true }
+          { category, gateReady, policyContext, decision: null, native: true, fullAccessLaneIds }
         );
       }
       const lane = lanes.find((l) => l.id === decision.laneId);
-      const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy).verdict : decision.policyVerdict;
+      const elevated = lane ? core.isReaderElevated?.(lane, fullAccessLaneIds) ?? false : false;
+      const verdict = lane ? core.evaluate({ category }, lane, policyContext, policy, elevated).verdict : decision.policyVerdict;
       const preferNote = preferLaneId && decision.laneId !== preferLaneId ? `  note: preferred lane "${preferLaneId}" was not used \u2014 it isn't eligible, available, or capable for this category (fell back to normal routing).` : void 0;
       const yoloNote = yolo ? `  \u26A0\uFE0F YOLO mode ON: trust/egress gates are bypassed \u2014 workers/readers are selectable even on private/sensitive/unknown context. Disable with /tokenmaxed:yolo off.` : void 0;
       const quotaLines = [];
@@ -10468,7 +10500,7 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...yoloNote ? [yoloNote] : [],
         ...preferNote ? [preferNote] : []
       ].join("\n");
-      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {} });
+      return ok(text, { category, gateReady, policyContext, decision, verdict, native: false, yolo, fullAccessLaneIds, ...difficulty ? { difficulty } : {}, ...priorStructured ? { capabilityPrior: priorStructured } : {}, ...preferLaneId ? { preferLaneId } : {}, ...hostBlocked.length > 0 ? { host: deps.host ?? null, hostBlocked: hostBlocked.map((l) => l.id) } : {} });
     })
   };
   const statusTool = {
@@ -10625,6 +10657,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         model: {
           type: "string",
           description: `OPTIONAL exact-model pin. Set ONLY when the USER explicitly named a model in their prompt (e.g. "use minimax for this", "route this to gpt-5.5") \u2014 never infer it. Pass the VENDOR MODEL ID, normalizing obvious colloquial names first ("ChatGPT 5.5" \u2192 gpt-5.5, "Haiku" \u2192 claude-haiku); both exact versioned ids (gpt-5.5) and family names (minimax \u2192 its concrete resolution) match, case-insensitively. If the pin is refused as not connected, the reply lists the connected models: retry ONCE with the listed id when the user's intent maps to it unambiguously, otherwise relay the list and ask. TokenMaxed never substitutes a different model for an explicit pin. Omit for normal cheapest-capable routing.`
+        },
+        full_access: {
+          type: "boolean",
+          description: "OPTIONAL. Set ONLY when the user explicitly authorized full repo access for the model named in `model` \u2014 elevates that reader lane to full repo access for THIS call. Requires `model`. Never infer it."
         }
       }
     },
@@ -10638,6 +10674,10 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
       const access_need = optEnum(args, "access_need", ACCESS_NEEDS);
       const difficulty = optEnum(args, "difficulty", DIFFICULTIES);
       const model = optString(args, "model");
+      const full_access = optBool(args, "full_access");
+      if (full_access && !model) {
+        throw new ToolInputError("full_access requires a model pin.");
+      }
       if (!deps.getEnabled()) {
         return ok(
           "TokenMaxed routing is DISABLED for this project \u2014 handle this task yourself (native). Run /tokenmaxed:on to re-enable.",
@@ -10656,7 +10696,8 @@ ${alerts.map((a) => `     ${a}`).join("\n")}` : formatSummaryBanner(data);
         ...files && files.length ? { files } : {},
         ...access_need ? { access_need } : {},
         ...difficulty ? { difficulty } : {},
-        ...model ? { model } : {}
+        ...model ? { model } : {},
+        ...full_access !== void 0 ? { full_access } : {}
       });
       const finalOutcome = resolution.categoryInferred ? {
         ...outcome,
@@ -10784,7 +10825,77 @@ ${r.notes}` : "";
       return ok(lines.join("\n"), { path: report.path, present: report.present, ...report.warning ? { warning: report.warning } : {}, rows });
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
+  const setFullAccessTool = {
+    name: "router_set_full_access",
+    description: "Grant or revoke full repo access for a specific, named model in TokenMaxed reader lanes. When granted, that reader lane is selectable regardless of repo_class/sensitivity and receives the full, unminimized repo context verbatim. The fail-closed secret scanner still applies and output is reader-derived. Persistent per project. Powers /tokenmaxed:full-access.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        model: {
+          type: "string",
+          description: "The model name/id to grant or revoke (e.g. minimax, gemini-1.5-pro). If empty/omitted and off is true, clears all grants for this project."
+        },
+        off: {
+          type: "boolean",
+          description: "Set to true to REVOKE access for the named model (or clear all grants if model is empty/omitted). Defaults to false (grant access)."
+        }
+      }
+    },
+    handler: (deps, args) => guarded(() => {
+      const raw = optString(args, "model");
+      const model = typeof raw === "string" ? raw.trim() : void 0;
+      const off = optBool(args, "off") ?? false;
+      if (off) {
+        if (!model) {
+          deps.revokeFullAccess?.();
+          return ok(
+            "Reader Full-Access Grants CLEARED for this project. TokenMaxed will route reader lanes with default permissions and minimization.",
+            { fullAccessLaneIds: null }
+          );
+        } else {
+          const allReaderLanes = deps.readerLanes?.() ?? [];
+          const matchedLanes = allReaderLanes.filter((l) => core.modelMatchesPin(l.model, model) || l.id.toLowerCase() === model.toLowerCase());
+          if (matchedLanes.length === 0) {
+            throw new ToolInputError(`No connected reader lanes match "${model}".`);
+          }
+          for (const lane of matchedLanes) {
+            deps.revokeFullAccess?.(lane.id);
+          }
+          const revokedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(", ");
+          return ok(
+            `Reader Full-Access Grant REVOKED for: ${revokedNames} in this project. The secret scanner still applies and output remains reader-derived.`,
+            { revokedLanes: matchedLanes.map((l) => l.id) }
+          );
+        }
+      } else {
+        if (!model) {
+          throw new ToolInputError('"model" is required to grant full access.');
+        }
+        const allReaderLanes = deps.readerLanes?.() ?? [];
+        const matchedLanes = allReaderLanes.filter((l) => core.modelMatchesPin(l.model, model));
+        if (matchedLanes.length === 0) {
+          const connectable = allReaderLanes.map((l) => l.model).sort();
+          throw new ToolInputError(
+            `No connected reader lanes match "${model}". Connected reader models: ${connectable.join(", ") || "(none)"}`
+          );
+        }
+        for (const lane of matchedLanes) {
+          deps.grantFullAccess?.(lane.id);
+        }
+        const grantedNames = matchedLanes.map((l) => `${l.id} (${l.model})`).join(", ");
+        return ok(
+          `Reader Full-Access GRANTED to: ${grantedNames} for this project.
+\xB7 receives the full, unminimized repository context (attached files verbatim)
+\xB7 is selectable regardless of repo class/sensitivity and safety gates
+\xB7 the fail-closed secret scanner is still enforced (secrets block egress)
+\xB7 output is reader-derived.`,
+          { grantedLanes: matchedLanes.map((l) => l.id) }
+        );
+      }
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, delegateTool, reviewTool, setupTool, configTool];
 }
 function receiptLine(r) {
   const int = (n) => Math.round(n).toLocaleString("en-US");
@@ -10810,7 +10921,8 @@ ${receiptLine(o.receipt)}` : "";
     const reasonNote = (o.status === "blocked" || o.status === "failed") && o.reason ? ` \u2014 ${o.reason}` : "";
     const note2 = o.recordingFailed ? " (note: this attempt could not be recorded to the ledger)" : "";
     const taint2 = o.readerDerived ? "\n\n\u26A0\uFE0F reader-derived: any quoted reader output above may include private repo code \u2014 do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts." : "";
-    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}${receiptText}${inferenceText}`, {
+    const fullAccessNote2 = o.fullAccessGranted ? "\n\n\xB7 ran with granted full repo access (reader-derived; secret scan still enforced)" : "";
+    return ok(`Handle this task yourself (native): ${why}${reasonNote}.${note2}${taint2}${fullAccessNote2}${receiptText}${inferenceText}`, {
       native: true,
       status: o.status,
       laneId: o.laneId,
@@ -10818,6 +10930,8 @@ ${receiptLine(o.receipt)}` : "";
       ...o.failureKind ? { failureKind: o.failureKind } : {},
       ...o.readerDerived ? { readerDerived: true } : {},
       ...o.recordingFailed ? { recordingFailed: true } : {},
+      ...o.fullAccessGranted ? { fullAccessGranted: true } : {},
+      ...o.fullAccessLaneIds ? { fullAccessLaneIds: o.fullAccessLaneIds } : {},
       ...receiptFields,
       ...inferenceFields
     });
@@ -10826,24 +10940,28 @@ ${receiptLine(o.receipt)}` : "";
   const note = o.recordingFailed ? "\n\n(note: this offload could not be recorded to the ledger.)" : "";
   const taint = o.readerDerived ? "\n\n\u26A0\uFE0F reader-derived: this text may include private repo code \u2014 do not re-delegate it to an untrusted/worker lane or paste it into untrusted contexts." : "";
   const taintFlag = o.readerDerived ? { readerDerived: true } : {};
+  const fullAccessNote = o.fullAccessGranted ? "\n\n\xB7 ran with granted full repo access (reader-derived; secret scan still enforced)" : "";
+  const fullAccessFlag = o.fullAccessGranted ? { fullAccessGranted: true } : {};
   if (o.reviewUnavailable) {
     return ok(
       `Offloaded to ${lane} \u2014 UNREVIEWED (${o.reason ?? "manager review unavailable"}). Inspect it yourself before using:
 
-${o.resultText ?? ""}${taint}${note}${receiptText}${inferenceText}`,
-      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...o.recordingFailed ? { recordingFailed: true } : {}, ...receiptFields, ...inferenceFields }
+${o.resultText ?? ""}${taint}${fullAccessNote}${note}${receiptText}${inferenceText}`,
+      { native: false, laneId: o.laneId, model: o.model, status: o.status, reviewUnavailable: true, ...o.reason ? { reason: o.reason } : {}, ...taintFlag, ...fullAccessFlag, ...o.fullAccessLaneIds ? { fullAccessLaneIds: o.fullAccessLaneIds } : {}, ...o.recordingFailed ? { recordingFailed: true } : {}, ...receiptFields, ...inferenceFields }
     );
   }
   const how = o.reason ? ` (${o.reason})` : "";
   return ok(`Offloaded to ${lane}${how}. Use this result:
 
-${o.resultText ?? ""}${taint}${note}${receiptText}${inferenceText}`, {
+${o.resultText ?? ""}${taint}${fullAccessNote}${note}${receiptText}${inferenceText}`, {
     native: false,
     laneId: o.laneId,
     model: o.model,
     status: o.status,
     ...o.reason ? { reason: o.reason } : {},
     ...taintFlag,
+    ...fullAccessFlag,
+    ...o.fullAccessLaneIds ? { fullAccessLaneIds: o.fullAccessLaneIds } : {},
     ...o.recordingFailed ? { recordingFailed: true } : {},
     ...receiptFields,
     ...inferenceFields

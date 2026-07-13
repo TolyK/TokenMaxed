@@ -323,51 +323,78 @@ export async function minimize(
 export async function minimizeForReader(
   request: MinimizedRequest,
   scanSecrets: SecretScanner,
+  opts?: { fullAccess?: boolean },
 ): Promise<ReaderMinimizeResult> {
-  const ins = validateInstruction(request);
-  if (typeof ins !== 'string') return ins;
+  const fullAccess = opts?.fullAccess ?? false;
 
-  // Reader context gate (hard floor): public OR private repo, but sensitivity MUST
-  // be normal, and unknown repo_class is rejected (fail-closed). This is the
-  // boundary-level half of the un-overridable cap the policy gate also enforces.
-  const repoClass: RepoClass = request.repo_class ?? 'unknown';
-  const sensitivity: Sensitivity = request.sensitivity ?? 'unknown';
-  if (!((repoClass === 'public' || repoClass === 'private') && sensitivity === 'normal')) {
-    return blocked(
-      `context not safe for a reader lane (repo_class=${repoClass}, sensitivity=${sensitivity}); ` +
-        'a reader requires a known (public/private) repo + normal sensitivity',
-    );
+  // Validate instruction (skip length bound if fullAccess is true)
+  if (typeof request.instruction !== 'string' || request.instruction.trim() === '') {
+    return blocked('instruction must be a non-empty string');
+  }
+  if (!TASK_CATEGORIES.includes(request.category)) {
+    return blocked(`category must be one of: ${TASK_CATEGORIES.join(', ')}`);
+  }
+  if (!fullAccess && request.instruction.length > LIMITS.maxInstructionChars) {
+    return blocked(`instruction exceeds ${LIMITS.maxInstructionChars} chars`);
   }
 
-  const collected = collectAttachments(request);
-  if ('ok' in collected) return collected;
+  // Reader context gate: only if NOT fullAccess
+  if (!fullAccess) {
+    const repoClass: RepoClass = request.repo_class ?? 'unknown';
+    const sensitivity: Sensitivity = request.sensitivity ?? 'unknown';
+    if (!((repoClass === 'public' || repoClass === 'private') && sensitivity === 'normal')) {
+      return blocked(
+        `context not safe for a reader lane (repo_class=${repoClass}, sensitivity=${sensitivity}); ` +
+          'a reader requires a known (public/private) repo + normal sensitivity',
+      );
+    }
+  }
 
-  // --- scrub (keep repo-relative paths + code identifiers — the point of reader —
-  // but redact absolute paths / remotes / urls / emails) ---
-  const instruction = scrubText(request.instruction);
-  const scrubbedAttachments = collected.map((a) => ({ ...a, content: scrubText(a.content) }));
+  // Collect attachments
+  const rawAttachments = request.attachments ?? [];
+  if (!Array.isArray(rawAttachments)) return blocked('attachments must be an array');
+  if (!fullAccess && rawAttachments.length > LIMITS.maxAttachments) {
+    return blocked(`too many attachments (max ${LIMITS.maxAttachments})`);
+  }
 
-  const overLimit = enforceTotal(instruction, scrubbedAttachments);
-  if (overLimit) return overLimit;
+  const collected: MinimizedAttachment[] = [];
+  for (let i = 0; i < rawAttachments.length; i++) {
+    const v = validateAttachment(rawAttachments[i], i);
+    if ('ok' in v) return v;
+    if (!fullAccess && v.content.length > LIMITS.maxAttachmentChars) {
+      return blocked(`attachment[${i}] exceeds ${LIMITS.maxAttachmentChars} chars`);
+    }
+    collected.push(v);
+  }
 
-  // --- secret scan on BOTH raw and scrubbed text (scrub must not be able to mask a
-  // secret), fail-closed ---
-  const secret = await secretGate(
-    [
-      request.instruction,
-      ...collected.map((a) => a.content),
-      instruction,
-      ...scrubbedAttachments.map((a) => a.content),
-    ],
-    scanSecrets,
-    'reader',
-  );
+  // Scrub and verify total
+  const instruction = fullAccess ? request.instruction : scrubText(request.instruction);
+  const processedAttachments = fullAccess
+    ? collected
+    : collected.map((a) => ({ ...a, content: scrubText(a.content) }));
+
+  if (!fullAccess) {
+    const overLimit = enforceTotal(instruction, processedAttachments);
+    if (overLimit) return overLimit;
+  }
+
+  // Secret scan on raw/scrubbed texts, fail-closed
+  const scanTexts = fullAccess
+    ? [request.instruction, ...collected.map((a) => a.content)]
+    : [
+        request.instruction,
+        ...collected.map((a) => a.content),
+        instruction,
+        ...processedAttachments.map((a) => a.content),
+      ];
+
+  const secret = await secretGate(scanTexts, scanSecrets, 'reader');
   if (secret) return secret;
 
   // --- brand + freeze (distinct reader brand + registry; tainted reader-derived) ---
   const payload: ReaderPayload = Object.freeze({
     instruction,
-    attachments: Object.freeze(scrubbedAttachments.map((a) => Object.freeze(a))),
+    attachments: Object.freeze(processedAttachments.map((a) => Object.freeze(a))),
     category: request.category,
     origin: 'reader-derived' as const,
     [READER_BRAND]: true as const,

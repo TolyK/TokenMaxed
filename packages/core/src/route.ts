@@ -85,6 +85,14 @@ function capPenaltyFor(headroom: number | undefined): number {
 }
 
 /**
+ * Lane ids the user explicitly authorized to be elevated from `reader` to full repo access.
+ * Returns true if the lane has a trust mode of 'reader' and its ID is present in the fullAccessLaneIds list.
+ */
+export function isReaderElevated(lane: Lane, fullAccessLaneIds?: readonly string[]): boolean {
+  return lane.trust_mode === 'reader' && !!fullAccessLaneIds && fullAccessLaneIds.includes(lane.id);
+}
+
+/**
  * Enforcement order is law. A non-`full` lane (worker/reader/blocked) may run
  * ONLY once the minimization/policy gate is ready AND its executor is
  * egress-certified. Until then, only `full`, non-`api` lanes are selectable —
@@ -96,8 +104,15 @@ function capPenaltyFor(headroom: number | undefined): number {
  *   Defaults to `false`. In this step it only relaxes the pre-gate "no API lane"
  *   restriction for full (trusted) lanes; worker admission lands with the policy
  *   engine + egress certification.
+ * @param elevated whether this lane is elevated to full access.
  */
-export function isSelectablePreGate(lane: Lane, gateReady = false, readerEgress = false, yolo = false): boolean {
+export function isSelectablePreGate(
+  lane: Lane,
+  gateReady = false,
+  readerEgress = false,
+  yolo = false,
+  elevated = false,
+): boolean {
   // YOLO (--dangerously-skip-permissions analogue): the trust-tier structural gate
   // (gate-ready, reader-egress opt-in, per-lane repo_read_attestation) is WAIVED, so
   // every tier is selectable EXCEPT `blocked`. The executor-certification checks
@@ -109,6 +124,9 @@ export function isSelectablePreGate(lane: Lane, gateReady = false, readerEgress 
     if (lane.trust_mode === 'worker') return isExecutorCertified(lane);
     if (lane.trust_mode === 'reader') return isReaderExecutorCertified(lane);
     return false; // `blocked` (never) and any unknown/legacy value.
+  }
+  if (lane.trust_mode === 'reader' && elevated) {
+    return isReaderExecutorCertified(lane);
   }
   // ALLOWLIST + fail-closed: only `full`/`worker`/`reader` have selectable logic.
   // Full (trusted, user-approved) lanes: CLI/local always selectable; an API lane
@@ -484,15 +502,22 @@ export function eligibleLanes(task: Task, ctx: RouteContext, policy: Policy): El
   for (const lane of ctx.lanes) {
     // Order: disabled → host scope → structural gates → access → policy.
     if (disabled.has(lane.id) || !hostAllowsLane(lane, ctx)) continue;
-    if (!isSelectablePreGate(lane, gateReady, readerEgress, yolo)) continue;
+    const elevated = isReaderElevated(lane, ctx.fullAccessLaneIds);
+    if (!isSelectablePreGate(lane, gateReady, readerEgress, yolo, elevated)) continue;
     if (repoTight && !canDoRepoTight(lane)) continue;
-    const { verdict } = evaluate(task, lane, policyContext, policy);
+    const { verdict } = evaluate(task, lane, policyContext, policy, elevated);
     // Normal: drop `block` AND `force-trusted`-on-non-full. YOLO: waive the egress
     // policy (deny-by-default, sensitive/private, reader hard cap — all surface as
     // `force-trusted`, never `block`) but still honor an explicit `block` rule — the
     // ONLY way `evaluate` yields `block` — as a deliberate operator kill-switch, like
     // `disabledLaneIds` and a permission deny-rule under --dangerously-skip-permissions.
-    if (yolo ? verdict === 'block' : !laneAllowedByVerdict(lane, verdict)) continue;
+    // Elevated readers survive force-trusted unless secretHit is true or blocked.
+    const admitted = elevated
+      ? verdict !== 'block' && policyContext.secretHit !== true
+      : laneAllowedByVerdict(lane, verdict);
+    // An elevated reader never takes a secret context, even under YOLO.
+    if (elevated && policyContext.secretHit === true) continue;
+    if (yolo ? verdict === 'block' : !admitted) continue;
     out.push({ lane, verdict });
   }
   return out;
