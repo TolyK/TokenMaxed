@@ -12142,7 +12142,200 @@ ${r.notes}` : "";
       }
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool];
+  const backtestTool = {
+    name: "router_backtest",
+    description: "Compare routing decisions of two policies (policyA vs policyB) over historical workload. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        policyA: {
+          type: "string",
+          description: "First policy to compare. Defaults to currently active policy."
+        },
+        policyB: {
+          type: "string",
+          description: "Second policy to compare. Defaults to cheapest (or balanced if current is cheapest)."
+        },
+        period: {
+          type: "string",
+          description: 'Window: "all" (default) or N + d/h, e.g. "7d".'
+        }
+      }
+    },
+    handler: (deps, args) => guardedAsync(async () => {
+      try {
+        const period = optString(args, "period");
+        let since;
+        if (period !== void 0) {
+          try {
+            since = resolveSinceIso(period, deps.now());
+          } catch {
+            throw new ToolInputError(
+              `Invalid period format "${period}". Expect "all", or "7d", "24h", etc.`
+            );
+          }
+        }
+        let events;
+        try {
+          events = core.filterEventsSince(deps.readLedger(), since);
+        } catch {
+          return ok(
+            `Could not read the ledger. No backtest comparison is available.`,
+            {
+              error: true,
+              message: `could not read the ledger`
+            }
+          );
+        }
+        const lanes = deps.allLanes ? deps.allLanes() : [];
+        const policy = deps.loadPolicy ? deps.loadPolicy() : { schema_version: 1, rules: [] };
+        const currentPolicy = deps.routingPolicy?.() ?? (deps.tieredStrategy === "tiered" ? "cheapest" : "balanced");
+        const policyAStr = optString(args, "policyA");
+        const policyBStr = optString(args, "policyB");
+        if (policyAStr !== void 0 && !isValidRoutingPolicy(policyAStr)) {
+          throw new ToolInputError(`"policyA" must be one of: ${NAMED_ROUTING_POLICIES.join(", ")}.`);
+        }
+        if (policyBStr !== void 0 && !isValidRoutingPolicy(policyBStr)) {
+          throw new ToolInputError(`"policyB" must be one of: ${NAMED_ROUTING_POLICIES.join(", ")}.`);
+        }
+        const policyA = policyAStr ?? currentPolicy;
+        const policyB = policyBStr ?? (policyA === "cheapest" ? "balanced" : "cheapest");
+        const observedCapability = deps.getFrozen?.() ? void 0 : deps.observedCapability();
+        const observedCapabilityByModel = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModel?.();
+        const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModelDifficulty?.();
+        const capPrior = deps.capabilityPrior?.(lanes);
+        const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
+        const capHeadroom2 = deps.capHeadroom?.(lanes);
+        const quotaCtx = capHeadroom2 ? { capHeadroom: capHeadroom2 } : {};
+        const healthPenalty = deps.healthPenalty?.(lanes);
+        const healthCtx = healthPenalty ? { healthPenalty } : {};
+        const grants = deps.getFullAccess ? deps.getFullAccess(lanes) : [];
+        const fullAccessLaneIds = [];
+        for (const lane of lanes) {
+          if (lane.trust_mode === "reader") {
+            const matchesProjectOrEnvGrant = grants.some((g) => g.toLowerCase() === lane.id.toLowerCase());
+            if (matchesProjectOrEnvGrant) {
+              fullAccessLaneIds.push(lane.id);
+            }
+          }
+        }
+        if (deps.getYolo?.()) {
+          const configReaders = deps.readerLanes ? deps.readerLanes() : [];
+          for (const lane of configReaders) {
+            if (!fullAccessLaneIds.includes(lane.id)) {
+              fullAccessLaneIds.push(lane.id);
+            }
+          }
+        }
+        let availableIds;
+        if (deps.availableLaneIds) {
+          const tempCtx = {
+            lanes,
+            gateReady: deps.gateReady,
+            readerEgress: deps.readerEgress,
+            policyContext: {},
+            access_need: "worker-ok",
+            ...deps.host ? { host: deps.host } : {},
+            ...deps.getYolo?.() ? { yolo: true } : {},
+            ...observedCapability ? { observedCapability } : {},
+            ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+            ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+            ...priorCtx,
+            ...quotaCtx,
+            ...healthCtx,
+            ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {},
+            routingPolicy: policyA,
+            ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+            ...policyA === "cheapest" ? { strategy: "tiered", ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {} } : {}
+          };
+          const eligibleUnion = /* @__PURE__ */ new Map();
+          for (const category of core.taskCategories) {
+            const eligible = core.eligibleLanes({ category }, tempCtx, policy);
+            for (const e of eligible) {
+              eligibleUnion.set(e.lane.id, e.lane);
+            }
+          }
+          availableIds = await deps.availableLaneIds([...eligibleUnion.values()]);
+        }
+        const baseCtx = {
+          lanes,
+          gateReady: deps.gateReady,
+          readerEgress: deps.readerEgress,
+          policyContext: {},
+          access_need: "worker-ok",
+          ...deps.host ? { host: deps.host } : {},
+          ...deps.getYolo?.() ? { yolo: true } : {},
+          ...observedCapability ? { observedCapability } : {},
+          ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+          ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+          ...priorCtx,
+          ...quotaCtx,
+          ...healthCtx,
+          ...availableIds ? { availableLaneIds: availableIds } : {},
+          ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+          ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {},
+          ...deps.preferredLane?.() ? { preferLaneId: deps.preferredLane() } : {},
+          ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
+        };
+        if (!core.analyzeBacktest) {
+          return failResult("Backtest core function is not available on this server.");
+        }
+        const result = core.analyzeBacktest(events, baseCtx, policy, deps.now(), {
+          policyA,
+          policyB
+        });
+        const header = [
+          `Routing Backtest Comparison: policy "${policyA}" vs "${policyB}"`,
+          `[what-if over your CURRENT config + observed evidence (not a historical-config replay)]`,
+          `  window: ${period ?? "all history"}`,
+          `  policy decision differences: ${result.diffPercent.toFixed(1)}% of workload`,
+          `  net signal: ${result.netSignal}`
+        ];
+        const lines = [...header];
+        if (result.differences.length > 0) {
+          lines.push(``, `Differences breakdown:`);
+          for (const diff of result.differences) {
+            const diffHeader = `  - Category: "${diff.category}"${diff.difficulty ? ` (${diff.difficulty})` : ""}, share of workload: ${diff.workloadSharePercent.toFixed(1)}%`;
+            lines.push(diffHeader);
+            lines.push(`    - policy "${policyA}" would route to: ${diff.pickA}`);
+            lines.push(`    - policy "${policyB}" would route to: ${diff.pickB}`);
+            lines.push(`    - Reroute quality proxy comparison:`);
+            const renderEvidence = (pick, ev) => {
+              if (pick === "native") return "native host (no evidence stored)";
+              if (!ev) return "no observed evidence";
+              const rateStr = ev.rate.toFixed(2);
+              const ciStr = ev.lo !== void 0 && ev.hi !== void 0 ? ` [${ev.lo.toFixed(2)} - ${ev.hi.toFixed(2)}]` : "";
+              const freshStr = ev.freshnessDays !== void 0 ? `, freshness: ${ev.freshnessDays.toFixed(1)}d` : "";
+              return `rate: ${rateStr}${ciStr}, n: ${ev.n.toFixed(1)}${freshStr}`;
+            };
+            lines.push(`      - ${diff.pickA}: ${renderEvidence(diff.pickA, diff.evidenceA)}`);
+            lines.push(`      - ${diff.pickB}: ${renderEvidence(diff.pickB, diff.evidenceB)}`);
+            let verdictStr = "";
+            if (diff.comparison === "insufficient_evidence") {
+              verdictStr = "insufficient evidence to say which is better";
+            } else if (diff.comparison === "favors_A") {
+              verdictStr = `evidence favors ${diff.pickA} (A)`;
+            } else if (diff.comparison === "favors_B") {
+              verdictStr = `evidence favors ${diff.pickB} (B)`;
+            } else {
+              verdictStr = "neutral (overlapping confidence intervals)";
+            }
+            lines.push(`      - Verdict: ${verdictStr}`);
+          }
+        } else {
+          lines.push(``, `No decision differences detected between policy "${policyA}" and "${policyB}" over this workload.`);
+        }
+        return ok(lines.join("\n"), result);
+      } catch (err) {
+        if (err instanceof ToolInputError) {
+          throw err;
+        }
+        return failResult("Backtest failed");
+      }
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool, backtestTool];
 }
 function receiptLine(r) {
   const int = (n) => Math.round(n).toLocaleString("en-US");

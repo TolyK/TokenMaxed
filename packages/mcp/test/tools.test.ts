@@ -35,6 +35,7 @@ import {
   resolveLaneModelKey,
   declaredCapabilityFor,
   effectiveCapabilityFor,
+  analyzeBacktest,
 } from '../../core/src/index.ts';
 import type { Lane, LedgerEvent, Policy, RouteDecision, OutcomeEventInput, OutcomeEvent, PriceTable } from '../../core/src/index.ts';
 
@@ -70,6 +71,7 @@ const CORE: CorePort = {
   resolveLaneModelKey,
   declaredCapabilityFor,
   effectiveCapabilityFor,
+  analyzeBacktest,
 };
 const TOOLS = createTools(CORE);
 
@@ -171,6 +173,7 @@ test('builds the expected tool set with object input schemas', () => {
   assert.deepEqual(
     TOOLS.map((t) => t.name).sort(),
     [
+      'router_backtest',
       'router_config',
       'router_delegate',
       'router_doctor',
@@ -2448,4 +2451,94 @@ test('router_plan handles finite-sum overflow structured null and rendered unava
   const stats = (res.structuredContent as any).laneStats['strong-lane'];
   assert.equal(stats.meteredSpent, null);
   assert.equal(stats.meteredSpentUnavailable, true);
+});
+
+test('router_backtest tool execution, category-aware availability, and count-free output', async () => {
+  const strong = lane({ id: 'strong-lane', model: 'claude-opus-4-7', costBasis: 'metered', capability: { feature: 1.0, bugfix: 1.0 } });
+  const weakFeature = lane({ id: 'weak-lane-feature', model: 'claude-haiku', costBasis: 'local', capability: { feature: 0.7 } });
+  const weakBugfix = lane({ id: 'weak-lane-bugfix', model: 'llama3', costBasis: 'local', capability: { bugfix: 0.7 } });
+
+  const d = deps({
+    allLanes: () => [strong, weakFeature, weakBugfix],
+    readLedger: () => [
+      {
+        event_type: 'task',
+        schema_version: 2,
+        id: 't-1',
+        seq: 1,
+        ts: new Date(FIXED_NOW).toISOString(),
+        task_id: 't-1',
+        attempt: 0,
+        category: 'feature',
+        laneId: 'weak-lane-feature',
+        model: 'claude-haiku',
+        status: 'ok',
+        actual_cost: 0,
+        frontier_cost: 0.05,
+        metered_spent: 0,
+        frontier_avoided: 0.05,
+        metered_avoided: 0.05,
+        policy_verdict: 'allow',
+      } as any,
+      {
+        event_type: 'task',
+        schema_version: 2,
+        id: 't-2',
+        seq: 2,
+        ts: new Date(FIXED_NOW).toISOString(),
+        task_id: 't-2',
+        attempt: 0,
+        category: 'bugfix',
+        laneId: 'weak-lane-bugfix',
+        model: 'llama3',
+        status: 'ok',
+        actual_cost: 0,
+        frontier_cost: 0.05,
+        metered_spent: 0,
+        frontier_avoided: 0.05,
+        metered_avoided: 0.05,
+        policy_verdict: 'allow',
+      } as any
+    ],
+    now: () => FIXED_NOW,
+    availableLaneIds: async (lanes) => {
+      const ids = lanes.map((l) => l.id).sort();
+      // Assert that the probed lanes are the union of feature-eligible and bugfix-eligible lanes
+      assert.deepEqual(ids, ['strong-lane', 'weak-lane-bugfix', 'weak-lane-feature']);
+      return ids;
+    },
+    tierFloor: 0.2,
+  });
+
+  const res = await call('router_backtest', d, { policyA: 'balanced', policyB: 'cheapest' });
+  assert.notEqual(res.isError, true);
+
+  const text = res.content[0]!.text;
+
+  // Assert count-free text output
+  assert.doesNotMatch(text, /total workload decisions/i);
+  assert.doesNotMatch(text, /volume:/i);
+  assert.doesNotMatch(text, /decision\(s\)/i);
+
+  // Assert shares/percentages are rendered
+  assert.match(text, /policy decision differences: 100\.0% of workload/i);
+  assert.match(text, /share of workload: 50\.0%/i);
+  assert.match(text, /net signal: neutral \/ insufficient/i);
+
+  // Assert count-free structured content
+  const struct = res.structuredContent as any;
+  assert.ok(struct);
+  assert.equal(struct.diffPercent, 100);
+  assert.equal(struct.differences[0].workloadSharePercent, 50);
+  assert.ok(!('totalDecisions' in struct));
+  assert.ok(!('diffCount' in struct));
+  assert.ok(!('volume' in struct.differences[0]));
+});
+
+test('router_backtest tool rejects invalid period with ToolInputError details', async () => {
+  const d = deps({});
+  const res = await call('router_backtest', d, { period: 'banana' });
+  assert.equal(res.isError, true);
+  const text = res.content[0]!.text;
+  assert.match(text, /Invalid period format "banana"/i);
 });

@@ -46,6 +46,10 @@ import type {
   PlanOptimizationResult,
   PlanOptimizationSuggestion,
   LanePlanStats,
+  BacktestDifference,
+  BacktestSummary,
+  BacktestPolicy,
+  BacktestEvidence,
 } from '@tokenmaxed/core';
 
 import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshness-report.ts';
@@ -57,7 +61,7 @@ import type { SettingKey, SettingsReport } from './settings.ts';
 import { formatSummaryBanner } from './summary.ts';
 import type { SummaryData } from './summary.ts';
 import { isValidIso8601 } from './target.ts';
-import { isValidRoutingPolicy } from './routing-policy.ts';
+import { isValidRoutingPolicy, NAMED_ROUTING_POLICIES } from './routing-policy.ts';
 import type { NamedRoutingPolicy } from './routing-policy.ts';
 import type { DoctorFinding, DoctorReport } from './doctor.ts';
 
@@ -110,6 +114,16 @@ export interface CorePort {
       routingContext?: RouteContext;
     }
   ) => PlanOptimizationResult;
+  analyzeBacktest?: (
+    events: readonly LedgerEvent[],
+    baseCtx: RouteContext,
+    policy: Policy,
+    now: number,
+    opts: {
+      policyA: any;
+      policyB: any;
+    }
+  ) => BacktestSummary;
 }
 
 /** P2: metadata about the active rankings snapshot, for /why + /status + setup. */
@@ -2845,7 +2859,231 @@ function policyExplanation(
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool];
+  const backtestTool: ToolDef = {
+    name: 'router_backtest',
+    description:
+      'Compare routing decisions of two policies (policyA vs policyB) over historical workload. Read-only.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        policyA: {
+          type: 'string',
+          description: 'First policy to compare. Defaults to currently active policy.',
+        },
+        policyB: {
+          type: 'string',
+          description: 'Second policy to compare. Defaults to cheapest (or balanced if current is cheapest).',
+        },
+        period: {
+          type: 'string',
+          description: 'Window: "all" (default) or N + d/h, e.g. "7d".',
+        },
+      },
+    },
+    handler: (deps, args) =>
+      guardedAsync(async () => {
+        try {
+          const period = optString(args, 'period');
+          let since: string | undefined;
+          if (period !== undefined) {
+            try {
+              since = resolveSinceIso(period, deps.now());
+            } catch {
+              throw new ToolInputError(
+                `Invalid period format "${period}". Expect "all", or "7d", "24h", etc.`
+              );
+            }
+          }
+
+          let events: LedgerEvent[];
+          try {
+            events = core.filterEventsSince(deps.readLedger(), since);
+          } catch {
+            return ok(
+              `Could not read the ledger. No backtest comparison is available.`,
+              {
+                error: true,
+                message: `could not read the ledger`,
+              }
+            );
+          }
+
+          const lanes = deps.allLanes ? deps.allLanes() : [];
+          const policy = deps.loadPolicy ? deps.loadPolicy() : { schema_version: 1, rules: [] };
+
+          const currentPolicy = deps.routingPolicy?.() ?? (deps.tieredStrategy === 'tiered' ? 'cheapest' : 'balanced');
+          const policyAStr = optString(args, 'policyA');
+          const policyBStr = optString(args, 'policyB');
+
+          if (policyAStr !== undefined && !isValidRoutingPolicy(policyAStr)) {
+            throw new ToolInputError(`"policyA" must be one of: ${NAMED_ROUTING_POLICIES.join(', ')}.`);
+          }
+          if (policyBStr !== undefined && !isValidRoutingPolicy(policyBStr)) {
+            throw new ToolInputError(`"policyB" must be one of: ${NAMED_ROUTING_POLICIES.join(', ')}.`);
+          }
+
+          const policyA = (policyAStr as NamedRoutingPolicy) ?? currentPolicy;
+          const policyB = (policyBStr as NamedRoutingPolicy) ?? (policyA === 'cheapest' ? 'balanced' : 'cheapest');
+
+          // Construct the RouteContext
+          const observedCapability = deps.getFrozen?.() ? undefined : deps.observedCapability();
+          const observedCapabilityByModel = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModel?.();
+          const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModelDifficulty?.();
+
+          const capPrior = deps.capabilityPrior?.(lanes);
+          const priorCtx: Partial<RouteContext> =
+            capPrior?.state === 'on'
+              ? { capabilityPrior: capPrior.overlay, ...(capPrior.stale ? { capabilityPriorStale: true } : {}) }
+              : {};
+
+          const capHeadroom = deps.capHeadroom?.(lanes);
+          const quotaCtx: Partial<RouteContext> = capHeadroom ? { capHeadroom } : {};
+
+          const healthPenalty = deps.healthPenalty?.(lanes);
+          const healthCtx: Partial<RouteContext> = healthPenalty ? { healthPenalty } : {};
+
+          const grants = deps.getFullAccess ? deps.getFullAccess(lanes) : [];
+          const fullAccessLaneIds: string[] = [];
+          for (const lane of lanes) {
+            if (lane.trust_mode === 'reader') {
+              const matchesProjectOrEnvGrant = grants.some((g) => g.toLowerCase() === lane.id.toLowerCase());
+              if (matchesProjectOrEnvGrant) {
+                fullAccessLaneIds.push(lane.id);
+              }
+            }
+          }
+          if (deps.getYolo?.()) {
+            const configReaders = deps.readerLanes ? deps.readerLanes() : [];
+            for (const lane of configReaders) {
+              if (!fullAccessLaneIds.includes(lane.id)) {
+                fullAccessLaneIds.push(lane.id);
+              }
+            }
+          }
+
+          let availableIds: string[] | undefined;
+          if (deps.availableLaneIds) {
+            const tempCtx: RouteContext = {
+              lanes,
+              gateReady: deps.gateReady,
+              readerEgress: deps.readerEgress,
+              policyContext: {},
+              access_need: 'worker-ok',
+              ...(deps.host ? { host: deps.host } : {}),
+              ...(deps.getYolo?.() ? { yolo: true } : {}),
+              ...(observedCapability ? { observedCapability } : {}),
+              ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+              ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
+              ...priorCtx,
+              ...quotaCtx,
+              ...healthCtx,
+              ...(fullAccessLaneIds.length ? { fullAccessLaneIds } : {}),
+              routingPolicy: policyA,
+              ...(deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}),
+              ...(policyA === 'cheapest'
+                ? { strategy: 'tiered' as const, ...(deps.tierFloor !== undefined ? { tierFloor: deps.tierFloor } : {}) }
+                : {}),
+            };
+            const eligibleUnion = new Map<string, Lane>();
+            for (const category of core.taskCategories) {
+              const eligible = core.eligibleLanes({ category }, tempCtx, policy);
+              for (const e of eligible) {
+                eligibleUnion.set(e.lane.id, e.lane);
+              }
+            }
+            availableIds = await deps.availableLaneIds([...eligibleUnion.values()]);
+          }
+
+          const baseCtx: RouteContext = {
+            lanes,
+            gateReady: deps.gateReady,
+            readerEgress: deps.readerEgress,
+            policyContext: {},
+            access_need: 'worker-ok',
+            ...(deps.host ? { host: deps.host } : {}),
+            ...(deps.getYolo?.() ? { yolo: true } : {}),
+            ...(observedCapability ? { observedCapability } : {}),
+            ...(observedCapabilityByModel ? { observedCapabilityByModel } : {}),
+            ...(observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {}),
+            ...priorCtx,
+            ...quotaCtx,
+            ...healthCtx,
+            ...(availableIds ? { availableLaneIds: availableIds } : {}),
+            ...(deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {}),
+            ...(deps.tierFloor !== undefined ? { tierFloor: deps.tierFloor } : {}),
+            ...(deps.preferredLane?.() ? { preferLaneId: deps.preferredLane() } : {}),
+            ...(fullAccessLaneIds.length ? { fullAccessLaneIds } : {}),
+          };
+
+          if (!core.analyzeBacktest) {
+            return failResult('Backtest core function is not available on this server.');
+          }
+
+          const result = core.analyzeBacktest(events, baseCtx, policy, deps.now(), {
+            policyA,
+            policyB,
+          });
+
+          const header = [
+            `Routing Backtest Comparison: policy "${policyA}" vs "${policyB}"`,
+            `[what-if over your CURRENT config + observed evidence (not a historical-config replay)]`,
+            `  window: ${period ?? 'all history'}`,
+            `  policy decision differences: ${result.diffPercent.toFixed(1)}% of workload`,
+            `  net signal: ${result.netSignal}`,
+          ];
+
+          const lines = [...header];
+
+          if (result.differences.length > 0) {
+            lines.push(``, `Differences breakdown:`);
+            for (const diff of result.differences) {
+              const diffHeader = `  - Category: "${diff.category}"${diff.difficulty ? ` (${diff.difficulty})` : ''}, share of workload: ${diff.workloadSharePercent.toFixed(1)}%`;
+              lines.push(diffHeader);
+              lines.push(`    - policy "${policyA}" would route to: ${diff.pickA}`);
+              lines.push(`    - policy "${policyB}" would route to: ${diff.pickB}`);
+              lines.push(`    - Reroute quality proxy comparison:`);
+
+              const renderEvidence = (pick: string, ev?: BacktestEvidence) => {
+                if (pick === 'native') return 'native host (no evidence stored)';
+                if (!ev) return 'no observed evidence';
+                const rateStr = ev.rate.toFixed(2);
+                const ciStr = ev.lo !== undefined && ev.hi !== undefined ? ` [${ev.lo.toFixed(2)} - ${ev.hi.toFixed(2)}]` : '';
+                const freshStr = ev.freshnessDays !== undefined ? `, freshness: ${ev.freshnessDays.toFixed(1)}d` : '';
+                return `rate: ${rateStr}${ciStr}, n: ${ev.n.toFixed(1)}${freshStr}`;
+              };
+
+              lines.push(`      - ${diff.pickA}: ${renderEvidence(diff.pickA, diff.evidenceA)}`);
+              lines.push(`      - ${diff.pickB}: ${renderEvidence(diff.pickB, diff.evidenceB)}`);
+
+              let verdictStr = '';
+              if (diff.comparison === 'insufficient_evidence') {
+                verdictStr = 'insufficient evidence to say which is better';
+              } else if (diff.comparison === 'favors_A') {
+                verdictStr = `evidence favors ${diff.pickA} (A)`;
+              } else if (diff.comparison === 'favors_B') {
+                verdictStr = `evidence favors ${diff.pickB} (B)`;
+              } else {
+                verdictStr = 'neutral (overlapping confidence intervals)';
+              }
+              lines.push(`      - Verdict: ${verdictStr}`);
+            }
+          } else {
+            lines.push(``, `No decision differences detected between policy "${policyA}" and "${policyB}" over this workload.`);
+          }
+
+          return ok(lines.join('\n'), result as unknown as Record<string, unknown>);
+        } catch (err) {
+          if (err instanceof ToolInputError) {
+            throw err;
+          }
+          // Wrap the WHOLE handler so ANY error is content-free (never err.message)
+          return failResult('Backtest failed');
+        }
+      }),
+  };
+
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool, backtestTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */
