@@ -144,6 +144,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:status` · `/tokenmaxed:on` · `/tokenmaxed:off` | show / enable / disable routing for this project |
 | `/tokenmaxed:config [key] [value\|clear]` | show or persist the feature settings (`~/.tokenmaxed/settings.json`) — the durable alternative to launch-time env flags. An env var always overrides a stored setting; the kill-switch, YOLO, and API keys stay env-only. Hooks/statusline apply changes on their next run; routing flags apply at the next session. |
 | `/tokenmaxed:prefer <lane>` · `/tokenmaxed:prefer off` | temporarily favor one configured lane (any vendor, CLI or API) over normal routing — e.g. to push a sprint's work to a cheaper subscription while another's credits run low; clears with `off`. Honored only when that lane is eligible, available, and capable for the task (else it falls back to normal routing). Persisted per project; no relaunch. |
+| `/tokenmaxed:full-access [model]` · `/tokenmaxed:full-access off` | grant/revoke a named model's reader lane(s) full repo access — the scoped alternative to YOLO; secret scanner still enforced; output reader-derived. |
 | `/tokenmaxed:yolo` · `/tokenmaxed:yolo off` | **⚠️ dangerous** — turn YOLO mode on/off for this project (the `--dangerously-skip-permissions` analogue); see **YOLO mode** under optional features below. |
 
 ### Launch it (and turn on optional features)

@@ -255,6 +255,7 @@ export async function runTask(
     if (!deps.executeReader || !deps.readerLaneDTO) {
       return { decision, laneId: lane.id, status: 'blocked', native: true, failureKind: 'policy_blocked', events: [event('blocked', ZERO_USAGE)] };
     }
+    const elevated = !!effectiveCtx.fullAccessLaneIds?.includes(lane.id);
     const rmin = await minimizeForReader(
       {
         instruction: request.instruction,
@@ -264,6 +265,7 @@ export async function runTask(
         ...(policyContext.sensitivity ? { sensitivity: policyContext.sensitivity } : {}),
       },
       deps.scanSecrets,
+      { fullAccess: elevated },
     );
     if (!rmin.ok) {
       return { decision, laneId: lane.id, status: 'blocked', native: true, failureKind: 'policy_blocked', events: [event('blocked', ZERO_USAGE)] };

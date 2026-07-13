@@ -48,7 +48,7 @@ function isManual(name: string): boolean {
 /** Every `/tokenmaxed:<cmd>` referenced in the README. */
 function documentedCommands(): Set<string> {
   const found = new Set<string>();
-  for (const m of README.matchAll(/\/tokenmaxed:([a-z]+)/g)) found.add(m[1]!);
+  for (const m of README.matchAll(/\/tokenmaxed:([a-z\-]+)/g)) found.add(m[1]!);
   return found;
 }
 

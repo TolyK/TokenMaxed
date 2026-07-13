@@ -72,7 +72,13 @@ function ruleMatches(
  * Evaluate the policy for a (task, lane) pair. The first matching ordered rule
  * wins; otherwise the deny-by-default baseline applies.
  */
-export function evaluate(task: Task, lane: Lane, ctx: PolicyContext, policy: Policy): PolicyDecision {
+export function evaluate(
+  task: Task,
+  lane: Lane,
+  ctx: PolicyContext,
+  policy: Policy,
+  elevated = false,
+): PolicyDecision {
   const repoClass: RepoClass = ctx.repo_class ?? 'unknown';
   const sensitivity: Sensitivity = ctx.sensitivity ?? 'unknown';
 
@@ -107,11 +113,13 @@ export function evaluate(task: Task, lane: Lane, ctx: PolicyContext, policy: Pol
   // (so only a full lane may take the work) rather than block, unless a rule already
   // blocked it. Reader on a known (public/private) + normal + no-secret context is
   // unaffected — that is the tier's intended use.
-  if (
+  // When elevated is true, reader hard cap ONLY fires if secretHit is true.
+  const isHardCapped =
     lane.trust_mode === 'reader' &&
     decision.verdict !== 'block' &&
-    (sensitivity !== 'normal' || repoClass === 'unknown' || ctx.secretHit === true)
-  ) {
+    (elevated ? ctx.secretHit === true : (sensitivity !== 'normal' || repoClass === 'unknown' || ctx.secretHit === true));
+
+  if (isHardCapped) {
     return {
       verdict: 'force-trusted',
       reason: 'reader hard cap: reader lanes require a known repo + normal sensitivity + no secret',

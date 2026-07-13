@@ -7519,7 +7519,7 @@ function matchOne(condition, value) {
 function ruleMatches(rule, task, lane, repoClass, sensitivity) {
   return matchOne(rule.repo_class, repoClass) && matchOne(rule.sensitivity, sensitivity) && matchOne(rule.trust_mode, lane.trust_mode) && matchOne(rule.provenance, lane.provenance) && matchOne(rule.jurisdiction, lane.jurisdiction) && matchOne(rule.category, task.category);
 }
-function evaluate(task, lane, ctx, policy) {
+function evaluate(task, lane, ctx, policy, elevated = false) {
   const repoClass = ctx.repo_class ?? "unknown";
   const sensitivity = ctx.sensitivity ?? "unknown";
   let decision;
@@ -7538,7 +7538,8 @@ function evaluate(task, lane, ctx, policy) {
   if (ctx.secretHit === true && decision.verdict === "allow") {
     decision = { verdict: "force-trusted", reason: "secret detected: trusted/local lanes only" };
   }
-  if (lane.trust_mode === "reader" && decision.verdict !== "block" && (sensitivity !== "normal" || repoClass === "unknown" || ctx.secretHit === true)) {
+  const isHardCapped = lane.trust_mode === "reader" && decision.verdict !== "block" && (elevated ? ctx.secretHit === true : sensitivity !== "normal" || repoClass === "unknown" || ctx.secretHit === true);
+  if (isHardCapped) {
     return {
       verdict: "force-trusted",
       reason: "reader hard cap: reader lanes require a known repo + normal sensitivity + no secret"
@@ -7650,12 +7651,15 @@ function parsePolicyConfig(text) {
 
 // ../core/src/route.ts
 var DEFAULT_CAPABILITY = 0.5;
-function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false) {
+function isSelectablePreGate(lane, gateReady = false, readerEgress = false, yolo = false, elevated = false) {
   if (yolo) {
     if (lane.trust_mode === "full") return true;
     if (lane.trust_mode === "worker") return isExecutorCertified(lane);
     if (lane.trust_mode === "reader") return isReaderExecutorCertified(lane);
     return false;
+  }
+  if (lane.trust_mode === "reader" && elevated) {
+    return isReaderExecutorCertified(lane);
   }
   if (lane.trust_mode === "full") return gateReady || lane.kind !== "api";
   if (lane.trust_mode === "worker") return gateReady && isExecutorCertified(lane);

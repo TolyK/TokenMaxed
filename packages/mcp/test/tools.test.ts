@@ -30,8 +30,14 @@ import {
 } from '../../core/src/index.ts';
 import type { Lane, LedgerEvent, Policy, RouteDecision } from '../../core/src/index.ts';
 
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { createTools, dispatch, resolveCategory } from '../src/tools.ts';
 import type { CorePort, DelegateOutcome, DelegateRequest, ReviewOutcome, SetupReport, ToolDeps } from '../src/tools.ts';
+import { makeServerDeps } from '../src/server.ts';
 
 // --- harness -------------------------------------------------------------------
 
@@ -151,6 +157,7 @@ test('builds the expected tool set with object input schemas', () => {
       'router_review',
       'router_savings',
       'router_set_enabled',
+      'router_set_full_access',
       'router_set_prefer',
       'router_set_yolo',
       'router_setup',
@@ -1003,4 +1010,131 @@ test('preview passes repo_class/sensitivity into the policy context', async () =
     sensitivity: 'sensitive',
   });
   assert.deepEqual(r.structuredContent!.policyContext, { repo_class: 'private', sensitivity: 'sensitive' });
+});
+
+test('router_delegate and router_preview reject full_access without a model pin', async () => {
+  const r1 = await call('router_delegate', deps(), { instruction: 'test', full_access: true });
+  assert.equal(r1.isError, true);
+  assert.match(r1.content[0]!.text, /full_access requires a model pin/);
+
+  const r2 = await call('router_preview', deps(), { category: 'bugfix', full_access: true });
+  assert.equal(r2.isError, true);
+  assert.match(r2.content[0]!.text, /full_access requires a model pin/);
+});
+
+test('preview using a PERSISTED lane-id grant elevates exactly that reader lane, and stored grant of a family-prefix of a DIFFERENT model does not elevate it', async () => {
+  const targetReader = lane({ id: 'minimax-api', model: 'minimax-m3', trust_mode: 'reader', kind: 'api' });
+  const otherReader = lane({ id: 'minimax-cheap-api', model: 'minimax-m3-cheap', trust_mode: 'reader', kind: 'api' });
+  const lanes = [targetReader, otherReader];
+
+  // Grant is for 'minimax-api'
+  const grants = ['minimax-api'];
+  
+  const r = await call(
+    'router_preview',
+    deps({
+      candidateLanes: () => lanes,
+      getFullAccess: (ls) => {
+        const projectGrantsLower = new Set(grants.map((x) => x.toLowerCase()));
+        return (ls ?? lanes).filter((l) => projectGrantsLower.has(l.id.toLowerCase())).map((l) => l.id);
+      },
+      gateReady: true,
+      readerEgress: true,
+    }),
+    {
+      category: 'bugfix',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    }
+  );
+
+  assert.notEqual(r.isError, true);
+  const decision = r.structuredContent!.decision as { laneId: string } | null;
+  assert.ok(decision);
+  assert.equal(decision.laneId, 'minimax-api');
+});
+
+test('delegate and preview compute IDENTICAL fullAccessLaneIds including exact-match decoy verification (FIX D)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tokenmaxed-wiring-'));
+  const lanesYaml = `lanes:
+  - id: minimax-api
+    kind: api
+    model: MiniMax-M3
+    trust_mode: reader
+    costBasis: metered
+    provenance: minimax
+    jurisdiction: CN
+    endpoint: http://localhost
+    capability:
+      bugfix: 0.8
+    repo_read_attestation: true
+  - id: minimax-cheap-api
+    kind: api
+    model: MiniMax-M3-cheap
+    trust_mode: reader
+    costBasis: subscription
+    provenance: minimax
+    jurisdiction: CN
+    endpoint: http://localhost
+    capability:
+      bugfix: 0.6
+    repo_read_attestation: true
+  - id: claude-native
+    kind: cli
+    model: claude-opus
+    trust_mode: full
+    costBasis: subscription
+    provenance: anthropic
+    jurisdiction: US
+    native: true
+    capability:
+      bugfix: 0.95
+`;
+  writeFileSync(join(dir, 'lanes.yaml'), lanesYaml, 'utf8');
+  writeFileSync(join(dir, 'full-access.json'), JSON.stringify({ 'wiring-test': ['minimax-api'] }), 'utf8');
+
+  const env = {
+    TOKENMAXED_LANES: join(dir, 'lanes.yaml'),
+    TOKENMAXED_LEDGER: join(dir, 'ledger.jsonl'),
+    TOKENMAXED_STATE: join(dir, 'state.json'),
+    TOKENMAXED_FULL_ACCESS_STATE: join(dir, 'full-access.json'),
+    TOKENMAXED_PRICES: fileURLToPath(new URL('../prices.seed.json', import.meta.url)),
+    TOKENMAXED_PROJECT: 'wiring-test',
+    TOKENMAXED_GATE_READY: 'true',
+    TOKENMAXED_READER_EGRESS: 'true',
+  };
+
+  try {
+    const serverDeps = makeServerDeps(env);
+    
+    // 1. Call router_preview via dispatch
+    const previewRes = await dispatch(TOOLS, serverDeps, 'router_preview', {
+      category: 'bugfix',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.ok(!previewRes.isError, JSON.stringify(previewRes));
+    const previewIds = previewRes.structuredContent!.fullAccessLaneIds as string[];
+    assert.ok(previewIds);
+    assert.deepEqual(previewIds, ['minimax-api']);
+
+    // 2. Call router_delegate via dispatch
+    const delegateRes = await dispatch(TOOLS, serverDeps, 'router_delegate', {
+      category: 'bugfix',
+      instruction: 'test',
+      repo_class: 'private',
+      sensitivity: 'sensitive',
+    });
+    assert.notEqual(delegateRes.isError, true);
+    const delegateIds = delegateRes.structuredContent!.fullAccessLaneIds as string[];
+    assert.ok(delegateIds, JSON.stringify(delegateRes));
+    assert.deepEqual(delegateIds, ['minimax-api']);
+
+    // 3. Confirm both paths computed IDENTICAL fullAccessLaneIds
+    assert.deepEqual(previewIds, delegateIds);
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
 });

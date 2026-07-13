@@ -44,6 +44,12 @@ How to offload:
      TokenMaxed never substitutes a different model for an explicit pin, so
      relay that reason rather than silently picking another lane. Only set
      `model` when the user actually named one; never infer it.
+   - **Full Repo Access Grant.** When the USER explicitly grants a named model
+     full access to the repo for a task ("let minimax see the whole repo for this",
+     "give gemini full access here"), pass **`full_access: true`** together with the
+     **`model`** pin. Relay to the user that the grant is scoped to that one lane for
+     this call, the fail-closed secret scanner is still enforced, and output remains
+     reader-derived.
    - **Set `access_need` when you already know the task needs full access.** Leave
      it unset (or `auto`) for ordinary bounded subtasks — they try a worker, and a
      worker that turns out to need repo/tool context it can't see will hand the

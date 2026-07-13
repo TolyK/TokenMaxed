@@ -322,6 +322,12 @@ export interface RouteContext {
   /** The locally-configured candidate lanes. */
   lanes: Lane[];
   /**
+   * Lane ids the user explicitly authorized to be elevated from `reader` to full repo access
+   * (per-project grant or per-prompt flag, resolved by the adapter). Absent ⇒ no elevation,
+   * byte-identical to before. Only affects `reader` lanes.
+   */
+  fullAccessLaneIds?: readonly string[];
+  /**
    * F: the host framework this routing runs under (lowercase id, e.g.
    * 'claude-code' | 'codex-cli' | 'cli'). Set by each adapter (TOKENMAXED_HOST).
    * Consumed ONLY by {@link Lane.hosts} allowlists; absent + no allowlists ⇒

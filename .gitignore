@@ -44,3 +44,6 @@ npm-debug.log*
 # Personal per-machine settings overrides (e.g. TOKENMAXED_REVIEW_ON_STOP for a
 # machine where the codex CLI cold-start exceeds the Stop-review timeout)
 .claude/settings.local.json
+
+# Codex CLI working artifacts (created by `codex exec` in the repo)
+.codex/
