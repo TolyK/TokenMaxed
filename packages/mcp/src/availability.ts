@@ -121,12 +121,17 @@ export async function availableLaneIds(lanes: readonly Lane[], deps: Availabilit
  * namespaced BYOK auth + real fetch). Shared by routing (server), host-turn
  * review, and setup so they all agree on which lanes can run.
  */
-export function makeAvailabilityProbe(env: NodeJS.ProcessEnv): (lanes: readonly Lane[]) => Promise<string[]> {
+export function makeAvailabilityDeps(env: NodeJS.ProcessEnv): AvailabilityDeps {
   const resolveAuth = makeResolveAuth(env);
   const fetchImpl = globalThis.fetch as unknown as FetchLike | undefined;
   // Use the SAME augmented PATH that makeCliSpawn spawns with — otherwise a CLI
   // installed beside Node (nvm/global-npm, e.g. codex) could be marked unavailable
   // under a stripped host PATH and never even reach the spawn that would find it.
   const path = spawnPath(process.execPath, env.PATH);
-  return (lanes) => availableLaneIds(lanes, { path, resolveAuth, ...(fetchImpl ? { fetchImpl } : {}) });
+  return { path, resolveAuth, ...(fetchImpl ? { fetchImpl } : {}) };
+}
+
+export function makeAvailabilityProbe(env: NodeJS.ProcessEnv): (lanes: readonly Lane[]) => Promise<string[]> {
+  const deps = makeAvailabilityDeps(env);
+  return (lanes) => availableLaneIds(lanes, deps);
 }

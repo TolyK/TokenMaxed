@@ -140,6 +140,7 @@ function deps(over: Partial<ToolDeps> = {}): ToolDeps {
     routingPolicyExplicit: () => false,
     readerLanes: () => [],
     allLanes: () => [],
+    doctor: async () => ({ findings: [] }),
     now: () => FIXED_NOW,
     ...over,
   };
@@ -158,6 +159,7 @@ test('builds the expected tool set with object input schemas', () => {
     [
       'router_config',
       'router_delegate',
+      'router_doctor',
       'router_preview',
       'router_review',
       'router_savings',
@@ -1689,4 +1691,39 @@ test('router_preview: forecast renders correctly with overflow/negative prices',
   assert.ok(!textNegative.includes('$NaN'));
   assert.ok(!textNegative.includes('$-'));
   assert.equal((resNegative.structuredContent as any)?.forecast?.estCostUsd, undefined);
+});
+
+test('router_doctor runs diagnostics and formats findings sorted by severity', async () => {
+  // 1. Healthy setup (no findings)
+  const dHealthy = deps({
+    doctor: async () => ({ findings: [] }),
+  });
+  const resHealthy = await call('router_doctor', dHealthy);
+  assert.notEqual(resHealthy.isError, true);
+  assert.match(resHealthy.content[0]!.text, /no problems found/);
+  assert.deepEqual(resHealthy.structuredContent!.findings, []);
+
+  // 2. Setup with multiple findings (errors, warnings, infos)
+  const findings: any[] = [
+    { severity: 'warn', title: 'Stale model', detail: 'Using old model', fix: 'Pin newer' },
+    { severity: 'error', title: 'Malformed config', detail: 'Invalid yaml', fix: 'Fix yaml' },
+    { severity: 'info', title: 'Plugin suggestion', detail: 'Use CLI plugin', fix: 'Check plugin url' },
+  ];
+  const dFindings = deps({
+    doctor: async () => ({ findings }),
+  });
+  const resFindings = await call('router_doctor', dFindings);
+  assert.notEqual(resFindings.isError, true);
+  const text = resFindings.content[0]!.text;
+
+  // Sorted severity order: error, warn, info
+  assert.match(text, /✗ \[ERROR\] Malformed config/);
+  assert.match(text, /⚠ \[WARN\] Stale model/);
+  assert.match(text, /ℹ \[INFO\] Plugin suggestion/);
+
+  // Assert structured findings are returned
+  assert.deepEqual(
+    (resFindings.structuredContent!.findings as any[]).map((f) => f.title),
+    ['Malformed config', 'Stale model', 'Plugin suggestion']
+  );
 });

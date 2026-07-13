@@ -53,6 +53,7 @@ import type { SummaryData } from './summary.ts';
 import { isValidIso8601 } from './target.ts';
 import { isValidRoutingPolicy } from './routing-policy.ts';
 import type { NamedRoutingPolicy } from './routing-policy.ts';
+import type { DoctorFinding, DoctorReport } from './doctor.ts';
 
 // --- ports + result + dependency shapes ----------------------------------------
 
@@ -318,6 +319,8 @@ export interface ToolDeps {
   review: () => Promise<ReviewOutcome>;
   /** Create/validate user config and report setup status (A-8). */
   setup: () => Promise<SetupReport>;
+  /** Check TokenMaxed setup and report prioritized, actionable findings. */
+  doctor?: () => Promise<DoctorReport>;
   /** Current wall-clock in ms (injected so tests are deterministic). */
   now: () => number;
 }
@@ -2206,7 +2209,31 @@ function policyExplanation(
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool];
+  const doctorTool: ToolDef = {
+    name: 'router_doctor',
+    description:
+      'Run the TokenMaxed doctor diagnostic command to check config, lanes, availability, gates, and freshness. Reports a prioritized list of actionable problems with fixes.',
+    inputSchema: { type: 'object', additionalProperties: false, properties: {} },
+    handler: (deps) =>
+      guardedAsync(async () => {
+        if (!deps.doctor) {
+          throw new ToolInputError('Doctor diagnostic not supported by this host.');
+        }
+        const report = await deps.doctor();
+        const severityOrder = { error: 0, warn: 1, info: 2 };
+        const sorted = [...report.findings].sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
+        if (sorted.length === 0) {
+          return ok('✓ no problems found', { findings: [] });
+        }
+        const lines = sorted.map((f) => {
+          const prefix = f.severity === 'error' ? '✗' : f.severity === 'warn' ? '⚠' : 'ℹ';
+          return `${prefix} [${f.severity.toUpperCase()}] ${f.title}\n  Detail: ${f.detail}\n  Fix: ${f.fix}`;
+        });
+        return ok(lines.join('\n\n'), { findings: sorted });
+      }),
+  };
+
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

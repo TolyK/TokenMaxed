@@ -136,6 +136,7 @@ to a cheaper lane") or drive everything by hand:
 | Command | What it does |
 |---|---|
 | `/tokenmaxed:setup` | create/validate config and show status |
+| `/tokenmaxed:doctor` | check the setup end-to-end and report actionable problems |
 | `/tokenmaxed:summary` | at-a-glance: 24h/7d/lifetime usage + metered $ avoided, your lanes + the active reviewer |
 | `/tokenmaxed:savings [7d]` | savings from the local ledger |
 | `/tokenmaxed:tokens [by lane]` | token usage (by model or lane) |
