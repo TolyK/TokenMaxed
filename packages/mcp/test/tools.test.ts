@@ -29,8 +29,9 @@ import {
   serializeEvent,
   forecastCost,
   contributingOutcomes,
+  analyzePlan,
 } from '../../core/src/index.ts';
-import type { Lane, LedgerEvent, Policy, RouteDecision, OutcomeEventInput, OutcomeEvent } from '../../core/src/index.ts';
+import type { Lane, LedgerEvent, Policy, RouteDecision, OutcomeEventInput, OutcomeEvent, PriceTable } from '../../core/src/index.ts';
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -58,6 +59,7 @@ const CORE: CorePort = {
   CLASSIFY_FALLBACK_CATEGORY,
   forecastCost,
   contributingOutcomes,
+  analyzePlan,
 };
 const TOOLS = createTools(CORE);
 
@@ -163,6 +165,7 @@ test('builds the expected tool set with object input schemas', () => {
       'router_delegate',
       'router_doctor',
       'router_feedback',
+      'router_plan',
       'router_preview',
       'router_review',
       'router_savings',
@@ -2041,4 +2044,272 @@ test('preview includes user feedback provenance annotation in why reasoning only
   assert.notEqual(res4.isError, true);
   assert.match(res4.content[0]!.text, /learned \(includes your feedback\)/);
   assert.match((res4.structuredContent!.decision as any).reason, /learned \(includes your feedback\)/);
+});
+
+test('router_plan tool executes correctly and matches CLI/core behavior', async () => {
+  const strong = lane({ id: 'strong-lane', model: 'claude-opus-4-7', costBasis: 'metered', capability: { feature: 1.0 } });
+  const sub = lane({ id: 'sub-lane', model: 'claude-haiku', costBasis: 'subscription', capability: { boilerplate: 0.9 } });
+  const metered = lane({ id: 'metered-lane', model: 'gpt-5.5', costBasis: 'metered', capability: { bugfix: 0.9 } });
+  const local = lane({ id: 'local-lane', model: 'llama3', costBasis: 'local', capability: { feature: 0.85 } });
+  const lanes = [strong, sub, metered, local];
+
+  const mockEvents = [
+    ...Array.from({ length: 9 }, (_, i) => ({
+      event_type: 'task',
+      schema_version: 2,
+      id: `t-${i}`,
+      seq: i,
+      ts: new Date(FIXED_NOW).toISOString(),
+      task_id: `t-${i}`,
+      attempt: 0,
+      category: 'feature',
+      laneId: 'strong-lane',
+      model: 'claude-opus-4-7',
+      trust_mode: 'full',
+      provenance: 'anthropic',
+      status: 'ok',
+      tokens_in: 1000,
+      tokens_out: 500,
+      tokens_estimated: false,
+      actual_cost: 0.5,
+      frontier_cost: 0.5,
+      metered_spent: 0.5,
+      frontier_avoided: 0,
+      metered_avoided: 0,
+      policy_verdict: 'allow',
+    } as any)),
+    {
+      event_type: 'task',
+      schema_version: 2,
+      id: 't-9',
+      seq: 9,
+      ts: new Date(FIXED_NOW).toISOString(),
+      task_id: 't-9',
+      attempt: 0,
+      category: 'boilerplate',
+      laneId: 'sub-lane',
+      model: 'claude-haiku',
+      trust_mode: 'full',
+      provenance: 'anthropic',
+      status: 'ok',
+      tokens_in: 1000,
+      tokens_out: 500,
+      tokens_estimated: false,
+      actual_cost: 0,
+      frontier_cost: 0.05,
+      metered_spent: 0,
+      frontier_avoided: 0.05,
+      metered_avoided: 0.05,
+      policy_verdict: 'allow',
+    } as any,
+    {
+      event_type: 'task',
+      schema_version: 2,
+      id: 't-10',
+      seq: 10,
+      ts: new Date(FIXED_NOW).toISOString(),
+      task_id: 't-10',
+      attempt: 0,
+      category: 'bugfix',
+      laneId: 'metered-lane',
+      model: 'gpt-5.5',
+      trust_mode: 'full',
+      provenance: 'openai',
+      status: 'ok',
+      tokens_in: 1000,
+      tokens_out: 500,
+      tokens_estimated: false,
+      actual_cost: 0.2,
+      frontier_cost: 0.05,
+      metered_spent: 0.2,
+      frontier_avoided: -0.15,
+      metered_avoided: -0.15,
+      policy_verdict: 'allow',
+    } as any,
+  ];
+
+  const priceTable: PriceTable = {
+    schema_version: 1,
+    frontier_model: 'claude-opus-4-7',
+    models: {
+      'claude-opus-4-7': { inputPer1M: 15, outputPer1M: 75 },
+      'gpt-5.5': { inputPer1M: 10, outputPer1M: 30 },
+      'claude-haiku': { inputPer1M: 0.25, outputPer1M: 1.25 },
+      'llama3': { inputPer1M: 0, outputPer1M: 0 },
+    },
+  };
+
+  const d = deps({
+    allLanes: () => lanes,
+    readLedger: () => mockEvents,
+    loadPriceTable: () => priceTable,
+    now: () => FIXED_NOW,
+  });
+
+  const res = await call('router_plan', d);
+  assert.notEqual(res.isError, true);
+  assert.match(res.content[0]!.text, /Plan Optimization Advisory \(routed-share only — not your total usage\)/);
+  assert.match(res.content[0]!.text, /total routed offloads: 11 routed attempts \(routed-share only\)/);
+
+  // Verify stats printed in output with routed-share separation (FIX D)
+  assert.match(res.content[0]!.text, /strong-lane/);
+  assert.match(res.content[0]!.text, /delivered successes: 9 successes \(routed-share only\)/);
+  assert.match(res.content[0]!.text, /routed attempts: 9 attempts \(81.8% of total routed attempts\) \(routed-share only\)/);
+
+  // Verify category qualifier (FIX D)
+  assert.match(res.content[0]!.text, /categories: feature \(9 routed attempts\) \(routed-share only\)/);
+
+  // Verify frontier breakdown qualifier (FIX D)
+  assert.match(res.content[0]!.text, /feature: 9 routed attempts \(100.0% of lane's routed attempts\) \(routed-share only\)/);
+
+  // Underused suggestion
+  assert.match(res.content[0]!.text, /Underused lane: sub-lane/);
+
+  // Frontier conservation suggestion
+  assert.match(res.content[0]!.text, /Frontier-conservation: strong-lane \(feature\)/);
+
+  // Metered spend suggestion
+  assert.match(res.content[0]!.text, /Metered spend: metered-lane/);
+
+  // Verify structured scope-metadata fields are present (FIX D)
+  const structured = res.structuredContent as any;
+  assert.equal(structured.frontierCategoryBreakdownScope, 'routed attempts per frontier lane');
+  assert.deepEqual(structured.frontierCategoryBreakdownRoutedAttempts, structured.frontierCategoryBreakdown);
+  const stats = structured.laneStats['strong-lane'];
+  assert.equal(stats.shareScope, 'routed-share only');
+  assert.equal(stats.sharePercentageOfRoutedAttempts, stats.share);
+  assert.equal(stats.categoryDistributionScope, 'routed attempts');
+  assert.deepEqual(stats.categoryDistributionRoutedAttempts, stats.categoryDistribution);
+});
+
+test('router_plan handles empty/sparse ledger gracefully', async () => {
+  const dEmpty = deps({
+    allLanes: () => [],
+    readLedger: () => [],
+    now: () => FIXED_NOW,
+  });
+  const res = await call('router_plan', dEmpty);
+  assert.notEqual(res.isError, true);
+  assert.match(res.content[0]!.text, /not enough routed history to advise yet \(need more offloads\)/);
+});
+
+test('router_plan handles ledger read error gracefully', async () => {
+  const dError = deps({
+    readLedger: () => { throw new Error('Ledger file is corrupt in path /usr/local/var/log'); },
+    now: () => FIXED_NOW,
+  });
+  const res = await call('router_plan', dError);
+  assert.notEqual(res.isError, true);
+  assert.match(res.content[0]!.text, /Could not read the ledger. No plan optimization advice is available./);
+
+  // Assert rendered text does not contain the thrown ledger string or path (Fix 2)
+  assert.doesNotMatch(res.content[0]!.text, /Ledger file is corrupt|\/usr\/local\/var\/log/);
+
+  // Assert structured output is strictly error-only (Fix 1)
+  assert.deepEqual(res.structuredContent, {
+    error: true,
+    message: 'could not read the ledger',
+  });
+});
+
+test('router_plan handles throwing loadPriceTable/analyzePlan gracefully without leaking message', async () => {
+  // Case 1: loadPriceTable throws (leaks nothing)
+  const dThrowing = deps({
+    allLanes: () => [],
+    readLedger: () => [
+      ...Array.from({ length: 10 }, (_, i) => ({
+        event_type: 'task',
+        schema_version: 2,
+        id: `t-${i}`,
+        seq: i,
+        ts: new Date(FIXED_NOW).toISOString(),
+        task_id: `t-${i}`,
+        attempt: 0,
+        category: 'feature',
+        laneId: 'strong-lane',
+        model: 'claude-opus-4-7',
+        status: 'ok',
+      } as any))
+    ],
+    loadPriceTable: () => { throw new Error('SECRET_API_KEY_LEAK in config path /etc/passwd'); },
+    now: () => FIXED_NOW,
+  });
+  const res1 = await call('router_plan', dThrowing);
+  assert.notEqual(res1.isError, true);
+  assert.match(res1.content[0]!.text, /Could not compute plan advice — check setup/);
+
+  // Assert rendered text does not contain thrown key/path (Fix 3)
+  assert.doesNotMatch(res1.content[0]!.text, /SECRET_API_KEY_LEAK|\/etc\/passwd/);
+
+  // Assert structured output is strictly error-only (Fix 1)
+  assert.deepEqual(res1.structuredContent, {
+    error: true,
+    message: 'could not compute plan advice — check setup',
+  });
+
+  // Case 2: analyzePlan itself throws due to malformed input (leaks nothing)
+  const dAnalyzePlanThrowing = deps({
+    allLanes: () => [],
+    readLedger: () => [
+      ...Array.from({ length: 10 }, (_, i) => ({
+        event_type: 'task',
+        schema_version: 2,
+        id: `t-${i}`,
+        seq: i,
+        ts: new Date(FIXED_NOW).toISOString(),
+        task_id: `t-${i}`,
+        attempt: 0,
+        category: 'feature',
+        laneId: 'strong-lane',
+        model: 'claude-opus-4-7',
+        status: 'ok',
+      } as any))
+    ],
+    loadPriceTable: () => null as any, // causes analyzePlan frontierModel lookup to throw TypeError
+    now: () => FIXED_NOW,
+  });
+  const res2 = await call('router_plan', dAnalyzePlanThrowing);
+  assert.notEqual(res2.isError, true);
+  assert.match(res2.content[0]!.text, /Could not compute plan advice — check setup/);
+
+  // Assert rendered text does not contain any details of the thrown error (Fix 3)
+  assert.doesNotMatch(res2.content[0]!.text, /TypeError|frontier_model|Cannot read properties|null/i);
+
+  // Assert structured output is strictly error-only (Fix 1)
+  assert.deepEqual(res2.structuredContent, {
+    error: true,
+    message: 'could not compute plan advice — check setup',
+  });
+});
+
+test('router_plan handles finite-sum overflow structured null and rendered unavailable', async () => {
+  const strong = lane({ id: 'strong-lane', model: 'claude-opus-4-7', costBasis: 'metered', capability: { feature: 1.0 } });
+  const d = deps({
+    allLanes: () => [strong],
+    readLedger: () => [
+      ...Array.from({ length: 5 }, (_, i) => ({
+        event_type: 'task',
+        schema_version: 2,
+        id: `t-${i}`,
+        seq: i,
+        ts: new Date(FIXED_NOW).toISOString(),
+        task_id: `t-${i}`,
+        attempt: 0,
+        category: 'feature',
+        laneId: 'strong-lane',
+        model: 'claude-opus-4-7',
+        status: 'ok',
+        // Summing two finite spend values that exceed MAX_VALUE to cause Infinity overflow (FIX C)
+        metered_spent: i >= 3 ? 1e308 : 0.5,
+      } as any))
+    ],
+    now: () => FIXED_NOW,
+  });
+  const res = await call('router_plan', d);
+  assert.notEqual(res.isError, true);
+  assert.match(res.content[0]!.text, /metered spend: metered spend unavailable — data anomaly \(routed-share only\)/);
+
+  const stats = (res.structuredContent as any).laneStats['strong-lane'];
+  assert.equal(stats.meteredSpent, null);
+  assert.equal(stats.meteredSpentUnavailable, true);
 });

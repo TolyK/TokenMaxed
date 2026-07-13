@@ -17,6 +17,7 @@ const P = 'mcp__plugin_tokenmaxed_tokenmaxed__';
 const MANUAL_SKILLS: ReadonlyArray<{ name: string; tool: string }> = [
   { name: 'savings', tool: `${P}router_savings` },
   { name: 'tokens', tool: `${P}router_tokens` },
+  { name: 'plan', tool: `${P}router_plan` },
   { name: 'summary', tool: `${P}router_summary` },
   { name: 'why', tool: `${P}router_preview` },
   { name: 'off', tool: `${P}router_set_enabled` },

@@ -7696,6 +7696,376 @@ function hostAllowsLane(lane, ctx) {
   return typeof ctx.host === "string" && ctx.host !== "" && lane.hosts.includes(ctx.host);
 }
 
+// ../core/src/price.ts
+var PriceError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PriceError";
+  }
+};
+function isPlainObject2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function requireNonNegativeNumber(value, where) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new PriceError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function validatePriceTable(data) {
+  if (!isPlainObject2(data)) {
+    throw new PriceError("Price table must be a JSON object.");
+  }
+  if (typeof data.schema_version !== "number") {
+    throw new PriceError('Price table "schema_version" must be a number.');
+  }
+  if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
+    throw new PriceError('Price table "frontier_model" must be a non-empty string.');
+  }
+  if (!isPlainObject2(data.models)) {
+    throw new PriceError('Price table "models" must be a mapping of model id to prices.');
+  }
+  const models = /* @__PURE__ */ Object.create(null);
+  for (const [model, raw] of Object.entries(data.models)) {
+    if (!isPlainObject2(raw)) {
+      throw new PriceError(`Price table models["${model}"] must be a mapping.`);
+    }
+    const entry = {
+      inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
+      outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`)
+    };
+    if (raw.family !== void 0) {
+      if (typeof raw.family !== "string" || raw.family.trim() === "") {
+        throw new PriceError(`models["${model}"].family must be a non-empty string when present.`);
+      }
+      entry.family = raw.family;
+    }
+    if (raw.released !== void 0) {
+      if (typeof raw.released !== "string" || Number.isNaN(Date.parse(raw.released))) {
+        throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
+      }
+      entry.released = raw.released;
+    }
+    models[model] = entry;
+  }
+  if (!Object.hasOwn(models, data.frontier_model)) {
+    throw new PriceError(
+      `Price table frontier_model "${data.frontier_model}" has no entry in models.`
+    );
+  }
+  return { schema_version: data.schema_version, frontier_model: data.frontier_model, models };
+}
+
+// ../core/src/ledger.ts
+var SCHEMA_VERSION = 2;
+var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
+var NATIVE_REASONS = ["no_route", "host_native"];
+var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
+var VOTERS = ["reviewer_model", "user"];
+var SUBJECT_TYPES = ["router_task", "host_turn"];
+var OUTCOME_ACTIONS = ["accept", "rework", "escalate", "give_back"];
+var EVENT_FIELDS = [
+  "event_type",
+  "schema_version",
+  "id",
+  "seq",
+  "ts",
+  "task_id",
+  "attempt",
+  "parent_task_id",
+  "category",
+  "laneId",
+  "model",
+  "trust_mode",
+  "provenance",
+  "status",
+  "tokens_in",
+  "tokens_out",
+  "tokens_estimated",
+  "actual_cost",
+  "frontier_cost",
+  "metered_spent",
+  "frontier_avoided",
+  "metered_avoided",
+  "policy_verdict",
+  "superseded",
+  "native_reason"
+];
+var OUTCOME_EVENT_FIELDS = [
+  "event_type",
+  "schema_version",
+  "id",
+  "seq",
+  "ts",
+  "subject_id",
+  "subject_type",
+  "task_id",
+  "turn_id",
+  "review_id",
+  "attempt",
+  "category",
+  "subject_lane_id",
+  "subject_provenance",
+  "subject_model",
+  "subject_model_resolved",
+  "difficulty",
+  "reviewer_lane_id",
+  "reviewer_model",
+  "reviewer_trust_mode",
+  "reviewer_provenance",
+  "verdict",
+  "voter",
+  "policy_verdict",
+  "action_taken",
+  "target_lane_id"
+];
+var LedgerError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "LedgerError";
+  }
+};
+function isPlainObject3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function requireString(value, where) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new LedgerError(`${where} must be a non-empty string.`);
+  }
+  return value;
+}
+function optionalString(value, where) {
+  if (value === void 0) return void 0;
+  return requireString(value, where);
+}
+function requireIsoTimestamp(value, where) {
+  const s = requireString(value, where);
+  if (Number.isNaN(Date.parse(s))) {
+    throw new LedgerError(`${where} must be a valid ISO-8601 timestamp (got ${JSON.stringify(value)}).`);
+  }
+  return s;
+}
+function requireNonNegativeNumber2(value, where) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new LedgerError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function requireNonNegativeInt(value, where) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new LedgerError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function requireBoolean(value, where) {
+  if (typeof value !== "boolean") {
+    throw new LedgerError(`${where} must be a boolean (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function requireEnum(value, allowed, where) {
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    throw new LedgerError(`${where} must be one of: ${allowed.join(", ")} (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function validateEventInput(input) {
+  const actual_cost = requireNonNegativeNumber2(input.actual_cost, "task.actual_cost");
+  const frontier_cost = requireNonNegativeNumber2(input.frontier_cost, "task.frontier_cost");
+  const metered_spent = requireNonNegativeNumber2(input.metered_spent, "task.metered_spent");
+  const out = {
+    task_id: requireString(input.task_id, "task.task_id"),
+    attempt: requireNonNegativeInt(input.attempt, "task.attempt"),
+    category: requireEnum(input.category, TASK_CATEGORIES, "task.category"),
+    laneId: requireString(input.laneId, "task.laneId"),
+    model: requireString(input.model, "task.model"),
+    trust_mode: requireEnum(input.trust_mode, TRUST_MODES, "task.trust_mode"),
+    provenance: requireString(input.provenance, "task.provenance"),
+    status: requireEnum(input.status, TASK_STATUSES, "task.status"),
+    tokens_in: requireNonNegativeInt(input.tokens_in, "task.tokens_in"),
+    tokens_out: requireNonNegativeInt(input.tokens_out, "task.tokens_out"),
+    tokens_estimated: requireBoolean(input.tokens_estimated, "task.tokens_estimated"),
+    actual_cost,
+    frontier_cost,
+    metered_spent,
+    frontier_avoided: frontier_cost - actual_cost,
+    metered_avoided: frontier_cost - metered_spent,
+    policy_verdict: requireEnum(input.policy_verdict, POLICY_VERDICTS, "task.policy_verdict")
+  };
+  const parent = optionalString(input.parent_task_id, "task.parent_task_id");
+  if (parent !== void 0) out.parent_task_id = parent;
+  if (input.superseded !== void 0) out.superseded = requireBoolean(input.superseded, "task.superseded");
+  if (input.native_reason !== void 0) {
+    out.native_reason = requireEnum(input.native_reason, NATIVE_REASONS, "task.native_reason");
+  }
+  return out;
+}
+function validateOutcomeInput(input) {
+  const out = {
+    subject_id: requireString(input.subject_id, "outcome.subject_id"),
+    subject_type: requireEnum(input.subject_type, SUBJECT_TYPES, "outcome.subject_type"),
+    review_id: requireString(input.review_id, "outcome.review_id"),
+    attempt: requireNonNegativeInt(input.attempt, "outcome.attempt"),
+    category: requireEnum(input.category, TASK_CATEGORIES, "outcome.category"),
+    reviewer_lane_id: requireString(input.reviewer_lane_id, "outcome.reviewer_lane_id"),
+    reviewer_model: requireString(input.reviewer_model, "outcome.reviewer_model"),
+    reviewer_trust_mode: requireEnum(input.reviewer_trust_mode, TRUST_MODES, "outcome.reviewer_trust_mode"),
+    reviewer_provenance: requireString(input.reviewer_provenance, "outcome.reviewer_provenance"),
+    verdict: requireEnum(input.verdict, REVIEW_VERDICTS, "outcome.verdict"),
+    voter: requireEnum(input.voter, VOTERS, "outcome.voter"),
+    policy_verdict: requireEnum(input.policy_verdict, POLICY_VERDICTS, "outcome.policy_verdict")
+  };
+  const task_id = optionalString(input.task_id, "outcome.task_id");
+  if (task_id !== void 0) out.task_id = task_id;
+  const turn_id = optionalString(input.turn_id, "outcome.turn_id");
+  if (turn_id !== void 0) out.turn_id = turn_id;
+  const subject_lane_id = optionalString(input.subject_lane_id, "outcome.subject_lane_id");
+  if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
+  const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
+  if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
+  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
+  if (subject_model !== void 0) out.subject_model = subject_model;
+  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
+  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
+  if (input.difficulty !== void 0) {
+    out.difficulty = requireEnum(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
+  }
+  if (input.action_taken !== void 0) {
+    out.action_taken = requireEnum(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
+  }
+  const target_lane_id = optionalString(input.target_lane_id, "outcome.target_lane_id");
+  if (target_lane_id !== void 0) out.target_lane_id = target_lane_id;
+  return out;
+}
+function serializeFields(event, fields) {
+  const record = {};
+  for (const field of fields) {
+    const value = event[field];
+    if (value !== void 0) record[field] = value;
+  }
+  return JSON.stringify(record);
+}
+function serializeEvent(event) {
+  return event.event_type === "task" ? serializeFields(event, EVENT_FIELDS) : serializeFields(event, OUTCOME_EVENT_FIELDS);
+}
+function parseMeta(obj) {
+  const event_type = obj.event_type === void 0 ? "task" : requireEnum(obj.event_type, ["task", "outcome"], "event.event_type");
+  const schema_version = obj.schema_version === void 0 ? 0 : requireNonNegativeInt(obj.schema_version, "event.schema_version");
+  return {
+    event_type,
+    schema_version,
+    id: requireString(obj.id, "event.id"),
+    seq: requireNonNegativeInt(obj.seq, "event.seq"),
+    ts: requireIsoTimestamp(obj.ts, "event.ts")
+  };
+}
+function backfillLegacyTask(obj) {
+  return {
+    task_id: obj.id,
+    attempt: 0,
+    // A legacy `block` verdict was a blocked send — preserve it so blockCount holds.
+    status: obj.policy_verdict === "block" ? "blocked" : "ok",
+    trust_mode: "full",
+    provenance: "unknown",
+    ...obj
+    // any field actually present on the row wins over the legacy default
+  };
+}
+function parseEvent(obj) {
+  if (!isPlainObject3(obj)) {
+    throw new LedgerError("Ledger record must be a JSON object.");
+  }
+  const meta = parseMeta(obj);
+  if (meta.event_type === "task") {
+    const source = obj.event_type === void 0 ? backfillLegacyTask(obj) : obj;
+    return { ...meta, event_type: "task", ...validateEventInput(source) };
+  }
+  return { ...meta, event_type: "outcome", ...validateOutcomeInput(obj) };
+}
+function filterEventsSince(events, sinceIso) {
+  if (sinceIso === void 0) return [...events];
+  const since = Date.parse(sinceIso);
+  if (Number.isNaN(since)) {
+    throw new LedgerError(`filterEventsSince: invalid ISO timestamp ${JSON.stringify(sinceIso)}.`);
+  }
+  return events.filter((e) => Date.parse(e.ts) >= since);
+}
+function taskEventsOf(events) {
+  return events.filter((e) => e.event_type === "task");
+}
+function summarize(events) {
+  const tasks = taskEventsOf(events);
+  let frontier_cost = 0;
+  let actual_cost = 0;
+  let metered_spent_total = 0;
+  let blockCount = 0;
+  let nativeFallbacks = 0;
+  let realEvents = 0;
+  const laneMix = /* @__PURE__ */ Object.create(null);
+  for (const e of tasks) {
+    if (e.status === "native") {
+      nativeFallbacks += 1;
+      continue;
+    }
+    realEvents += 1;
+    actual_cost += e.actual_cost;
+    metered_spent_total += e.metered_spent;
+    if (e.status === "blocked") blockCount += 1;
+    if (e.status === "ok" && e.superseded !== true) frontier_cost += e.frontier_cost;
+    laneMix[e.laneId] = (laneMix[e.laneId] ?? 0) + 1;
+  }
+  const frontier_avoided = frontier_cost - actual_cost;
+  const metered_avoided = frontier_cost - metered_spent_total;
+  const pct2 = (n) => frontier_cost === 0 ? 0 : 100 * n / frontier_cost;
+  const savings = {
+    frontier_cost,
+    frontier_avoided,
+    metered_spent: metered_spent_total,
+    metered_avoided,
+    frontier_avoided_pct: pct2(frontier_avoided),
+    metered_avoided_pct: pct2(metered_avoided)
+  };
+  return { events: realEvents, savings, actual_cost, metered_spent_total, laneMix, blockCount, nativeFallbacks };
+}
+function emptyBucket() {
+  return {
+    in: 0,
+    out: 0,
+    total: 0,
+    estimated: { in: 0, out: 0, total: 0 },
+    reported: { in: 0, out: 0, total: 0 }
+  };
+}
+function addToBucket(b, e) {
+  b.in += e.tokens_in;
+  b.out += e.tokens_out;
+  b.total += e.tokens_in + e.tokens_out;
+  const sub = e.tokens_estimated ? b.estimated : b.reported;
+  sub.in += e.tokens_in;
+  sub.out += e.tokens_out;
+  sub.total += e.tokens_in + e.tokens_out;
+}
+function group(map, key, e) {
+  let g = map[key];
+  if (!g) {
+    g = { ...emptyBucket(), events: 0 };
+    map[key] = g;
+  }
+  addToBucket(g, e);
+  g.events += 1;
+}
+function tokenStats(events) {
+  const total = emptyBucket();
+  const byModel = /* @__PURE__ */ Object.create(null);
+  const byLane = /* @__PURE__ */ Object.create(null);
+  for (const e of taskEventsOf(events)) {
+    addToBucket(total, e);
+    group(byModel, e.model, e);
+    group(byLane, e.laneId, e);
+  }
+  return { total, byModel, byLane };
+}
+
 // ../core/src/window-quota.ts
 var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
 var WINDOW_WARN_USED = 0.7;
@@ -7901,16 +8271,16 @@ var LaneConfigError = class extends Error {
     this.name = "LaneConfigError";
   }
 };
-function isPlainObject2(value) {
+function isPlainObject4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function requireString(value, where) {
+function requireString2(value, where) {
   if (typeof value !== "string" || value.trim() === "") {
     throw new LaneConfigError(`${where} must be a non-empty string.`);
   }
   return value;
 }
-function requireEnum(value, allowed, where) {
+function requireEnum2(value, allowed, where) {
   if (typeof value !== "string" || !allowed.includes(value)) {
     throw new LaneConfigError(
       `${where} must be one of: ${allowed.join(", ")} (got ${JSON.stringify(value)}).`
@@ -7920,7 +8290,7 @@ function requireEnum(value, allowed, where) {
 }
 function parseCapability(value, where) {
   if (value === void 0) return void 0;
-  if (!isPlainObject2(value)) {
+  if (!isPlainObject4(value)) {
     throw new LaneConfigError(`${where} must be a mapping of category to a number in [0, 1].`);
   }
   const out = {};
@@ -7941,7 +8311,7 @@ function parseCapability(value, where) {
 }
 function parseLane(entry, index) {
   const where = `lanes[${index}]`;
-  if (!isPlainObject2(entry)) {
+  if (!isPlainObject4(entry)) {
     throw new LaneConfigError(`${where} must be a mapping.`);
   }
   for (const key of Object.keys(entry)) {
@@ -7951,25 +8321,25 @@ function parseLane(entry, index) {
       );
     }
   }
-  const id = requireString(entry.id, `${where}.id`);
+  const id = requireString2(entry.id, `${where}.id`);
   const at = (field) => `lanes[${index}] (${id}).${field}`;
   const rawTrust = entry.trust_mode;
   const aliasedTrust = typeof rawTrust === "string" && rawTrust in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[rawTrust] : rawTrust;
-  const trust_mode = requireEnum(aliasedTrust, TRUST_MODES, at("trust_mode"));
+  const trust_mode = requireEnum2(aliasedTrust, TRUST_MODES, at("trust_mode"));
   const lane = {
     id,
-    kind: requireEnum(entry.kind, LANE_KINDS, at("kind")),
-    model: requireString(entry.model, at("model")),
+    kind: requireEnum2(entry.kind, LANE_KINDS, at("kind")),
+    model: requireString2(entry.model, at("model")),
     trust_mode,
-    costBasis: requireEnum(entry.costBasis, COST_BASES, at("costBasis")),
-    provenance: requireString(entry.provenance, at("provenance")),
-    jurisdiction: requireString(entry.jurisdiction, at("jurisdiction"))
+    costBasis: requireEnum2(entry.costBasis, COST_BASES, at("costBasis")),
+    provenance: requireString2(entry.provenance, at("provenance")),
+    jurisdiction: requireString2(entry.jurisdiction, at("jurisdiction"))
   };
   if (entry.roles !== void 0) {
     if (!Array.isArray(entry.roles)) {
       throw new LaneConfigError(`${at("roles")} must be an array of: ${LANE_ROLES.join(", ")}.`);
     }
-    lane.roles = entry.roles.map((r, i) => requireEnum(r, LANE_ROLES, `${at("roles")}[${i}]`));
+    lane.roles = entry.roles.map((r, i) => requireEnum2(r, LANE_ROLES, `${at("roles")}[${i}]`));
   }
   if (entry.manager_allowed !== void 0) {
     if (typeof entry.manager_allowed !== "boolean") {
@@ -7995,7 +8365,7 @@ function parseLane(entry, index) {
     lane.repo_read_attestation = entry.repo_read_attestation;
   }
   if (entry.execution_mode !== void 0) {
-    const mode = requireEnum(entry.execution_mode, EXECUTION_MODES, at("execution_mode"));
+    const mode = requireEnum2(entry.execution_mode, EXECUTION_MODES, at("execution_mode"));
     if (mode === "agentic" && trust_mode !== "full") {
       throw new LaneConfigError(
         `${at("execution_mode")}: 'agentic' is only allowed when trust_mode is 'full' (got trust_mode '${trust_mode}'). Untrusted lanes are never agentic-with-access.`
@@ -8010,10 +8380,10 @@ function parseLane(entry, index) {
     }
     lane.native = entry.native;
   }
-  if (entry.model_family !== void 0) lane.model_family = requireString(entry.model_family, at("model_family"));
-  if (entry.command !== void 0) lane.command = requireString(entry.command, at("command"));
-  if (entry.endpoint !== void 0) lane.endpoint = requireString(entry.endpoint, at("endpoint"));
-  if (entry.authHandle !== void 0) lane.authHandle = requireString(entry.authHandle, at("authHandle"));
+  if (entry.model_family !== void 0) lane.model_family = requireString2(entry.model_family, at("model_family"));
+  if (entry.command !== void 0) lane.command = requireString2(entry.command, at("command"));
+  if (entry.endpoint !== void 0) lane.endpoint = requireString2(entry.endpoint, at("endpoint"));
+  if (entry.authHandle !== void 0) lane.authHandle = requireString2(entry.authHandle, at("authHandle"));
   if (entry.args !== void 0) {
     if (!Array.isArray(entry.args) || entry.args.some((a) => typeof a !== "string")) {
       throw new LaneConfigError(`${at("args")} must be an array of strings.`);
@@ -8116,7 +8486,7 @@ function parseLaneConfig(text) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new LaneConfigError(`Could not parse lane config as YAML: ${detail}`);
   }
-  if (!isPlainObject2(doc) || !Array.isArray(doc.lanes)) {
+  if (!isPlainObject4(doc) || !Array.isArray(doc.lanes)) {
     throw new LaneConfigError('Lane config must be a mapping with a "lanes" array.');
   }
   if (doc.lanes.length === 0) {
@@ -8131,376 +8501,6 @@ function parseLaneConfig(text) {
     seen.add(lane.id);
   }
   return new LaneRegistry(lanes);
-}
-
-// ../core/src/price.ts
-var PriceError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "PriceError";
-  }
-};
-function isPlainObject3(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function requireNonNegativeNumber(value, where) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new PriceError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function validatePriceTable(data) {
-  if (!isPlainObject3(data)) {
-    throw new PriceError("Price table must be a JSON object.");
-  }
-  if (typeof data.schema_version !== "number") {
-    throw new PriceError('Price table "schema_version" must be a number.');
-  }
-  if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
-    throw new PriceError('Price table "frontier_model" must be a non-empty string.');
-  }
-  if (!isPlainObject3(data.models)) {
-    throw new PriceError('Price table "models" must be a mapping of model id to prices.');
-  }
-  const models = /* @__PURE__ */ Object.create(null);
-  for (const [model, raw] of Object.entries(data.models)) {
-    if (!isPlainObject3(raw)) {
-      throw new PriceError(`Price table models["${model}"] must be a mapping.`);
-    }
-    const entry = {
-      inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
-      outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`)
-    };
-    if (raw.family !== void 0) {
-      if (typeof raw.family !== "string" || raw.family.trim() === "") {
-        throw new PriceError(`models["${model}"].family must be a non-empty string when present.`);
-      }
-      entry.family = raw.family;
-    }
-    if (raw.released !== void 0) {
-      if (typeof raw.released !== "string" || Number.isNaN(Date.parse(raw.released))) {
-        throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
-      }
-      entry.released = raw.released;
-    }
-    models[model] = entry;
-  }
-  if (!Object.hasOwn(models, data.frontier_model)) {
-    throw new PriceError(
-      `Price table frontier_model "${data.frontier_model}" has no entry in models.`
-    );
-  }
-  return { schema_version: data.schema_version, frontier_model: data.frontier_model, models };
-}
-
-// ../core/src/ledger.ts
-var SCHEMA_VERSION = 2;
-var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
-var NATIVE_REASONS = ["no_route", "host_native"];
-var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
-var VOTERS = ["reviewer_model", "user"];
-var SUBJECT_TYPES = ["router_task", "host_turn"];
-var OUTCOME_ACTIONS = ["accept", "rework", "escalate", "give_back"];
-var EVENT_FIELDS = [
-  "event_type",
-  "schema_version",
-  "id",
-  "seq",
-  "ts",
-  "task_id",
-  "attempt",
-  "parent_task_id",
-  "category",
-  "laneId",
-  "model",
-  "trust_mode",
-  "provenance",
-  "status",
-  "tokens_in",
-  "tokens_out",
-  "tokens_estimated",
-  "actual_cost",
-  "frontier_cost",
-  "metered_spent",
-  "frontier_avoided",
-  "metered_avoided",
-  "policy_verdict",
-  "superseded",
-  "native_reason"
-];
-var OUTCOME_EVENT_FIELDS = [
-  "event_type",
-  "schema_version",
-  "id",
-  "seq",
-  "ts",
-  "subject_id",
-  "subject_type",
-  "task_id",
-  "turn_id",
-  "review_id",
-  "attempt",
-  "category",
-  "subject_lane_id",
-  "subject_provenance",
-  "subject_model",
-  "subject_model_resolved",
-  "difficulty",
-  "reviewer_lane_id",
-  "reviewer_model",
-  "reviewer_trust_mode",
-  "reviewer_provenance",
-  "verdict",
-  "voter",
-  "policy_verdict",
-  "action_taken",
-  "target_lane_id"
-];
-var LedgerError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "LedgerError";
-  }
-};
-function isPlainObject4(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function requireString2(value, where) {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new LedgerError(`${where} must be a non-empty string.`);
-  }
-  return value;
-}
-function optionalString(value, where) {
-  if (value === void 0) return void 0;
-  return requireString2(value, where);
-}
-function requireIsoTimestamp(value, where) {
-  const s = requireString2(value, where);
-  if (Number.isNaN(Date.parse(s))) {
-    throw new LedgerError(`${where} must be a valid ISO-8601 timestamp (got ${JSON.stringify(value)}).`);
-  }
-  return s;
-}
-function requireNonNegativeNumber2(value, where) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new LedgerError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function requireNonNegativeInt(value, where) {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new LedgerError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function requireBoolean(value, where) {
-  if (typeof value !== "boolean") {
-    throw new LedgerError(`${where} must be a boolean (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function requireEnum2(value, allowed, where) {
-  if (typeof value !== "string" || !allowed.includes(value)) {
-    throw new LedgerError(`${where} must be one of: ${allowed.join(", ")} (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function validateEventInput(input) {
-  const actual_cost = requireNonNegativeNumber2(input.actual_cost, "task.actual_cost");
-  const frontier_cost = requireNonNegativeNumber2(input.frontier_cost, "task.frontier_cost");
-  const metered_spent = requireNonNegativeNumber2(input.metered_spent, "task.metered_spent");
-  const out = {
-    task_id: requireString2(input.task_id, "task.task_id"),
-    attempt: requireNonNegativeInt(input.attempt, "task.attempt"),
-    category: requireEnum2(input.category, TASK_CATEGORIES, "task.category"),
-    laneId: requireString2(input.laneId, "task.laneId"),
-    model: requireString2(input.model, "task.model"),
-    trust_mode: requireEnum2(input.trust_mode, TRUST_MODES, "task.trust_mode"),
-    provenance: requireString2(input.provenance, "task.provenance"),
-    status: requireEnum2(input.status, TASK_STATUSES, "task.status"),
-    tokens_in: requireNonNegativeInt(input.tokens_in, "task.tokens_in"),
-    tokens_out: requireNonNegativeInt(input.tokens_out, "task.tokens_out"),
-    tokens_estimated: requireBoolean(input.tokens_estimated, "task.tokens_estimated"),
-    actual_cost,
-    frontier_cost,
-    metered_spent,
-    frontier_avoided: frontier_cost - actual_cost,
-    metered_avoided: frontier_cost - metered_spent,
-    policy_verdict: requireEnum2(input.policy_verdict, POLICY_VERDICTS, "task.policy_verdict")
-  };
-  const parent = optionalString(input.parent_task_id, "task.parent_task_id");
-  if (parent !== void 0) out.parent_task_id = parent;
-  if (input.superseded !== void 0) out.superseded = requireBoolean(input.superseded, "task.superseded");
-  if (input.native_reason !== void 0) {
-    out.native_reason = requireEnum2(input.native_reason, NATIVE_REASONS, "task.native_reason");
-  }
-  return out;
-}
-function validateOutcomeInput(input) {
-  const out = {
-    subject_id: requireString2(input.subject_id, "outcome.subject_id"),
-    subject_type: requireEnum2(input.subject_type, SUBJECT_TYPES, "outcome.subject_type"),
-    review_id: requireString2(input.review_id, "outcome.review_id"),
-    attempt: requireNonNegativeInt(input.attempt, "outcome.attempt"),
-    category: requireEnum2(input.category, TASK_CATEGORIES, "outcome.category"),
-    reviewer_lane_id: requireString2(input.reviewer_lane_id, "outcome.reviewer_lane_id"),
-    reviewer_model: requireString2(input.reviewer_model, "outcome.reviewer_model"),
-    reviewer_trust_mode: requireEnum2(input.reviewer_trust_mode, TRUST_MODES, "outcome.reviewer_trust_mode"),
-    reviewer_provenance: requireString2(input.reviewer_provenance, "outcome.reviewer_provenance"),
-    verdict: requireEnum2(input.verdict, REVIEW_VERDICTS, "outcome.verdict"),
-    voter: requireEnum2(input.voter, VOTERS, "outcome.voter"),
-    policy_verdict: requireEnum2(input.policy_verdict, POLICY_VERDICTS, "outcome.policy_verdict")
-  };
-  const task_id = optionalString(input.task_id, "outcome.task_id");
-  if (task_id !== void 0) out.task_id = task_id;
-  const turn_id = optionalString(input.turn_id, "outcome.turn_id");
-  if (turn_id !== void 0) out.turn_id = turn_id;
-  const subject_lane_id = optionalString(input.subject_lane_id, "outcome.subject_lane_id");
-  if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
-  const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
-  if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
-  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
-  if (subject_model !== void 0) out.subject_model = subject_model;
-  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
-  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
-  if (input.difficulty !== void 0) {
-    out.difficulty = requireEnum2(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
-  }
-  if (input.action_taken !== void 0) {
-    out.action_taken = requireEnum2(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
-  }
-  const target_lane_id = optionalString(input.target_lane_id, "outcome.target_lane_id");
-  if (target_lane_id !== void 0) out.target_lane_id = target_lane_id;
-  return out;
-}
-function serializeFields(event, fields) {
-  const record = {};
-  for (const field of fields) {
-    const value = event[field];
-    if (value !== void 0) record[field] = value;
-  }
-  return JSON.stringify(record);
-}
-function serializeEvent(event) {
-  return event.event_type === "task" ? serializeFields(event, EVENT_FIELDS) : serializeFields(event, OUTCOME_EVENT_FIELDS);
-}
-function parseMeta(obj) {
-  const event_type = obj.event_type === void 0 ? "task" : requireEnum2(obj.event_type, ["task", "outcome"], "event.event_type");
-  const schema_version = obj.schema_version === void 0 ? 0 : requireNonNegativeInt(obj.schema_version, "event.schema_version");
-  return {
-    event_type,
-    schema_version,
-    id: requireString2(obj.id, "event.id"),
-    seq: requireNonNegativeInt(obj.seq, "event.seq"),
-    ts: requireIsoTimestamp(obj.ts, "event.ts")
-  };
-}
-function backfillLegacyTask(obj) {
-  return {
-    task_id: obj.id,
-    attempt: 0,
-    // A legacy `block` verdict was a blocked send — preserve it so blockCount holds.
-    status: obj.policy_verdict === "block" ? "blocked" : "ok",
-    trust_mode: "full",
-    provenance: "unknown",
-    ...obj
-    // any field actually present on the row wins over the legacy default
-  };
-}
-function parseEvent(obj) {
-  if (!isPlainObject4(obj)) {
-    throw new LedgerError("Ledger record must be a JSON object.");
-  }
-  const meta = parseMeta(obj);
-  if (meta.event_type === "task") {
-    const source = obj.event_type === void 0 ? backfillLegacyTask(obj) : obj;
-    return { ...meta, event_type: "task", ...validateEventInput(source) };
-  }
-  return { ...meta, event_type: "outcome", ...validateOutcomeInput(obj) };
-}
-function filterEventsSince(events, sinceIso) {
-  if (sinceIso === void 0) return [...events];
-  const since = Date.parse(sinceIso);
-  if (Number.isNaN(since)) {
-    throw new LedgerError(`filterEventsSince: invalid ISO timestamp ${JSON.stringify(sinceIso)}.`);
-  }
-  return events.filter((e) => Date.parse(e.ts) >= since);
-}
-function taskEventsOf(events) {
-  return events.filter((e) => e.event_type === "task");
-}
-function summarize(events) {
-  const tasks = taskEventsOf(events);
-  let frontier_cost = 0;
-  let actual_cost = 0;
-  let metered_spent_total = 0;
-  let blockCount = 0;
-  let nativeFallbacks = 0;
-  let realEvents = 0;
-  const laneMix = /* @__PURE__ */ Object.create(null);
-  for (const e of tasks) {
-    if (e.status === "native") {
-      nativeFallbacks += 1;
-      continue;
-    }
-    realEvents += 1;
-    actual_cost += e.actual_cost;
-    metered_spent_total += e.metered_spent;
-    if (e.status === "blocked") blockCount += 1;
-    if (e.status === "ok" && e.superseded !== true) frontier_cost += e.frontier_cost;
-    laneMix[e.laneId] = (laneMix[e.laneId] ?? 0) + 1;
-  }
-  const frontier_avoided = frontier_cost - actual_cost;
-  const metered_avoided = frontier_cost - metered_spent_total;
-  const pct2 = (n) => frontier_cost === 0 ? 0 : 100 * n / frontier_cost;
-  const savings = {
-    frontier_cost,
-    frontier_avoided,
-    metered_spent: metered_spent_total,
-    metered_avoided,
-    frontier_avoided_pct: pct2(frontier_avoided),
-    metered_avoided_pct: pct2(metered_avoided)
-  };
-  return { events: realEvents, savings, actual_cost, metered_spent_total, laneMix, blockCount, nativeFallbacks };
-}
-function emptyBucket() {
-  return {
-    in: 0,
-    out: 0,
-    total: 0,
-    estimated: { in: 0, out: 0, total: 0 },
-    reported: { in: 0, out: 0, total: 0 }
-  };
-}
-function addToBucket(b, e) {
-  b.in += e.tokens_in;
-  b.out += e.tokens_out;
-  b.total += e.tokens_in + e.tokens_out;
-  const sub = e.tokens_estimated ? b.estimated : b.reported;
-  sub.in += e.tokens_in;
-  sub.out += e.tokens_out;
-  sub.total += e.tokens_in + e.tokens_out;
-}
-function group(map, key, e) {
-  let g = map[key];
-  if (!g) {
-    g = { ...emptyBucket(), events: 0 };
-    map[key] = g;
-  }
-  addToBucket(g, e);
-  g.events += 1;
-}
-function tokenStats(events) {
-  const total = emptyBucket();
-  const byModel = /* @__PURE__ */ Object.create(null);
-  const byLane = /* @__PURE__ */ Object.create(null);
-  for (const e of taskEventsOf(events)) {
-    addToBucket(total, e);
-    group(byModel, e.model, e);
-    group(byLane, e.laneId, e);
-  }
-  return { total, byModel, byLane };
 }
 
 // ../core/src/node.ts

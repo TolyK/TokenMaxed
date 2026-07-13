@@ -43,6 +43,9 @@ import type {
   CostForecast,
   CostBasis,
   PriceTable,
+  PlanOptimizationResult,
+  PlanOptimizationSuggestion,
+  LanePlanStats,
 } from '@tokenmaxed/core';
 
 import { renderModelIdMismatchWarnings, renderStalenessWarnings } from './freshness-report.ts';
@@ -92,6 +95,16 @@ export interface CorePort {
   resolvedPriorFor?: (lane: Lane, category: TaskCategory, priorOverlay?: CapabilityPriorOverlay, opts?: ResolvedPriorOptions) => ResolvedPrior;
   forecastCost?: (promptText: string, lane: { model: string; costBasis: CostBasis }, priceTable?: PriceTable) => CostForecast;
   contributingOutcomes?: (events: readonly LedgerEvent[], now: number, opts?: any) => OutcomeEvent[];
+  analyzePlan?: (
+    events: readonly LedgerEvent[],
+    lanes: readonly Lane[],
+    priceTable: PriceTable,
+    now: number,
+    opts?: {
+      periodLabel?: string;
+      routingContext?: RouteContext;
+    }
+  ) => PlanOptimizationResult;
 }
 
 /** P2: metadata about the active rankings snapshot, for /why + /status + setup. */
@@ -2512,7 +2525,151 @@ function policyExplanation(
       }),
   };
 
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool];
+  const planTool: ToolDef = {
+    name: 'router_plan',
+    description:
+      'Suggest portfolio/lane improvements based on your routed-share history. Read-only.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        period: { type: 'string', description: 'Window: "all" (default) or N + d/h, e.g. "7d".' },
+      },
+    },
+    handler: (deps, args) =>
+      guardedAsync(async () => {
+        try {
+          const period = optString(args, 'period');
+          let events: LedgerEvent[];
+          try {
+            const since = resolveSinceIso(period, deps.now());
+            events = core.filterEventsSince(deps.readLedger(), since);
+          } catch {
+            return ok(
+              `Could not read the ledger. No plan optimization advice is available.`,
+              {
+                error: true,
+                message: `could not read the ledger`,
+              }
+            );
+          }
+
+          const lanes = deps.allLanes ? deps.allLanes() : [];
+          const priceTable = deps.loadPriceTable ? deps.loadPriceTable() : { schema_version: 1, frontier_model: '', models: {} };
+
+          // Construct a partial RouteContext to feed to the capability computations
+          const observedCapability = deps.getFrozen?.() ? undefined : deps.observedCapability();
+          const observedCapabilityByModel = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModel?.();
+          const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? undefined : deps.observedCapabilityByModelDifficulty?.();
+          const routingContext: RouteContext = {
+            lanes,
+            observedCapability,
+            observedCapabilityByModel,
+            observedCapabilityByModelDifficulty,
+          };
+
+          if (!core.analyzePlan) {
+            return failResult('Plan optimizer core function is not available on this server.');
+          }
+
+          const result = core.analyzePlan(events, lanes, priceTable, deps.now(), {
+            periodLabel: period && period !== 'all' ? `last ${period}` : 'all history',
+            routingContext,
+          });
+
+          if (result.message) {
+            const advisoryLines = [
+              `Plan Optimization Advisory (routed-share only — not your total usage)`,
+              `  window: ${period ?? 'all history'}`,
+              `  status: ${result.message}`,
+            ];
+            return ok(advisoryLines.join('\n'), result as unknown as Record<string, unknown>);
+          }
+
+          const lines = [
+            `Plan Optimization Advisory (routed-share only — not your total usage)`,
+            `  window: ${period ?? 'all history'}`,
+            `  total routed offloads: ${result.totalRoutedOffloads} routed attempts (routed-share only)`,
+            ``,
+            `Lane Portfolio Stats (routed-share only):`,
+          ];
+
+          // Gather all lanes we have stats for (including historical ones returned by analyzePlan)
+          const laneIds = Object.keys(result.laneStats);
+          for (const laneId of laneIds) {
+            const stats = result.laneStats[laneId]!;
+            const isFrontier = lanes.find((l) => l.id === laneId)?.model === priceTable.frontier_model;
+            const label = isFrontier ? ' (frontier)' : '';
+            lines.push(`  ${laneId}${label}:`);
+            lines.push(`    delivered successes: ${stats.deliveredCount} successes (routed-share only)`);
+            const spent = stats.meteredSpent;
+            const spendStr = stats.meteredSpentUnavailable || spent === null
+              ? 'metered spend unavailable — data anomaly'
+              : `$${spent.toFixed(4)}`;
+            lines.push(`    metered spend: ${spendStr} (routed-share only)`);
+            lines.push(`    routed attempts: ${stats.routedCount} attempts (${stats.share.toFixed(1)}% of total routed attempts) (routed-share only)`);
+
+            const cats = Object.keys(stats.categoryDistribution) as TaskCategory[];
+            if (cats.length > 0) {
+              const catParts = cats.map((c) => `${c} (${stats.categoryDistribution[c]} routed attempts)`).join(', ');
+              lines.push(`    categories: ${catParts} (routed-share only)`);
+            }
+          }
+
+          // Frontier breakdown per frontier lane (FIX 6 & FIX 7)
+          const frontierLaneIds = Object.keys(result.frontierCategoryBreakdown);
+          if (frontierLaneIds.length > 0) {
+            lines.push(``, `Frontier Lane Category Breakdown (routed-share only):`);
+            for (const fLaneId of frontierLaneIds) {
+              const breakdown = result.frontierCategoryBreakdown[fLaneId] ?? {};
+              const stats = result.laneStats[fLaneId];
+              const fRoutedCount = stats ? stats.routedCount : 0;
+              lines.push(`  ${fLaneId}:`);
+              const cats = Object.keys(breakdown) as TaskCategory[];
+              if (cats.length === 0 || fRoutedCount === 0) {
+                lines.push(`    (no frontier lane tasks recorded) (routed-share only)`);
+              } else {
+                for (const cat of cats) {
+                  const count = breakdown[cat] ?? 0;
+                  const pct = (100 * count) / fRoutedCount;
+                  lines.push(`    ${cat}: ${count} routed attempts (${pct.toFixed(1)}% of lane's routed attempts) (routed-share only)`);
+                }
+              }
+            }
+          }
+
+          lines.push(``, `Suggestions:`);
+          if (result.suggestions.length === 0) {
+            lines.push(`  No portfolio optimization suggestions based on the routed history in this window.`);
+          } else {
+            result.suggestions.forEach((s, idx) => {
+              lines.push(`  ${idx + 1}. ${s.title}`);
+              lines.push(`     Evidence: ${s.evidence}`);
+              lines.push(`     Suggestion: ${s.suggestion}`);
+              lines.push(``);
+            });
+            // Remove trailing empty line if suggestions ended with one
+            if (lines[lines.length - 1] === '') {
+              lines.pop();
+            }
+          }
+
+          return ok(lines.join('\n'), result as unknown as Record<string, unknown>);
+        } catch {
+          // ANY exception from allLanes / loadPriceTable / the capability loaders / analyzePlan
+          // is captured here to prevent echoing err.message
+          return ok(
+            `Could not compute plan advice — check setup.`,
+            {
+              error: true,
+              message: `could not compute plan advice — check setup`,
+            }
+          );
+        }
+      }),
+  };
+
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool];
 }
 
 /** Render a {@link DelegateOutcome} as an advisory directive to the host. */

@@ -23827,6 +23827,710 @@ function orderTiered(scored, candidates, task, ctx) {
   return [...clears.sort(byTier), ...rest];
 }
 
+// ../core/src/usage.ts
+var UsageError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UsageError";
+  }
+};
+function estimateTokens(text) {
+  if (text.length === 0) return 0;
+  return Math.ceil(text.length / 4);
+}
+function reportedInt(value, where) {
+  if (value === void 0) return 0;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new UsageError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function resolveUsage(args) {
+  const { reported, promptText = "", resultText = "" } = args;
+  const hasReported = reported !== void 0 && typeof reported.tokens_in === "number" && typeof reported.tokens_out === "number";
+  if (hasReported) {
+    const baseIn = reportedInt(reported.tokens_in, "reported.tokens_in");
+    const out = reportedInt(reported.tokens_out, "reported.tokens_out");
+    const cacheRead = reportedInt(reported.cache_read_input_tokens, "reported.cache_read_input_tokens");
+    const cacheCreate = reportedInt(
+      reported.cache_creation_input_tokens,
+      "reported.cache_creation_input_tokens"
+    );
+    return {
+      // Cache tokens count as input usage; we never claim them as cache savings.
+      tokens_in: baseIn + cacheRead + cacheCreate,
+      tokens_out: out,
+      tokens_estimated: false
+    };
+  }
+  return {
+    tokens_in: estimateTokens(promptText),
+    tokens_out: estimateTokens(resultText),
+    tokens_estimated: true
+  };
+}
+function usageFromReported(reported) {
+  const toInt = (n) => {
+    const v = Math.floor(Number(n));
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  };
+  const tokens_in = toInt(reported.tokens_in) + toInt(reported.cache_read_input_tokens) + toInt(reported.cache_creation_input_tokens);
+  return { tokens_in, tokens_out: toInt(reported.tokens_out), tokens_estimated: false };
+}
+
+// ../core/src/price.ts
+var PriceError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PriceError";
+  }
+};
+function isPlainObject5(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function requireNonNegativeNumber(value, where) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new PriceError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function validatePriceTable(data) {
+  if (!isPlainObject5(data)) {
+    throw new PriceError("Price table must be a JSON object.");
+  }
+  if (typeof data.schema_version !== "number") {
+    throw new PriceError('Price table "schema_version" must be a number.');
+  }
+  if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
+    throw new PriceError('Price table "frontier_model" must be a non-empty string.');
+  }
+  if (!isPlainObject5(data.models)) {
+    throw new PriceError('Price table "models" must be a mapping of model id to prices.');
+  }
+  const models = /* @__PURE__ */ Object.create(null);
+  for (const [model, raw] of Object.entries(data.models)) {
+    if (!isPlainObject5(raw)) {
+      throw new PriceError(`Price table models["${model}"] must be a mapping.`);
+    }
+    const entry = {
+      inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
+      outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`)
+    };
+    if (raw.family !== void 0) {
+      if (typeof raw.family !== "string" || raw.family.trim() === "") {
+        throw new PriceError(`models["${model}"].family must be a non-empty string when present.`);
+      }
+      entry.family = raw.family;
+    }
+    if (raw.released !== void 0) {
+      if (typeof raw.released !== "string" || Number.isNaN(Date.parse(raw.released))) {
+        throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
+      }
+      entry.released = raw.released;
+    }
+    models[model] = entry;
+  }
+  if (!Object.hasOwn(models, data.frontier_model)) {
+    throw new PriceError(
+      `Price table frontier_model "${data.frontier_model}" has no entry in models.`
+    );
+  }
+  return { schema_version: data.schema_version, frontier_model: data.frontier_model, models };
+}
+function requireUsage(usage) {
+  for (const key of ["tokens_in", "tokens_out"]) {
+    const v = usage[key];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      throw new PriceError(`usage.${key} must be a finite number >= 0 (got ${JSON.stringify(v)}).`);
+    }
+  }
+}
+function priceForModel(table, model, usage) {
+  requireUsage(usage);
+  const p = Object.hasOwn(table.models, model) ? table.models[model] : void 0;
+  if (!p) {
+    throw new PriceError(`No price for model "${model}" in the price table.`);
+  }
+  return usage.tokens_in / 1e6 * p.inputPer1M + usage.tokens_out / 1e6 * p.outputPer1M;
+}
+function computeCostPrimitives(table, lane, usage) {
+  const frontier_cost = priceForModel(table, table.frontier_model, usage);
+  const actual_cost = lane.costBasis === "metered" ? priceForModel(table, lane.model, usage) : 0;
+  const metered_spent = lane.costBasis === "metered" ? actual_cost : 0;
+  return {
+    frontier_cost,
+    actual_cost,
+    metered_spent,
+    frontier_avoided: frontier_cost - actual_cost,
+    metered_avoided: frontier_cost - metered_spent
+  };
+}
+function forecastCost(promptText, lane, priceTable) {
+  let estTokensIn = 0;
+  if (typeof promptText === "string") {
+    estTokensIn = estimateTokens(promptText);
+  }
+  if (typeof estTokensIn !== "number" || !Number.isFinite(estTokensIn) || estTokensIn < 0) {
+    estTokensIn = 0;
+  }
+  estTokensIn = Math.floor(estTokensIn);
+  const basis = lane.costBasis;
+  if (basis === "subscription") {
+    return {
+      estTokensIn,
+      estCostUsd: 0,
+      basis,
+      note: "flat-rate subscription"
+    };
+  }
+  if (basis === "local") {
+    return {
+      estTokensIn,
+      estCostUsd: 0,
+      basis,
+      note: "local \u2014 no metered cost"
+    };
+  }
+  const missingNote = `missing price entry for model "${lane.model}" (price unavailable / output extra)`;
+  if (!priceTable || !priceTable.models || !Object.hasOwn(priceTable.models, lane.model)) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote
+    };
+  }
+  const price = priceTable.models[lane.model];
+  if (!price || typeof price.inputPer1M !== "number" || !Number.isFinite(price.inputPer1M) || price.inputPer1M < 0) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote
+    };
+  }
+  const estCostUsd = estTokensIn * price.inputPer1M / 1e6;
+  if (typeof estCostUsd !== "number" || !Number.isFinite(estCostUsd) || estCostUsd < 0) {
+    return {
+      estTokensIn,
+      basis,
+      note: missingNote
+    };
+  }
+  return {
+    estTokensIn,
+    estCostUsd,
+    basis,
+    note: "input only, output extra"
+  };
+}
+
+// ../core/src/ledger.ts
+var SCHEMA_VERSION = 2;
+var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
+var NATIVE_REASONS = ["no_route", "host_native"];
+var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
+var VOTERS = ["reviewer_model", "user"];
+var SUBJECT_TYPES = ["router_task", "host_turn"];
+var OUTCOME_ACTIONS = ["accept", "rework", "escalate", "give_back"];
+var EVENT_FIELDS = [
+  "event_type",
+  "schema_version",
+  "id",
+  "seq",
+  "ts",
+  "task_id",
+  "attempt",
+  "parent_task_id",
+  "category",
+  "laneId",
+  "model",
+  "trust_mode",
+  "provenance",
+  "status",
+  "tokens_in",
+  "tokens_out",
+  "tokens_estimated",
+  "actual_cost",
+  "frontier_cost",
+  "metered_spent",
+  "frontier_avoided",
+  "metered_avoided",
+  "policy_verdict",
+  "superseded",
+  "native_reason"
+];
+var OUTCOME_EVENT_FIELDS = [
+  "event_type",
+  "schema_version",
+  "id",
+  "seq",
+  "ts",
+  "subject_id",
+  "subject_type",
+  "task_id",
+  "turn_id",
+  "review_id",
+  "attempt",
+  "category",
+  "subject_lane_id",
+  "subject_provenance",
+  "subject_model",
+  "subject_model_resolved",
+  "difficulty",
+  "reviewer_lane_id",
+  "reviewer_model",
+  "reviewer_trust_mode",
+  "reviewer_provenance",
+  "verdict",
+  "voter",
+  "policy_verdict",
+  "action_taken",
+  "target_lane_id"
+];
+var LedgerError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "LedgerError";
+  }
+};
+function isPlainObject6(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function requireString(value, where) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new LedgerError(`${where} must be a non-empty string.`);
+  }
+  return value;
+}
+function optionalString(value, where) {
+  if (value === void 0) return void 0;
+  return requireString(value, where);
+}
+function requireIsoTimestamp(value, where) {
+  const s = requireString(value, where);
+  if (Number.isNaN(Date.parse(s))) {
+    throw new LedgerError(`${where} must be a valid ISO-8601 timestamp (got ${JSON.stringify(value)}).`);
+  }
+  return s;
+}
+function requireNonNegativeNumber2(value, where) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new LedgerError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function requireNonNegativeInt(value, where) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new LedgerError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function requireBoolean(value, where) {
+  if (typeof value !== "boolean") {
+    throw new LedgerError(`${where} must be a boolean (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function requireEnum(value, allowed, where) {
+  if (typeof value !== "string" || !allowed.includes(value)) {
+    throw new LedgerError(`${where} must be one of: ${allowed.join(", ")} (got ${JSON.stringify(value)}).`);
+  }
+  return value;
+}
+function validateEventInput(input) {
+  const actual_cost = requireNonNegativeNumber2(input.actual_cost, "task.actual_cost");
+  const frontier_cost = requireNonNegativeNumber2(input.frontier_cost, "task.frontier_cost");
+  const metered_spent = requireNonNegativeNumber2(input.metered_spent, "task.metered_spent");
+  const out = {
+    task_id: requireString(input.task_id, "task.task_id"),
+    attempt: requireNonNegativeInt(input.attempt, "task.attempt"),
+    category: requireEnum(input.category, TASK_CATEGORIES, "task.category"),
+    laneId: requireString(input.laneId, "task.laneId"),
+    model: requireString(input.model, "task.model"),
+    trust_mode: requireEnum(input.trust_mode, TRUST_MODES, "task.trust_mode"),
+    provenance: requireString(input.provenance, "task.provenance"),
+    status: requireEnum(input.status, TASK_STATUSES, "task.status"),
+    tokens_in: requireNonNegativeInt(input.tokens_in, "task.tokens_in"),
+    tokens_out: requireNonNegativeInt(input.tokens_out, "task.tokens_out"),
+    tokens_estimated: requireBoolean(input.tokens_estimated, "task.tokens_estimated"),
+    actual_cost,
+    frontier_cost,
+    metered_spent,
+    frontier_avoided: frontier_cost - actual_cost,
+    metered_avoided: frontier_cost - metered_spent,
+    policy_verdict: requireEnum(input.policy_verdict, POLICY_VERDICTS, "task.policy_verdict")
+  };
+  const parent = optionalString(input.parent_task_id, "task.parent_task_id");
+  if (parent !== void 0) out.parent_task_id = parent;
+  if (input.superseded !== void 0) out.superseded = requireBoolean(input.superseded, "task.superseded");
+  if (input.native_reason !== void 0) {
+    out.native_reason = requireEnum(input.native_reason, NATIVE_REASONS, "task.native_reason");
+  }
+  return out;
+}
+function validateOutcomeInput(input) {
+  const out = {
+    subject_id: requireString(input.subject_id, "outcome.subject_id"),
+    subject_type: requireEnum(input.subject_type, SUBJECT_TYPES, "outcome.subject_type"),
+    review_id: requireString(input.review_id, "outcome.review_id"),
+    attempt: requireNonNegativeInt(input.attempt, "outcome.attempt"),
+    category: requireEnum(input.category, TASK_CATEGORIES, "outcome.category"),
+    reviewer_lane_id: requireString(input.reviewer_lane_id, "outcome.reviewer_lane_id"),
+    reviewer_model: requireString(input.reviewer_model, "outcome.reviewer_model"),
+    reviewer_trust_mode: requireEnum(input.reviewer_trust_mode, TRUST_MODES, "outcome.reviewer_trust_mode"),
+    reviewer_provenance: requireString(input.reviewer_provenance, "outcome.reviewer_provenance"),
+    verdict: requireEnum(input.verdict, REVIEW_VERDICTS, "outcome.verdict"),
+    voter: requireEnum(input.voter, VOTERS, "outcome.voter"),
+    policy_verdict: requireEnum(input.policy_verdict, POLICY_VERDICTS, "outcome.policy_verdict")
+  };
+  const task_id = optionalString(input.task_id, "outcome.task_id");
+  if (task_id !== void 0) out.task_id = task_id;
+  const turn_id = optionalString(input.turn_id, "outcome.turn_id");
+  if (turn_id !== void 0) out.turn_id = turn_id;
+  const subject_lane_id = optionalString(input.subject_lane_id, "outcome.subject_lane_id");
+  if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
+  const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
+  if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
+  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
+  if (subject_model !== void 0) out.subject_model = subject_model;
+  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
+  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
+  if (input.difficulty !== void 0) {
+    out.difficulty = requireEnum(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
+  }
+  if (input.action_taken !== void 0) {
+    out.action_taken = requireEnum(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
+  }
+  const target_lane_id = optionalString(input.target_lane_id, "outcome.target_lane_id");
+  if (target_lane_id !== void 0) out.target_lane_id = target_lane_id;
+  return out;
+}
+function serializeFields(event, fields) {
+  const record2 = {};
+  for (const field of fields) {
+    const value = event[field];
+    if (value !== void 0) record2[field] = value;
+  }
+  return JSON.stringify(record2);
+}
+function serializeEvent(event) {
+  return event.event_type === "task" ? serializeFields(event, EVENT_FIELDS) : serializeFields(event, OUTCOME_EVENT_FIELDS);
+}
+function parseMeta(obj) {
+  const event_type = obj.event_type === void 0 ? "task" : requireEnum(obj.event_type, ["task", "outcome"], "event.event_type");
+  const schema_version = obj.schema_version === void 0 ? 0 : requireNonNegativeInt(obj.schema_version, "event.schema_version");
+  return {
+    event_type,
+    schema_version,
+    id: requireString(obj.id, "event.id"),
+    seq: requireNonNegativeInt(obj.seq, "event.seq"),
+    ts: requireIsoTimestamp(obj.ts, "event.ts")
+  };
+}
+function backfillLegacyTask(obj) {
+  return {
+    task_id: obj.id,
+    attempt: 0,
+    // A legacy `block` verdict was a blocked send — preserve it so blockCount holds.
+    status: obj.policy_verdict === "block" ? "blocked" : "ok",
+    trust_mode: "full",
+    provenance: "unknown",
+    ...obj
+    // any field actually present on the row wins over the legacy default
+  };
+}
+function parseEvent(obj) {
+  if (!isPlainObject6(obj)) {
+    throw new LedgerError("Ledger record must be a JSON object.");
+  }
+  const meta2 = parseMeta(obj);
+  if (meta2.event_type === "task") {
+    const source = obj.event_type === void 0 ? backfillLegacyTask(obj) : obj;
+    return { ...meta2, event_type: "task", ...validateEventInput(source) };
+  }
+  return { ...meta2, event_type: "outcome", ...validateOutcomeInput(obj) };
+}
+function filterEventsSince(events, sinceIso) {
+  if (sinceIso === void 0) return [...events];
+  const since = Date.parse(sinceIso);
+  if (Number.isNaN(since)) {
+    throw new LedgerError(`filterEventsSince: invalid ISO timestamp ${JSON.stringify(sinceIso)}.`);
+  }
+  return events.filter((e) => Date.parse(e.ts) >= since);
+}
+function taskEventsOf(events) {
+  return events.filter((e) => e.event_type === "task");
+}
+function summarize(events) {
+  const tasks = taskEventsOf(events);
+  let frontier_cost = 0;
+  let actual_cost = 0;
+  let metered_spent_total = 0;
+  let blockCount = 0;
+  let nativeFallbacks = 0;
+  let realEvents = 0;
+  const laneMix = /* @__PURE__ */ Object.create(null);
+  for (const e of tasks) {
+    if (e.status === "native") {
+      nativeFallbacks += 1;
+      continue;
+    }
+    realEvents += 1;
+    actual_cost += e.actual_cost;
+    metered_spent_total += e.metered_spent;
+    if (e.status === "blocked") blockCount += 1;
+    if (e.status === "ok" && e.superseded !== true) frontier_cost += e.frontier_cost;
+    laneMix[e.laneId] = (laneMix[e.laneId] ?? 0) + 1;
+  }
+  const frontier_avoided = frontier_cost - actual_cost;
+  const metered_avoided = frontier_cost - metered_spent_total;
+  const pct3 = (n) => frontier_cost === 0 ? 0 : 100 * n / frontier_cost;
+  const savings = {
+    frontier_cost,
+    frontier_avoided,
+    metered_spent: metered_spent_total,
+    metered_avoided,
+    frontier_avoided_pct: pct3(frontier_avoided),
+    metered_avoided_pct: pct3(metered_avoided)
+  };
+  return { events: realEvents, savings, actual_cost, metered_spent_total, laneMix, blockCount, nativeFallbacks };
+}
+function emptyBucket() {
+  return {
+    in: 0,
+    out: 0,
+    total: 0,
+    estimated: { in: 0, out: 0, total: 0 },
+    reported: { in: 0, out: 0, total: 0 }
+  };
+}
+function addToBucket(b, e) {
+  b.in += e.tokens_in;
+  b.out += e.tokens_out;
+  b.total += e.tokens_in + e.tokens_out;
+  const sub = e.tokens_estimated ? b.estimated : b.reported;
+  sub.in += e.tokens_in;
+  sub.out += e.tokens_out;
+  sub.total += e.tokens_in + e.tokens_out;
+}
+function group(map, key, e) {
+  let g = map[key];
+  if (!g) {
+    g = { ...emptyBucket(), events: 0 };
+    map[key] = g;
+  }
+  addToBucket(g, e);
+  g.events += 1;
+}
+function tokenStats(events) {
+  const total = emptyBucket();
+  const byModel = /* @__PURE__ */ Object.create(null);
+  const byLane = /* @__PURE__ */ Object.create(null);
+  for (const e of taskEventsOf(events)) {
+    addToBucket(total, e);
+    group(byModel, e.model, e);
+    group(byLane, e.laneId, e);
+  }
+  return { total, byModel, byLane };
+}
+
+// ../core/src/plan.ts
+function isLaneCheaperForCategory(y, x, category, nonNativeTasks, priceTable) {
+  const basisRank = { local: 0, subscription: 0, metered: 1 };
+  const rankY = basisRank[y.costBasis] ?? 99;
+  const rankX = basisRank[x.costBasis] ?? 99;
+  if (rankY !== rankX) {
+    return rankY < rankX;
+  }
+  if (y.costBasis === "metered" && x.costBasis === "metered") {
+    const categoryTasks = nonNativeTasks.filter((e) => e.category === category);
+    if (categoryTasks.length === 0) {
+      return false;
+    }
+    const avgIn = categoryTasks.reduce((sum, e) => sum + e.tokens_in, 0) / categoryTasks.length;
+    const avgOut = categoryTasks.reduce((sum, e) => sum + e.tokens_out, 0) / categoryTasks.length;
+    const avgUsage = { tokens_in: avgIn, tokens_out: avgOut };
+    try {
+      const priceY = priceForModel(priceTable, y.model, avgUsage);
+      const priceX = priceForModel(priceTable, x.model, avgUsage);
+      return priceY < priceX;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+function analyzePlan(events, lanes, priceTable, now, opts = {}) {
+  const periodLabel = opts.periodLabel ?? "all history";
+  const summary = summarize(events);
+  const totalRoutedOffloads = summary.events;
+  if (totalRoutedOffloads < 5) {
+    return {
+      totalRoutedOffloads,
+      laneStats: {},
+      frontierCategoryBreakdown: {},
+      frontierCategoryBreakdownRoutedAttempts: {},
+      frontierCategoryBreakdownScope: "routed attempts per frontier lane",
+      suggestions: [],
+      message: "not enough routed history to advise yet (need more offloads)"
+    };
+  }
+  const taskEvents = events.filter((e) => e.event_type === "task");
+  const nonNativeTasks = taskEvents.filter((e) => e.status !== "native");
+  const seenLanes = new Set(lanes.map((l) => l.id));
+  const allLanesList = [...lanes];
+  for (const e of nonNativeTasks) {
+    if (!seenLanes.has(e.laneId)) {
+      seenLanes.add(e.laneId);
+      allLanesList.push({
+        id: e.laneId,
+        kind: "api",
+        model: e.model,
+        trust_mode: e.trust_mode,
+        costBasis: e.actual_cost > 0 || e.metered_spent > 0 ? "metered" : "subscription",
+        provenance: e.provenance,
+        jurisdiction: "US",
+        capability: {}
+      });
+    }
+  }
+  const laneStats = {};
+  for (const lane of allLanesList) {
+    if (lane.native) continue;
+    laneStats[lane.id] = {
+      laneId: lane.id,
+      deliveredCount: 0,
+      routedCount: 0,
+      share: 0,
+      sharePercentageOfRoutedAttempts: 0,
+      shareScope: "routed-share only",
+      meteredSpent: 0,
+      categoryDistribution: {},
+      categoryDistributionRoutedAttempts: {},
+      categoryDistributionScope: "routed attempts"
+    };
+  }
+  for (const e of nonNativeTasks) {
+    const stats = laneStats[e.laneId];
+    if (!stats) continue;
+    stats.routedCount += 1;
+    if (e.status === "ok" && e.superseded !== true) {
+      stats.deliveredCount += 1;
+    }
+    if (stats.meteredSpentUnavailable !== true) {
+      if (!Number.isFinite(e.metered_spent) || e.metered_spent < 0) {
+        stats.meteredSpentUnavailable = true;
+        stats.meteredSpent = null;
+      } else {
+        if (stats.meteredSpent === null) {
+          stats.meteredSpent = e.metered_spent;
+        } else {
+          stats.meteredSpent += e.metered_spent;
+        }
+      }
+    }
+    stats.categoryDistribution[e.category] = (stats.categoryDistribution[e.category] ?? 0) + 1;
+    stats.categoryDistributionRoutedAttempts[e.category] = (stats.categoryDistributionRoutedAttempts[e.category] ?? 0) + 1;
+  }
+  for (const laneId of Object.keys(laneStats)) {
+    const stats = laneStats[laneId];
+    stats.share = totalRoutedOffloads > 0 ? 100 * stats.routedCount / totalRoutedOffloads : 0;
+    if (!Number.isFinite(stats.share) || stats.share < 0) {
+      stats.share = 0;
+    }
+    stats.sharePercentageOfRoutedAttempts = stats.share;
+    if (!stats.meteredSpentUnavailable) {
+      if (stats.meteredSpent !== null && (!Number.isFinite(stats.meteredSpent) || stats.meteredSpent < 0)) {
+        stats.meteredSpentUnavailable = true;
+        stats.meteredSpent = null;
+      }
+    }
+  }
+  const frontierModel = priceTable.frontier_model;
+  const frontierLanes = lanes.filter((l) => l.model === frontierModel);
+  const frontierLaneIds = new Set(frontierLanes.map((l) => l.id));
+  const frontierCategoryBreakdown = {};
+  const frontierCategoryBreakdownRoutedAttempts = {};
+  for (const fLane of frontierLanes) {
+    frontierCategoryBreakdown[fLane.id] = {};
+    frontierCategoryBreakdownRoutedAttempts[fLane.id] = {};
+  }
+  for (const e of nonNativeTasks) {
+    if (frontierLaneIds.has(e.laneId)) {
+      const breakdown = frontierCategoryBreakdown[e.laneId];
+      const breakdownRouted = frontierCategoryBreakdownRoutedAttempts[e.laneId];
+      if (breakdown && breakdownRouted) {
+        breakdown[e.category] = (breakdown[e.category] ?? 0) + 1;
+        breakdownRouted[e.category] = (breakdownRouted[e.category] ?? 0) + 1;
+      }
+    }
+  }
+  const suggestions = [];
+  for (const lane of lanes) {
+    if (lane.native) continue;
+    const stats = laneStats[lane.id];
+    if (!stats) continue;
+    if (stats.share < 10) {
+      const shareStr = stats.share.toFixed(1);
+      suggestions.push({
+        title: `Underused lane: ${lane.id}`,
+        evidence: `lane ${lane.id} handled ${stats.routedCount} of your ${totalRoutedOffloads} routed attempts (${shareStr}% routed-share) (routed-share only \u2014 not your total usage) over ${periodLabel}`,
+        suggestion: `Consider reviewing the configuration and usage of lane ${lane.id}, as it has a low routed usage share.`
+      });
+    }
+  }
+  for (const FL of frontierLanes) {
+    const stats = laneStats[FL.id];
+    if (!stats || stats.routedCount === 0) continue;
+    const breakdown = frontierCategoryBreakdown[FL.id] ?? {};
+    const categories = Object.keys(breakdown);
+    for (const cat of categories) {
+      const count = breakdown[cat] ?? 0;
+      const share = 100 * count / stats.routedCount;
+      if (share >= 20) {
+        for (const Y of lanes) {
+          if (Y.native || Y.id === FL.id || Y.model === frontierModel) continue;
+          if (isLaneCheaperForCategory(Y, FL, cat, nonNativeTasks, priceTable)) {
+            const capY = opts.routingContext ? effectiveCapabilityFor(Y, cat, opts.routingContext.observedCapability, {
+              modelOverlay: opts.routingContext.observedCapabilityByModel,
+              difficultyOverlay: opts.routingContext.observedCapabilityByModelDifficulty
+            }) : declaredCapabilityFor(Y, cat);
+            if (capY >= 0.7) {
+              const shareStr = share.toFixed(1);
+              suggestions.push({
+                title: `Frontier-conservation: ${FL.id} (${cat})`,
+                evidence: `category "${cat}" constitutes ${shareStr}% of your frontier lane ${FL.id}'s routed attempts (${count} of ${stats.routedCount} routed attempts) (routed-share only \u2014 not your total usage) over ${periodLabel}, and lane ${Y.id} is capable (capability ${capY.toFixed(2)}) and cheaper (${Y.costBasis} vs ${FL.costBasis})`,
+                suggestion: `routing category ${cat} to ${Y.id} would ease pressure on ${FL.id}`
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+  for (const lane of lanes) {
+    if (lane.native) continue;
+    const stats = laneStats[lane.id];
+    if (!stats) continue;
+    const hasSpent = stats.meteredSpent !== null && stats.meteredSpent > 0 || stats.meteredSpentUnavailable;
+    if (lane.costBasis === "metered" && hasSpent) {
+      const spendStr = stats.meteredSpentUnavailable ? "metered spend unavailable \u2014 data anomaly" : `$${(stats.meteredSpent ?? 0).toFixed(4)}`;
+      suggestions.push({
+        title: `Metered spend: ${lane.id}`,
+        evidence: `you spent ${spendStr} metered on lane ${lane.id} (routed-share only \u2014 not your total usage) across ${stats.routedCount} routed attempts over ${periodLabel}`,
+        suggestion: `Consider routing these tasks to a subscription or local lane as an alternative to avoid metered charges.`
+      });
+    }
+  }
+  return {
+    totalRoutedOffloads,
+    laneStats,
+    frontierCategoryBreakdown,
+    frontierCategoryBreakdownRoutedAttempts,
+    frontierCategoryBreakdownScope: "routed attempts per frontier lane",
+    suggestions
+  };
+}
+
 // ../core/src/window-quota.ts
 var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
 var WINDOW_WARN_USED = 0.7;
@@ -24268,16 +24972,16 @@ var LaneConfigError = class extends Error {
     this.name = "LaneConfigError";
   }
 };
-function isPlainObject5(value) {
+function isPlainObject7(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function requireString(value, where) {
+function requireString2(value, where) {
   if (typeof value !== "string" || value.trim() === "") {
     throw new LaneConfigError(`${where} must be a non-empty string.`);
   }
   return value;
 }
-function requireEnum(value, allowed, where) {
+function requireEnum2(value, allowed, where) {
   if (typeof value !== "string" || !allowed.includes(value)) {
     throw new LaneConfigError(
       `${where} must be one of: ${allowed.join(", ")} (got ${JSON.stringify(value)}).`
@@ -24287,7 +24991,7 @@ function requireEnum(value, allowed, where) {
 }
 function parseCapability(value, where) {
   if (value === void 0) return void 0;
-  if (!isPlainObject5(value)) {
+  if (!isPlainObject7(value)) {
     throw new LaneConfigError(`${where} must be a mapping of category to a number in [0, 1].`);
   }
   const out = {};
@@ -24308,7 +25012,7 @@ function parseCapability(value, where) {
 }
 function parseLane(entry, index) {
   const where = `lanes[${index}]`;
-  if (!isPlainObject5(entry)) {
+  if (!isPlainObject7(entry)) {
     throw new LaneConfigError(`${where} must be a mapping.`);
   }
   for (const key of Object.keys(entry)) {
@@ -24318,25 +25022,25 @@ function parseLane(entry, index) {
       );
     }
   }
-  const id = requireString(entry.id, `${where}.id`);
+  const id = requireString2(entry.id, `${where}.id`);
   const at = (field) => `lanes[${index}] (${id}).${field}`;
   const rawTrust = entry.trust_mode;
   const aliasedTrust = typeof rawTrust === "string" && rawTrust in TRUST_MODE_ALIASES ? TRUST_MODE_ALIASES[rawTrust] : rawTrust;
-  const trust_mode = requireEnum(aliasedTrust, TRUST_MODES, at("trust_mode"));
+  const trust_mode = requireEnum2(aliasedTrust, TRUST_MODES, at("trust_mode"));
   const lane = {
     id,
-    kind: requireEnum(entry.kind, LANE_KINDS, at("kind")),
-    model: requireString(entry.model, at("model")),
+    kind: requireEnum2(entry.kind, LANE_KINDS, at("kind")),
+    model: requireString2(entry.model, at("model")),
     trust_mode,
-    costBasis: requireEnum(entry.costBasis, COST_BASES, at("costBasis")),
-    provenance: requireString(entry.provenance, at("provenance")),
-    jurisdiction: requireString(entry.jurisdiction, at("jurisdiction"))
+    costBasis: requireEnum2(entry.costBasis, COST_BASES, at("costBasis")),
+    provenance: requireString2(entry.provenance, at("provenance")),
+    jurisdiction: requireString2(entry.jurisdiction, at("jurisdiction"))
   };
   if (entry.roles !== void 0) {
     if (!Array.isArray(entry.roles)) {
       throw new LaneConfigError(`${at("roles")} must be an array of: ${LANE_ROLES.join(", ")}.`);
     }
-    lane.roles = entry.roles.map((r, i) => requireEnum(r, LANE_ROLES, `${at("roles")}[${i}]`));
+    lane.roles = entry.roles.map((r, i) => requireEnum2(r, LANE_ROLES, `${at("roles")}[${i}]`));
   }
   if (entry.manager_allowed !== void 0) {
     if (typeof entry.manager_allowed !== "boolean") {
@@ -24362,7 +25066,7 @@ function parseLane(entry, index) {
     lane.repo_read_attestation = entry.repo_read_attestation;
   }
   if (entry.execution_mode !== void 0) {
-    const mode = requireEnum(entry.execution_mode, EXECUTION_MODES, at("execution_mode"));
+    const mode = requireEnum2(entry.execution_mode, EXECUTION_MODES, at("execution_mode"));
     if (mode === "agentic" && trust_mode !== "full") {
       throw new LaneConfigError(
         `${at("execution_mode")}: 'agentic' is only allowed when trust_mode is 'full' (got trust_mode '${trust_mode}'). Untrusted lanes are never agentic-with-access.`
@@ -24377,10 +25081,10 @@ function parseLane(entry, index) {
     }
     lane.native = entry.native;
   }
-  if (entry.model_family !== void 0) lane.model_family = requireString(entry.model_family, at("model_family"));
-  if (entry.command !== void 0) lane.command = requireString(entry.command, at("command"));
-  if (entry.endpoint !== void 0) lane.endpoint = requireString(entry.endpoint, at("endpoint"));
-  if (entry.authHandle !== void 0) lane.authHandle = requireString(entry.authHandle, at("authHandle"));
+  if (entry.model_family !== void 0) lane.model_family = requireString2(entry.model_family, at("model_family"));
+  if (entry.command !== void 0) lane.command = requireString2(entry.command, at("command"));
+  if (entry.endpoint !== void 0) lane.endpoint = requireString2(entry.endpoint, at("endpoint"));
+  if (entry.authHandle !== void 0) lane.authHandle = requireString2(entry.authHandle, at("authHandle"));
   if (entry.args !== void 0) {
     if (!Array.isArray(entry.args) || entry.args.some((a) => typeof a !== "string")) {
       throw new LaneConfigError(`${at("args")} must be an array of strings.`);
@@ -24483,7 +25187,7 @@ function parseLaneConfig(text) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new LaneConfigError(`Could not parse lane config as YAML: ${detail}`);
   }
-  if (!isPlainObject5(doc) || !Array.isArray(doc.lanes)) {
+  if (!isPlainObject7(doc) || !Array.isArray(doc.lanes)) {
     throw new LaneConfigError('Lane config must be a mapping with a "lanes" array.');
   }
   if (doc.lanes.length === 0) {
@@ -24498,512 +25202,6 @@ function parseLaneConfig(text) {
     seen.add(lane.id);
   }
   return new LaneRegistry(lanes);
-}
-
-// ../core/src/usage.ts
-var UsageError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "UsageError";
-  }
-};
-function estimateTokens(text) {
-  if (text.length === 0) return 0;
-  return Math.ceil(text.length / 4);
-}
-function reportedInt(value, where) {
-  if (value === void 0) return 0;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new UsageError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function resolveUsage(args) {
-  const { reported, promptText = "", resultText = "" } = args;
-  const hasReported = reported !== void 0 && typeof reported.tokens_in === "number" && typeof reported.tokens_out === "number";
-  if (hasReported) {
-    const baseIn = reportedInt(reported.tokens_in, "reported.tokens_in");
-    const out = reportedInt(reported.tokens_out, "reported.tokens_out");
-    const cacheRead = reportedInt(reported.cache_read_input_tokens, "reported.cache_read_input_tokens");
-    const cacheCreate = reportedInt(
-      reported.cache_creation_input_tokens,
-      "reported.cache_creation_input_tokens"
-    );
-    return {
-      // Cache tokens count as input usage; we never claim them as cache savings.
-      tokens_in: baseIn + cacheRead + cacheCreate,
-      tokens_out: out,
-      tokens_estimated: false
-    };
-  }
-  return {
-    tokens_in: estimateTokens(promptText),
-    tokens_out: estimateTokens(resultText),
-    tokens_estimated: true
-  };
-}
-function usageFromReported(reported) {
-  const toInt = (n) => {
-    const v = Math.floor(Number(n));
-    return Number.isFinite(v) && v > 0 ? v : 0;
-  };
-  const tokens_in = toInt(reported.tokens_in) + toInt(reported.cache_read_input_tokens) + toInt(reported.cache_creation_input_tokens);
-  return { tokens_in, tokens_out: toInt(reported.tokens_out), tokens_estimated: false };
-}
-
-// ../core/src/price.ts
-var PriceError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "PriceError";
-  }
-};
-function isPlainObject6(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function requireNonNegativeNumber(value, where) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new PriceError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function validatePriceTable(data) {
-  if (!isPlainObject6(data)) {
-    throw new PriceError("Price table must be a JSON object.");
-  }
-  if (typeof data.schema_version !== "number") {
-    throw new PriceError('Price table "schema_version" must be a number.');
-  }
-  if (typeof data.frontier_model !== "string" || data.frontier_model.trim() === "") {
-    throw new PriceError('Price table "frontier_model" must be a non-empty string.');
-  }
-  if (!isPlainObject6(data.models)) {
-    throw new PriceError('Price table "models" must be a mapping of model id to prices.');
-  }
-  const models = /* @__PURE__ */ Object.create(null);
-  for (const [model, raw] of Object.entries(data.models)) {
-    if (!isPlainObject6(raw)) {
-      throw new PriceError(`Price table models["${model}"] must be a mapping.`);
-    }
-    const entry = {
-      inputPer1M: requireNonNegativeNumber(raw.inputPer1M, `models["${model}"].inputPer1M`),
-      outputPer1M: requireNonNegativeNumber(raw.outputPer1M, `models["${model}"].outputPer1M`)
-    };
-    if (raw.family !== void 0) {
-      if (typeof raw.family !== "string" || raw.family.trim() === "") {
-        throw new PriceError(`models["${model}"].family must be a non-empty string when present.`);
-      }
-      entry.family = raw.family;
-    }
-    if (raw.released !== void 0) {
-      if (typeof raw.released !== "string" || Number.isNaN(Date.parse(raw.released))) {
-        throw new PriceError(`models["${model}"].released must be an ISO date string when present.`);
-      }
-      entry.released = raw.released;
-    }
-    models[model] = entry;
-  }
-  if (!Object.hasOwn(models, data.frontier_model)) {
-    throw new PriceError(
-      `Price table frontier_model "${data.frontier_model}" has no entry in models.`
-    );
-  }
-  return { schema_version: data.schema_version, frontier_model: data.frontier_model, models };
-}
-function requireUsage(usage) {
-  for (const key of ["tokens_in", "tokens_out"]) {
-    const v = usage[key];
-    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
-      throw new PriceError(`usage.${key} must be a finite number >= 0 (got ${JSON.stringify(v)}).`);
-    }
-  }
-}
-function priceForModel(table, model, usage) {
-  requireUsage(usage);
-  const p = Object.hasOwn(table.models, model) ? table.models[model] : void 0;
-  if (!p) {
-    throw new PriceError(`No price for model "${model}" in the price table.`);
-  }
-  return usage.tokens_in / 1e6 * p.inputPer1M + usage.tokens_out / 1e6 * p.outputPer1M;
-}
-function computeCostPrimitives(table, lane, usage) {
-  const frontier_cost = priceForModel(table, table.frontier_model, usage);
-  const actual_cost = lane.costBasis === "metered" ? priceForModel(table, lane.model, usage) : 0;
-  const metered_spent = lane.costBasis === "metered" ? actual_cost : 0;
-  return {
-    frontier_cost,
-    actual_cost,
-    metered_spent,
-    frontier_avoided: frontier_cost - actual_cost,
-    metered_avoided: frontier_cost - metered_spent
-  };
-}
-function forecastCost(promptText, lane, priceTable) {
-  let estTokensIn = 0;
-  if (typeof promptText === "string") {
-    estTokensIn = estimateTokens(promptText);
-  }
-  if (typeof estTokensIn !== "number" || !Number.isFinite(estTokensIn) || estTokensIn < 0) {
-    estTokensIn = 0;
-  }
-  estTokensIn = Math.floor(estTokensIn);
-  const basis = lane.costBasis;
-  if (basis === "subscription") {
-    return {
-      estTokensIn,
-      estCostUsd: 0,
-      basis,
-      note: "flat-rate subscription"
-    };
-  }
-  if (basis === "local") {
-    return {
-      estTokensIn,
-      estCostUsd: 0,
-      basis,
-      note: "local \u2014 no metered cost"
-    };
-  }
-  const missingNote = `missing price entry for model "${lane.model}" (price unavailable / output extra)`;
-  if (!priceTable || !priceTable.models || !Object.hasOwn(priceTable.models, lane.model)) {
-    return {
-      estTokensIn,
-      basis,
-      note: missingNote
-    };
-  }
-  const price = priceTable.models[lane.model];
-  if (!price || typeof price.inputPer1M !== "number" || !Number.isFinite(price.inputPer1M) || price.inputPer1M < 0) {
-    return {
-      estTokensIn,
-      basis,
-      note: missingNote
-    };
-  }
-  const estCostUsd = estTokensIn * price.inputPer1M / 1e6;
-  if (typeof estCostUsd !== "number" || !Number.isFinite(estCostUsd) || estCostUsd < 0) {
-    return {
-      estTokensIn,
-      basis,
-      note: missingNote
-    };
-  }
-  return {
-    estTokensIn,
-    estCostUsd,
-    basis,
-    note: "input only, output extra"
-  };
-}
-
-// ../core/src/ledger.ts
-var SCHEMA_VERSION = 2;
-var TASK_STATUSES = ["ok", "failed", "blocked", "fallback", "native"];
-var NATIVE_REASONS = ["no_route", "host_native"];
-var REVIEW_VERDICTS = ["pass", "needs-rework", "fail"];
-var VOTERS = ["reviewer_model", "user"];
-var SUBJECT_TYPES = ["router_task", "host_turn"];
-var OUTCOME_ACTIONS = ["accept", "rework", "escalate", "give_back"];
-var EVENT_FIELDS = [
-  "event_type",
-  "schema_version",
-  "id",
-  "seq",
-  "ts",
-  "task_id",
-  "attempt",
-  "parent_task_id",
-  "category",
-  "laneId",
-  "model",
-  "trust_mode",
-  "provenance",
-  "status",
-  "tokens_in",
-  "tokens_out",
-  "tokens_estimated",
-  "actual_cost",
-  "frontier_cost",
-  "metered_spent",
-  "frontier_avoided",
-  "metered_avoided",
-  "policy_verdict",
-  "superseded",
-  "native_reason"
-];
-var OUTCOME_EVENT_FIELDS = [
-  "event_type",
-  "schema_version",
-  "id",
-  "seq",
-  "ts",
-  "subject_id",
-  "subject_type",
-  "task_id",
-  "turn_id",
-  "review_id",
-  "attempt",
-  "category",
-  "subject_lane_id",
-  "subject_provenance",
-  "subject_model",
-  "subject_model_resolved",
-  "difficulty",
-  "reviewer_lane_id",
-  "reviewer_model",
-  "reviewer_trust_mode",
-  "reviewer_provenance",
-  "verdict",
-  "voter",
-  "policy_verdict",
-  "action_taken",
-  "target_lane_id"
-];
-var LedgerError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "LedgerError";
-  }
-};
-function isPlainObject7(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function requireString2(value, where) {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new LedgerError(`${where} must be a non-empty string.`);
-  }
-  return value;
-}
-function optionalString(value, where) {
-  if (value === void 0) return void 0;
-  return requireString2(value, where);
-}
-function requireIsoTimestamp(value, where) {
-  const s = requireString2(value, where);
-  if (Number.isNaN(Date.parse(s))) {
-    throw new LedgerError(`${where} must be a valid ISO-8601 timestamp (got ${JSON.stringify(value)}).`);
-  }
-  return s;
-}
-function requireNonNegativeNumber2(value, where) {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    throw new LedgerError(`${where} must be a finite number >= 0 (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function requireNonNegativeInt(value, where) {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-    throw new LedgerError(`${where} must be a non-negative integer (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function requireBoolean(value, where) {
-  if (typeof value !== "boolean") {
-    throw new LedgerError(`${where} must be a boolean (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function requireEnum2(value, allowed, where) {
-  if (typeof value !== "string" || !allowed.includes(value)) {
-    throw new LedgerError(`${where} must be one of: ${allowed.join(", ")} (got ${JSON.stringify(value)}).`);
-  }
-  return value;
-}
-function validateEventInput(input) {
-  const actual_cost = requireNonNegativeNumber2(input.actual_cost, "task.actual_cost");
-  const frontier_cost = requireNonNegativeNumber2(input.frontier_cost, "task.frontier_cost");
-  const metered_spent = requireNonNegativeNumber2(input.metered_spent, "task.metered_spent");
-  const out = {
-    task_id: requireString2(input.task_id, "task.task_id"),
-    attempt: requireNonNegativeInt(input.attempt, "task.attempt"),
-    category: requireEnum2(input.category, TASK_CATEGORIES, "task.category"),
-    laneId: requireString2(input.laneId, "task.laneId"),
-    model: requireString2(input.model, "task.model"),
-    trust_mode: requireEnum2(input.trust_mode, TRUST_MODES, "task.trust_mode"),
-    provenance: requireString2(input.provenance, "task.provenance"),
-    status: requireEnum2(input.status, TASK_STATUSES, "task.status"),
-    tokens_in: requireNonNegativeInt(input.tokens_in, "task.tokens_in"),
-    tokens_out: requireNonNegativeInt(input.tokens_out, "task.tokens_out"),
-    tokens_estimated: requireBoolean(input.tokens_estimated, "task.tokens_estimated"),
-    actual_cost,
-    frontier_cost,
-    metered_spent,
-    frontier_avoided: frontier_cost - actual_cost,
-    metered_avoided: frontier_cost - metered_spent,
-    policy_verdict: requireEnum2(input.policy_verdict, POLICY_VERDICTS, "task.policy_verdict")
-  };
-  const parent = optionalString(input.parent_task_id, "task.parent_task_id");
-  if (parent !== void 0) out.parent_task_id = parent;
-  if (input.superseded !== void 0) out.superseded = requireBoolean(input.superseded, "task.superseded");
-  if (input.native_reason !== void 0) {
-    out.native_reason = requireEnum2(input.native_reason, NATIVE_REASONS, "task.native_reason");
-  }
-  return out;
-}
-function validateOutcomeInput(input) {
-  const out = {
-    subject_id: requireString2(input.subject_id, "outcome.subject_id"),
-    subject_type: requireEnum2(input.subject_type, SUBJECT_TYPES, "outcome.subject_type"),
-    review_id: requireString2(input.review_id, "outcome.review_id"),
-    attempt: requireNonNegativeInt(input.attempt, "outcome.attempt"),
-    category: requireEnum2(input.category, TASK_CATEGORIES, "outcome.category"),
-    reviewer_lane_id: requireString2(input.reviewer_lane_id, "outcome.reviewer_lane_id"),
-    reviewer_model: requireString2(input.reviewer_model, "outcome.reviewer_model"),
-    reviewer_trust_mode: requireEnum2(input.reviewer_trust_mode, TRUST_MODES, "outcome.reviewer_trust_mode"),
-    reviewer_provenance: requireString2(input.reviewer_provenance, "outcome.reviewer_provenance"),
-    verdict: requireEnum2(input.verdict, REVIEW_VERDICTS, "outcome.verdict"),
-    voter: requireEnum2(input.voter, VOTERS, "outcome.voter"),
-    policy_verdict: requireEnum2(input.policy_verdict, POLICY_VERDICTS, "outcome.policy_verdict")
-  };
-  const task_id = optionalString(input.task_id, "outcome.task_id");
-  if (task_id !== void 0) out.task_id = task_id;
-  const turn_id = optionalString(input.turn_id, "outcome.turn_id");
-  if (turn_id !== void 0) out.turn_id = turn_id;
-  const subject_lane_id = optionalString(input.subject_lane_id, "outcome.subject_lane_id");
-  if (subject_lane_id !== void 0) out.subject_lane_id = subject_lane_id;
-  const subject_provenance = optionalString(input.subject_provenance, "outcome.subject_provenance");
-  if (subject_provenance !== void 0) out.subject_provenance = subject_provenance;
-  const subject_model = optionalString(input.subject_model, "outcome.subject_model");
-  if (subject_model !== void 0) out.subject_model = subject_model;
-  const subject_model_resolved = optionalString(input.subject_model_resolved, "outcome.subject_model_resolved");
-  if (subject_model_resolved !== void 0) out.subject_model_resolved = subject_model_resolved;
-  if (input.difficulty !== void 0) {
-    out.difficulty = requireEnum2(input.difficulty, DIFFICULTY_BUCKETS, "outcome.difficulty");
-  }
-  if (input.action_taken !== void 0) {
-    out.action_taken = requireEnum2(input.action_taken, OUTCOME_ACTIONS, "outcome.action_taken");
-  }
-  const target_lane_id = optionalString(input.target_lane_id, "outcome.target_lane_id");
-  if (target_lane_id !== void 0) out.target_lane_id = target_lane_id;
-  return out;
-}
-function serializeFields(event, fields) {
-  const record2 = {};
-  for (const field of fields) {
-    const value = event[field];
-    if (value !== void 0) record2[field] = value;
-  }
-  return JSON.stringify(record2);
-}
-function serializeEvent(event) {
-  return event.event_type === "task" ? serializeFields(event, EVENT_FIELDS) : serializeFields(event, OUTCOME_EVENT_FIELDS);
-}
-function parseMeta(obj) {
-  const event_type = obj.event_type === void 0 ? "task" : requireEnum2(obj.event_type, ["task", "outcome"], "event.event_type");
-  const schema_version = obj.schema_version === void 0 ? 0 : requireNonNegativeInt(obj.schema_version, "event.schema_version");
-  return {
-    event_type,
-    schema_version,
-    id: requireString2(obj.id, "event.id"),
-    seq: requireNonNegativeInt(obj.seq, "event.seq"),
-    ts: requireIsoTimestamp(obj.ts, "event.ts")
-  };
-}
-function backfillLegacyTask(obj) {
-  return {
-    task_id: obj.id,
-    attempt: 0,
-    // A legacy `block` verdict was a blocked send — preserve it so blockCount holds.
-    status: obj.policy_verdict === "block" ? "blocked" : "ok",
-    trust_mode: "full",
-    provenance: "unknown",
-    ...obj
-    // any field actually present on the row wins over the legacy default
-  };
-}
-function parseEvent(obj) {
-  if (!isPlainObject7(obj)) {
-    throw new LedgerError("Ledger record must be a JSON object.");
-  }
-  const meta2 = parseMeta(obj);
-  if (meta2.event_type === "task") {
-    const source = obj.event_type === void 0 ? backfillLegacyTask(obj) : obj;
-    return { ...meta2, event_type: "task", ...validateEventInput(source) };
-  }
-  return { ...meta2, event_type: "outcome", ...validateOutcomeInput(obj) };
-}
-function filterEventsSince(events, sinceIso) {
-  if (sinceIso === void 0) return [...events];
-  const since = Date.parse(sinceIso);
-  if (Number.isNaN(since)) {
-    throw new LedgerError(`filterEventsSince: invalid ISO timestamp ${JSON.stringify(sinceIso)}.`);
-  }
-  return events.filter((e) => Date.parse(e.ts) >= since);
-}
-function taskEventsOf(events) {
-  return events.filter((e) => e.event_type === "task");
-}
-function summarize(events) {
-  const tasks = taskEventsOf(events);
-  let frontier_cost = 0;
-  let actual_cost = 0;
-  let metered_spent_total = 0;
-  let blockCount = 0;
-  let nativeFallbacks = 0;
-  let realEvents = 0;
-  const laneMix = /* @__PURE__ */ Object.create(null);
-  for (const e of tasks) {
-    if (e.status === "native") {
-      nativeFallbacks += 1;
-      continue;
-    }
-    realEvents += 1;
-    actual_cost += e.actual_cost;
-    metered_spent_total += e.metered_spent;
-    if (e.status === "blocked") blockCount += 1;
-    if (e.status === "ok" && e.superseded !== true) frontier_cost += e.frontier_cost;
-    laneMix[e.laneId] = (laneMix[e.laneId] ?? 0) + 1;
-  }
-  const frontier_avoided = frontier_cost - actual_cost;
-  const metered_avoided = frontier_cost - metered_spent_total;
-  const pct3 = (n) => frontier_cost === 0 ? 0 : 100 * n / frontier_cost;
-  const savings = {
-    frontier_cost,
-    frontier_avoided,
-    metered_spent: metered_spent_total,
-    metered_avoided,
-    frontier_avoided_pct: pct3(frontier_avoided),
-    metered_avoided_pct: pct3(metered_avoided)
-  };
-  return { events: realEvents, savings, actual_cost, metered_spent_total, laneMix, blockCount, nativeFallbacks };
-}
-function emptyBucket() {
-  return {
-    in: 0,
-    out: 0,
-    total: 0,
-    estimated: { in: 0, out: 0, total: 0 },
-    reported: { in: 0, out: 0, total: 0 }
-  };
-}
-function addToBucket(b, e) {
-  b.in += e.tokens_in;
-  b.out += e.tokens_out;
-  b.total += e.tokens_in + e.tokens_out;
-  const sub = e.tokens_estimated ? b.estimated : b.reported;
-  sub.in += e.tokens_in;
-  sub.out += e.tokens_out;
-  sub.total += e.tokens_in + e.tokens_out;
-}
-function group(map, key, e) {
-  let g = map[key];
-  if (!g) {
-    g = { ...emptyBucket(), events: 0 };
-    map[key] = g;
-  }
-  addToBucket(g, e);
-  g.events += 1;
-}
-function tokenStats(events) {
-  const total = emptyBucket();
-  const byModel = /* @__PURE__ */ Object.create(null);
-  const byLane = /* @__PURE__ */ Object.create(null);
-  for (const e of taskEventsOf(events)) {
-    addToBucket(total, e);
-    group(byModel, e.model, e);
-    group(byLane, e.laneId, e);
-  }
-  return { total, byModel, byLane };
 }
 
 // ../core/src/reassign.ts
@@ -29940,7 +30138,129 @@ ${r.notes}` : "";
       return ok(lines.join("\n\n"), { findings: sorted });
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool];
+  const planTool = {
+    name: "router_plan",
+    description: "Suggest portfolio/lane improvements based on your routed-share history. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        period: { type: "string", description: 'Window: "all" (default) or N + d/h, e.g. "7d".' }
+      }
+    },
+    handler: (deps, args) => guardedAsync(async () => {
+      try {
+        const period = optString(args, "period");
+        let events;
+        try {
+          const since = resolveSinceIso(period, deps.now());
+          events = core.filterEventsSince(deps.readLedger(), since);
+        } catch {
+          return ok(
+            `Could not read the ledger. No plan optimization advice is available.`,
+            {
+              error: true,
+              message: `could not read the ledger`
+            }
+          );
+        }
+        const lanes = deps.allLanes ? deps.allLanes() : [];
+        const priceTable = deps.loadPriceTable ? deps.loadPriceTable() : { schema_version: 1, frontier_model: "", models: {} };
+        const observedCapability = deps.getFrozen?.() ? void 0 : deps.observedCapability();
+        const observedCapabilityByModel = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModel?.();
+        const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModelDifficulty?.();
+        const routingContext = {
+          lanes,
+          observedCapability,
+          observedCapabilityByModel,
+          observedCapabilityByModelDifficulty
+        };
+        if (!core.analyzePlan) {
+          return failResult("Plan optimizer core function is not available on this server.");
+        }
+        const result = core.analyzePlan(events, lanes, priceTable, deps.now(), {
+          periodLabel: period && period !== "all" ? `last ${period}` : "all history",
+          routingContext
+        });
+        if (result.message) {
+          const advisoryLines = [
+            `Plan Optimization Advisory (routed-share only \u2014 not your total usage)`,
+            `  window: ${period ?? "all history"}`,
+            `  status: ${result.message}`
+          ];
+          return ok(advisoryLines.join("\n"), result);
+        }
+        const lines = [
+          `Plan Optimization Advisory (routed-share only \u2014 not your total usage)`,
+          `  window: ${period ?? "all history"}`,
+          `  total routed offloads: ${result.totalRoutedOffloads} routed attempts (routed-share only)`,
+          ``,
+          `Lane Portfolio Stats (routed-share only):`
+        ];
+        const laneIds = Object.keys(result.laneStats);
+        for (const laneId of laneIds) {
+          const stats = result.laneStats[laneId];
+          const isFrontier = lanes.find((l) => l.id === laneId)?.model === priceTable.frontier_model;
+          const label = isFrontier ? " (frontier)" : "";
+          lines.push(`  ${laneId}${label}:`);
+          lines.push(`    delivered successes: ${stats.deliveredCount} successes (routed-share only)`);
+          const spent = stats.meteredSpent;
+          const spendStr = stats.meteredSpentUnavailable || spent === null ? "metered spend unavailable \u2014 data anomaly" : `$${spent.toFixed(4)}`;
+          lines.push(`    metered spend: ${spendStr} (routed-share only)`);
+          lines.push(`    routed attempts: ${stats.routedCount} attempts (${stats.share.toFixed(1)}% of total routed attempts) (routed-share only)`);
+          const cats = Object.keys(stats.categoryDistribution);
+          if (cats.length > 0) {
+            const catParts = cats.map((c) => `${c} (${stats.categoryDistribution[c]} routed attempts)`).join(", ");
+            lines.push(`    categories: ${catParts} (routed-share only)`);
+          }
+        }
+        const frontierLaneIds = Object.keys(result.frontierCategoryBreakdown);
+        if (frontierLaneIds.length > 0) {
+          lines.push(``, `Frontier Lane Category Breakdown (routed-share only):`);
+          for (const fLaneId of frontierLaneIds) {
+            const breakdown = result.frontierCategoryBreakdown[fLaneId] ?? {};
+            const stats = result.laneStats[fLaneId];
+            const fRoutedCount = stats ? stats.routedCount : 0;
+            lines.push(`  ${fLaneId}:`);
+            const cats = Object.keys(breakdown);
+            if (cats.length === 0 || fRoutedCount === 0) {
+              lines.push(`    (no frontier lane tasks recorded) (routed-share only)`);
+            } else {
+              for (const cat of cats) {
+                const count = breakdown[cat] ?? 0;
+                const pct3 = 100 * count / fRoutedCount;
+                lines.push(`    ${cat}: ${count} routed attempts (${pct3.toFixed(1)}% of lane's routed attempts) (routed-share only)`);
+              }
+            }
+          }
+        }
+        lines.push(``, `Suggestions:`);
+        if (result.suggestions.length === 0) {
+          lines.push(`  No portfolio optimization suggestions based on the routed history in this window.`);
+        } else {
+          result.suggestions.forEach((s, idx) => {
+            lines.push(`  ${idx + 1}. ${s.title}`);
+            lines.push(`     Evidence: ${s.evidence}`);
+            lines.push(`     Suggestion: ${s.suggestion}`);
+            lines.push(``);
+          });
+          if (lines[lines.length - 1] === "") {
+            lines.pop();
+          }
+        }
+        return ok(lines.join("\n"), result);
+      } catch {
+        return ok(
+          `Could not compute plan advice \u2014 check setup.`,
+          {
+            error: true,
+            message: `could not compute plan advice \u2014 check setup`
+          }
+        );
+      }
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool];
 }
 function receiptLine(r) {
   const int2 = (n) => Math.round(n).toLocaleString("en-US");
@@ -30510,7 +30830,7 @@ function fileFullAccessStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan };
 function receiptFromEvents(events) {
   const legs = events.filter((e) => e.status !== "native");
   if (legs.length === 0) return void 0;

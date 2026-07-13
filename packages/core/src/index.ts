@@ -1,6 +1,9 @@
 /** Public surface of the TokenMaxed routing brain. */
 
 export * from './types.ts';
+export { analyzePlan } from './plan.ts';
+export type { LanePlanStats, PlanOptimizationSuggestion, PlanOptimizationResult } from './plan.ts';
+
 export {
   routeDecide,
   eligibleLanes,

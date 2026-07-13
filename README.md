@@ -139,6 +139,7 @@ to a cheaper lane") or drive everything by hand:
 | `/tokenmaxed:doctor` | check the setup end-to-end and report actionable problems |
 | `/tokenmaxed:summary` | at-a-glance: 24h/7d/lifetime usage + metered $ avoided, your lanes + the active reviewer |
 | `/tokenmaxed:savings [7d]` | savings from the local ledger |
+| `/tokenmaxed:plan [7d]` | portfolio/lane suggestions based on routed usage history (read-only) |
 | `/tokenmaxed:tokens [by lane]` | token usage (by model or lane) |
 | `/tokenmaxed:why <category>` | preview which lane would handle a category — nothing runs |
 | `/tokenmaxed:review` | manager review of your current working-tree changes |
