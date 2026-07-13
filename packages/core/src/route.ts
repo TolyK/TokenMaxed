@@ -257,7 +257,7 @@ export function resolveLaneModelKey(lane: Lane): string {
 }
 
 /** Observed evidence for a lane×category from model- or lane-keyed overlays. */
-function observedForLane(
+export function observedForLane(
   lane: Lane,
   category: Task['category'],
   laneOverlay?: ObservedCapabilityByLane,

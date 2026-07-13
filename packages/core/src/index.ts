@@ -3,6 +3,8 @@
 export * from './types.ts';
 export { analyzePlan } from './plan.ts';
 export type { LanePlanStats, PlanOptimizationSuggestion, PlanOptimizationResult } from './plan.ts';
+export { analyzeBacktest, observedForLaneWithDifficulty } from './backtest.ts';
+export type { BacktestPolicy, BacktestDifference, BacktestSummary, BacktestEvidence } from './backtest.ts';
 
 export {
   routeDecide,
@@ -21,6 +23,7 @@ export {
   effectiveCapabilityOptsFromContext,
   effectiveOptsForTask,
   resolveLaneModelKey,
+  observedForLane,
   DEFAULT_CAPABILITY,
   DEFAULT_PRIOR_STRENGTH,
   DEFAULT_TIER_FLOOR,

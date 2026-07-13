@@ -22668,6 +22668,459 @@ function analyzePlan(events, lanes, priceTable, now, opts = {}) {
   };
 }
 
+// ../core/src/feedback.ts
+var MS_PER_DAY = 864e5;
+var SEP = "\0";
+var DEFAULT_HALF_LIFE_DAYS = 30;
+function verdictValue(verdict) {
+  if (verdict === "pass") return 1;
+  if (verdict === "needs-rework") return 0.5;
+  return 0;
+}
+function isLearnableOutcome(e) {
+  return e.event_type === "outcome" && e.subject_type === "router_task" && (e.voter === "reviewer_model" || e.voter === "user") && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
+}
+function modelKeyFromOutcome(e) {
+  const resolved = e.subject_model_resolved?.trim();
+  if (resolved) return resolved;
+  const raw = e.subject_model?.trim();
+  if (raw) return raw;
+  return void 0;
+}
+function dedupKey(e) {
+  return [e.task_id, e.attempt, modelKeyFromOutcome(e), e.category].join(SEP);
+}
+function contributingOutcomes(events, now, opts = {}) {
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const latest = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (!isLearnableOutcome(e)) continue;
+    const modelKey = modelKeyFromOutcome(e);
+    if (!modelKey) continue;
+    if (!Number.isFinite(Date.parse(e.ts))) continue;
+    const key = dedupKey(e);
+    const prev = latest.get(key);
+    if (!prev || e.seq > prev.seq) latest.set(key, e);
+  }
+  const result = [];
+  for (const e of latest.values()) {
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    if (!Number.isFinite(weight) || weight <= 0) continue;
+    result.push(e);
+  }
+  return result;
+}
+function outcomeCapability(events, now, opts = {}) {
+  const contribs = contributingOutcomes(events, now, opts);
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const acc = /* @__PURE__ */ new Map();
+  for (const e of contribs) {
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    const modelKey = modelKeyFromOutcome(e);
+    const accKey = [modelKey, e.category].join(SEP);
+    let a = acc.get(accKey);
+    if (!a) {
+      a = { modelKey, category: e.category, weightSum: 0, weightedValueSum: 0 };
+      acc.set(accKey, a);
+    }
+    a.weightSum += weight;
+    a.weightedValueSum += weight * verdictValue(e.verdict);
+  }
+  const overlay = /* @__PURE__ */ Object.create(null);
+  for (const a of acc.values()) {
+    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
+    const observed = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
+    const inner = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
+    inner[a.category] = observed;
+  }
+  return overlay;
+}
+function outcomeCapabilityByDifficulty(events, now, opts = {}) {
+  const contribs = contributingOutcomes(events, now, opts);
+  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
+  const nowMs = Number.isFinite(now) ? now : Number.NaN;
+  const acc = /* @__PURE__ */ new Map();
+  for (const e of contribs) {
+    const difficulty = e.difficulty;
+    if (!difficulty) continue;
+    const tsMs = Date.parse(e.ts);
+    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
+    const weight = Math.pow(0.5, ageDays / halfLife);
+    const modelKey = modelKeyFromOutcome(e);
+    const accKey = [modelKey, e.category, difficulty].join(SEP);
+    let a = acc.get(accKey);
+    if (!a) {
+      a = { modelKey, category: e.category, difficulty, weightSum: 0, weightedValueSum: 0 };
+      acc.set(accKey, a);
+    }
+    a.weightSum += weight;
+    a.weightedValueSum += weight * verdictValue(e.verdict);
+  }
+  const overlay = /* @__PURE__ */ Object.create(null);
+  for (const a of acc.values()) {
+    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
+    const byCategory = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
+    const byDifficulty = byCategory[a.category] ?? (byCategory[a.category] = /* @__PURE__ */ Object.create(null));
+    byDifficulty[a.difficulty] = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
+  }
+  return overlay;
+}
+function zValueForConfidence(confidence) {
+  const map = {
+    0.8: 1.28155,
+    0.85: 1.43953,
+    0.9: 1.64485,
+    0.95: 1.95996,
+    0.98: 2.32635,
+    0.99: 2.57583,
+    0.999: 3.29053
+  };
+  return map[confidence] ?? 1.95996;
+}
+function capabilityInterval(observed, opts) {
+  if (!observed) return void 0;
+  const rawN = observed.n;
+  const rawRate = observed.rate;
+  if (!Number.isFinite(rawN) || rawN <= 0 || !Number.isFinite(rawRate) || rawRate < 0 || rawRate > 1) {
+    return void 0;
+  }
+  const rate = rawRate;
+  const confidence = opts?.confidence ?? 0.95;
+  const z = zValueForConfidence(confidence);
+  const z2 = z * z;
+  const denom = 1 + z2 / rawN;
+  if (!Number.isFinite(denom) || denom === 0) {
+    return void 0;
+  }
+  const center = (rate + z2 / (2 * rawN)) / denom;
+  const inner = rate * (1 - rate) / rawN + z2 / (4 * rawN * rawN);
+  if (inner < 0 || !Number.isFinite(inner)) {
+    return void 0;
+  }
+  const spread = z * Math.sqrt(inner) / denom;
+  if (!Number.isFinite(center) || !Number.isFinite(spread)) {
+    return void 0;
+  }
+  const lo = Math.max(0, Math.min(1, center - spread));
+  const hi = Math.max(0, Math.min(1, center + spread));
+  return { lo, hi, n: rawN, rate };
+}
+function evidenceFreshnessDays(outcomes, now) {
+  if (!Number.isFinite(now)) {
+    return void 0;
+  }
+  if (!outcomes || outcomes.length === 0) {
+    return void 0;
+  }
+  let maxTs = -Infinity;
+  let hasValid = false;
+  for (const e of outcomes) {
+    if (!e.ts) continue;
+    const tsMs = Date.parse(e.ts);
+    if (Number.isFinite(tsMs)) {
+      if (tsMs > maxTs) {
+        maxTs = tsMs;
+      }
+      hasValid = true;
+    }
+  }
+  if (!hasValid || maxTs === -Infinity) {
+    return void 0;
+  }
+  const ageDays = (now - maxTs) / MS_PER_DAY;
+  return Math.max(0, ageDays);
+}
+
+// ../core/src/backtest.ts
+var MIN_SIGNIFICANT_N = 5;
+function isValidObserved(obs) {
+  if (!obs) return false;
+  const { rate, n } = obs;
+  return Number.isFinite(rate) && rate >= 0 && rate <= 1 && Number.isFinite(n) && n >= 0;
+}
+function sanitizeEvidence(obs, lo, hi, freshness) {
+  const rate = Number.isFinite(obs.rate) && obs.rate >= 0 && obs.rate <= 1 ? obs.rate : 0;
+  const n = Number.isFinite(obs.n) && obs.n >= 0 ? obs.n : 0;
+  if (n <= 0) return void 0;
+  const cleanLo = lo !== void 0 && Number.isFinite(lo) && lo >= 0 && lo <= 1 ? lo : void 0;
+  const cleanHi = hi !== void 0 && Number.isFinite(hi) && hi >= 0 && hi <= 1 ? hi : void 0;
+  const cleanFresh = freshness !== void 0 && Number.isFinite(freshness) && freshness >= 0 ? freshness : void 0;
+  return {
+    rate,
+    n,
+    ...cleanLo !== void 0 ? { lo: cleanLo } : {},
+    ...cleanHi !== void 0 ? { hi: cleanHi } : {},
+    ...cleanFresh !== void 0 ? { freshnessDays: cleanFresh } : {}
+  };
+}
+function observedForLaneWithDifficulty(lane, category, difficulty, laneOverlay, modelOverlay, difficultyOverlay, onResolveSource) {
+  const modelKey = resolveLaneModelKey(lane);
+  if (difficulty && difficultyOverlay) {
+    const cell2 = difficultyOverlay[modelKey]?.[category]?.[difficulty];
+    if (cell2) {
+      onResolveSource?.("difficulty");
+      return cell2;
+    }
+  }
+  if (modelOverlay) {
+    const cell2 = modelOverlay[modelKey]?.[category];
+    if (cell2) {
+      onResolveSource?.("model");
+      return cell2;
+    }
+    return void 0;
+  }
+  const cell = laneOverlay?.[lane.id]?.[category];
+  if (cell) {
+    onResolveSource?.("lane");
+    return cell;
+  }
+  return void 0;
+}
+function analyzeBacktest(events, baseCtx, policy, now, opts) {
+  const { policyA, policyB } = opts;
+  const difficultyMap = /* @__PURE__ */ new Map();
+  for (const e of events) {
+    if (e.event_type === "outcome" && e.task_id && e.difficulty) {
+      difficultyMap.set(`${e.task_id}:${e.attempt}`, e.difficulty);
+    }
+  }
+  const workloadCells = /* @__PURE__ */ new Map();
+  let totalDecisions = 0;
+  for (const e of events) {
+    if (e.event_type === "task") {
+      if (e.status !== "native") {
+        const difficulty = difficultyMap.get(`${e.task_id}:${e.attempt}`);
+        const key = `${e.category}:${difficulty || ""}`;
+        const existing = workloadCells.get(key);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          workloadCells.set(key, { category: e.category, difficulty, count: 1 });
+        }
+        totalDecisions += 1;
+      }
+    }
+  }
+  if (totalDecisions === 0) {
+    return {
+      diffPercent: 0,
+      differences: [],
+      netSignal: "neutral / insufficient"
+    };
+  }
+  const sanitizeObservedCapability = (overlay) => {
+    if (!overlay) return void 0;
+    const clean = {};
+    for (const [laneId, categories] of Object.entries(overlay)) {
+      if (!categories) continue;
+      const cleanCats = {};
+      for (const [cat, obs] of Object.entries(categories)) {
+        if (isValidObserved(obs)) {
+          cleanCats[cat] = obs;
+        }
+      }
+      clean[laneId] = cleanCats;
+    }
+    return clean;
+  };
+  const sanitizeObservedCapabilityByModel = (overlay) => {
+    if (!overlay) return void 0;
+    const clean = {};
+    for (const [model, categories] of Object.entries(overlay)) {
+      if (!categories) continue;
+      const cleanCats = {};
+      for (const [cat, obs] of Object.entries(categories)) {
+        if (isValidObserved(obs)) {
+          cleanCats[cat] = obs;
+        }
+      }
+      clean[model] = cleanCats;
+    }
+    return clean;
+  };
+  const sanitizeObservedCapabilityByModelDifficulty = (overlay) => {
+    if (!overlay) return void 0;
+    const clean = {};
+    for (const [model, categories] of Object.entries(overlay)) {
+      if (!categories) continue;
+      const cleanCats = {};
+      for (const [cat, diffs] of Object.entries(categories)) {
+        if (!diffs) continue;
+        const cleanDiffs = {};
+        for (const [diff, obs] of Object.entries(diffs)) {
+          if (isValidObserved(obs)) {
+            cleanDiffs[diff] = obs;
+          }
+        }
+        cleanCats[cat] = cleanDiffs;
+      }
+      clean[model] = cleanCats;
+    }
+    return clean;
+  };
+  const cleanCtx = {
+    ...baseCtx,
+    observedCapability: sanitizeObservedCapability(baseCtx.observedCapability),
+    observedCapabilityByModel: sanitizeObservedCapabilityByModel(baseCtx.observedCapabilityByModel),
+    observedCapabilityByModelDifficulty: sanitizeObservedCapabilityByModelDifficulty(baseCtx.observedCapabilityByModelDifficulty)
+  };
+  const contributing = contributingOutcomes(events, now);
+  function getFreshness(lane, category, difficulty, source) {
+    if (!source) return void 0;
+    const modelKey = resolveLaneModelKey(lane);
+    const laneOutcomes = contributing.filter((e) => {
+      if (e.category !== category) return false;
+      const outcomeModel = e.subject_model_resolved?.trim() || e.subject_model?.trim();
+      if (source === "difficulty") {
+        return e.difficulty === difficulty && outcomeModel === modelKey;
+      }
+      if (source === "model") {
+        return outcomeModel === modelKey;
+      }
+      if (source === "lane") {
+        return e.subject_lane_id === lane.id;
+      }
+      return false;
+    });
+    const fresh = evidenceFreshnessDays(laneOutcomes, now);
+    return fresh !== void 0 && Number.isFinite(fresh) && fresh >= 0 ? fresh : void 0;
+  }
+  const differences = [];
+  let diffCount = 0;
+  const sortedCellKeys = [...workloadCells.keys()].sort();
+  for (const key of sortedCellKeys) {
+    const cell = workloadCells.get(key);
+    const task = {
+      category: cell.category,
+      difficulty: cell.difficulty
+    };
+    const buildCtxForPolicy = (pol) => {
+      return {
+        ...cleanCtx,
+        routingPolicy: pol,
+        strategy: pol === "cheapest" ? "tiered" : void 0
+      };
+    };
+    const ctxA = buildCtxForPolicy(policyA);
+    const ctxB = buildCtxForPolicy(policyB);
+    let pickA = "native";
+    let pickB = "native";
+    try {
+      pickA = routeDecide(task, ctxA, policy).laneId;
+    } catch {
+    }
+    try {
+      pickB = routeDecide(task, ctxB, policy).laneId;
+    } catch {
+    }
+    if (pickA !== pickB) {
+      diffCount += cell.count;
+      const laneA = baseCtx.lanes.find((l) => l.id === pickA);
+      const laneB = baseCtx.lanes.find((l) => l.id === pickB);
+      let obsSourceA;
+      let obsSourceB;
+      let obsA = laneA ? observedForLaneWithDifficulty(
+        laneA,
+        cell.category,
+        cell.difficulty,
+        cleanCtx.observedCapability,
+        cleanCtx.observedCapabilityByModel,
+        cleanCtx.observedCapabilityByModelDifficulty,
+        (src) => {
+          obsSourceA = src;
+        }
+      ) : void 0;
+      let obsB = laneB ? observedForLaneWithDifficulty(
+        laneB,
+        cell.category,
+        cell.difficulty,
+        cleanCtx.observedCapability,
+        cleanCtx.observedCapabilityByModel,
+        cleanCtx.observedCapabilityByModelDifficulty,
+        (src) => {
+          obsSourceB = src;
+        }
+      ) : void 0;
+      if (!isValidObserved(obsA)) {
+        obsA = void 0;
+        obsSourceA = void 0;
+      }
+      if (!isValidObserved(obsB)) {
+        obsB = void 0;
+        obsSourceB = void 0;
+      }
+      const intA = obsA ? capabilityInterval(obsA) : void 0;
+      const intB = obsB ? capabilityInterval(obsB) : void 0;
+      const freshnessA = laneA ? getFreshness(laneA, cell.category, cell.difficulty, obsSourceA) : void 0;
+      const freshnessB = laneB ? getFreshness(laneB, cell.category, cell.difficulty, obsSourceB) : void 0;
+      const isThinA = !obsA || obsA.n < MIN_SIGNIFICANT_N;
+      const isThinB = !obsB || obsB.n < MIN_SIGNIFICANT_N;
+      let comparison = "insufficient_evidence";
+      if (isThinA || isThinB) {
+        comparison = "insufficient_evidence";
+      } else if (intA && intB) {
+        if (intA.lo > intB.hi) {
+          comparison = "favors_A";
+        } else if (intB.lo > intA.hi) {
+          comparison = "favors_B";
+        } else {
+          comparison = "neutral";
+        }
+      }
+      const evidenceA = obsA ? sanitizeEvidence(obsA, intA?.lo, intA?.hi, freshnessA) : void 0;
+      const evidenceB = obsB ? sanitizeEvidence(obsB, intB?.lo, intB?.hi, freshnessB) : void 0;
+      const workloadSharePercent = totalDecisions > 0 ? cell.count / totalDecisions * 100 : 0;
+      differences.push({
+        category: cell.category,
+        difficulty: cell.difficulty,
+        workloadSharePercent,
+        pickA,
+        pickB,
+        ...evidenceA ? { evidenceA } : {},
+        ...evidenceB ? { evidenceB } : {},
+        comparison
+      });
+    }
+  }
+  let favorAVolume = 0;
+  let favorBVolume = 0;
+  let totalDiffVolume = 0;
+  for (const diff of differences) {
+    const cellKey = `${diff.category}:${diff.difficulty || ""}`;
+    const cellCount = workloadCells.get(cellKey)?.count || 0;
+    totalDiffVolume += cellCount;
+    if (diff.comparison === "favors_A") {
+      favorAVolume += cellCount;
+    } else if (diff.comparison === "favors_B") {
+      favorBVolume += cellCount;
+    }
+  }
+  let netSignal = "neutral / insufficient";
+  if (totalDiffVolume > 0) {
+    const neutralOrInsufficientVolume = totalDiffVolume - favorAVolume - favorBVolume;
+    if (neutralOrInsufficientVolume < totalDiffVolume / 2) {
+      if (favorAVolume > favorBVolume) {
+        netSignal = "evidence favors A";
+      } else if (favorBVolume > favorAVolume) {
+        netSignal = "evidence favors B";
+      }
+    }
+  }
+  const diffPercent = totalDecisions > 0 ? diffCount / totalDecisions * 100 : 0;
+  return {
+    diffPercent,
+    differences,
+    netSignal
+  };
+}
+
 // ../core/src/window-quota.ts
 var FIVE_HOUR_MS = 5 * 60 * 60 * 1e3;
 var WINDOW_WARN_USED = 0.7;
@@ -22962,175 +23415,6 @@ function quotaEstimate(lane, events, opts, now) {
     confidence,
     dominantSource
   };
-}
-
-// ../core/src/feedback.ts
-var MS_PER_DAY = 864e5;
-var SEP = "\0";
-var DEFAULT_HALF_LIFE_DAYS = 30;
-function verdictValue(verdict) {
-  if (verdict === "pass") return 1;
-  if (verdict === "needs-rework") return 0.5;
-  return 0;
-}
-function isLearnableOutcome(e) {
-  return e.event_type === "outcome" && e.subject_type === "router_task" && (e.voter === "reviewer_model" || e.voter === "user") && typeof e.subject_lane_id === "string" && e.subject_lane_id !== "" && typeof e.task_id === "string" && e.task_id !== "";
-}
-function modelKeyFromOutcome(e) {
-  const resolved = e.subject_model_resolved?.trim();
-  if (resolved) return resolved;
-  const raw = e.subject_model?.trim();
-  if (raw) return raw;
-  return void 0;
-}
-function dedupKey(e) {
-  return [e.task_id, e.attempt, modelKeyFromOutcome(e), e.category].join(SEP);
-}
-function contributingOutcomes(events, now, opts = {}) {
-  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
-  const nowMs = Number.isFinite(now) ? now : Number.NaN;
-  const latest = /* @__PURE__ */ new Map();
-  for (const e of events) {
-    if (!isLearnableOutcome(e)) continue;
-    const modelKey = modelKeyFromOutcome(e);
-    if (!modelKey) continue;
-    if (!Number.isFinite(Date.parse(e.ts))) continue;
-    const key = dedupKey(e);
-    const prev = latest.get(key);
-    if (!prev || e.seq > prev.seq) latest.set(key, e);
-  }
-  const result = [];
-  for (const e of latest.values()) {
-    const tsMs = Date.parse(e.ts);
-    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
-    const weight = Math.pow(0.5, ageDays / halfLife);
-    if (!Number.isFinite(weight) || weight <= 0) continue;
-    result.push(e);
-  }
-  return result;
-}
-function outcomeCapability(events, now, opts = {}) {
-  const contribs = contributingOutcomes(events, now, opts);
-  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
-  const nowMs = Number.isFinite(now) ? now : Number.NaN;
-  const acc = /* @__PURE__ */ new Map();
-  for (const e of contribs) {
-    const tsMs = Date.parse(e.ts);
-    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
-    const weight = Math.pow(0.5, ageDays / halfLife);
-    const modelKey = modelKeyFromOutcome(e);
-    const accKey = [modelKey, e.category].join(SEP);
-    let a = acc.get(accKey);
-    if (!a) {
-      a = { modelKey, category: e.category, weightSum: 0, weightedValueSum: 0 };
-      acc.set(accKey, a);
-    }
-    a.weightSum += weight;
-    a.weightedValueSum += weight * verdictValue(e.verdict);
-  }
-  const overlay = /* @__PURE__ */ Object.create(null);
-  for (const a of acc.values()) {
-    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
-    const observed = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
-    const inner = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
-    inner[a.category] = observed;
-  }
-  return overlay;
-}
-function outcomeCapabilityByDifficulty(events, now, opts = {}) {
-  const contribs = contributingOutcomes(events, now, opts);
-  const halfLife = Number.isFinite(opts.halfLifeDays) && opts.halfLifeDays > 0 ? opts.halfLifeDays : DEFAULT_HALF_LIFE_DAYS;
-  const nowMs = Number.isFinite(now) ? now : Number.NaN;
-  const acc = /* @__PURE__ */ new Map();
-  for (const e of contribs) {
-    const difficulty = e.difficulty;
-    if (!difficulty) continue;
-    const tsMs = Date.parse(e.ts);
-    const ageDays = Number.isFinite(nowMs) ? Math.max(0, (nowMs - tsMs) / MS_PER_DAY) : 0;
-    const weight = Math.pow(0.5, ageDays / halfLife);
-    const modelKey = modelKeyFromOutcome(e);
-    const accKey = [modelKey, e.category, difficulty].join(SEP);
-    let a = acc.get(accKey);
-    if (!a) {
-      a = { modelKey, category: e.category, difficulty, weightSum: 0, weightedValueSum: 0 };
-      acc.set(accKey, a);
-    }
-    a.weightSum += weight;
-    a.weightedValueSum += weight * verdictValue(e.verdict);
-  }
-  const overlay = /* @__PURE__ */ Object.create(null);
-  for (const a of acc.values()) {
-    if (!(a.weightSum > 0) || !Number.isFinite(a.weightSum)) continue;
-    const byCategory = overlay[a.modelKey] ?? (overlay[a.modelKey] = /* @__PURE__ */ Object.create(null));
-    const byDifficulty = byCategory[a.category] ?? (byCategory[a.category] = /* @__PURE__ */ Object.create(null));
-    byDifficulty[a.difficulty] = { rate: a.weightedValueSum / a.weightSum, n: a.weightSum };
-  }
-  return overlay;
-}
-function zValueForConfidence(confidence) {
-  const map = {
-    0.8: 1.28155,
-    0.85: 1.43953,
-    0.9: 1.64485,
-    0.95: 1.95996,
-    0.98: 2.32635,
-    0.99: 2.57583,
-    0.999: 3.29053
-  };
-  return map[confidence] ?? 1.95996;
-}
-function capabilityInterval(observed, opts) {
-  if (!observed) return void 0;
-  const rawN = observed.n;
-  const rawRate = observed.rate;
-  if (!Number.isFinite(rawN) || rawN <= 0 || !Number.isFinite(rawRate) || rawRate < 0 || rawRate > 1) {
-    return void 0;
-  }
-  const rate = rawRate;
-  const confidence = opts?.confidence ?? 0.95;
-  const z = zValueForConfidence(confidence);
-  const z2 = z * z;
-  const denom = 1 + z2 / rawN;
-  if (!Number.isFinite(denom) || denom === 0) {
-    return void 0;
-  }
-  const center = (rate + z2 / (2 * rawN)) / denom;
-  const inner = rate * (1 - rate) / rawN + z2 / (4 * rawN * rawN);
-  if (inner < 0 || !Number.isFinite(inner)) {
-    return void 0;
-  }
-  const spread = z * Math.sqrt(inner) / denom;
-  if (!Number.isFinite(center) || !Number.isFinite(spread)) {
-    return void 0;
-  }
-  const lo = Math.max(0, Math.min(1, center - spread));
-  const hi = Math.max(0, Math.min(1, center + spread));
-  return { lo, hi, n: rawN, rate };
-}
-function evidenceFreshnessDays(outcomes, now) {
-  if (!Number.isFinite(now)) {
-    return void 0;
-  }
-  if (!outcomes || outcomes.length === 0) {
-    return void 0;
-  }
-  let maxTs = -Infinity;
-  let hasValid = false;
-  for (const e of outcomes) {
-    if (!e.ts) continue;
-    const tsMs = Date.parse(e.ts);
-    if (Number.isFinite(tsMs)) {
-      if (tsMs > maxTs) {
-        maxTs = tsMs;
-      }
-      hasValid = true;
-    }
-  }
-  if (!hasValid || maxTs === -Infinity) {
-    return void 0;
-  }
-  const ageDays = (now - maxTs) / MS_PER_DAY;
-  return Math.max(0, ageDays);
 }
 
 // ../core/src/registry.ts
@@ -28610,7 +28894,200 @@ ${r.notes}` : "";
       }
     })
   };
-  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool];
+  const backtestTool = {
+    name: "router_backtest",
+    description: "Compare routing decisions of two policies (policyA vs policyB) over historical workload. Read-only.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        policyA: {
+          type: "string",
+          description: "First policy to compare. Defaults to currently active policy."
+        },
+        policyB: {
+          type: "string",
+          description: "Second policy to compare. Defaults to cheapest (or balanced if current is cheapest)."
+        },
+        period: {
+          type: "string",
+          description: 'Window: "all" (default) or N + d/h, e.g. "7d".'
+        }
+      }
+    },
+    handler: (deps, args) => guardedAsync(async () => {
+      try {
+        const period = optString(args, "period");
+        let since;
+        if (period !== void 0) {
+          try {
+            since = resolveSinceIso(period, deps.now());
+          } catch {
+            throw new ToolInputError(
+              `Invalid period format "${period}". Expect "all", or "7d", "24h", etc.`
+            );
+          }
+        }
+        let events;
+        try {
+          events = core.filterEventsSince(deps.readLedger(), since);
+        } catch {
+          return ok(
+            `Could not read the ledger. No backtest comparison is available.`,
+            {
+              error: true,
+              message: `could not read the ledger`
+            }
+          );
+        }
+        const lanes = deps.allLanes ? deps.allLanes() : [];
+        const policy = deps.loadPolicy ? deps.loadPolicy() : { schema_version: 1, rules: [] };
+        const currentPolicy = deps.routingPolicy?.() ?? (deps.tieredStrategy === "tiered" ? "cheapest" : "balanced");
+        const policyAStr = optString(args, "policyA");
+        const policyBStr = optString(args, "policyB");
+        if (policyAStr !== void 0 && !isValidRoutingPolicy(policyAStr)) {
+          throw new ToolInputError(`"policyA" must be one of: ${NAMED_ROUTING_POLICIES.join(", ")}.`);
+        }
+        if (policyBStr !== void 0 && !isValidRoutingPolicy(policyBStr)) {
+          throw new ToolInputError(`"policyB" must be one of: ${NAMED_ROUTING_POLICIES.join(", ")}.`);
+        }
+        const policyA = policyAStr ?? currentPolicy;
+        const policyB = policyBStr ?? (policyA === "cheapest" ? "balanced" : "cheapest");
+        const observedCapability = deps.getFrozen?.() ? void 0 : deps.observedCapability();
+        const observedCapabilityByModel = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModel?.();
+        const observedCapabilityByModelDifficulty = deps.getFrozen?.() ? void 0 : deps.observedCapabilityByModelDifficulty?.();
+        const capPrior = deps.capabilityPrior?.(lanes);
+        const priorCtx = capPrior?.state === "on" ? { capabilityPrior: capPrior.overlay, ...capPrior.stale ? { capabilityPriorStale: true } : {} } : {};
+        const capHeadroom2 = deps.capHeadroom?.(lanes);
+        const quotaCtx = capHeadroom2 ? { capHeadroom: capHeadroom2 } : {};
+        const healthPenalty = deps.healthPenalty?.(lanes);
+        const healthCtx = healthPenalty ? { healthPenalty } : {};
+        const grants = deps.getFullAccess ? deps.getFullAccess(lanes) : [];
+        const fullAccessLaneIds = [];
+        for (const lane of lanes) {
+          if (lane.trust_mode === "reader") {
+            const matchesProjectOrEnvGrant = grants.some((g) => g.toLowerCase() === lane.id.toLowerCase());
+            if (matchesProjectOrEnvGrant) {
+              fullAccessLaneIds.push(lane.id);
+            }
+          }
+        }
+        if (deps.getYolo?.()) {
+          const configReaders = deps.readerLanes ? deps.readerLanes() : [];
+          for (const lane of configReaders) {
+            if (!fullAccessLaneIds.includes(lane.id)) {
+              fullAccessLaneIds.push(lane.id);
+            }
+          }
+        }
+        let availableIds;
+        if (deps.availableLaneIds) {
+          const tempCtx = {
+            lanes,
+            gateReady: deps.gateReady,
+            readerEgress: deps.readerEgress,
+            policyContext: {},
+            access_need: "worker-ok",
+            ...deps.host ? { host: deps.host } : {},
+            ...deps.getYolo?.() ? { yolo: true } : {},
+            ...observedCapability ? { observedCapability } : {},
+            ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+            ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+            ...priorCtx,
+            ...quotaCtx,
+            ...healthCtx,
+            ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {},
+            routingPolicy: policyA,
+            ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+            ...policyA === "cheapest" ? { strategy: "tiered", ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {} } : {}
+          };
+          const eligibleUnion = /* @__PURE__ */ new Map();
+          for (const category of core.taskCategories) {
+            const eligible = core.eligibleLanes({ category }, tempCtx, policy);
+            for (const e of eligible) {
+              eligibleUnion.set(e.lane.id, e.lane);
+            }
+          }
+          availableIds = await deps.availableLaneIds([...eligibleUnion.values()]);
+        }
+        const baseCtx = {
+          lanes,
+          gateReady: deps.gateReady,
+          readerEgress: deps.readerEgress,
+          policyContext: {},
+          access_need: "worker-ok",
+          ...deps.host ? { host: deps.host } : {},
+          ...deps.getYolo?.() ? { yolo: true } : {},
+          ...observedCapability ? { observedCapability } : {},
+          ...observedCapabilityByModel ? { observedCapabilityByModel } : {},
+          ...observedCapabilityByModelDifficulty ? { observedCapabilityByModelDifficulty } : {},
+          ...priorCtx,
+          ...quotaCtx,
+          ...healthCtx,
+          ...availableIds ? { availableLaneIds: availableIds } : {},
+          ...deps.laneCost ? { laneCost: deps.laneCost(lanes) } : {},
+          ...deps.tierFloor !== void 0 ? { tierFloor: deps.tierFloor } : {},
+          ...deps.preferredLane?.() ? { preferLaneId: deps.preferredLane() } : {},
+          ...fullAccessLaneIds.length ? { fullAccessLaneIds } : {}
+        };
+        if (!core.analyzeBacktest) {
+          return failResult("Backtest core function is not available on this server.");
+        }
+        const result = core.analyzeBacktest(events, baseCtx, policy, deps.now(), {
+          policyA,
+          policyB
+        });
+        const header = [
+          `Routing Backtest Comparison: policy "${policyA}" vs "${policyB}"`,
+          `[what-if over your CURRENT config + observed evidence (not a historical-config replay)]`,
+          `  window: ${period ?? "all history"}`,
+          `  policy decision differences: ${result.diffPercent.toFixed(1)}% of workload`,
+          `  net signal: ${result.netSignal}`
+        ];
+        const lines = [...header];
+        if (result.differences.length > 0) {
+          lines.push(``, `Differences breakdown:`);
+          for (const diff of result.differences) {
+            const diffHeader = `  - Category: "${diff.category}"${diff.difficulty ? ` (${diff.difficulty})` : ""}, share of workload: ${diff.workloadSharePercent.toFixed(1)}%`;
+            lines.push(diffHeader);
+            lines.push(`    - policy "${policyA}" would route to: ${diff.pickA}`);
+            lines.push(`    - policy "${policyB}" would route to: ${diff.pickB}`);
+            lines.push(`    - Reroute quality proxy comparison:`);
+            const renderEvidence = (pick2, ev) => {
+              if (pick2 === "native") return "native host (no evidence stored)";
+              if (!ev) return "no observed evidence";
+              const rateStr = ev.rate.toFixed(2);
+              const ciStr = ev.lo !== void 0 && ev.hi !== void 0 ? ` [${ev.lo.toFixed(2)} - ${ev.hi.toFixed(2)}]` : "";
+              const freshStr = ev.freshnessDays !== void 0 ? `, freshness: ${ev.freshnessDays.toFixed(1)}d` : "";
+              return `rate: ${rateStr}${ciStr}, n: ${ev.n.toFixed(1)}${freshStr}`;
+            };
+            lines.push(`      - ${diff.pickA}: ${renderEvidence(diff.pickA, diff.evidenceA)}`);
+            lines.push(`      - ${diff.pickB}: ${renderEvidence(diff.pickB, diff.evidenceB)}`);
+            let verdictStr = "";
+            if (diff.comparison === "insufficient_evidence") {
+              verdictStr = "insufficient evidence to say which is better";
+            } else if (diff.comparison === "favors_A") {
+              verdictStr = `evidence favors ${diff.pickA} (A)`;
+            } else if (diff.comparison === "favors_B") {
+              verdictStr = `evidence favors ${diff.pickB} (B)`;
+            } else {
+              verdictStr = "neutral (overlapping confidence intervals)";
+            }
+            lines.push(`      - Verdict: ${verdictStr}`);
+          }
+        } else {
+          lines.push(``, `No decision differences detected between policy "${policyA}" and "${policyB}" over this workload.`);
+        }
+        return ok(lines.join("\n"), result);
+      } catch (err) {
+        if (err instanceof ToolInputError) {
+          throw err;
+        }
+        return failResult("Backtest failed");
+      }
+    })
+  };
+  return [savingsTool, tokensTool, summaryTool, previewTool, statusTool, setEnabledTool, setPreferTool, setFullAccessTool, setYoloTool, setReserveTool, setCalibrationTool, setRoutedShareTool, setTargetTool, delegateTool, reviewTool, setupTool, configTool, setPolicyTool, doctorTool, feedbackTool, setFreezeTool, planTool, backtestTool];
 }
 function receiptLine(r) {
   const int2 = (n) => Math.round(n).toLocaleString("en-US");
@@ -29180,7 +29657,7 @@ function fileFullAccessStore(statePath) {
     }
   };
 }
-var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor };
+var CORE = { filterEventsSince, summarize, tokenStats, routeDecide, eligibleLanes, hostAllowsLane, modelMatchesPin, evaluate, isReaderElevated, taskCategories: TASK_CATEGORIES, classifyTask, MIN_CLASSIFY_CONFIDENCE, CLASSIFY_FALLBACK_CATEGORY, resolvedPriorFor, laneQuotaState, quotaEstimate, forecastCost, contributingOutcomes, analyzePlan, capabilityInterval, evidenceFreshnessDays, resolveLaneModelKey, declaredCapabilityFor, effectiveCapabilityFor, analyzeBacktest };
 function receiptFromEvents(events) {
   const legs = events.filter((e) => e.status !== "native");
   if (legs.length === 0) return void 0;
