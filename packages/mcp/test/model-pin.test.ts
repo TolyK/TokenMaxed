@@ -266,3 +266,37 @@ test('pin × escalation: needs-rework REWORKS on the SAME pinned lane (maxEscala
     rmSync(dir0, { recursive: true, force: true });
   }
 });
+
+test('escalation wiring: passes maxRounds from parseMaxRounds to runWithEscalation', async () => {
+  const alwaysReworkYaml = MANAGED_LANES_YAML.replace(
+    "args: ['-e', 'process.stdout.write(\"VERDICT: pass\")']",
+    `args: ['-e', 'process.stdout.write("VERDICT: needs-rework")']`,
+  );
+
+  // Set TOKENMAXED_REVIEW_MAX_ROUNDS to 3
+  const { dir, env } = setupDir(alwaysReworkYaml, {
+    TOKENMAXED_ESCALATE: 'true',
+    TOKENMAXED_REVIEW_MAX_ROUNDS: '3',
+  });
+  try {
+    const outcome = await makeServerDeps(env).delegate({ category: 'bugfix', instruction: 'noop', model: 'pin-m' });
+    // Since it always fails/needs-rework and maxRounds is 3, it should run 3 legs (initial + 2 reworks) and then give back
+    assert.equal(outcome.native, true, JSON.stringify(outcome));
+    assert.equal(outcome.receipt?.legs, 3, JSON.stringify(outcome.receipt));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+
+  // Set TOKENMAXED_REVIEW_MAX_ROUNDS to 2
+  const { dir: dir2, env: env2 } = setupDir(alwaysReworkYaml, {
+    TOKENMAXED_ESCALATE: 'true',
+    TOKENMAXED_REVIEW_MAX_ROUNDS: '2',
+  });
+  try {
+    const outcome2 = await makeServerDeps(env2).delegate({ category: 'bugfix', instruction: 'noop', model: 'pin-m' });
+    assert.equal(outcome2.native, true, JSON.stringify(outcome2));
+    assert.equal(outcome2.receipt?.legs, 2, JSON.stringify(outcome2.receipt));
+  } finally {
+    rmSync(dir2, { recursive: true, force: true });
+  }
+});

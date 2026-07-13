@@ -64,6 +64,7 @@ import { fetchModelList } from './model-list.ts';
 import { makeSummaryFromEnv } from './summary-deps.ts';
 import { homeFile, makeCliSpawn, makeLoadPolicy, makeResolveAuth } from './config.ts';
 import { REVIEW_BUDGET_MS, makeHostReviewDeps, makeReviewRunner } from './host-review.ts';
+import { parseMaxRounds } from './reviewer.ts';
 import { fmtEta, fmtWindow } from './summary.ts';
 import { runReviewWithBudget } from './review-budget.ts';
 import { runSetup } from './setup.ts';
@@ -907,6 +908,7 @@ export function makeServerDeps(env: NodeJS.ProcessEnv = process.env): ToolDeps {
         : ctx.availableLaneIds;
       const esc = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes, availableLaneIds: escAvailable }, policy, escDeps, {
         candidates: managerPool,
+        maxRounds: parseMaxRounds(env),
         ...(pinnedModel ? { maxEscalations: 0 } : {}),
       });
       let escRecordingFailed = false;

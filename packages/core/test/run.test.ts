@@ -490,3 +490,232 @@ test('reader lane is not selected when reader egress is off (degrades to native)
   const r = await runTask({ category: 'bugfix', instruction: 'x' }, { ...readerCtx, readerEgress: false }, allowReader, d);
   assert.equal(r.native, true); // no selectable lane ⇒ native
 });
+
+// --- C-13 offload-loop iterate-until-clean tests ---
+
+test('escalation with maxRounds:5: multiple reworks/escalations iterate until pass', async () => {
+  // 4 needs-rework verdicts, then 1 pass.
+  // This consumes 4 reworks and then accepts.
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework', 'VERDICT: needs-rework', 'VERDICT: needs-rework', 'VERDICT: needs-rework', 'VERDICT: pass']),
+    { candidates: ePool, maxRounds: 5 }
+  );
+  assert.equal(r.final_action, 'accept_after_rework');
+  assert.equal(r.subjectLaneId, 'cheap');
+  // Initial task + 4 reworks = 5 task events total
+  const tasks = r.events.filter((e) => e.kind === 'task');
+  assert.equal(tasks.length, 5);
+  // Verify only the final task is not superseded
+  assert.ok(tasks.slice(0, 4).every((t) => t.event.superseded === true));
+  assert.notEqual(tasks[4]!.event.superseded, true);
+});
+
+test('escalation with maxRounds:5: multiple reworks then escalation then pass', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework', 'VERDICT: needs-rework', 'VERDICT: fail', 'VERDICT: pass']),
+    { candidates: ePool, maxRounds: 5 }
+  );
+  assert.equal(r.final_action, 'accept_after_escalation');
+  assert.equal(r.subjectLaneId, 'target');
+  const tasks = r.events.filter((e) => e.kind === 'task');
+  assert.equal(tasks.length, 4); // initial, rework 1, rework 2, escalate
+  assert.equal((tasks[0]!.event as any).laneId, 'cheap');
+  assert.equal((tasks[1]!.event as any).laneId, 'cheap');
+  assert.equal((tasks[2]!.event as any).laneId, 'cheap');
+  assert.equal((tasks[3]!.event as any).laneId, 'target');
+});
+
+test('escalation with maxRounds:3: gives back when budget is exhausted after reworks and escalation', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework', 'VERDICT: fail', 'VERDICT: fail']),
+    { candidates: ePool, maxRounds: 3 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  assert.equal(r.subjectLaneId, 'target');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3); // 3 review outcomes
+  assert.equal((outcomes[0]!.event as any).action_taken, 'rework');
+  assert.equal((outcomes[1]!.event as any).action_taken, 'escalate');
+  assert.equal((outcomes[2]!.event as any).action_taken, 'give_back');
+});
+
+test('escalation: a metered subject cannot free-rework and skips to escalate/give_back', async () => {
+  const meteredCheap = elane({ id: 'meteredCheap', costBasis: 'metered', capability: { bugfix: 0.5 } });
+  const ctx: RouteContext = { lanes: [meteredCheap], policyContext: { repo_class: 'public', sensitivity: 'normal' } };
+  
+  // Reviewer returns needs-rework. Since meteredCheap is metered, it skips rework and tries to escalate.
+  // With no target, it gives back.
+  const r = await runWithEscalation(
+    eReq,
+    ctx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: [meteredCheap, eMgr], maxRounds: 5 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  assert.equal(r.subjectLaneId, 'meteredCheap');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 1);
+  assert.equal((outcomes[0]!.event as any).action_taken, 'give_back');
+});
+
+test('escalation with maxRounds:5 and maxEscalations:0 (pin): reworks iterate but no escalation happens', async () => {
+  // fail verdict under pin should immediately give_back (escalation suppressed)
+  const rFail = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: fail']),
+    { candidates: ePool, maxRounds: 5, maxEscalations: 0 }
+  );
+  assert.equal(rFail.final_action, 'give_back');
+  assert.equal((rFail.events[1]!.event as any).action_taken, 'give_back');
+
+  // needs-rework verdict under pin should rework same-lane up to maxRounds (5)
+  const rRework = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: 5, maxEscalations: 0 }
+  );
+  assert.equal(rRework.final_action, 'give_back');
+  assert.equal(rRework.subjectLaneId, 'cheap');
+  const tasks = rRework.events.filter((e) => e.kind === 'task');
+  assert.equal(tasks.length, 5); // initial + 4 reworks
+});
+
+test('escalation: with maxRounds ABSENT, behavior is byte-identical to the current 1+1', async () => {
+  // With default maxReworks=1, maxEscalations=1:
+  // needs-rework repeatedly -> 1 rework (cheap) -> 1 escalate (target) -> give_back
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool }
+  );
+  assert.equal(r.final_action, 'give_back');
+  assert.equal(r.subjectLaneId, 'target');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+  assert.equal((outcomes[0]!.event as any).action_taken, 'rework');
+  assert.equal((outcomes[1]!.event as any).action_taken, 'escalate');
+  assert.equal((outcomes[2]!.event as any).action_taken, 'give_back');
+});
+
+// --- C-13 maxRounds input normalization safety tests ---
+
+test('escalation with maxRounds: Infinity falls back to legacy (3 rounds)', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: Infinity }
+  );
+  assert.equal(r.final_action, 'give_back');
+  assert.equal(r.subjectLaneId, 'target');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+});
+
+test('escalation with maxRounds: NaN falls back to legacy (3 rounds)', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: NaN }
+  );
+  assert.equal(r.final_action, 'give_back');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+});
+
+test('escalation with maxRounds: 3.5 is normalized to 3 rounds', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: 3.5 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+});
+
+test('escalation with maxRounds: 2.9 is normalized to 2 rounds', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: 2.9 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 2);
+});
+
+test('escalation with maxRounds: 0 falls back to legacy (3 rounds)', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: 0 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+});
+
+test('escalation with maxRounds: -1 falls back to legacy (3 rounds)', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: -1 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+});
+
+test('escalation with maxRounds: 0.5 falls back to legacy (3 rounds)', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: 0.5 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+});
+
+test('escalation with maxRounds: Number.MAX_SAFE_INTEGER + 1 falls back to legacy (3 rounds)', async () => {
+  const r = await runWithEscalation(
+    eReq,
+    eCtx,
+    noPolicy,
+    edeps(['VERDICT: needs-rework']),
+    { candidates: ePool, maxRounds: Number.MAX_SAFE_INTEGER + 1 }
+  );
+  assert.equal(r.final_action, 'give_back');
+  const outcomes = r.events.filter((e) => e.kind === 'outcome');
+  assert.equal(outcomes.length, 3);
+});

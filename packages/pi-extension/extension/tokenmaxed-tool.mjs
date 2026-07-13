@@ -23360,9 +23360,14 @@ function deriveOutcomeDifficulty(stage, action) {
   return stage === 0 ? "easy" : "moderate";
 }
 async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
-  const maxReworks = opts.maxReworks ?? 1;
-  const maxEscalations = opts.maxEscalations ?? 1;
+  const rawMaxRounds = opts.maxRounds;
+  const floored = rawMaxRounds !== void 0 ? Math.floor(rawMaxRounds) : void 0;
+  const validRounds = rawMaxRounds !== void 0 && Number.isFinite(rawMaxRounds) && Number.isSafeInteger(floored) && floored !== void 0 && floored >= 1;
+  const maxRounds = validRounds ? floored : void 0;
+  const maxReworks = maxRounds !== void 0 ? opts.maxReworks ?? maxRounds : opts.maxReworks ?? 1;
+  const maxEscalations = maxRounds !== void 0 ? opts.maxEscalations ?? maxRounds : opts.maxEscalations ?? 1;
   const minCapabilityDelta = opts.minCapabilityDelta ?? 0.15;
+  const budget = maxRounds !== void 0 ? maxRounds : maxReworks + maxEscalations + 1;
   const task = {
     category: request.category,
     ...request.difficulty ? { difficulty: request.difficulty } : {}
@@ -23381,7 +23386,7 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
   }
   let subjectLane = subject;
   const counters = { reworks: 0, escalations: 0 };
-  for (let round = 0; round < maxReworks + maxEscalations + 1; round++) {
+  for (let round = 0; round < budget; round++) {
     const output = current.resultText;
     const reviewedAttempt = attempt;
     const stage = counters.reworks + counters.escalations;
@@ -23401,6 +23406,9 @@ async function runWithEscalation(request, ctx, policy, deps, opts = {}) {
     let action = escalationDecision(verdict, counters, { maxReworks, maxEscalations });
     if (action === "rework" && !isMarginalFree(subjectLane)) {
       action = escalationDecision(verdict, { reworks: maxReworks, escalations: counters.escalations }, { maxReworks, maxEscalations });
+    }
+    if (action !== "accept" && round + 1 >= budget) {
+      action = "give_back";
     }
     let target = null;
     if (action === "escalate") {
@@ -25180,7 +25188,9 @@ var MAX_REVIEW_ROUNDS_CAP = 20;
 function parseMaxRounds(env) {
   const raw = env.TOKENMAXED_REVIEW_MAX_ROUNDS;
   if (raw === void 0) return DEFAULT_REVIEW_MAX_ROUNDS;
-  const n = Number.parseInt(raw, 10);
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return DEFAULT_REVIEW_MAX_ROUNDS;
+  const n = Number.parseInt(trimmed, 10);
   if (!Number.isFinite(n) || n < 1) return DEFAULT_REVIEW_MAX_ROUNDS;
   return Math.min(n, MAX_REVIEW_ROUNDS_CAP);
 }
@@ -27236,6 +27246,7 @@ function makeServerDeps(env = process.env) {
       const escAvailable = pinnedModel ? [.../* @__PURE__ */ new Set([...ctx.availableLaneIds, ...await probeAvailable(managerPool)])] : ctx.availableLaneIds;
       const esc2 = await runWithEscalation(taskInput, { ...ctx, lanes: offloadLanes, availableLaneIds: escAvailable }, policy, escDeps, {
         candidates: managerPool,
+        maxRounds: parseMaxRounds(env),
         ...pinnedModel ? { maxEscalations: 0 } : {}
       });
       let escRecordingFailed = false;
