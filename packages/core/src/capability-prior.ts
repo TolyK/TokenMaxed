@@ -16,6 +16,7 @@ import type {
   TaskCategory,
 } from './types.ts';
 import { TASK_CATEGORIES } from './types.ts';
+import { isKnownCategory } from './taxonomy.ts';
 
 /** Mirrors {@link DEFAULT_CAPABILITY} in route.ts (duplicated to avoid a circular import). */
 const DEFAULT_CAPABILITY = 0.5;
@@ -188,7 +189,6 @@ export type ValidateSnapshotResult =
   | { valid: false; reason: string };
 
 const CONFIDENCE_LEVELS = new Set(['low', 'moderate', 'high']);
-const CATEGORIES = new Set<string>(TASK_CATEGORIES);
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -211,7 +211,7 @@ export function computeSnapshotHash(snapshot: Omit<CapabilitySnapshot, 'hash'> &
 function validateSnapshotEntry(raw: unknown, index: number): CapabilitySnapshotEntry | string {
   if (!isPlainObject(raw)) return `entries[${index}] must be an object`;
   const category = raw.category;
-  if (typeof category !== 'string' || !CATEGORIES.has(category)) {
+  if (typeof category !== 'string' || !isKnownCategory(category)) {
     return `entries[${index}].category is not a known task category`;
   }
   const model = raw.model;
@@ -286,7 +286,7 @@ export function validateSnapshot(obj: unknown): ValidateSnapshotResult {
   if (!isPlainObject(mapping)) return { valid: false, reason: 'mapping must be an object' };
   const parsedMapping: Partial<Record<TaskCategory, string>> = {};
   for (const [key, chartId] of Object.entries(mapping)) {
-    if (!CATEGORIES.has(key)) return { valid: false, reason: `mapping.${key} is not a known task category` };
+    if (!isKnownCategory(key)) return { valid: false, reason: `mapping.${key} is not a known task category` };
     if (typeof chartId !== 'string' || chartId === '') {
       return { valid: false, reason: `mapping.${key} must be a non-empty chart id` };
     }
@@ -389,6 +389,7 @@ export function overlayFromSnapshot(
 
   for (const lane of lanes) {
     const resolvedModel = resolveLaneModelId(lane, opts.priceTable);
+    // Intentionally coding-scoped: iterates the coding snapshot's category space; per-domain non-coding snapshots are a Phase-2 follow-up.
     for (const category of TASK_CATEGORIES) {
       if (!snapshot.mapping[category]) continue;
       const entry = findSnapshotEntry(snapshot, resolvedModel, category);

@@ -16,7 +16,8 @@
 
 import { parse as parseYaml } from 'yaml';
 
-import { POLICY_VERDICTS, TASK_CATEGORIES, TRUST_MODE_ALIASES, TRUST_MODES } from './types.ts';
+import { POLICY_VERDICTS, TRUST_MODE_ALIASES, TRUST_MODES } from './types.ts';
+import { activeCategories } from './taxonomy.ts';
 import type {
   Lane,
   Policy,
@@ -199,7 +200,7 @@ function parseRule(entry: unknown, index: number): PolicyRule {
   const trust_mode = validateCondition(rawTrust, TRUST_MODES, `${where}.trust_mode`);
   const provenance = validateCondition(entry.provenance, null, `${where}.provenance`);
   const jurisdiction = validateCondition(entry.jurisdiction, null, `${where}.jurisdiction`);
-  const category = validateCondition(entry.category, TASK_CATEGORIES, `${where}.category`);
+  const category = validateCondition(entry.category, activeCategories(), `${where}.category`);
   if (repo_class !== undefined) rule.repo_class = repo_class as PolicyRule['repo_class'];
   if (sensitivity !== undefined) rule.sensitivity = sensitivity as PolicyRule['sensitivity'];
   if (trust_mode !== undefined) rule.trust_mode = trust_mode as PolicyRule['trust_mode'];

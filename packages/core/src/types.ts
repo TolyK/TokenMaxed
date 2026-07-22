@@ -61,8 +61,8 @@ export type ExecutionMode = 'answer-only' | 'agentic';
  */
 export type CostBasis = 'subscription' | 'metered' | 'local';
 
-/** The fixed v0 task taxonomy (kept small on purpose; full taxonomy is out of scope for v0). */
-export type TaskCategory =
+/** The coding domain's fixed category union — strong typing for coding-domain internals. */
+export type CodingCategory =
   | 'boilerplate'
   | 'bugfix'
   | 'refactor'
@@ -71,8 +71,15 @@ export type TaskCategory =
   | 'codegen'
   | 'docs';
 
+/**
+ * A task category WIRE id (bare string, e.g. "bugfix"). Runtime-validated against the
+ * taxonomy registry (see taxonomy.ts) instead of a compile-time union, so task domains
+ * are runtime-pluggable. Coding's categories are {@link CodingCategory}.
+ */
+export type TaskCategory = string;
+
 /** All task categories, in canonical order. */
-export const TASK_CATEGORIES: readonly TaskCategory[] = [
+export const TASK_CATEGORIES: readonly CodingCategory[] = [
   'boilerplate',
   'bugfix',
   'refactor',
