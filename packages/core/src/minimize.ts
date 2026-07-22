@@ -35,7 +35,7 @@
  */
 
 import type { RepoClass, Sensitivity, TaskCategory } from './types.ts';
-import { TASK_CATEGORIES } from './types.ts';
+import { activeCategories, isKnownCategory } from './taxonomy.ts';
 
 /** Module-private brand — not exported, so no other module can construct a payload. */
 const BRAND: unique symbol = Symbol('MinimizedPayload');
@@ -188,8 +188,8 @@ function validateInstruction(request: MinimizedRequest): string | BlockResult {
   if (typeof request.instruction !== 'string' || request.instruction.trim() === '') {
     return blocked('instruction must be a non-empty string');
   }
-  if (!TASK_CATEGORIES.includes(request.category)) {
-    return blocked(`category must be one of: ${TASK_CATEGORIES.join(', ')}`);
+  if (!isKnownCategory(request.category)) {
+    return blocked(`category must be one of: ${activeCategories().join(', ')}`);
   }
   if (request.instruction.length > LIMITS.maxInstructionChars) {
     return blocked(`instruction exceeds ${LIMITS.maxInstructionChars} chars`);
@@ -331,8 +331,8 @@ export async function minimizeForReader(
   if (typeof request.instruction !== 'string' || request.instruction.trim() === '') {
     return blocked('instruction must be a non-empty string');
   }
-  if (!TASK_CATEGORIES.includes(request.category)) {
-    return blocked(`category must be one of: ${TASK_CATEGORIES.join(', ')}`);
+  if (!isKnownCategory(request.category)) {
+    return blocked(`category must be one of: ${activeCategories().join(', ')}`);
   }
   if (!fullAccess && request.instruction.length > LIMITS.maxInstructionChars) {
     return blocked(`instruction exceeds ${LIMITS.maxInstructionChars} chars`);

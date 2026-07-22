@@ -7384,6 +7384,65 @@ var TASK_CATEGORIES = [
 var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
+// ../core/src/taxonomy.ts
+var CODING_DOMAIN = "coding";
+var TaxonomyError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TaxonomyError";
+  }
+};
+var domains = /* @__PURE__ */ new Map();
+var wireOwner = /* @__PURE__ */ new Map();
+function registerDomain(spec) {
+  const { domain, categories } = spec;
+  if (domain === "" || domain.includes("/")) {
+    throw new TaxonomyError(
+      `Invalid domain id '${domain}': must be non-empty and must not contain '/'`
+    );
+  }
+  const seen = /* @__PURE__ */ new Set();
+  for (const cat of categories) {
+    if (cat === "" || cat.includes("/")) {
+      throw new TaxonomyError(
+        `Invalid category id '${cat}': must be non-empty and must not contain '/'`
+      );
+    }
+    if (seen.has(cat)) {
+      throw new TaxonomyError(`Duplicate category id '${cat}' in domain '${domain}'`);
+    }
+    seen.add(cat);
+    const owner = wireOwner.get(cat);
+    if (owner !== void 0 && owner !== domain) {
+      throw new TaxonomyError(
+        `Wire category '${cat}' is already registered by domain '${owner}'`
+      );
+    }
+  }
+  if (domains.has(domain)) {
+    for (const cat of domains.get(domain)) {
+      if (wireOwner.get(cat) === domain) {
+        wireOwner.delete(cat);
+      }
+    }
+  }
+  domains.set(domain, categories.slice());
+  for (const cat of categories) {
+    wireOwner.set(cat, domain);
+  }
+}
+function activeCategories() {
+  const out = [];
+  for (const cats of domains.values()) {
+    out.push(...cats);
+  }
+  return out;
+}
+function isKnownCategory(wireId) {
+  return wireOwner.has(wireId);
+}
+registerDomain({ domain: CODING_DOMAIN, categories: [...TASK_CATEGORIES] });
+
 // ../core/src/access.ts
 var INSUFFICIENT_CONTEXT_SENTINEL = "INSUFFICIENT_CONTEXT:";
 
@@ -7396,9 +7455,6 @@ function parseModelAlias(model) {
   if (m && m[1].trim() !== "") return { latest: true, family: m[1].trim() };
   return { latest: false, id: model };
 }
-
-// ../core/src/capability-prior.ts
-var CATEGORIES = new Set(TASK_CATEGORIES);
 
 // ../core/src/policy.ts
 var import_yaml = __toESM(require_dist(), 1);
@@ -7811,7 +7867,6 @@ var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
 var EXECUTION_MODES = ["answer-only", "agentic"];
-var CATEGORIES2 = new Set(TASK_CATEGORIES);
 var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
@@ -7870,9 +7925,9 @@ function parseCapability(value, where) {
   }
   const out = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES2.has(category)) {
+    if (!isKnownCategory(category)) {
       throw new LaneConfigError(
-        `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(", ")}.`
+        `${where}.${category} is not a known task category. Valid: ${activeCategories().join(", ")}.`
       );
     }
     if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0 || raw > 1) {

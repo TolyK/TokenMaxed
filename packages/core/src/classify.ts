@@ -1,15 +1,15 @@
-import type { TaskCategory } from './types.ts';
+import type { CodingCategory } from './types.ts';
 
 export const MIN_CLASSIFY_CONFIDENCE = 0.5;
-export const CLASSIFY_FALLBACK_CATEGORY: TaskCategory = 'feature';
+export const CLASSIFY_FALLBACK_CATEGORY: CodingCategory = 'feature';
 
 export interface Classification {
-  category: TaskCategory;
+  category: CodingCategory;
   confidence: number;
-  scores: Partial<Record<TaskCategory, number>>;
+  scores: Partial<Record<CodingCategory, number>>;
 }
 
-const CATEGORY_ORDER: TaskCategory[] = [
+const CATEGORY_ORDER: CodingCategory[] = [
   'boilerplate',
   'bugfix',
   'refactor',
@@ -19,7 +19,7 @@ const CATEGORY_ORDER: TaskCategory[] = [
   'docs',
 ];
 
-const SIGNALS: Record<TaskCategory, string[]> = {
+const SIGNALS: Record<CodingCategory, string[]> = {
   bugfix: [
     'fix',
     'bug',
@@ -113,7 +113,7 @@ function escapeRegExp(str: string): string {
 }
 
 export function classifyTask(text: string): Classification {
-  const scores: Record<TaskCategory, number> = {
+  const scores: Record<CodingCategory, number> = {
     boilerplate: 0,
     bugfix: 0,
     refactor: 0,
@@ -140,7 +140,7 @@ export function classifyTask(text: string): Classification {
 
   // Find the top score and the category with the top score.
   let topScore = 0;
-  let topCategory: TaskCategory | null = null;
+  let topCategory: CodingCategory | null = null;
 
   for (const category of CATEGORY_ORDER) {
     const score = scores[category];

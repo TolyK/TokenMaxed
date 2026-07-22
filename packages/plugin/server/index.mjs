@@ -22808,6 +22808,65 @@ var TRUSTED_PROVENANCES = ["anthropic", "openai", "google", "meta"];
 var DIFFICULTY_BUCKETS = ["easy", "moderate", "hard"];
 var POLICY_VERDICTS = ["allow", "block", "force-trusted"];
 
+// ../core/src/taxonomy.ts
+var CODING_DOMAIN = "coding";
+var TaxonomyError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TaxonomyError";
+  }
+};
+var domains = /* @__PURE__ */ new Map();
+var wireOwner = /* @__PURE__ */ new Map();
+function registerDomain(spec) {
+  const { domain, categories } = spec;
+  if (domain === "" || domain.includes("/")) {
+    throw new TaxonomyError(
+      `Invalid domain id '${domain}': must be non-empty and must not contain '/'`
+    );
+  }
+  const seen = /* @__PURE__ */ new Set();
+  for (const cat of categories) {
+    if (cat === "" || cat.includes("/")) {
+      throw new TaxonomyError(
+        `Invalid category id '${cat}': must be non-empty and must not contain '/'`
+      );
+    }
+    if (seen.has(cat)) {
+      throw new TaxonomyError(`Duplicate category id '${cat}' in domain '${domain}'`);
+    }
+    seen.add(cat);
+    const owner = wireOwner.get(cat);
+    if (owner !== void 0 && owner !== domain) {
+      throw new TaxonomyError(
+        `Wire category '${cat}' is already registered by domain '${owner}'`
+      );
+    }
+  }
+  if (domains.has(domain)) {
+    for (const cat of domains.get(domain)) {
+      if (wireOwner.get(cat) === domain) {
+        wireOwner.delete(cat);
+      }
+    }
+  }
+  domains.set(domain, categories.slice());
+  for (const cat of categories) {
+    wireOwner.set(cat, domain);
+  }
+}
+function activeCategories() {
+  const out = [];
+  for (const cats of domains.values()) {
+    out.push(...cats);
+  }
+  return out;
+}
+function isKnownCategory(wireId) {
+  return wireOwner.has(wireId);
+}
+registerDomain({ domain: CODING_DOMAIN, categories: [...TASK_CATEGORIES] });
+
 // ../core/src/minimize.ts
 var BRAND = /* @__PURE__ */ Symbol("MinimizedPayload");
 var READER_BRAND = /* @__PURE__ */ Symbol("ReaderPayload");
@@ -22855,8 +22914,8 @@ function validateInstruction(request) {
   if (typeof request.instruction !== "string" || request.instruction.trim() === "") {
     return blocked("instruction must be a non-empty string");
   }
-  if (!TASK_CATEGORIES.includes(request.category)) {
-    return blocked(`category must be one of: ${TASK_CATEGORIES.join(", ")}`);
+  if (!isKnownCategory(request.category)) {
+    return blocked(`category must be one of: ${activeCategories().join(", ")}`);
   }
   if (request.instruction.length > LIMITS.maxInstructionChars) {
     return blocked(`instruction exceeds ${LIMITS.maxInstructionChars} chars`);
@@ -22932,8 +22991,8 @@ async function minimizeForReader(request, scanSecrets, opts) {
   if (typeof request.instruction !== "string" || request.instruction.trim() === "") {
     return blocked("instruction must be a non-empty string");
   }
-  if (!TASK_CATEGORIES.includes(request.category)) {
-    return blocked(`category must be one of: ${TASK_CATEGORIES.join(", ")}`);
+  if (!isKnownCategory(request.category)) {
+    return blocked(`category must be one of: ${activeCategories().join(", ")}`);
   }
   if (!fullAccess && request.instruction.length > LIMITS.maxInstructionChars) {
     return blocked(`instruction exceeds ${LIMITS.maxInstructionChars} chars`);
@@ -23309,7 +23368,6 @@ function resolvedPriorFor(lane, category, priorOverlay, opts = {}) {
   };
 }
 var CONFIDENCE_LEVELS = /* @__PURE__ */ new Set(["low", "moderate", "high"]);
-var CATEGORIES = new Set(TASK_CATEGORIES);
 function isPlainObject3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -23327,7 +23385,7 @@ function computeSnapshotHash(snapshot) {
 function validateSnapshotEntry(raw, index) {
   if (!isPlainObject3(raw)) return `entries[${index}] must be an object`;
   const category = raw.category;
-  if (typeof category !== "string" || !CATEGORIES.has(category)) {
+  if (typeof category !== "string" || !isKnownCategory(category)) {
     return `entries[${index}].category is not a known task category`;
   }
   const model = raw.model;
@@ -23396,7 +23454,7 @@ function validateSnapshot(obj) {
   if (!isPlainObject3(mapping)) return { valid: false, reason: "mapping must be an object" };
   const parsedMapping = {};
   for (const [key, chartId] of Object.entries(mapping)) {
-    if (!CATEGORIES.has(key)) return { valid: false, reason: `mapping.${key} is not a known task category` };
+    if (!isKnownCategory(key)) return { valid: false, reason: `mapping.${key} is not a known task category` };
     if (typeof chartId !== "string" || chartId === "") {
       return { valid: false, reason: `mapping.${key} must be a non-empty chart id` };
     }
@@ -23589,7 +23647,7 @@ function parseRule(entry, index) {
   const trust_mode = validateCondition(rawTrust, TRUST_MODES, `${where}.trust_mode`);
   const provenance = validateCondition(entry.provenance, null, `${where}.provenance`);
   const jurisdiction = validateCondition(entry.jurisdiction, null, `${where}.jurisdiction`);
-  const category = validateCondition(entry.category, TASK_CATEGORIES, `${where}.category`);
+  const category = validateCondition(entry.category, activeCategories(), `${where}.category`);
   if (repo_class !== void 0) rule.repo_class = repo_class;
   if (sensitivity !== void 0) rule.sensitivity = sensitivity;
   if (trust_mode !== void 0) rule.trust_mode = trust_mode;
@@ -25700,7 +25758,6 @@ var LANE_KINDS = ["cli", "api", "local"];
 var COST_BASES = ["subscription", "metered", "local"];
 var LANE_ROLES = ["manager", "worker"];
 var EXECUTION_MODES = ["answer-only", "agentic"];
-var CATEGORIES2 = new Set(TASK_CATEGORIES);
 var ALLOWED_LANE_KEYS = /* @__PURE__ */ new Set([
   "id",
   "kind",
@@ -25759,9 +25816,9 @@ function parseCapability(value, where) {
   }
   const out = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES2.has(category)) {
+    if (!isKnownCategory(category)) {
       throw new LaneConfigError(
-        `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(", ")}.`
+        `${where}.${category} is not a known task category. Valid: ${activeCategories().join(", ")}.`
       );
     }
     if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0 || raw > 1) {

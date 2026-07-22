@@ -15,7 +15,8 @@ import { parse as parseYaml } from 'yaml';
 
 import { parseModelAlias } from './model-freshness.ts';
 import { declaredCapabilityFor } from './route.ts';
-import { TASK_CATEGORIES, TRUST_MODE_ALIASES, TRUST_MODES } from './types.ts';
+import { TRUST_MODE_ALIASES, TRUST_MODES } from './types.ts';
+import { activeCategories, isKnownCategory } from './taxonomy.ts';
 import type {
   CostBasis,
   ExecutionMode,
@@ -29,7 +30,7 @@ const LANE_KINDS: readonly LaneKind[] = ['cli', 'api', 'local'];
 const COST_BASES: readonly CostBasis[] = ['subscription', 'metered', 'local'];
 const LANE_ROLES: readonly LaneRole[] = ['manager', 'worker'];
 const EXECUTION_MODES: readonly ExecutionMode[] = ['answer-only', 'agentic'];
-const CATEGORIES = new Set<string>(TASK_CATEGORIES);
+
 
 /** Fields a lane entry may declare. Anything else is rejected as a likely typo. */
 const ALLOWED_LANE_KEYS = new Set([
@@ -103,9 +104,9 @@ function parseCapability(
   }
   const out: Partial<Record<TaskCategory, number>> = {};
   for (const [category, raw] of Object.entries(value)) {
-    if (!CATEGORIES.has(category)) {
+    if (!isKnownCategory(category)) {
       throw new LaneConfigError(
-        `${where}.${category} is not a known task category. Valid: ${TASK_CATEGORIES.join(', ')}.`,
+        `${where}.${category} is not a known task category. Valid: ${activeCategories().join(', ')}.`,
       );
     }
     if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0 || raw > 1) {
